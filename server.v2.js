@@ -7,12 +7,13 @@ import { execFile, spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readBridgeConfig, resolveBridgePaths } from "./src/v2/config/bridge-config.js";
 import {
   integrationPreviewReceiptSchema,
   sanitizedWorkspaceSchema,
@@ -54,28 +55,24 @@ import {
   scopeChangedFileViolations,
   validateChangedFilesForPlan,
 } from "./src/v2/policy/scope-results.js";
+import { createChildEnvBuilders } from "./src/v2/runtime/child-env.js";
+import { createIsolatedOpenCodeRuntimeManager } from "./src/v2/runtime/isolated-opencode-runtime.js";
 
 const execFileAsync = promisify(execFile);
-const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
-const USER_HOME_DIR = homedir();
-const DEFAULT_OPENCODE_CONFIG_DIR = process.env.XDG_CONFIG_HOME
-  ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
-  : path.join(USER_HOME_DIR, ".config", "opencode");
-const DEFAULT_OPENCODE_DATA_DIR = process.env.XDG_DATA_HOME
-  ? path.join(process.env.XDG_DATA_HOME, "opencode")
-  : path.join(USER_HOME_DIR, ".local", "share", "opencode");
-const DEFAULT_OPENCODE_CACHE_HOME = process.env.XDG_CACHE_HOME || path.join(USER_HOME_DIR, ".cache");
-const DEFAULT_OPENCODE_STATE_HOME = process.env.XDG_STATE_HOME || path.join(USER_HOME_DIR, ".local", "state");
-const CODEX_STATE_HOME = String(process.env.CODEX_HOME || path.join(USER_HOME_DIR, ".codex")).trim();
-const OPENCODE_EXE = String(
-  process.env.CODEX_OPENCODE_EXECUTABLE || process.env.OPENCODE_EXE || "opencode"
-).trim() || "opencode";
-const OPENCODE_AGENT_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_AGENT_DIR || path.join(DEFAULT_OPENCODE_CONFIG_DIR, "agents")).trim()
-);
-const OPENCODE_SKILL_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_SKILL_DIR || path.join(DEFAULT_OPENCODE_CONFIG_DIR, "skills")).trim()
-);
+const BRIDGE_PATHS = resolveBridgePaths({
+  runtimeDir: path.dirname(fileURLToPath(import.meta.url)),
+});
+const {
+  BRIDGE_RUNTIME_DIR,
+  USER_HOME_DIR,
+  DEFAULT_OPENCODE_CONFIG_DIR,
+  DEFAULT_OPENCODE_DATA_DIR,
+  OPENCODE_EXE,
+  OPENCODE_AGENT_DIR,
+  OPENCODE_SKILL_DIR,
+  GLOBAL_BRIDGE_STATE_DIR,
+  BRIDGE_OPENCODE_HOME_DIR,
+} = BRIDGE_PATHS;
 const MCP_ORCHESTRATOR_AGENT = String(
   process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "mcp-orchestrator"
 ).trim() || "mcp-orchestrator";
@@ -157,67 +154,8 @@ const REQUIRED_MANAGED_SKILLS = Object.freeze([
   "test-failure-diagnosis",
 ]);
 const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
-const GLOBAL_BRIDGE_STATE_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
-);
-const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
-const CONFIG = Object.freeze({
-  readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
-  writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
-  builderTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_BUILDER_TIMEOUT_MS", 1000 * 60 * 15),
-  orchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS", 1000 * 60 * 6),
-  contractorOrchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS", 1000 * 60 * 20),
-  validationCommandTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS", 1000 * 60 * 5),
-  maxReadOnlyAgentRetries: readNonNegativeIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES", 2),
-  readOnlyRetryBaseDelayMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS", 1000),
-  readOnlyRetryMaxElapsedMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS", 1000 * 60 * 8),
-  maxProcessOutputChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS", 1024 * 1024 * 2),
-  maxAssistantResponseChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS", 1024 * 128),
-  maxIgnoredSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES", 20000),
-  maxSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILES", 25000),
-  maxSnapshotFileBytes: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES", 1024 * 1024),
-  maxSnapshotTotalBytes: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES", 1024 * 1024 * 128),
-  defaultReadLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_READ_LOCK_MODE", ["off"], "off"),
-  defaultWriteLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE", ["simple", "strict"], "simple"),
-  defaultParallelWriteLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE", ["strict"], "strict"),
-  parallelLimit: readPositiveIntEnv("CODEX_OPENCODE_PARALLEL_LIMIT", 6),
-  logLevel: readChoiceEnv("CODEX_OPENCODE_LOG_LEVEL", ["off", "error", "warn", "info", "debug"], "warn"),
-  worktreeMode: readChoiceEnv("CODEX_OPENCODE_WORKTREE_MODE", ["off", "write", "all"], "off"),
-  worktreeRoot: String(process.env.CODEX_OPENCODE_WORKTREE_ROOT || "global").trim() || "global",
-  worktreeCleanup: readChoiceEnv("CODEX_OPENCODE_WORKTREE_CLEANUP", ["always", "on_success", "never"], "never"),
-  worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
-  queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "memory"),
-  queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
-  queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
-  queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
-  queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
-  queueReadOnlyRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_READONLY_RETRIES", 0),
-  queueWriteRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_WRITE_RETRIES", 0),
-  queueHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_HEARTBEAT_MS", 1000 * 15),
-  queueLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_LEASE_MS", 1000 * 60),
-  queueRetentionDays: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_RETENTION_DAYS", 0),
-  queueResultMaxChars: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS", 8000),
-  integrationPreviewMaxChars: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS", 12000),
-  allowExternalPlugins: readChoiceEnv("CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS", ["false", "true"], "false") === "true",
-  externalPluginAllowlist: readCsvEnv("CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST"),
-  externalPluginManifestPath: String(process.env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || "").trim(),
-  expectedExternalPluginManifestSha256: String(process.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 || "").trim().toLowerCase(),
-  validationExecutableAllowlist: readCsvEnv("CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST", ["git"]),
-  validationExecutableSha256Allowlist: readCsvEnv("CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST").map((item) => item.toLowerCase()),
-  trustedPolicySha256: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_SHA256 || "").trim().toLowerCase(),
-  trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
-  trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
-  providerConcurrencyLimit: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2),
-  providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
-  providerLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_MS", 1000 * 60 * 4),
-  providerHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS", 1000 * 20),
-  providerConcurrencyKey: String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "opencode-default-account").trim() || "opencode-default-account",
-  sanitizedMaxFiles: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_FILES", 25000),
-  sanitizedMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_BYTES", 1024 * 1024 * 1024),
-  policyMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_POLICY_MAX_BYTES", 1024 * 128),
-  contractorAuthorizationSha256: String(process.env.CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 || "").trim().toLowerCase(),
-});
+const CONFIG = readBridgeConfig(process.env);
 const defaultReadOnlyAgentTimeoutMs = CONFIG.readOnlyAgentTimeoutMs;
 const defaultWriteAgentTimeoutMs = CONFIG.writeAgentTimeoutMs;
 const defaultBuilderTimeoutMs = CONFIG.builderTimeoutMs;
@@ -269,276 +207,18 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-function readPositiveIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) && value > 0 ? value : fallback;
-}
+const { buildOpenCodeEnv, buildValidationEnv } = createChildEnvBuilders({
+  bridgePaths: BRIDGE_PATHS,
+});
 
-function readNonNegativeIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) && value >= 0 ? value : fallback;
-}
-
-function readCsvEnv(name, fallback = []) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) {
-    return [...fallback];
-  }
-  return [...new Set(String(raw).split(",").map((item) => item.trim()).filter(Boolean))];
-}
-
-function readChoiceEnv(name, allowedValues, fallback) {
-  const value = String(process.env[name] || "").trim().toLowerCase();
-  return allowedValues.includes(value) ? value : fallback;
-}
-
-const OPENCODE_BASE_ENV_KEYS = new Set([
-  "APPDATA",
-  "ComSpec",
-  "HOME",
-  "HOMEDRIVE",
-  "HOMEPATH",
-  "LOCALAPPDATA",
-  "NUMBER_OF_PROCESSORS",
-  "OS",
-  "Path",
-  "PATH",
-  "PATHEXT",
-  "PROGRAMDATA",
-  "ProgramData",
-  "PROGRAMFILES",
-  "ProgramFiles",
-  "SystemDrive",
-  "SystemRoot",
-  "TEMP",
-  "TMP",
-  "TMPDIR",
-  "USERPROFILE",
-  "XDG_CACHE_HOME",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_STATE_HOME",
-  "LANG",
-  "LC_ALL",
-  "NO_COLOR",
-  "TERM",
-]);
-const SENSITIVE_ENV_PATTERN = /(?:api[-_]?key|access[-_]?token|auth|credential|password|secret|token|private[-_]?key|(?:^|_)pat(?:$|_))/i;
-
-function buildOpenCodeEnv(extra = {}) {
-  const passthrough = new Set(
-    String(process.env.CODEX_OPENCODE_PASSTHROUGH_ENV || "")
-      .split(",")
-      .map((name) => name.trim())
-      .filter(Boolean)
-  );
-  const allowSensitive = String(process.env.CODEX_OPENCODE_ALLOW_SENSITIVE_ENV || "").trim().toLowerCase() === "true";
-  const env = {};
-  for (const [key, value] of Object.entries({ ...process.env, ...extra })) {
-    const forbiddenConfigOverride = ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR"].includes(key.toUpperCase());
-    const permitted = OPENCODE_BASE_ENV_KEYS.has(key) || passthrough.has(key);
-    const runtimePathKey = ["PATH", "PATHEXT", "HOMEPATH"].includes(key.toUpperCase());
-    if (forbiddenConfigOverride || !permitted || (!runtimePathKey && !allowSensitive && SENSITIVE_ENV_PATTERN.test(key))) {
-      continue;
-    }
-    env[key] = value;
-  }
-  if (process.platform === "win32" && !Object.keys(env).some((key) => key.toUpperCase() === "PATHEXT")) {
-    env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
-  }
-  // OpenCode also scans the legacy $HOME/.opencode tree even when repository
-  // config is disabled. Keep that control surface bridge-owned while preserving
-  // the operator's explicit XDG config/data/cache/state locations.
-  env.HOME = String(extra.HOME || BRIDGE_OPENCODE_HOME_DIR);
-  env.USERPROFILE = String(extra.USERPROFILE || env.HOME);
-  env.XDG_CONFIG_HOME = String(extra.XDG_CONFIG_HOME || path.dirname(DEFAULT_OPENCODE_CONFIG_DIR));
-  env.XDG_DATA_HOME = String(extra.XDG_DATA_HOME || path.dirname(DEFAULT_OPENCODE_DATA_DIR));
-  env.XDG_CACHE_HOME = String(extra.XDG_CACHE_HOME || DEFAULT_OPENCODE_CACHE_HOME);
-  env.XDG_STATE_HOME = String(extra.XDG_STATE_HOME || DEFAULT_OPENCODE_STATE_HOME);
-  // OpenCode's version-pinned internal plugins include the Codex OAuth transport.
-  // `--pure` suppresses configured external plugins without disabling those
-  // binary-bundled authentication hooks. External plugins are verified below.
-  delete env.OPENCODE_DISABLE_DEFAULT_PLUGINS;
-  // Repository-controlled OpenCode config can register local/remote MCP servers,
-  // provider endpoints, formatters, and other executable control surfaces. Bridge
-  // jobs use only operator-managed global configuration and bridge-pinned CLI args.
-  env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  env.OPENCODE_DISABLE_SHARE = "true";
-  env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "true";
-  env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "true";
-  env.OPENCODE_DISABLE_AUTOUPDATE = "true";
-  env.OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
-  env.OPENCODE_DISABLE_MODELS_FETCH = "true";
-  // Each bridge child is a bounded one-shot process. Durable queue/pipeline audit
-  // belongs to the bridge SQLite store; a shared OpenCode session DB creates
-  // cross-process lock races and unnecessary prompt/session persistence.
-  env.OPENCODE_DB = ":memory:";
-  env.OPENCODE_DISABLE_CHANNEL_DB = "true";
-  return env;
-}
-
-async function readOpenCodeAuthContentForIsolatedRuntime() {
-  const authPath = path.join(DEFAULT_OPENCODE_DATA_DIR, "auth.json");
-  try {
-    const authStat = await stat(authPath);
-    if (!authStat.isFile() || authStat.size > 1024 * 1024) {
-      throw new Error("OpenCode auth.json is not a bounded regular file.");
-    }
-    const content = await readFile(authPath, "utf8");
-    const parsed = JSON.parse(content);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("OpenCode auth.json must contain a JSON object.");
-    }
-    return content;
-  } catch (error) {
-    if (error?.code === "ENOENT") return "";
-    throw error;
-  }
-}
-
-async function createIsolatedOpenCodeRuntime() {
-  const root = await mkdtemp(path.join(tmpdir(), `codex-opencode-sanitized-${process.pid}-`));
-  try {
-    const home = path.join(root, "home");
-    const configHome = path.join(root, "config");
-    const cacheHome = path.join(root, "cache");
-    const stateHome = path.join(root, "state");
-    const temporaryHome = path.join(root, "tmp");
-    await Promise.all([
-      mkdir(home, { recursive: true }),
-      mkdir(configHome, { recursive: true }),
-      mkdir(cacheHome, { recursive: true }),
-      mkdir(stateHome, { recursive: true }),
-      mkdir(temporaryHome, { recursive: true }),
-    ]);
-    const env = buildOpenCodeEnv({
-      HOME: home,
-      USERPROFILE: home,
-      XDG_DATA_HOME: root,
-      XDG_CONFIG_HOME: configHome,
-      XDG_CACHE_HOME: cacheHome,
-      XDG_STATE_HOME: stateHome,
-      TEMP: temporaryHome,
-      TMP: temporaryHome,
-      TMPDIR: temporaryHome,
-    });
-    env.OPENCODE_DB = ":memory:";
-    env.OPENCODE_DISABLE_CHANNEL_DB = "true";
-    env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-    env.OPENCODE_DISABLE_SHARE = "true";
-    env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "true";
-    env.OPENCODE_DISABLE_CLAUDE_CODE = "true";
-    env.OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
-    env.OPENCODE_DISABLE_MODELS_FETCH = "true";
-    env.OPENCODE_DISABLE_AUTOUPDATE = "true";
-    env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-      plugin: [],
-      mcp: {},
-      formatter: false,
-      lsp: false,
-      share: "disabled",
-      autoshare: false,
-      autoupdate: false,
-      skills: { paths: [], urls: [] },
-      agent: {
-        [MCP_SANITIZED_READER_AGENT]: {
-          description: "Bridge-owned reader for exact manifest-pinned sanitized workspaces.",
-          mode: MCP_SANITIZED_READER_PROFILE.mode,
-          model: `${MCP_SANITIZED_READER_PROFILE.provider}/${MCP_SANITIZED_READER_PROFILE.model}`,
-          variant: MCP_SANITIZED_READER_PROFILE.variant,
-          temperature: 0,
-          prompt: MCP_SANITIZED_READER_PROMPT,
-          tools: { apply_patch: false, edit: false, write: false, task: false, bash: false, webfetch: false, websearch: false, skill: false },
-          permission: {
-            edit: "deny",
-            task: "deny",
-            bash: "deny",
-            webfetch: "deny",
-            websearch: "deny",
-            external_directory: "deny",
-            skill: "deny",
-            lsp: "deny",
-            repo_clone: "deny",
-          },
-        },
-      },
-    });
-    const authContent = await readOpenCodeAuthContentForIsolatedRuntime();
-    if (authContent) env.OPENCODE_AUTH_CONTENT = authContent;
-    return { root, env };
-  } catch (error) {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
-    throw error;
-  }
-}
-
-async function overwriteRegularFile(file, size) {
-  if (!Number.isSafeInteger(size) || size <= 0) return;
-  const handle = await open(file, "r+");
-  try {
-    const zeros = Buffer.alloc(Math.min(64 * 1024, size));
-    let offset = 0;
-    while (offset < size) {
-      const length = Math.min(zeros.length, size - offset);
-      await handle.write(zeros, 0, length, offset);
-      offset += length;
-    }
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-async function wipeIsolatedOpenCodeRuntime(root) {
-  const resolvedRoot = path.resolve(root || "");
-  const expectedPrefix = `codex-opencode-sanitized-${process.pid}-`;
-  if (!isPathInside(path.resolve(tmpdir()), resolvedRoot) || !path.basename(resolvedRoot).startsWith(expectedPrefix)) {
-    return { ok: false, error: "Refused to clean an untrusted isolated OpenCode runtime path." };
-  }
-  try {
-    const wipeTree = async (directory) => {
-      const entries = await readdir(directory, { withFileTypes: true });
-      for (const entry of entries) {
-        const target = path.join(directory, entry.name);
-        const targetStat = await lstat(target);
-        if (targetStat.isDirectory() && !targetStat.isSymbolicLink()) {
-          await wipeTree(target);
-        } else if (targetStat.isFile()) {
-          await overwriteRegularFile(target, targetStat.size);
-        }
-      }
-    };
-    await wipeTree(resolvedRoot);
-    await rm(resolvedRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    return { ok: true, error: "" };
-  } catch (error) {
-    return { ok: false, error: redactSensitiveText(error.message || String(error)) };
-  }
-}
-
-function buildValidationEnv(extra = {}) {
-  const env = {};
-  for (const key of OPENCODE_BASE_ENV_KEYS) {
-    if (process.env[key] !== undefined) {
-      env[key] = process.env[key];
-    }
-  }
-  for (const [key, value] of Object.entries(extra)) {
-    if (!SENSITIVE_ENV_PATTERN.test(key)) {
-      env[key] = value;
-    }
-  }
-  if (process.platform === "win32" && !Object.keys(env).some((key) => key.toUpperCase() === "PATHEXT")) {
-    env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
-  }
-  env.GIT_OPTIONAL_LOCKS = "0";
-  env.GIT_CONFIG_COUNT = "2";
-  env.GIT_CONFIG_KEY_0 = "core.fsmonitor";
-  env.GIT_CONFIG_VALUE_0 = "false";
-  env.GIT_CONFIG_KEY_1 = "core.untrackedCache";
-  env.GIT_CONFIG_VALUE_1 = "false";
-  return env;
-}
+const { createIsolatedOpenCodeRuntime, wipeIsolatedOpenCodeRuntime } = createIsolatedOpenCodeRuntimeManager({
+  bridgePaths: BRIDGE_PATHS,
+  buildOpenCodeEnv,
+  redactSensitiveText,
+  sanitizedReaderAgent: MCP_SANITIZED_READER_AGENT,
+  sanitizedReaderProfile: MCP_SANITIZED_READER_PROFILE,
+  sanitizedReaderPrompt: MCP_SANITIZED_READER_PROMPT,
+});
 
 function redactSensitiveText(value) {
   let text = String(value || "");
