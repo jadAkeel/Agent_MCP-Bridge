@@ -4,7 +4,7 @@
 
 This document is the authoritative v2 architecture specification for the global Codex to OpenCode multi-agent orchestration system.
 
-It describes the approved architecture, responsibilities, routing rules, lock rules, handoff protocol, Spec Kit policy, validation strategy, and the Flexible Fast Delegation capability. It is intended to be readable by a future human maintainer, Codex orchestrator, OpenCode orchestrator, reviewer, tester, or implementation agent without requiring previous conversation history.
+It describes the approved architecture, responsibilities, routing rules, lock rules, handoff protocol, Spec Kit policy, validation strategy, and the Managed Fast Delegation capability. It is intended to be readable by a future human maintainer, Codex orchestrator, OpenCode orchestrator, reviewer, tester, or implementation agent without requiring previous conversation history.
 
 The system goal is:
 
@@ -21,6 +21,24 @@ OpenCode Agents
 ```
 
 Codex is the primary orchestrator. OpenCode is the execution backend. The MCP bridge provides the controlled protocol boundary between them.
+
+## Hardened Operating Invariants (2026-08-09)
+
+These invariants supersede any older example in this document that conflicts with them:
+
+- An executed writer worktree is retained until Codex reviews an exact preview receipt, integration applies and validates successfully, and cleanup is explicitly requested. Job success alone never deletes output.
+- Writer worktree creation rejects every dirty source state as `dirty_worktree_requires_checkpoint`; the bridge never commits, stashes, resets, or overlays user changes.
+- File scope controls edits, not row-level reads. Sensitive audits use an externally prepared read-only sanitized workspace with raw artifacts physically absent and exact manifest verification before and after each wave.
+- Provider retries are bounded and read-only-only; requested, configured, and runtime-observed model evidence is distinct. Silent model/agent fallback is disabled.
+- External plugins remain off/`--pure` by default. Opt-in requires exact name/version and an out-of-band pinned integrity manifest; the bridge never persists provider or Contractor credentials.
+- Repository policy is untrusted and tightening-only. Validation commands require exact out-of-band policy approval plus an operator executable/argument policy and run with `shell:false` in a credential-free environment.
+- Queue ownership uses process-instance leases and heartbeats. Audit records are not replayable jobs, and a foreign live job is never failed merely because it is absent from local memory.
+- Direct parallel execution is one synchronous barrier and returns terminal per-job results, not queue IDs. Use queue/pipeline tools for monitoring or individual cancellation.
+- Subagent routing rejects by default; any explicit proxy must be a verified read-only agent and the actual route/model is reported.
+- Locks are renewable coordination leases, not OS filesystem locks. Receipt-bound source/target/base digests and before/after snapshots detect external mutations.
+- Truncated essential output, incomplete snapshots, or unsafe rollback are terminal and cannot be reported as full success.
+
+No finite review or test suite proves zero future defects. Host compromise, malicious repositories, provider outages, semantic data leakage, and unofficial OAuth supply-chain/account risk require external controls such as a VM/container and least-privilege accounts.
 
 ---
 
@@ -164,7 +182,7 @@ Role:
 - Primary Codex orchestrator with optional Spec Kit support.
 - Uses Spec Kit only when the user task explicitly requires Spec Kit or when the current workflow already uses Spec Kit.
 - Does not initialize Spec Kit automatically for global Codex/OpenCode bridge work.
-- Supports normal Codex orchestration and Flexible Fast Delegation Mode.
+- Supports normal Codex orchestration and Managed Fast Delegation Mode.
 
 Use this orchestrator when:
 
@@ -187,7 +205,7 @@ Role:
 - Primary Codex orchestrator for lightweight planning, delegation, implementation supervision, review, and validation.
 - Never initializes Spec Kit.
 - Does not create `.specify/`, `specs/`, or project-local Spec Kit files.
-- Supports normal Codex orchestration and Flexible Fast Delegation Mode.
+- Supports normal Codex orchestration and Managed Fast Delegation Mode.
 
 Use this orchestrator when:
 
@@ -200,21 +218,21 @@ If a task requires Spec Kit while using the non-Spec-Kit orchestrator, the orche
 
 ---
 
-## Flexible Fast Delegation Mode
+## Managed Fast Delegation Mode
 
-Flexible Fast Delegation Mode is an optional behavior inside both existing Codex orchestrators.
+Managed Fast Delegation Mode is an optional behavior inside both existing Codex orchestrators.
 
 It does not create a new Codex orchestrator.
 
-It does not create a new OpenCode agent.
+It uses a dedicated MCP-safe OpenCode planning agent while preserving the regular standalone orchestrator.
 
-It uses the existing OpenCode `orchestrator` agent as a temporary delegated executor.
+It accepts the requested role `orchestrator`, routes that MCP call to `mcp-orchestrator`, then routes implementation to direct MCP-managed writer agents.
 
 ### Purpose
 
-The purpose is to let Codex quickly delegate a bounded task to OpenCode's existing orchestrator when the user explicitly asks for speed, delegation, or OpenCode orchestration.
+The purpose is to let Codex quickly obtain a bounded OpenCode plan and execute it through visible, independently scoped writer agents when the user explicitly asks for speed, delegation, or OpenCode orchestration.
 
-Codex remains the primary authority. OpenCode orchestrator performs execution or analysis inside the delegated scope and returns a concise result. Codex reviews the result and gives the final answer.
+Codex remains the primary authority. OpenCode orchestrator performs read-only analysis and returns a concise plan. Codex reviews the plan, invokes direct builder/debugger jobs, reviews and integrates their worktrees, validates the result, and gives the final answer.
 
 ### Normal Mode
 
@@ -237,27 +255,29 @@ final answer
 
 Normal Codex orchestration includes understanding the request, planning, splitting work when useful, delegating to specific agents when needed, reviewing, validating, and returning the final answer.
 
-### Fast Delegation Mode
+### Managed Fast Delegation Mode
 
-Fast Delegation Mode is used only when explicitly triggered.
+Managed Fast Delegation Mode is used only when explicitly triggered.
 
 ```text
 Codex
   ↓
-OpenCode orchestrator
+OpenCode orchestrator (planning-only)
   ↓
-result summary
+direct builder/debugger jobs through MCP
+  ↓
+reviewer/tester gates
   ↓
 Codex review
   ↓
-validation when possible
+reviewed worktree integration and validation
   ↓
 final answer
 ```
 
 ### Trigger Examples
 
-Examples that may trigger Fast Delegation Mode:
+Examples that may trigger Managed Fast Delegation Mode:
 
 ```text
 خلّي OpenCode orchestrator يحلها
@@ -268,23 +288,24 @@ OpenCode يحل ويرجع ملخص
 خليها على OpenCode ويرجع summary
 ```
 
-Fast Delegation Mode must not be triggered silently for ordinary tasks. The user's request must clearly ask for speed, delegation, or OpenCode orchestrator handling.
+Managed Fast Delegation Mode must not be triggered silently for ordinary tasks. The user's request must clearly ask for speed, delegation, or OpenCode orchestrator handling.
 
 ### Rules
 
-- No new agents are created.
-- Use the existing OpenCode `orchestrator` only.
+- Use the dedicated OpenCode `mcp-orchestrator` only for read-only planning through MCP.
 - Codex remains the primary authority.
-- OpenCode orchestrator acts as delegated executor.
+- `mcp-orchestrator` must not write or invoke any subagent through MCP; `edit` and `task` are both denied.
+- Codex invokes direct `builder` or `debugger` jobs with explicit Scope Contracts.
 - Codex performs final review.
-- Codex performs validation when possible.
+- Codex previews and reviews worktree integration before applying it.
+- Codex performs final validation.
 - Send compact context only.
 - Send a bounded task only.
 - Do not send full conversation history.
-- Use direct routing to `opencode run --agent orchestrator`.
+- Use MCP routing so bridge policy and agent discovery remain enforceable.
 - Do not silently fallback to `build`.
-- If `orchestrator` is missing, return a clear error.
-- If edits are allowed through MCP, use explicit lock and allowed-edit boundaries.
+- If `mcp-orchestrator` is missing, return a clear error and never fall back to a write-capable agent.
+- Every direct writer uses explicit locks, allowed-edit boundaries, changed-file validation, and worktree review.
 
 ### Delegation Task Packet
 
@@ -379,29 +400,32 @@ Codex must not blindly trust the delegated result.
 
 ## OpenCode Orchestrator Modes
 
-The global OpenCode orchestrator exists at:
+The MCP-safe planner exists at:
+
+```text
+~/.config/opencode/agents/mcp-orchestrator.md
+```
+
+The regular backup/standalone orchestrator remains at:
 
 ```text
 ~/.config/opencode/agents/orchestrator.md
 ```
 
-It is a backup and delegation target, not the default leader while Codex is active.
-
-### Mode 1: Delegated Executor
+### Mode 1: MCP Delegated Planner
 
 Use this mode when Codex calls OpenCode orchestrator through MCP with a bounded task.
 
 Responsibilities:
 
 - Treat Codex as the primary orchestrator.
-- Treat Codex as lock owner for MCP-delegated write work.
 - Stay inside the delegated scope.
-- Use only granted paths for edits.
-- Assign non-overlapping owned paths to any internal OpenCode subagents.
-- Stop and request integration if a required file is outside the granted lock.
+- Remain read-only.
+- Never launch internal OpenCode subagents.
+- Return proposed non-overlapping scopes for direct MCP-managed writer calls.
 - Return a concise structured result.
 
-The MCP lock protocol applies in this mode.
+The MCP bridge enforces this mode by routing to `mcp-orchestrator`, whose `edit` and `task` permissions are denied.
 
 ### Mode 2: Backup Orchestrator
 
@@ -451,7 +475,7 @@ builder      -> builder
 tester       -> tester
 architect    -> architect
 debugger     -> debugger
-orchestrator -> orchestrator
+orchestrator -> mcp-orchestrator
 ```
 
 Equivalent command shape:
@@ -469,7 +493,7 @@ builder      -> opencode run --agent builder
 tester       -> opencode run --agent tester
 architect    -> opencode run --agent architect
 debugger     -> opencode run --agent debugger
-orchestrator -> opencode run --agent orchestrator
+orchestrator -> opencode run --agent mcp-orchestrator
 ```
 
 Prohibited silent routing:
@@ -815,7 +839,7 @@ The Spec Kit-aware orchestrator may use Spec Kit only when:
 - The repository already uses Spec Kit for the current workflow.
 - The current task is explicitly governed by Spec Kit artifacts.
 
-It must not initialize Spec Kit automatically just because Flexible Fast Delegation Mode was triggered.
+It must not initialize Spec Kit automatically just because Managed Fast Delegation Mode was triggered.
 
 For global Codex/OpenCode MCP bridge setup, validation, routing, lock, handoff, or agent-configuration work, it should avoid creating project-local Spec Kit artifacts unless explicitly requested.
 
@@ -858,9 +882,10 @@ Verify:
 - Codex can delegate to builder.
 - Codex can delegate to reviewer.
 - Codex can delegate to tester.
-- Codex can delegate to OpenCode `orchestrator` in Fast Delegation Mode.
-- OpenCode orchestrator returns the expected result format.
-- Codex reviews the delegated OpenCode orchestrator result before finalizing.
+- Codex can delegate read-only planning to OpenCode `orchestrator` in Managed Fast Delegation Mode.
+- OpenCode orchestrator returns the expected plan and proposed writer scopes.
+- OpenCode orchestrator write or nested-writer requests are rejected.
+- Codex reviews the plan before invoking direct writer agents.
 
 ### Routing Tests
 
@@ -873,7 +898,7 @@ builder      -> builder
 tester       -> tester
 architect    -> architect
 debugger     -> debugger
-orchestrator -> orchestrator
+orchestrator -> mcp-orchestrator
 ```
 
 Verify:
@@ -909,9 +934,9 @@ Verify:
 
 Verify:
 
-- No new agents are created for Fast Delegation Mode.
+- The dedicated `mcp-orchestrator` safety agent is installed.
 - The two existing Codex orchestrators still parse and load.
-- The global OpenCode `orchestrator` agent exists.
+- The global OpenCode `mcp-orchestrator` and `orchestrator` agents exist.
 - No repo-local `.opencode/`, `.specify/`, or `specs/` are created unless explicitly requested.
 
 ---
@@ -928,22 +953,22 @@ run_opencode_agent routes builder directly
 run_opencode_agent routes tester directly
 run_opencode_agent routes architect directly when available
 run_opencode_agent routes debugger directly when available
-run_opencode_agent routes orchestrator directly
+run_opencode_agent routes requested orchestrator to mcp-orchestrator
 unknown agent returns clear error
 fallback to build is explicit, not silent
 run_opencode_parallel allows safe read-only parallel work
 run_opencode_parallel rejects unsafe overlapping writes
 write delegation requires concrete locks
 shared/global file edits require serial integration
-global orchestrator.md exists
-OpenCode orchestrator supports Delegated Executor mode
+global mcp-orchestrator.md and orchestrator.md exist
+mcp-orchestrator enforces read-only delegated planning with task denied
 OpenCode orchestrator supports Backup Orchestrator mode
 OpenCode orchestrator supports Standalone Orchestrator mode
 handoff protocol is documented and usable
-Fast Delegation Mode works
+Managed Fast Delegation Mode works
 Codex review after delegation works
 OpenCode orchestrator delegation works
-No new agents are created for Fast Delegation Mode
+Dedicated mcp-orchestrator safety routing is verified
 Direct routing is verified
 Handoff is verified
 Validation is verified
@@ -961,12 +986,12 @@ No repo-local .specify/ or specs/ is created unless explicitly requested
 
 The final architecture is a global multi-agent orchestration layer where Codex remains the primary orchestrator, the MCP bridge provides controlled direct access to OpenCode, and OpenCode agents act as bounded executors.
 
-Normal work flows from Codex to specific OpenCode agents such as planner, builder, reviewer, tester, architect, or debugger. When explicitly requested for speed or delegation, either Codex orchestrator may use Flexible Fast Delegation Mode to send a bounded task directly to the existing OpenCode `orchestrator`, receive a structured result, review it, validate when possible, and return the final answer.
+Normal work flows from Codex to specific OpenCode agents such as planner, builder, reviewer, tester, architect, or debugger. When explicitly requested for speed or delegation, either Codex orchestrator may use Managed Fast Delegation Mode to obtain a bounded read-only plan from OpenCode `orchestrator`, run direct scoped writer jobs, review and integrate their worktrees, validate the result, and return the final answer.
 
 OpenCode orchestrator can also act as a backup orchestrator from a handoff or as a standalone orchestrator when OpenCode is launched directly. Locks apply only to Codex-delegated MCP write work; standalone OpenCode manages its own local scoped execution.
 
 The intended workflow is planned, delegated, reviewed, validated, and recoverable:
 
 ```text
-READY: Codex ↔ MCP Bridge ↔ OpenCode Agents supports direct routing, safe locks, Fast Delegation Mode, handoff, review, and validation as a global system.
+READY: Codex ↔ MCP Bridge ↔ OpenCode Agents supports direct routing, safe locks, managed planning, isolated implementation, handoff, review, integration, and validation as a global system.
 ```

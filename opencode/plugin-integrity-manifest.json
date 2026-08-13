@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "openCodeVersion": "1.17.13",
+  "plugins": [
+    {
+      "specifier": "@cortexkit/opencode-antigravity-auth@2.0.0",
+      "root": "C:\\Users\\10User\\.cache\\opencode\\packages\\@cortexkit\\opencode-antigravity-auth@2.0.0",
+      "packageRoot": "C:\\Users\\10User\\.cache\\opencode\\packages\\@cortexkit\\opencode-antigravity-auth@2.0.0\\node_modules\\@cortexkit\\opencode-antigravity-auth",
+      "fileCount": 5673,
+      "entryCount": 6159,
+      "packageLockSha256": "ba71091ef148621f36f5f8b4f2db1860f061b601929f5a97e032dc08bfa6d010",
+      "treeSha256": "ed7e707c07f826fffb04d76aa41f58fc312a8528e3d20e6dcfb4e3a7c3386dee"
+    }
+  ],
+  "configs": [
+    {
+      "path": "C:\\Users\\10User\\codex-opencode-mcp\\opencode\\opencode.jsonc",
+      "sha256": "bec3ce551a9fb11f02e4c4c666f99de9b9df6cb724940f4ed1815784ae232055",
+      "scope": "global",
+      "plugins": []
+    }
+  ],
+  "settings": [
+    {
+      "path": "C:\\Users\\10User\\codex-opencode-mcp\\opencode\\antigravity.json",
+      "sha256": "cff6726cb6a3e45713e0018401ddb094fcc07e5b6c4227fa0a0e35e85b0d810f",
+      "requiredValues": {
+        "auto_update": false,
+        "debug": false,
+        "debug_tui": false,
+        "quota_fallback": false,
+        "quota_style_fallback": false,
+        "account_selection_strategy": "sticky",
+        "pid_offset_enabled": false
+      }
+    }
+  ]
+}

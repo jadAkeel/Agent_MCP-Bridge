@@ -1,5 +1,11 @@
 # Global Multi-Agent System: Codex ↔ OpenCode
 
+> **Legacy document:** this file is retained for history and is superseded by
+> [`global_multi_agent_system_goal_v2.md`](./global_multi_agent_system_goal_v2.md).
+> The current MCP route is `orchestrator -> mcp-orchestrator`; the dedicated
+> MCP agent denies edits and nested subagents. Do not use the older direct
+> orchestrator routing examples below as implementation guidance.
+
 ## الهدف النهائي
 
 الهدف هو بناء **Global Multi-Agent Orchestration System** يربط بين:

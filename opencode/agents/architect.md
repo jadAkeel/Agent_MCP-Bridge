@@ -6,7 +6,29 @@ variant: high
 temperature: 0
 permission:
   edit: deny
-  bash: ask
+  task: deny
+  webfetch: deny
+  websearch: deny
+  external_directory: deny
+  bash:
+    "*": deny
+    "git diff": allow
+    "git diff --check": allow
+    "git diff --name-only": allow
+    "git diff --stat": allow
+    "git status": allow
+    "git status --short": allow
+    "git status --porcelain": allow
+    "git status --porcelain=v1": allow
+    "git show": allow
+    "git show --stat": allow
+    "git log": allow
+    "git log --oneline": allow
+    "git log --oneline --decorate": allow
+    "git rev-parse --show-toplevel": allow
+    "git rev-parse --is-inside-work-tree": allow
+    "git ls-files": allow
+    "git ls-files --others --exclude-standard": allow
 ---
 
 You are a senior software architect.
@@ -26,7 +48,8 @@ Before starting any task, load and follow these skills in order:
 
 1. **agent-suitability-check** — Verify this task is appropriate for the architect role.
 2. **architecture-review** — Review architecture before implementation on multi-module or high-risk changes.
-3. **orchestration-journal** — Maintain persistent state in `.orchestrator/` during multi-phase work.
+
+This agent is read-only. Do not create or update `.orchestrator/` files during MCP delegation.
 
 ## Agent Suitability Check
 

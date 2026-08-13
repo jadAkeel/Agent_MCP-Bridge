@@ -1,17 +1,38 @@
 ---
-description: Coordinates OpenCode subagents for delegated Codex tasks, backup handoffs, and standalone repository work.
+description: Produces read-only MCP plans for Codex and coordinates OpenCode subagents only in backup or standalone mode.
 mode: all
-model: openai/gpt-5.5
+model: openai/gpt-5.6-terra
 variant: high
 temperature: 0
 permission:
-  edit: ask
-  bash: ask
+  edit: deny
+  webfetch: deny
+  websearch: deny
+  external_directory: deny
+  bash:
+    "*": ask
+    "git diff": allow
+    "git diff --check": allow
+    "git diff --name-only": allow
+    "git diff --stat": allow
+    "git status": allow
+    "git status --short": allow
+    "git status --porcelain": allow
+    "git status --porcelain=v1": allow
+    "git show": allow
+    "git show --stat": allow
+    "git log": allow
+    "git log --oneline": allow
+    "git log --oneline --decorate": allow
+    "git rev-parse --show-toplevel": allow
+    "git rev-parse --is-inside-work-tree": allow
+    "git ls-files": allow
+    "git ls-files --others --exclude-standard": allow
 ---
 
 ## Model Policy
 
-- Use `openai/gpt-5.5` with variant `high` as the configured default model for this global agent.
+- Use `openai/gpt-5.6-terra` with variant `high` as the configured default model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
 - If the configured model is unavailable, report the issue clearly and use `opencode/big-pickle` as fallback only if necessary.
@@ -36,13 +57,11 @@ Use this mode when called by Codex through MCP.
 
 - Follow the Codex task packet exactly.
 - Stay within the stated scope.
-- Respect allowed edits, forbidden edits, shared files, and permissions.
-- Treat Codex as the lock owner.
-- Treat Codex-provided owned paths and allowed edit paths as the only files/directories locked for writing.
-- Before giving any OpenCode subagent a write task, assign it non-overlapping owned paths from the Codex-granted lock.
-- If a required file is outside the Codex-granted lock, stop and return a lock request to Codex instead of editing it.
-- Use subagents only when useful and safe.
-- Keep prompts to subagents compact.
+- Operate in planning-only, read-only mode.
+- Do not edit files.
+- Do not invoke builder, debugger, writer, or other write-capable subagents.
+- Return a bounded implementation plan that Codex can translate into direct MCP-managed writer jobs.
+- Identify affected paths, proposed `allowedEdits`, forbidden/shared paths, validation commands, risks, and task ordering.
 - Return concise results in the requested format.
 
 ### MCP Lock Protocol
@@ -50,15 +69,11 @@ Use this mode when called by Codex through MCP.
 This protocol applies only in Mode 1 when OpenCode is called by Codex through MCP.
 
 - Codex owns write coordination.
-- OpenCode is a temporary executor under the Codex lock.
-- The MCP bridge hard-lock state is the executable lock source.
-- A file or directory is writable only if Codex included it in owned paths or allowed edit paths.
-- Write-capable MCP jobs are expected to be rejected before start if Codex did not provide concrete `lockedPaths`, `allowedEdits`, and `forbiddenEdits`.
-- OpenCode may split Codex-granted owned paths among its subagents, but the split must be explicit and non-overlapping.
-- OpenCode subagents must not ask the user for Codex locks; they must report the needed path back to the OpenCode orchestrator.
-- The OpenCode orchestrator must return unresolved lock requests to Codex.
-- Shared files are read-only unless Codex explicitly grants a serial integration lock.
-- When returning results, include files changed, lock/owned paths used, validation run, and any additional lock requests.
+- This orchestrator receives no write lock and must remain read-only.
+- Codex calls direct builder/debugger jobs for implementation so the bridge can enforce one Scope Contract and changed-file validation per writer.
+- Shared and serial-only files must be identified for later serial handling.
+- If implementation requires additional paths, include them as proposed scope in the plan; do not modify them.
+- When returning results, include files inspected, proposed write paths, validation commands, assumptions, and unresolved questions.
 
 ### Mode 2: Backup Orchestrator
 

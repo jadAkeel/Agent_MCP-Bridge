@@ -1,727 +1,375 @@
 # Codex OpenCode MCP Bridge
 
-This bridge lets Codex call OpenCode agents through MCP while keeping Codex as the orchestrator.
+This bridge lets Codex call OpenCode agents through MCP while keeping Codex as the final orchestrator and reviewer.
 
-After changing `server.js`, restart or reload the MCP server process before relying on live MCP tool output. The running Node process keeps the previously loaded bridge code until it is restarted.
+One-sentence architecture: Codex decides what to delegate and merge, MCP Bridge enforces scope/routing/scheduling/validation, and OpenCode agents execute bounded tasks.
 
-## Repository Contents
-
-This repo is also a safe backup of the important non-secret global setup files:
-
-- `codex/agents/`: current Codex orchestrator and subagent configs.
-- `codex/skills/`: custom Codex skills, excluding bundled/system skills.
-- `codex/config.example.toml`: sanitized MCP config example.
-- `opencode/agents/`: current OpenCode agent configs.
-- `opencode/skills/`: current OpenCode skills, excluding backups.
-- `opencode/opencode.jsonc`: sanitized OpenCode config reference.
-- `docs/`: architecture goals and safe publish manifest.
-
-Sensitive runtime files are intentionally excluded. See `docs/SAFE_PUBLISH_MANIFEST.md`.
-
-## Architecture Overview
-
-The bridge implements this global workflow:
+## Official Safety Model
 
 ```text
-User
--> Codex
--> MCP Bridge
--> OpenCode CLI
--> OpenCode agents
+Scope Contract = law
+Queue = scheduler
+Worktree = isolation
+Lock = temporary collision guard
+Changed-file validation = enforcement
+Codex = final authority
 ```
 
-Codex remains the primary orchestrator. The MCP bridge is the execution and safety boundary: it resolves the requested OpenCode agent, builds a compact task packet, applies temporary write locks when needed, runs `opencode run --agent <agent>`, captures duration and exit status, checks for OpenCode fallback/API errors, validates detected changed files, releases temporary locks, and returns the result to Codex for review.
+Every write job must have an explicit Scope Contract. Locks are not the primary safety system; they only prevent obvious MCP-managed collisions before execution. The actual result is enforced by changed-file validation.
 
-OpenCode is the execution backend. OpenCode agents should receive bounded tasks with explicit scope, allowed edits, forbidden edits, and validation expectations. The global `orchestrator` agent can be used as a delegated executor or backup orchestrator, but Codex is still responsible for final review when Codex is active.
+## Three Workflow Levels
 
-The OpenCode `orchestrator` is read-only by default when invoked through this bridge. If Codex passes `write: true` with bounded `lockedPaths` and `allowedEdits`, the bridge automatically treats it as a bounded writer for one isolated service folder. The bridge rejects nested writer delegation because internal builders would bypass MCP per-writer locks.
+| Task type | Tool | Lock | Queue | Worktree | Pipeline |
+| --- | --- | --- | --- | --- | --- |
+| Read-only review | `run_opencode_agent` reviewer/planner/tester/architect | off | no | no | no |
+| Single small write | `validate_delegation_plan` + `run_opencode_agent` builder/debugger | simple | no | optional | no |
+| Single risky write | validate + builder/debugger + reviewer/tester | simple | optional | recommended | no |
+| Parallel independent writes | pipeline + queue | strict | yes | yes | yes |
+| Shared-file change | serial builder/debugger | simple | optional | recommended | no/optional |
+| Large feature | pipeline | strict | yes | yes | yes |
 
-For risky or parallel work, use `validate_delegation_plan` before execution:
+Use the simplest level that fits the task. Pipelines are advanced-only and are rejected when too small.
 
-```text
-Codex
--> validate_delegation_plan
--> run_opencode_agent or run_opencode_parallel
--> MCP validation
--> Codex review
-```
+## Scope Contract
 
-The preflight tool does not run OpenCode agents and does not acquire locks. It validates the same path, lock, timeout, parallel-overlap, active-lock, and agent-routing rules used by execution tools.
-
-## Agent Routing
-
-`run_opencode_agent` requests the named OpenCode agent when it exists:
-
-```text
-planner   -> opencode run --agent planner <prompt>
-reviewer  -> opencode run --agent reviewer <prompt>
-tester    -> opencode run --agent tester <prompt>
-builder   -> opencode run --agent builder <prompt>
-debugger  -> opencode run --agent debugger <prompt>
-architect -> opencode run --agent architect <prompt>
-orchestrator -> opencode run --agent orchestrator <prompt>
-build     -> opencode run --agent build <prompt>
-```
-
-The bridge checks OpenCode agent availability before running. It does not silently route all requests through `build`.
-
-The expected global delegation roles (`planner`, `reviewer`, `tester`, `builder`, `debugger`, `architect`, and `orchestrator`) should be configured as runnable OpenCode agents, usually `mode: all`, so direct CLI routing is the normal path.
-
-If OpenCode reports native fallback after a direct run, the bridge reports that result as rejected because the requested role may not have executed. Results always report:
-
-- requested agent and mode
-- actual OpenCode agent used
-- fallback status and reason, when fallback was explicitly allowed
-- whether subagent proxying was used
-- whether native OpenCode fallback was detected
-- whether OpenCode returned an API error event
-
-`subagentStrategy: "proxy"` remains available for true OpenCode subagents that are intentionally not runnable as primary/all agents. In that mode, the bridge runs a primary/all OpenCode agent, `build` by default, and injects the requested subagent definition into the prompt.
-
-Use `subagentStrategy: "reject"` when you want the bridge to fail instead of proxying subagents.
-
-Example reviewer call:
+Write jobs require:
 
 ```json
 {
-  "agent": "reviewer",
-  "task": "Review this diff. Do not edit files."
+  "mode": "write",
+  "read": [],
+  "write": [],
+  "allowedEdits": [],
+  "forbidden": [],
+  "shared": [],
+  "serialOnly": [],
+  "validationCommand": ""
 }
 ```
 
-## Delegation Preflight
+Rules:
 
-`validate_delegation_plan` checks whether a single or parallel OpenCode delegation plan is safe before running it.
+- Missing write contracts are rejected with `missing_scope_contract`.
+- Empty write allowlists are rejected with `empty_allowed_edits`.
+- Files outside `allowedEdits` are rejected after execution.
+- Read-only agents that edit files are rejected.
+- Forbidden files must never be edited.
+- Shared and serial-only files require serial handling.
 
-It verifies:
+## Main Tools
 
-- direct agent routing and explicit fallback behavior
-- normalized lock paths
-- read/write lock modes
-- missing or unsafe paths
-- allowed edit paths staying inside locked paths
-- parallel write overlap
-- active lock conflicts
-- effective timeout for each job
+- `get_opencode_bridge_status`: verify OpenCode, Git, agent discovery, and effective worktree/queue/lock settings.
+- `validate_delegation_plan`: preflight one or more jobs without running OpenCode or acquiring locks.
+- `run_opencode_agent`: run one bounded OpenCode agent.
+- `run_opencode_parallel`: run independent jobs only when their write scopes are safe.
+- `enqueue_opencode_job`: schedule a job through the MCP queue.
+- `diagnose_opencode_bridge`: show correlated jobs, pipelines, locks, provider leases, preserved work, retry safety, and recovery actions for one repository.
+- `create_multi_agent_pipeline`: create an audited multi-agent plan with ownership, worktree, integration, and final-validation checks.
+- `run_multi_agent_pipeline`: enqueue planned pipeline jobs.
+- `get_multi_agent_pipeline` / `list_multi_agent_pipelines`: inspect pipeline status, queue jobs, integrations, and audit events.
+- `integrate_opencode_worktree`: dry-run or serially integrate one reviewed worktree/branch.
+- `finalize_multi_agent_pipeline`: run final validation and optional reviewer/tester gates.
+- `acquire_agent_lock` / `release_agent_lock`: exceptional manual cleanup/debugging only.
 
-Accepted plans report the execution mode, planned command shape, actual agent, lock mode, lock type, normalized locked paths, allowed edits, timeout, and queue status. Rejected plans use the same structured error fields as execution failures.
+`run_opencode_parallel` is a synchronous barrier. It returns terminal results for the direct jobs and measured overlap, not queue job IDs; callers must not poll `get_opencode_job` for those results. Use queue or pipeline tools when jobs must be monitored or cancelled independently.
 
-Example preflight for one writer:
+## Orchestrator Modes
 
-```json
-{
-  "jobs": [
-    {
-      "agent": "builder",
-      "task": "Implement only the web UI change.",
-      "write": true,
-      "lockedPaths": ["apps/web/**"],
-      "allowedEdits": ["apps/web/**"]
-    }
-  ]
-}
-```
+By default, a requested OpenCode `orchestrator` is routed to the dedicated `mcp-orchestrator`. That agent is read-only and has OpenCode's `task` permission denied, so it cannot launch nested writers. Codex remains the coordinator and calls bounded workers directly.
 
-Example preflight for parallel writers:
+The managed `planner`, `architect`, `reviewer`, and `tester` agents also deny both edits and nested subagent launches.
+Known write-capable agents such as `builder` and `debugger` are rejected under read-only locks; use them only as bounded worktree writers.
 
-```json
-{
-  "jobs": [
-    {
-      "agent": "builder",
-      "task": "Edit web.",
-      "write": true,
-      "lockedPaths": ["apps/web/**"],
-      "allowedEdits": ["apps/web/**"]
-    },
-    {
-      "agent": "debugger",
-      "task": "Edit api.",
-      "write": true,
-      "lockedPaths": ["apps/api/**"],
-      "allowedEdits": ["apps/api/**"]
-    }
-  ]
-}
-```
-
-## Job Queue and Git Worktrees
-
-The bridge includes an optional lightweight queue for scheduled OpenCode work:
+Contractor mode is disabled until the operator configures `CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256`. When the user explicitly requests the OpenCode Orchestrator by name for the current task, Codex may opt in with all three fields:
 
 ```text
-Codex
--> enqueue_opencode_job
--> MCP Queue
--> Scope Contract validation
--> lock/conflict check
--> optional Git worktree
--> OpenCode agent
--> changed-file validation
--> Codex review
+orchestratorMode: contractor
+userAuthorizedOrchestrator: true
+contractorAuthorizationToken: <operator-held secret matching the configured hash>
 ```
 
-Direct `run_opencode_agent` and `run_opencode_parallel` still work. The queue is for scalable scheduling, status tracking, cancellation, and serializing conflicting writers.
+The Bridge then routes the one outer job to `mcp-contractor-orchestrator`. That parent cannot edit, invoke a shell, or load skills; it may coordinate only an allowlisted set of OpenCode worker, planning, review, and test agents, and delegates repository commands or validation to those bounded subagents. Recursive orchestrator calls are denied by OpenCode task permissions. Because nested task execution has no interactive permission-response channel, every managed nested role defaults shell access to deny and exposes only the bridge-reviewed exact Git diagnostic allowlist. The Bridge isolates OpenCode's legacy home and every XDG control/state root, attests the exact parent and every allowlisted nested profile initially and immediately before execution, and uses an in-memory OpenCode session database. The whole contract must be a single bounded write job with explicit `lockedPaths`, `allowedEdits`, a write Scope Contract, and validation. It always runs in an isolated worktree, which is retained for Codex review and explicit integration. The Bridge independently runs the final validation gate even when a subagent reports its own check.
 
-Queue tools:
+```text
+User explicitly authorizes OpenCode Orchestrator
+-> Codex creates one bounded contract
+-> MCP contractor orchestrator
+-> internal OpenCode subagents
+-> consolidated diff/report
+-> Codex review and integration decision
+```
 
-- `enqueue_opencode_job`: enqueue one job using the same safety checks as `run_opencode_agent`.
-- `list_opencode_jobs`: list queued/running/completed jobs.
-- `get_opencode_job`: retrieve one job and its result text.
-- `cancel_opencode_job`: cancel pending/blocked jobs, or request cancellation for running jobs.
+Contractor mode is rejected when the capability is unconfigured/invalid or the explicit authorization flag is absent, and it cannot be placed in `run_opencode_parallel` or a multi-job pipeline. The plaintext token is neither returned nor persisted. MCP validates the aggregate contract and final changed files; it does not expose per-subagent locks inside OpenCode, so use this mode only when the user deliberately chooses the broker workflow.
 
-Read-only jobs can run in parallel. Write jobs with overlapping normalized edit scopes wait by default, or fail immediately when `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY=reject`.
+## Worktrees And Integration
 
-Git worktrees are off by default. When enabled with `CODEX_OPENCODE_WORKTREE_MODE=write` or `all`, eligible jobs run inside generated Git worktrees. Locks still apply, Scope Contracts still apply, and changed-file validation runs against the worktree result. The bridge returns the worktree path, branch, changed files, diff stat, and a patch preview for Codex review.
+Recommended production setting:
 
-Example queued builder:
+```text
+CODEX_OPENCODE_WORKTREE_MODE=write
+CODEX_OPENCODE_WORKTREE_ROOT=global
+```
+
+Worktree output is never merged automatically. The safe integration flow is:
+
+```text
+integrate_opencode_worktree(dryRun: true)
+-> bridge returns a full-patch SHA-256, source/base identity, target-state digest, contract digest, and previewReceipt
+-> Codex reviews the bounded patch preview, changed files, and immutable digests
+-> integrate_opencode_worktree(reviewed: true, previewReceipt: <exact receipt>, cleanupAfterSuccess: true)
+-> validationCommand runs
+-> rollback on validation failure
+-> source is re-hashed; cleanup occurs only after an explicit passing gate
+```
+
+Non-dry-run integration without both `reviewed: true` and the exact unexpired preview receipt is rejected. Any source or target mutation after preview returns `integration_preview_stale`. Source cleanup is opt-in, requires `validationGate.status === "passed"`, and rechecks the source patch immediately before removal. Pipeline cleanup is deferred until final validation, reviewer, and tester gates all succeed. Failed, partial, unreviewed, and not-yet-integrated worktrees are retained.
+
+Before creating any writer worktree, the bridge rejects staged, unstaged, untracked, conflicted, or dirty-submodule state with `dirty_worktree_requires_checkpoint`—including dirt unrelated to the requested scope. A worktree starts from a pinned commit/tree and cannot safely reproduce uncheckpointed prerequisites. The bridge never stashes, resets, commits, or overlays the source checkout; create or select an external checkpoint and retry.
+
+## Project Policy
+
+Pipeline creation loads `.mcp/agent-policy.json` when present.
+
+Recommended policy:
 
 ```json
 {
-  "agent": "builder",
-  "task": "Implement only the billing service.",
-  "write": true,
-  "lockMode": "simple",
-  "lockedPaths": ["apps/billing/**"],
-  "scope": {
-    "read": ["apps/billing/**", "packages/ui/**"],
-    "write": ["apps/billing/**"],
-    "forbidden": [".env", ".env.*", "package-lock.json"]
-  }
+  "version": 1,
+  "owners": {
+    "apps/web/**": "web",
+    "apps/api/**": "api",
+    "packages/shared/**": "shared"
+  },
+  "forbiddenEdits": [
+    ".env",
+    ".env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/secrets/**"
+  ],
+  "sharedFiles": [
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "tsconfig.json",
+    "packages/shared/**",
+    "schema/**",
+    "migrations/**"
+  ],
+  "serialOnly": [
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "database/**",
+    "migrations/**",
+    "schema/**"
+  ],
+  "requiresWorktrees": true,
+  "finalValidationCommand": "git diff --check"
 }
 ```
 
-## Fallback Behavior
+The policy schema is strict and repository policy is tightening-only: it cannot disable required worktrees. A caller-supplied `trustedPolicySha256` is diagnostic only and grants no authority. A policy containing `finalValidationCommand` is accepted only when the operator environment pins its canonical repository root, exact repo-relative path, and bytes through `CODEX_OPENCODE_TRUSTED_POLICY_ROOT`, `CODEX_OPENCODE_TRUSTED_POLICY_PATH`, and `CODEX_OPENCODE_TRUSTED_POLICY_SHA256`, and pins the canonical Git executable hash in `CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST`. Copying approved bytes into another repository or path grants no authority. Repository policy may use only bounded, read/check Git vectors; package scripts and repository interpreters require an explicitly trusted coordinator command or an external sandbox. The executable, exact argument vector, policy bytes, and provenance are revalidated before each execution. Changing or revoking any pin fails closed.
 
-Missing-agent fallback to `build` is disabled by default. If an agent is missing, the tool returns a clear routing error.
+The bridge also applies conservative defaults for env/secrets, manifests, lockfiles, shared packages, schemas, and migrations. Lock paths are canonicalized to repository-relative form before SQLite coordination, so absolute and relative spellings of the same path cannot bypass overlap checks. Multiple readers may share one path; writers remain exclusive. Reviewed integration takes a repository-wide `serial_integration` lease and waits for every reader, writer, or other integration to finish.
 
-Set `allowFallbackToBuild: true` only when `build` is an acceptable fallback. Results always report the requested agent, actual agent, whether fallback was used, and the fallback reason.
+## LangGraph TUI
+
+Run:
+
+```powershell
+npm run tui
+```
+
+The TUI uses `@langchain/langgraph` to drive the lifecycle menu and starts this bridge as a stdio MCP client. It shows bounded pipeline/job state, agent strategy, task hash/length, the exact provider/model/variant requested from active OpenCode debug configuration, separately available runtime-observed evidence, context/scope, locks, allowed edits, validation command, retained worktree identity, changed files, integration queue, final gates, and audit events. OpenCode's JSON event stream may not expose authoritative runtime model metadata, so the bridge never relabels a configured CLI pin as runtime attestation.
+
+The TUI shows operational context and model metadata. It does not expose private chain-of-thought.
 
 ## Configuration
 
-Behavior can be tuned with environment variables before the MCP server starts:
+Recommended production environment fragment (the MCP `args` entry itself must
+point at an immutable published release, not this working tree):
+
+```text
+CODEX_OPENCODE_WORKTREE_MODE=write
+CODEX_OPENCODE_WORKTREE_ROOT=global
+CODEX_OPENCODE_QUEUE_MODE=sqlite
+CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY=wait
+CODEX_OPENCODE_DEFAULT_READ_LOCK_MODE=off
+CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE=simple
+CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE=strict
+CODEX_OPENCODE_WORKTREE_CLEANUP=never
+CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT=2
+CODEX_OPENCODE_QUEUE_HEARTBEAT_MS=15000
+CODEX_OPENCODE_QUEUE_LEASE_MS=60000
+CODEX_OPENCODE_QUEUE_RETENTION_DAYS=0
+CODEX_OPENCODE_PROVIDER_LEASE_MS=240000
+CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS=20000
+CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS=8000
+CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS=12000
+CODEX_OPENCODE_EXPECTED_SERVER_SHA256=<sha256-of-the-published-server.js>
+CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256=<sha256-of-release-manifest.json>
+```
+
+The bridge runs every OpenCode command with `--pure` by default. In the pinned OpenCode runtime, `--pure` suppresses configured external plugins while retaining binary-bundled authentication hooks such as the Codex OAuth transport; the bridge must not set `OPENCODE_DISABLE_DEFAULT_PLUGINS`, because that also disables required built-in OAuth routing. Those internal hooks share the exact OpenCode-version trust boundary. A release-manifest-pinned process must keep `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=false`: startup and fresh health reject immutable release pinning with external plugins because the reviewed Antigravity plugin stores credentials under the same `XDG_CONFIG_HOME` that must be read-only release configuration.
+
+Outside immutable production mode, the external-plugin verifier remains fail-closed: enabling plugins requires an exact `name@version` allowlist, a pinned integrity manifest, exact effective config origins, canonical cache resolution, the complete package/dependency tree and lock, host version, and non-secret settings. Unexpected sources, siblings, plugins, links, junctions, ranges, tags, URLs, local files, or hash/version/config drift are rejected. This is integrity enforcement against accidental/configuration drift, not protection from an attacker who can rewrite verified files between checks; use OS isolation for that threat.
+
+### Production Builder authentication
+
+The immutable production Builder uses:
+
+```text
+OpenCode: 1.17.13
+External plugins: disabled (--pure)
+Builder model: openai/gpt-5.6-terra
+Variant: high
+Authentication: OpenCode built-in Codex OAuth transport
+```
+
+The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.json` files plus managed agents and skills. `XDG_CONFIG_HOME` points at the immutable release root, while built-in OAuth data remains in provider-owned OpenCode data storage. The builder and manifest never publish or hash `auth.json`, `antigravity-accounts.json`, or credential values. At runtime, isolated-role discovery may read a bounded, valid built-in `auth.json` object and pass it only as `OPENCODE_AUTH_CONTENT` to the one-shot child; it is never logged, returned, added to prompts, or persisted by the bridge. The Antigravity account file is never read by bridge code.
+
+### Optional Antigravity plugin evidence
+
+This reviewed manifest requires OpenCode to report exactly `1.17.13`; upgrades require regenerating and re-pinning the plugin manifest. Version `2.0.0` of the CortexKit package currently has an upstream OpenTUI peer-dependency conflict with `opencode plugin` on this Windows host. The MCP bridge does not use the optional plugin TUI, so this machine installs only the server plugin and its exact OpenCode host dependency. If the OpenCode plugin cache is cleared, rebuild that pinned server-only install from the repository root:
+
+```powershell
+$pluginCache = Join-Path $env:USERPROFILE '.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.0.0'
+New-Item -ItemType Directory -Path $pluginCache -Force | Out-Null
+Copy-Item -LiteralPath '.\opencode\cortexkit-server-package.json' -Destination (Join-Path $pluginCache 'package.json') -Force
+npm install --prefix $pluginCache --ignore-scripts --legacy-peer-deps
+npm audit --prefix $pluginCache --omit=dev
+```
+
+This is an unofficial OAuth plugin. It stores a Google refresh token in the provider-owned local Antigravity account file and its maintainers warn that using it may violate Google's terms or lead to account restrictions. The package remains independently audited and its integrity verifier remains tested, but it is not activated by the immutable production profile. The bridge never reads, hashes, copies, logs, returns, or writes its account file or credentials. Only the reviewed nonsecret `opencode.jsonc` and `antigravity.json` inputs are hash-pinned. Keep debug, automatic updates, and quota/account fallback disabled; never commit or copy the credential file, and prefer a dedicated low-privilege account for any separate development use.
+
+On the Codex MCP server entry, set `startup_timeout_sec = 120` and `tool_timeout_sec = 1500`. Codex otherwise defaults MCP tool calls to 60 seconds, which is shorter than the bridge's builder and orchestrator limits. The bundled TUI uses the same 25-minute client timeout; override it with `CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS` only when needed.
+
+The bridge resolves `opencode` from `PATH` by default instead of using a machine-specific executable path. Portable overrides are available through `CODEX_OPENCODE_EXECUTABLE`, `CODEX_OPENCODE_AGENT_DIR`, `CODEX_OPENCODE_SKILL_DIR`, and `CODEX_OPENCODE_STATE_DIR`; production source-evidence paths are bound to the verified release as described below.
+
+For production, point the Codex MCP entry at a new published snapshot outside the working tree and set both integrity hashes. `npm run release:build -- C:\absolute\new-release` copies only the bounded runtime, reviewed nonsecret config/settings, managed agents, and complete managed skill trees; rejects links and credential-bearing config keys; rewrites only the staged manifest paths; creates an exact-file manifest; and refuses to overwrite an existing destination. The server hash pins the entry point; the manifest hash pins every shipped file, including `bin/`, `opencode.jsonc`, `antigravity.json`, managed profiles/skills, and `node_modules`. `XDG_CONFIG_HOME`, `CODEX_OPENCODE_AGENT_DIR`, `CODEX_OPENCODE_SKILL_DIR`, and the plugin-manifest path must point at exact verified release locations, and external plugins must remain disabled. No global agent, skill, or config tree is staged or replaced during activation. Effective agents and authoritative `debug skill` names, origins, and complete trees must match before affected roles can spawn. Read-only ACL verification, atomic config replacement, fresh-process health, and automatic config rollback follow [docs/SAFE_PUBLISH_MANIFEST.md](docs/SAFE_PUBLISH_MANIFEST.md).
+
+`CODEX_OPENCODE_WORKTREE_ROOT=global` keeps generated worktrees under the bridge state directory instead of adding `.codex-worktrees/` to each repository. SQLite lock, queue, and pipeline state is also stored under the bridge state directory in per-repository hashed databases; `.mcp/` remains reserved for an optional repository policy file and is not used for runtime databases.
+
+## Sanitized Workspaces
+
+`verify_sanitized_workspace` and the optional per-job `sanitizedWorkspace` contract support exact, read-only workspace waves without widening the declared root to a Git repository:
+
+```json
+{
+  "root": "C:\\absolute\\sanitized-workspace",
+  "manifestPath": "C:\\trusted\\sanitized-manifest.json",
+  "manifestSha256": "<64-hex-sha256>",
+  "requiredFiles": ["filtered/input.jsonl", "instructions.md"],
+  "forbiddenFiles": ["raw/**", "**/*.xlsx", "credentials/**"]
+}
+```
+
+The pinned version-1 manifest contains an exact `files` map (`relative/path` to SHA-256) and exact `directories` array. Verification rejects traversal, absolute/case-colliding/duplicate entries, additions, removals, mutations, missing required files, forbidden files, unsupported entries, symlinks, and Windows junctions/reparse links. The bridge verifies immediately before and after each single/queued/parallel wave. Sanitized jobs are always read-only, use `subagentStrategy: "reject"`, run at the exact manifest root without a Git worktree, and are automatically routed without fallback to the bridge-owned `mcp-sanitized-reader`. Its exact mode/model/variant/temperature/prompt and edit/task/bash/web/skill/external permissions are re-attested immediately before spawn.
+
+Every bridge child forces `OPENCODE_DISABLE_PROJECT_CONFIG=true`, so a repository cannot register a local/remote MCP server, formatter, provider endpoint, or agent override through `opencode.json[c]` or `.opencode`. Sanitized children go further: they use an inline bridge-owned config with no plugins, MCP servers, LSP, formatter, sharing, external skills, or Claude compatibility; the session database is `:memory:`; and the bounded built-in OpenCode `auth.json` is supplied only through `OPENCODE_AUTH_CONTENT` in the child environment. OpenCode still creates home/cache/state/log/repository bookkeeping plus automatic tool-output and process-temp permissions, so `HOME`/`USERPROFILE`, every `XDG_*` root, and `TEMP`/`TMP`/`TMPDIR` all point into one fresh per-run runtime outside the manifest. Only that runtime's exact tool-output and `tmp/opencode` scratch directories are accepted as external-path exceptions, and the bridge overwrites and removes the whole runtime tree before it can report success. It never points either exception or an OpenCode control/state root at the original repository or shared user state.
+
+This contract is file-level integrity, not data minimization or an OS sandbox. It cannot filter rows/columns inside CSV, JSONL, Parquet, workbooks, databases, archives, or embedded documents; those transformations must happen outside the bridge before the manifest is created. A same-user native process can still race filesystem checks, and a hard process/OS crash may require inspection of a retained uniquely prefixed temporary runtime before the next cleanup. Use a VM/container and a pure/no-network provider path for hostile or high-sensitivity inputs.
+
+Useful defaults:
 
 | Variable | Default | Purpose |
-| --- | ---: | --- |
-| `CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS` | `180000` | Timeout for planner, architect, reviewer, tester, and other read-only jobs. |
-| `CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS` | `600000` | Default timeout for write jobs. |
-| `CODEX_OPENCODE_BUILDER_TIMEOUT_MS` | `900000` | Builder-specific timeout. |
-| `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS` | `1200000` | OpenCode orchestrator timeout. |
-| `CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES` | `2` | Retry count for read-only timeouts. |
-| `CODEX_OPENCODE_DEFAULT_READ_LOCK_MODE` | `off` | Default lock mode for read-only jobs. |
-| `CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE` | `simple` | Default lock mode for a single writer. |
-| `CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE` | `strict` | Default lock mode for multiple parallel writers. |
-| `CODEX_OPENCODE_PARALLEL_LIMIT` | `6` | Maximum jobs accepted by `run_opencode_parallel`. |
-| `CODEX_OPENCODE_LOG_LEVEL` | `warn` | Structured stderr logging level: `off`, `error`, `warn`, `info`, or `debug`. |
-| `CODEX_OPENCODE_WORKTREE_MODE` | `off` | Worktree mode: `off`, `write`, or `all`. |
-| `CODEX_OPENCODE_WORKTREE_ROOT` | `.codex-worktrees` | Root directory for generated Git worktrees. |
-| `CODEX_OPENCODE_WORKTREE_CLEANUP` | `never` | Cleanup policy: `always`, `on_success`, or `never`. |
-| `CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX` | `agent` | Branch prefix for generated worktree branches. |
-| `CODEX_OPENCODE_QUEUE_MODE` | `memory` | Queue storage mode: `off`, `memory`, or `sqlite`. |
-| `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Maximum queued jobs running at once. |
-| `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY` | `wait` | Queue write conflict policy: `wait` or `reject`. |
-| `CODEX_OPENCODE_QUEUE_READONLY_RETRIES` | `2` | Queue-level retry count for safe read-only jobs. |
-| `CODEX_OPENCODE_QUEUE_WRITE_RETRIES` | `0` | Queue-level retry count for write jobs. |
+| --- | --- | --- |
+| `CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS` | `180000` | Planner/reviewer/tester timeout. |
+| `CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS` | `600000` | Generic writer timeout. |
+| `CODEX_OPENCODE_BUILDER_TIMEOUT_MS` | `900000` | Builder/debugger timeout. |
+| `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS` | `360000` | Per-attempt orchestrator planning timeout; three attempts remain within the 25-minute MCP client limit. |
+| `CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS` | `1200000` | Explicit contractor orchestration timeout; write jobs are not retried automatically. |
+| `CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256` | unset | SHA-256 of the operator-held Contractor capability. Contractor mode is disabled when unset and requires the matching `contractorAuthorizationToken` plus explicit user authorization. |
+| `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS` | `false` | Immutable releases require `false` and use `--pure`; external plugins are available only to separately reviewed, unpinned development deployments. |
+| `CODEX_OPENCODE_AGENT_DIR` | global OpenCode `agents` | Managed source-profile directory. With release pins enabled this must be the verified release's `opencode/agents`. |
+| `CODEX_OPENCODE_SKILL_DIR` | global OpenCode `skills` | Managed source-skill directory. With release pins enabled this must be the verified release's `opencode/skills`; affected roles reject effective name/origin/tree drift before spawn. |
+| `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | `300000` | Validation command timeout. |
+| `CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS` | `2097152` | Per-stream subprocess capture cap. MCP results contain the bounded final response and tool outcome summary, not raw JSON events. |
+| `CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS` | `131072` | Maximum assistant final response returned to MCP. |
+| `CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS` | `12000` | Maximum exact patch preview eligible for a single-use review receipt; oversized or redacted evidence fails closed. |
+| `CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES` | `20000` | Fail-closed cap for metadata-only ignored-file snapshots; ignored contents are not read. |
+| `CODEX_OPENCODE_MAX_SNAPSHOT_FILES` | `25000` | Fail-closed cap for the complete changed-file snapshot set. |
+| `CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES` | `1048576` | Files above this size and secret-pattern paths use metadata-only snapshots and are never retained for rollback. |
+| `CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES` | `134217728` | Aggregate rollback-content budget; execution fails closed when exceeded. |
+| `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Generated worktree root under the bridge state directory; set an explicit path only when needed. |
+| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `2` | Cross-process provider/account lease limit shared by direct, queued, and parallel calls. |
+| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` | `opencode-default-account` | Operator-defined account-pool key used by the global provider lease. |
+| `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Per-process queue scheduling limit; provider/account leases impose the cross-process execution cap. |
+| `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY` | `wait` | `wait` or `reject`. |
+| `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` | `2000` | Retry interval for jobs blocked by a lock held by another bridge process. |
+| `CODEX_OPENCODE_QUEUE_HEARTBEAT_MS` | `15000` | Owner-instance/job heartbeat interval. |
+| `CODEX_OPENCODE_QUEUE_LEASE_MS` | `60000` | Queue ownership lease; reconciliation also requires an expired instance lease and dead PID where verifiable. |
+| `CODEX_OPENCODE_QUEUE_STALE_AFTER_MS` | `7200000` | Legacy/unowned pending-record age before explicit startup/operator reconciliation as `not_resumable`. |
+| `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git` | Operator allowlist for validation executables; add `npm` deliberately when reviewed project scripts are required. |
+| `CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST` | unset | Canonical executable SHA-256 pins required for repository-policy validation. |
+| `CODEX_OPENCODE_TRUSTED_POLICY_ROOT` | unset | Canonical repository root approved for policy authority. Required with the policy path and hash. |
+| `CODEX_OPENCODE_TRUSTED_POLICY_PATH` | unset | Exact repo-relative policy path approved for authority. Required with the policy root and hash. |
+| `CODEX_OPENCODE_TRUSTED_POLICY_SHA256` | unset | Operator-held exact hash of trusted policy bytes. Required with the policy root and path; caller arguments cannot replace it. |
 
-Structured logs never include prompts, stdout, stderr, full environment variables, tokens, API keys, secrets, or passwords. At `info` level, successful OpenCode runs log agent, command shape, duration, lock mode, retry count, exit code, timeout status, and dry-run status. Warnings are emitted for timeouts, non-zero exits, API error events, and native OpenCode fallback detection.
+## Operational Boundaries
 
-## Compact Delegation Packets
+- Worktrees start from a pinned committed `HEAD` and tree. Any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; no source bytes/index/HEAD are changed by that preflight.
+- Executed writer worktrees are never removed by the job/queue/parallel cleanup setting. They remain the review and recovery source until receipt-bound integration and explicit validated cleanup.
+- SQLite queue acceptance persists an AES-256-GCM encrypted replay request before publishing the job to the in-process scheduler. The separate 32-byte `queue-request.key` in the state root is required for restart recovery and backup; contractor capability tokens are removed before encryption. Supply a stable `idempotencyKey` so an identical resubmission returns the original job and a changed request fails with `queue_idempotency_conflict`. Startup takes over queued work only after both the job and bridge-owner leases expire. Legacy rows without encrypted payloads remain explicitly `not_resumable`.
+- Terminal retention defaults to unlimited (`0`) so accepted job history does not disappear. Set a positive retention only when an external archive exists. Provider leases heartbeat every 20 seconds and expire after four minutes without renewal, keeping crash recovery within the five-minute objective while tolerating short local stalls.
+- A successful OpenCode process must emit a non-empty terminal JSON text event. Exit code 0 without a final response is rejected as `agent_empty_final_response`.
+- Transient 429/5xx/transport/timeouts are retried only for read-only work with no completed tool outcome, using one bounded exponential-backoff/jitter/Retry-After controller and one elapsed-time budget. Writes, hard quota, auth/OAuth refresh, billing, model/configuration errors, truncation, and structured terminal errors are never retried. Queue retries do not multiply the inner policy.
+- The active agent debug record is used to pin `--model provider/model` and `--variant`; configured and runtime-observed evidence are reported separately. Silent bridge fallback is disabled.
+- Raw process-capture or assistant-final truncation is terminal `essential_output_truncated`; bounded head/tail evidence and stream hashes/counts are retained rather than reporting a false success. If only durable queue-result storage exceeds `CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS`, the job remains `completed` with `completionOutcome: "completed_with_truncated_output"`, and the bounded text, original character count, SHA-256, and truncation flag are retained.
+- Running queue cancellation owned by a live bridge terminates the exact spawned OpenCode process tree, then records `agent_cancelled`. A dead-owner orphan is terminalized from lease evidence without blindly killing a possibly reused PID.
+- Path-only change evidence is never enough to overwrite a user or concurrent process. Ordinary job/parallel violations retain affected workspace/worktree files as unresolved evidence. Receipt-bound integration rolls back only bytes that still exactly match the bridge-owned post-patch snapshot; ambiguous mutations are retained and reported.
+- Validation commands use a minimal credential-free environment and an operator executable allowlist. An approved `npm test` still executes repository code and therefore remains an authorization decision, not a sandbox.
+- The bridge is a coordination and change-scope boundary, not an operating-system sandbox. Do not use it to execute untrusted or malicious repositories outside an appropriate VM/container.
+- Node may print an experimental `node:sqlite` warning. On the supported Node version this is expected; test failure is determined by the command exit code and assertions, not that warning.
 
-Callers can pass `delegation` fields to avoid sending large conversation history:
+## Test
 
-```json
-{
-  "agent": "planner",
-  "task": "Create a focused implementation plan.",
-  "delegation": {
-    "scope": ["src/auth/**"],
-    "allowedEdits": [],
-    "forbiddenEdits": ["package.json", "shared/**"],
-    "sharedFiles": ["shared/types.ts"],
-    "permissions": "read-only / bash ask"
-  }
-}
+```powershell
+npm test
 ```
 
-The bridge formats these fields as a small task contract with a fixed return format.
-
-Use this compact task packet shape instead of sending full chat history:
+This runs:
 
 ```text
-Role: <agent>
-
-Task: <bounded task>
-
-Scope:
-<files/directories/modules, or "current repo">
-
-Allowed edits:
-<paths or "none">
-
-Forbidden edits:
-<paths or "none specified">
-
-Shared files: <shared files frozen unless explicitly assigned>
-
-Permissions:
-<read-only / write allowed / bash ask / bash allowed>
-
-Return format:
-
-1. Summary
-2. Files inspected
-3. Files changed
-4. Changes made or proposed
-5. Risks
-6. Validation performed
-7. Validation still recommended
+node --check server.js
+node --check bin/tui.js
+node --check bin/e2e.js
+node --check bin/e2e-contractor.js
+node --check bin/e2e-concurrency.js
+node --check bin/build-release.js
+node --check bin/fresh-healthcheck.js
+node bin/build-release.js --self-test
+node bin/fresh-healthcheck.js --self-test
+node bin/tui.js --smoke
+node server.js --self-test
 ```
 
-## Safe Parallel Writes
+Dependency security check (requires registry access):
 
-`run_opencode_parallel` applies the same agent-routing rules as `run_opencode_agent`. Subagents are proxied by default so OpenCode does not silently fall back to a default primary agent. Read-only jobs can run in parallel by default.
-
-These lock rules apply to Codex-delegated work that enters OpenCode through this MCP bridge. In that flow, the MCP bridge creates temporary locks for write agents, OpenCode agents cannot grant locks to themselves, and write agents may edit only paths explicitly granted by the run call.
-
-When OpenCode is launched directly without Codex/MCP, temporary OpenCode subagents do not wait for Codex locks. The standalone OpenCode orchestrator should manage local scoped ownership internally when parallel writes are needed, or run work serially when ownership is unclear.
-
-## OpenCode Orchestrator Large Task Mode
-
-Codex may delegate a large task to the OpenCode `orchestrator` through Large Task Mode. Codex remains the authority, the MCP bridge infers the safe mode from the request, protects scope, validates changed files, and Codex reviews the final result.
-
-`orchestratorMode` is optional. The bridge infers it automatically:
-
-- no write scope: `planning-only`
-- `write: true` with bounded `lockedPaths` and `allowedEdits`: `bounded-writer`
-
-Codex may still pass `orchestratorMode` explicitly when it wants to be strict.
-
-Modes:
-
-- `planning-only`: OpenCode orchestrator does not write files. It returns architecture, task breakdown, expected files, proposed `allowedEdits`, risks, test plan, and follow-up builder/debugger jobs for Codex to run through MCP.
-- `bounded-writer`: OpenCode orchestrator may write as one single bounded writer inside an isolated service folder only.
-
-Use policy:
-
-- Small feature: Codex uses `builder` or `debugger` directly through MCP Bridge.
-- Large isolated service: Codex may use OpenCode `orchestrator` as `bounded-writer` inside a folder such as `apps/billing/**`.
-- Large service touching shared/global files: OpenCode `orchestrator` must run `planning-only`; Codex then distributes implementation to direct `builder`/`debugger` jobs through MCP Bridge.
-
-Planning-only example:
-
-```json
-{
-  "agent": "orchestrator",
-  "task": "Plan the complete billing service architecture. Return affected files, allowedEdits proposal, risks, and test plan.",
-  "lockMode": "off"
-}
+```powershell
+npm audit --omit=dev
 ```
 
-Bounded-writer example:
+Run the live, isolated A-to-Z check separately because it invokes configured OpenCode models:
 
-```json
-{
-  "agent": "orchestrator",
-  "task": "Build the isolated billing service only inside apps/billing. Do not run internal builders.",
-  "write": true,
-  "lockMode": "simple",
-  "lockedPaths": ["apps/billing/**"],
-  "allowedEdits": ["apps/billing/**"]
-}
+```powershell
+npm run test:e2e
+npm run test:e2e:contractor
 ```
 
-Bounded-writer rules:
+The ordinary live check creates a temporary Git repository, verifies bridge health, performs read-only orchestration, preflights and runs one scoped builder in a worktree, runs reviewer/tester gates, previews integration, integrates after review, validates the exact changed file, and then removes the temporary fixture on success. The contractor check separately exercises explicit authorization, isolated home/XDG/auth/session state, exact parent and nested-role attestation, one completed nested Builder task, reviewed integration, cleanup, and unchanged shared OpenCode data/cache metadata.
 
-- must be a single `run_opencode_agent` call
-- must use `write: true`
-- must use `lockMode: "simple"`
-- must provide non-empty `lockedPaths`
-- must provide non-empty `allowedEdits`
-- must not run, spawn, invoke, or delegate to internal builders, debuggers, writers, or parallel subagents
-- must not touch root configs, lockfiles, env files, shared packages, or other global/risky paths
+Run the cross-process concurrency stress without invoking models:
 
-If the task touches global/shared files, use planning-only first, then let Codex run direct writer jobs through MCP.
-
-## Temporary Write Locks
-
-For MCP-delegated work, the bridge keeps active locks in a local SQLite registry:
-
-```text
-<workspace>/.mcp/bridge-state.sqlite
+```powershell
+npm run test:concurrency
 ```
 
-If no safe workspace root is available, the bridge uses the global bridge state directory under `%USERPROFILE%\.codex\codex-opencode-mcp`.
+This starts independent MCP server processes against temporary repositories and shared SQLite state. It verifies shared readers, exclusive writers, absolute/relative path canonicalization, repository-wide serial integration, overlapping/disjoint writer races, release cleanup, SQLite busy retry behavior, and the cross-process provider/account concurrency ceiling.
 
-The SQLite registry uses WAL mode and token-based temporary locks. Lock release is allowed only when both the run id and lock token match, so an old run cannot release a newer lock.
+## Full Guide
 
-Available lock tools:
-
-- `acquire_agent_lock`: exceptional/debug manual coordination only.
-- `release_agent_lock`: exceptional/debug manual cleanup only.
-- `list_agent_locks`: list active, non-expired locks.
-
-Manual acquire/release is not the normal workflow. Do not call `acquire_agent_lock` or `release_agent_lock` before calling `builder`, `debugger`, or another write agent.
-
-The normal write workflow is:
-
-```text
-Codex
--> run_opencode_agent(builder)
--> MCP acquires temporary lock
--> builder runs
--> MCP validates changed files
--> MCP releases lock
-```
-
-`run_opencode_agent` and `run_opencode_parallel` acquire and release temporary write locks automatically. Write-capable OpenCode jobs called through MCP are rejected before start unless the run call provides both `lockedPaths` and `allowedEdits`.
-
-`lockedPaths` define coarse lock ownership. `allowedEdits` define the exact file or directory allowlist for changed-file validation. The bridge validates the resulting Git diff against `allowedEdits`, not only `lockedPaths`.
-
-Lock modes:
-
-- `off`: read-only agents such as planner, architect, reviewer, and tester.
-- `simple`: one write agent with one bounded edit zone.
-- `strict`: multiple parallel write agents with non-overlapping edit zones.
-
-If a lock conflict exists, the bridge returns a short error:
-
-```text
-Write lock conflict on: <path>
-```
-
-If a manual lock already exists and a write agent is invoked through `run_opencode_agent`, the bridge returns:
-
-```text
-Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.
-```
-
-Codex direct file edits do not require MCP locks. MCP locks coordinate OpenCode agents launched through this bridge.
-
-Timeout defaults:
-
-- read-only agents: `CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS`, default 3 minutes.
-- write agents: `CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS`, default 10 minutes.
-- builder: `CODEX_OPENCODE_BUILDER_TIMEOUT_MS`, default 15 minutes.
-- orchestrator: `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS`, default 20 minutes.
-- read-only retries: `CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES`, default 2 retries.
-
-If a read-only agent still times out after retries, it is marked unavailable and the rest of the parallel orchestration can continue.
-
-If a non-read-only agent times out, the result includes:
-
-```text
-Agent timeout: <agent>
-```
-
-Supported lock types:
-
-- `read`: for planner, architect, reviewer, tester, exploration, review, planning, and no-edit validation. Read-only agents never require locks.
-- `write`: for builder, debugger, and other implementation agents.
-- `serial_integration`: for single serial write steps. This lock is rejected by `run_opencode_parallel`.
-
-Write-capable jobs require:
-
-- `lockedPaths`
-- `allowedEdits`
-
-Optional fields:
-
-- `lockType: "write"`; inferred when `write: true`
-- `ownedPaths`; backward-compatible alias for `lockedPaths`
-- `forbiddenEdits`
-- `sharedFiles`
-- `validationCommand`
-
-New callers should use `lockedPaths`.
-
-Wildcard suffixes are normalized before validation:
-
-```text
-apps/web/**          -> apps/web
-packages/shared/**  -> packages/shared
-apps/api/**          -> apps/api
-apps/api/app/**      -> apps/api/app
-apps\api\app\**\     -> apps/api/app
-README.md           -> README.md
-```
-
-Path inputs that contain parent traversal, control characters, or home-directory shortcuts are rejected before execution.
-
-If only one write agent is running, the bridge allows execution immediately after acquiring its temporary lock. Strict overlap checks are enforced when multiple write agents run in parallel.
-
-For parallel writes, each write job must provide `lockedPaths` and `allowedEdits`. `allowedEdits` must stay inside `lockedPaths`. Parallel write jobs with overlapping normalized locks are rejected before execution.
-
-Write-capable parallel jobs must include:
-
-- `agent`
-- `task`
-- `lockedPaths`
-- `allowedEdits`
-
-Example builder call:
-
-```json
-{
-  "agent": "builder",
-  "task": "Implement only the web UI change.",
-  "write": true,
-  "lockMode": "simple",
-  "lockedPaths": ["apps/web/**"],
-  "allowedEdits": ["apps/web/**"],
-  "dryRun": true
-}
-```
-
-The bridge normalizes this to `apps/web`, acquires the temporary lock internally, and routes directly to:
-
-```text
-opencode run --agent builder
-```
-
-Example debugger call:
-
-```json
-{
-  "agent": "debugger",
-  "task": "Fix the failing shared package test only.",
-  "write": true,
-  "lockMode": "simple",
-  "lockedPaths": ["packages/shared/**"],
-  "allowedEdits": ["packages/shared/**"],
-  "dryRun": true
-}
-```
-
-Example planner call:
-
-```json
-{
-  "agent": "planner",
-  "task": "Plan the auth refactor. Do not edit files.",
-  "lockMode": "off",
-  "dryRun": true
-}
-```
-
-Example reviewer call:
-
-```json
-{
-  "agent": "reviewer",
-  "task": "Review the current diff. Do not edit files.",
-  "write": false,
-  "lockMode": "off",
-  "dryRun": true
-}
-```
-
-Planner, architect, reviewer, and tester are read-only by default and do not require locks.
-
-Example overlapping parallel write rejection:
-
-```json
-{
-  "jobs": [
-    {
-      "agent": "builder",
-      "task": "Edit web app.",
-      "write": true,
-      "lockMode": "strict",
-      "lockedPaths": ["apps/web/**"],
-      "allowedEdits": ["apps/web/**"]
-    },
-    {
-      "agent": "debugger",
-      "task": "Edit web components.",
-      "write": true,
-      "lockMode": "strict",
-      "lockedPaths": ["apps/web/src/**"],
-      "allowedEdits": ["apps/web/src/**"]
-    }
-  ]
-}
-```
-
-The bridge normalizes the locks to `apps/web` and `apps/web/src`, detects overlap, and rejects before execution.
-
-What not to do:
-
-```json
-{
-  "tool": "acquire_agent_lock",
-  "paths": ["apps/web/**"]
-}
-```
-
-Do not manually acquire a lock and then call `builder`. Use one `run_opencode_agent` call with `lockMode: "simple"`, `lockedPaths`, and `allowedEdits`.
-
-Every write task packet sent to OpenCode includes:
-
-```text
-Lock mode: simple
-
-Lock type: write
-
-Lock granted:
-<paths>
-
-Allowed edits:
-<paths>
-
-Forbidden edits:
-<paths>
-
-Shared files frozen: <paths>
-
-If you need files outside the lock:
-Do not edit them. Return NEEDS_INTEGRATION with the file/path needed, reason, and recommended change.
-```
-
-After each write agent finishes, it must report the lock used, files inspected, files changed, files it wanted but did not edit, validation performed, and risks.
-
-After all parallel jobs finish, the bridge checks detected changed files and rejects the combined result when:
-
-- a read-only job changed files
-- a write job changed files outside `allowedEdits`
-- a forbidden or shared/frozen file changed
-- a serial-only/global file changed
-- multiple jobs changed the same file
-- OpenCode native subagent fallback was detected
-- OpenCode returned an API error event
-
-Changed-file detection compares content snapshots for all Git-detected dirty and untracked files before and after each job. This catches additional edits to files that were already dirty or untracked before the agent started, instead of only noticing newly added filenames.
-
-Before each write agent runs, the bridge captures a rollback baseline for already-dirty files. When changed-file validation fails, it attempts to roll back only the files introduced or modified by that run. Pre-existing dirty user work is restored to its pre-agent content when possible. Newly created disallowed files are removed. Deleted disallowed tracked files are restored from Git when possible.
-
-The result reports:
-
-- `rollback: success | partial | failed | not_needed`
-- `disallowedFiles`
-- `rollbackFiles`
-- `unresolvedFiles`
-
-If rollback is partial or failed, inspect `unresolvedFiles` before continuing.
-
-## Serial-Only Paths
-
-Some files and directories are global/risky and cannot be edited during parallel execution. Examples include package files, lockfiles, root config files, `.env*`, `README.md`, route trees, database migrations, and `prisma/schema.prisma`.
-
-If a parallel write job's `lockedPaths` or `allowedEdits` overlaps a serial-only path, the bridge rejects before execution with:
-
-```text
-errorType: serial_only_path_in_parallel
-reason: This file or path is global/risky and cannot be edited during parallel execution.
-suggestedFix: Run this task serially, then run reviewer/tester validation.
-```
-
-Serial-only paths are allowed only in a single serial write job with explicit `allowedEdits`.
-
-## Error Handling
-
-Every rejected execution includes these fields:
-
-```text
-errorType: <classification>
-requestedAgent: <requested agent>
-actualAgent: <actual agent or none>
-reason: <why it failed>
-suggestedFix: <next action>
-lockMode: <off/simple/strict/unknown>
-durationMs: <elapsed time>
-conflictingPaths: <paths or none>
-lockedPaths: <paths, when relevant>
-allowedEdits: <paths, when relevant>
-runId: <SQLite lock run id, when relevant>
-rollback: <success/partial/failed/not_needed, when relevant>
-disallowedFiles: <paths, when relevant>
-serialOnlyMatches: <paths, when relevant>
-rollbackFiles: <paths, when relevant>
-unresolvedFiles: <paths, when relevant>
-```
-
-Common `errorType` values:
-
-- `lock_plan_rejected`
-- `missing_locked_paths`
-- `missing_allowed_edits`
-- `invalid_write_lock_mode`
-- `orchestrator_write_forbidden`
-- `orchestrator_large_task_requires_mode`
-- `orchestrator_bounded_writer_missing_scope`
-- `orchestrator_internal_writer_forbidden`
-- `orchestrator_global_file_requires_planning_only`
-- `serial_only_path_in_parallel`
-- `unsafe_path`
-- `read_only_edit_forbidden`
-- `agent_routing_error`
-- `manual_lock_conflict`
-- `write_lock_conflict`
-- `parallel_plan_rejected`
-- `changed_file_validation_error`
-- `agent_timeout`
-- `opencode_native_fallback`
-- `opencode_api_error`
-- `read_only_agent_unavailable`
-- `queue_disabled`
-- `queue_job_failed`
-- `worktree_git_not_available`
-- `worktree_path_unsafe`
-- `worktree_create_failed`
-- `worktree_checkout_failed`
-- `worktree_changed_file_validation_error`
-- `worktree_cleanup_failed`
-- `worktree_merge_conflict`
-
-Troubleshooting quick checks:
-
-- After editing `server.js`, restart the MCP server before retesting live tools.
-- For write agents, pass `write: true`, `lockedPaths`, and `allowedEdits`; do not call `acquire_agent_lock` first.
-- For read-only agents, use `lockMode: "off"` or omit lock fields.
-- If a parallel call is rejected, normalize the ownership zones and remove overlaps before retrying.
-- If a parallel call touches package files, lockfiles, root configs, routes, migrations, or README, run that step serially.
-- If OpenCode reports fallback, make the requested agent `mode: all` or explicitly choose a proxy strategy.
-- If an agent times out, raise the relevant timeout env var or reduce the delegated task scope.
-
-## Two-Phase Execution Model
-
-For non-trivial write work:
-
-1. Run isolated implementation jobs in parallel only when ownership zones do not overlap.
-2. Run one serial integration step for shared contracts, package files, migrations, generated files, and cross-module wiring.
-3. Run one review step and one validation step over the combined result.
-
-## Global OpenCode Orchestrator
-
-The global `orchestrator` agent is a backup and delegation target, not the default leader while Codex is active.
-
-When called through MCP without a write scope, the OpenCode `orchestrator` is limited to bounded read-only planning, coordination, and analysis. When Codex provides `write: true`, `lockMode: "simple"`, `lockedPaths`, and `allowedEdits`, the bridge infers bounded-writer mode automatically; Codex still performs the final review.
-
-It supports three modes:
-
-1. Delegated Executor: follow compact Codex task packets through MCP.
-2. Backup Orchestrator: continue from a handoff when Codex cannot continue.
-3. Standalone Orchestrator: inspect the current repository when OpenCode is launched directly.
-
-It is repo-agnostic. It must not create repo-local `.opencode/` directories or initialize Spec Kit unless explicitly asked.
-
-## HANDOFF_TO_OPENCODE
-
-When Codex cannot continue, provide OpenCode with this handoff:
-
-```text
-HANDOFF_TO_OPENCODE
-
-1. Original goal
-2. Current working directory
-3. Current repo state
-4. Codex plan
-5. Completed work
-6. Remaining work
-7. Files changed
-8. Commands run
-9. Validation result
-10. Risks
-11. Next recommended task
-```
-
-OpenCode's global orchestrator can continue from this handoff in any repository.
+See [MCP_BRIDGE_COMPLETE_GUIDE.md](MCP_BRIDGE_COMPLETE_GUIDE.md) for detailed operating rules, manual examples, validation errors, and the final checklist.

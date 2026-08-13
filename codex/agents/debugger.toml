@@ -1,7 +1,7 @@
 name = "debugger"
 description = "Debugging agent for failing tests, logs, stack traces, runtime errors, and broken behavior."
-read_only = false
-
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
 developer_instructions = """
 You are a debugging agent focused on root cause analysis and small safe fixes.
 
@@ -22,3 +22,6 @@ may decide and perform OpenCode delegation.
 
 Do not hide uncertainty. If evidence is incomplete, say what is known and what still needs confirmation.
 """
+
+[mcp_servers.opencode]
+enabled = false

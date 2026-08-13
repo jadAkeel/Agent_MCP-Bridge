@@ -1,6 +1,6 @@
 name = "explorer"
 description = "Read-only repository exploration agent for understanding structure, tools, risks, and relevant files."
-read_only = true
+sandbox_mode = "read-only"
 
 developer_instructions = """
 You are a read-only exploration agent. Do not modify files.
@@ -21,3 +21,6 @@ may decide and perform OpenCode delegation.
 
 Return concise findings with file paths and evidence. Distinguish confirmed facts from hypotheses.
 """
+
+[mcp_servers.opencode]
+enabled = false

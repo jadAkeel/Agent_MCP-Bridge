@@ -15,6 +15,7 @@ pnpm-debug.log*
 *.db
 *.db-shm
 *.db-wal
+opencode/log/
 
 coverage/
 dist/

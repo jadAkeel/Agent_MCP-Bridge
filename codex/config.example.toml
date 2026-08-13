@@ -3,18 +3,93 @@
 # Keep auth.json, runtime paths, session state, logs, and machine-specific trust
 # entries local to your computer.
 
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 service_tier = "default"
 
+# Development-only source-tree entry. For production, use the absolute Node
+# executable, replace this path with the absolute server.js inside a newly built
+# immutable release, and enable every exact release path/pin below. Never point a
+# production entry at a mutable working tree.
 [mcp_servers.opencode]
 command = "node"
 args = ["C:\\path\\to\\codex-opencode-mcp\\server.js"]
+startup_timeout_sec = 120
+tool_timeout_sec = 1500
 
-# Optional MCP bridge environment overrides:
-#
-# CODEX_OPENCODE_LOCK_MODE=auto
-# CODEX_OPENCODE_QUEUE_MODE=memory
-# CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT=6
-# CODEX_OPENCODE_WORKTREE_MODE=off
-# CODEX_OPENCODE_WORKTREE_ROOT=.codex-worktrees
+[mcp_servers.opencode.env]
+CODEX_OPENCODE_WORKTREE_MODE = "write"
+CODEX_OPENCODE_WORKTREE_ROOT = "global"
+# Executed writer worktrees are always retained. This legacy setting applies only
+# to empty/pre-execution cleanup paths; reviewed integration owns deletion.
+CODEX_OPENCODE_WORKTREE_CLEANUP = "never"
+CODEX_OPENCODE_QUEUE_RETENTION_DAYS = "0"
+CODEX_OPENCODE_PROVIDER_LEASE_MS = "240000"
+CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS = "20000"
+CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS = "8000"
+CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS = "2097152"
+CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS = "131072"
+CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS = "12000"
+CODEX_OPENCODE_MAX_SNAPSHOT_FILES = "25000"
+CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES = "20000"
+CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES = "1048576"
+CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES = "134217728"
+CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS = "2000"
+CODEX_OPENCODE_QUEUE_STALE_AFTER_MS = "7200000"
+CODEX_OPENCODE_QUEUE_HEARTBEAT_MS = "15000"
+CODEX_OPENCODE_QUEUE_LEASE_MS = "60000"
+CODEX_OPENCODE_QUEUE_MODE = "sqlite"
+CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY = "wait"
+CODEX_OPENCODE_DEFAULT_READ_LOCK_MODE = "off"
+CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE = "simple"
+CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE = "strict"
+CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS = "1200000"
+CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES = "2"
+CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS = "1000"
+CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS = "480000"
+CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2"
+CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY = "reviewed-provider-account-pool"
+CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git"
+# Repository policy authority is disabled until the canonical repository root,
+# exact repo-relative policy path, policy SHA-256, and canonical executable
+# SHA-256 are all operator-pinned.
+# CODEX_OPENCODE_TRUSTED_POLICY_ROOT = "C:\\absolute\\reviewed-repository"
+# CODEX_OPENCODE_TRUSTED_POLICY_PATH = ".mcp/agent-policy.json"
+# CODEX_OPENCODE_TRUSTED_POLICY_SHA256 = "<sha256-of-agent-policy.json>"
+# CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST = "<sha256-of-canonical-git-executable>"
+CODEX_OPENCODE_SANITIZED_MAX_FILES = "25000"
+CODEX_OPENCODE_SANITIZED_MAX_BYTES = "1073741824"
+
+# Immutable production releases require false and use OpenCode's built-in Codex
+# OAuth transport. External plugins remain available only to a separately
+# reviewed, unpinned development deployment.
+CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "false"
+# CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST = "@scope/plugin@1.2.3"
+# CODEX_OPENCODE_PLUGIN_MANIFEST_PATH = "C:\\trusted\\plugin-integrity-manifest.json"
+# CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = "<sha256-of-plugin-integrity-manifest.json>"
+
+# Mandatory production release pins. The manifest covers the exact release file
+# list, including server.js, package files, bin/, node_modules, reviewed nonsecret
+# OpenCode config/settings, managed agents, and managed skills. Follow the ordered
+# release procedure.
+# CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = "<sha256-of-server.js>"
+# CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 = "<sha256-of-release-manifest.json>"
+
+# Contractor mode is disabled unless this is configured. Store only the hash
+# here; supply the matching plaintext contractorAuthorizationToken per approved call.
+# CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 = "<sha256-of-operator-held-secret>"
+
+# Optional portable overrides. The bridge normally resolves `opencode` from PATH
+# and derives config/state directories from the current user's home directory.
+# With release pins, XDG_CONFIG_HOME must be the release root and all source
+# evidence paths must be exact release subtrees. Built-in OAuth/account data under
+# OpenCode's data home remains external and is never published or hash-pinned by
+# the builder. Isolated runtime discovery may pass bounded built-in auth to its
+# one-shot child environment; it is not persisted by the bridge.
+# CODEX_OPENCODE_EXECUTABLE = "C:\\path\\to\\opencode.exe"
+# XDG_CONFIG_HOME = "C:\\absolute\\release"
+# CODEX_OPENCODE_AGENT_DIR = "C:\\absolute\\release\\opencode\\agents"
+# CODEX_OPENCODE_SKILL_DIR = "C:\\absolute\\release\\opencode\\skills"
+# CODEX_OPENCODE_PLUGIN_MANIFEST_PATH = "C:\\absolute\\release\\opencode\\plugin-integrity-manifest.json"
+# CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = "<sha256-of-release-plugin-integrity-manifest.json>"
+# CODEX_OPENCODE_STATE_DIR = "C:\\path\\to\\bridge-state"

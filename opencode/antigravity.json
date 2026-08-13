@@ -1,0 +1,11 @@
+{
+  "auto_update": false,
+  "debug": false,
+  "debug_tui": false,
+  "cli_first": false,
+  "quota_fallback": false,
+  "quota_style_fallback": false,
+  "account_selection_strategy": "sticky",
+  "pid_offset_enabled": false,
+  "soft_quota_threshold_percent": 90
+}
