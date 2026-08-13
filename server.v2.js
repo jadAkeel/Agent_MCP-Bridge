@@ -57,6 +57,9 @@ import {
 } from "./src/v2/policy/scope-results.js";
 import { createChildEnvBuilders } from "./src/v2/runtime/child-env.js";
 import { createIsolatedOpenCodeRuntimeManager } from "./src/v2/runtime/isolated-opencode-runtime.js";
+import { delayWithSignal, nowMs, retryAfterMsFromText } from "./src/v2/runtime/timing.js";
+import { redactSensitiveText, sanitizeLogValue, sanitizePersistedValue } from "./src/v2/security/redaction.js";
+import { createEventLogger } from "./src/v2/telemetry/event-logger.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_PATHS = resolveBridgePaths({
@@ -162,7 +165,6 @@ const defaultBuilderTimeoutMs = CONFIG.builderTimeoutMs;
 const defaultOrchestratorTimeoutMs = CONFIG.orchestratorTimeoutMs;
 const defaultContractorOrchestratorTimeoutMs = CONFIG.contractorOrchestratorTimeoutMs;
 const maxReadOnlyAgentRetries = CONFIG.maxReadOnlyAgentRetries;
-const LOG_LEVELS = Object.freeze({ off: 0, error: 1, warn: 2, info: 3, debug: 4 });
 const DEFAULT_RETURN_FORMAT = [
   "1. Summary",
   "2. Lock used",
@@ -211,6 +213,11 @@ const { buildOpenCodeEnv, buildValidationEnv } = createChildEnvBuilders({
   bridgePaths: BRIDGE_PATHS,
 });
 
+const { logEvent } = createEventLogger({
+  logLevel: CONFIG.logLevel,
+  sanitizeLogValue,
+});
+
 const { createIsolatedOpenCodeRuntime, wipeIsolatedOpenCodeRuntime } = createIsolatedOpenCodeRuntimeManager({
   bridgePaths: BRIDGE_PATHS,
   buildOpenCodeEnv,
@@ -219,103 +226,6 @@ const { createIsolatedOpenCodeRuntime, wipeIsolatedOpenCodeRuntime } = createIso
   sanitizedReaderProfile: MCP_SANITIZED_READER_PROFILE,
   sanitizedReaderPrompt: MCP_SANITIZED_READER_PROMPT,
 });
-
-function redactSensitiveText(value) {
-  let text = String(value || "");
-  const replacements = [
-    [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi, "[private key redacted]"],
-    [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
-    [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
-    [/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[jwt redacted]"],
-    [/\b(?:sk|rk|pk|ghp|gho|github_pat|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
-    [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
-    [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
-    [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
-  ];
-  for (const [pattern, replacement] of replacements) {
-    text = text.replace(pattern, replacement);
-  }
-  return text;
-}
-
-function sanitizePersistedValue(value, depth = 0) {
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "string") {
-    return redactSensitiveText(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizePersistedValue(item, depth + 1));
-  }
-  if (typeof value === "object") {
-    const safe = {};
-    for (const [key, child] of Object.entries(value)) {
-      if (/token|secret|password|credential|api[-_]?key|authorization|cookie/i.test(key)) {
-        continue;
-      }
-      if (/^(task|prompt|messages|input)$/i.test(key)) {
-        const raw = String(child || "");
-        safe[`${key}Sha256`] = createHash("sha256").update(raw).digest("hex");
-        safe[`${key}Chars`] = raw.length;
-        continue;
-      }
-      safe[key] = sanitizePersistedValue(child, depth + 1);
-    }
-    return safe;
-  }
-  return redactSensitiveText(String(value));
-}
-
-function sanitizeLogValue(value, depth = 0) {
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    const redacted = redactSensitiveText(value);
-    return redacted.length > 1000 ? `${redacted.slice(0, 1000)}...` : redacted;
-  }
-
-  if (Array.isArray(value)) {
-    if (depth > 2) {
-      return `[${value.length} items]`;
-    }
-    return value.map((item) => sanitizeLogValue(item, depth + 1));
-  }
-
-  if (typeof value === "object") {
-    if (depth > 2) {
-      return "[object]";
-    }
-
-    const safe = {};
-    for (const [key, childValue] of Object.entries(value)) {
-      if (/prompt|stdout|stderr|env|token|secret|password|api[-_]?key/i.test(key)) {
-        continue;
-      }
-      safe[key] = sanitizeLogValue(childValue, depth + 1);
-    }
-    return safe;
-  }
-
-  return String(value);
-}
-
-function logEvent(level, event, data = {}) {
-  const configuredLevel = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.warn;
-  const eventLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
-  if (configuredLevel < eventLevel) {
-    return;
-  }
-
-  console.error(JSON.stringify({
-    ts: new Date().toISOString(),
-    level,
-    event,
-    ...sanitizeLogValue(data),
-  }));
-}
 
 async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null } = {}) {
   try {
@@ -916,54 +826,6 @@ function formatValidationGateResult(validationGate) {
     validationGate.stdout ? `Validation stdout:\n${validationGate.stdout}` : null,
     validationGate.stderr ? `Validation stderr:\n${validationGate.stderr}` : null,
   ].filter(Boolean).join("\n");
-}
-
-function nowMs() {
-  return Number(process.hrtime.bigint() / 1000000n);
-}
-
-function retryAfterMsFromText(value, currentTimeMs = Date.now()) {
-  const text = String(value || "");
-  const milliseconds = text.match(/(?:retry[-_ ]?after[-_ ]?ms|retryAfterMs)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)(?:\s*ms)?["']?/i);
-  if (milliseconds) {
-    return Math.max(0, Math.ceil(Number(milliseconds[1])));
-  }
-  const googleDelay = text.match(/(?:retry[-_ ]?delay|retryDelay)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)["']?/i);
-  if (googleDelay) {
-    return Math.max(0, Math.ceil(Number(googleDelay[1]) * 1000));
-  }
-  const seconds = text.match(/(?:retry[-_ ]?after|retryAfter)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?["']?/i);
-  if (seconds) {
-    return Math.max(0, Math.ceil(Number(seconds[1]) * 1000));
-  }
-  const httpDate = text.match(/retry-after\s*:\s*([^\r\n]+)/i);
-  if (httpDate) {
-    const parsed = Date.parse(httpDate[1].trim());
-    if (Number.isFinite(parsed)) return Math.max(0, parsed - currentTimeMs);
-  }
-  return 0;
-}
-
-function delayWithSignal(delayMs, signal = null) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new Error("cancelled"));
-      return;
-    }
-    let settled = false;
-    const finish = (callback) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", onAbort);
-      callback();
-    };
-    const timer = setTimeout(() => finish(resolve), Math.max(0, delayMs));
-    const onAbort = () => {
-      clearTimeout(timer);
-      finish(() => reject(new Error("cancelled")));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal = null } = {}) {
