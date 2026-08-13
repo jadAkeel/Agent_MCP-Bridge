@@ -15,13 +15,45 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   integrationPreviewReceiptSchema,
-  projectAgentPolicySchema,
   sanitizedWorkspaceSchema,
   scopeContractSchema,
   scopePathSetSchema,
   scopeTimeoutPolicySchema,
   scopeValidationSchema,
 } from "./src/v2/policy/schemas.js";
+import { DEFAULT_FORBIDDEN_EDIT_PATHS } from "./src/v2/policy/default-paths.js";
+import { unsafePathReason } from "./src/v2/policy/path-boundary.js";
+import {
+  findSerialOnlyMatches,
+  firstNonEmptyList,
+  hasAmbiguousPathPattern,
+  isPathInside,
+  isWithinAnyPath,
+  mergePathLists,
+  normalizeFilesystemCase,
+  normalizeList,
+  normalizeLockPath,
+  normalizeLockPathList,
+  normalizeLockPathListForCwd,
+  normalizePathForCompare,
+  overlaps,
+  unsafeChangedFiles,
+} from "./src/v2/policy/paths.js";
+import {
+  applyProjectPolicyToJobs,
+  normalizeProjectAgentPolicy,
+} from "./src/v2/policy/project-policy.js";
+import {
+  formatScopeContractForPrompt,
+  normalizeScopeContract,
+  scopeContractPathInputs,
+  scopeContractTimeout,
+} from "./src/v2/policy/scope-contracts.js";
+import {
+  changedFileValidationErrorType,
+  scopeChangedFileViolations,
+  validateChangedFilesForPlan,
+} from "./src/v2/policy/scope-results.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -186,56 +218,6 @@ const CONFIG = Object.freeze({
   policyMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_POLICY_MAX_BYTES", 1024 * 128),
   contractorAuthorizationSha256: String(process.env.CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 || "").trim().toLowerCase(),
 });
-const SERIAL_ONLY_PATHS = Object.freeze([
-  "package.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "bun.lockb",
-  "tsconfig.json",
-  "tsconfig.*.json",
-  "vite.config.*",
-  "next.config.*",
-  "nuxt.config.*",
-  "webpack.config.*",
-  "rollup.config.*",
-  "eslint.config.*",
-  ".eslintrc*",
-  ".prettierrc*",
-  ".env",
-  ".env.*",
-  "README.md",
-  "CHANGELOG.md",
-  "src/index.*",
-  "src/main.*",
-  "src/app.*",
-  "src/routes/**",
-  "app/routes/**",
-  "db/migrations/**",
-  "prisma/schema.prisma",
-]);
-const DEFAULT_FORBIDDEN_EDIT_PATHS = Object.freeze([
-  ".env",
-  ".env.*",
-  "**/.env",
-  "**/.env.*",
-  "*.pem",
-  "**/*.pem",
-  "*.key",
-  "**/*.key",
-  "secrets/**",
-  "**/secrets/**",
-]);
-const DEFAULT_SHARED_FILE_PATHS = Object.freeze([
-  "package.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "tsconfig.json",
-  "packages/shared/**",
-  "schema/**",
-  "migrations/**",
-]);
 const defaultReadOnlyAgentTimeoutMs = CONFIG.readOnlyAgentTimeoutMs;
 const defaultWriteAgentTimeoutMs = CONFIG.writeAgentTimeoutMs;
 const defaultBuilderTimeoutMs = CONFIG.builderTimeoutMs;
@@ -3112,275 +3094,6 @@ async function resolveAgent(requestedAgent, cwd, allowFallbackToBuild = false, s
   };
 }
 
-function normalizeList(value) {
-  if (!value) {
-    return [];
-  }
-  return Array.isArray(value) ? value.filter(Boolean) : [String(value)];
-}
-
-function uniqueList(values) {
-  return [...new Set(normalizeList(values).map((value) => String(value).trim()).filter(Boolean))];
-}
-
-function normalizeLockPath(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return "";
-  }
-
-  return raw
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/^\.\//, "")
-    .replace(/\/+$/, "")
-    .replace(/\/\*\*$/, "")
-    .replace(/\/\*$/, "")
-    .replace(/\/+$/, "");
-}
-
-function realPathBoundaryReason(rawPath, cwd) {
-  if (!cwd) {
-    return "";
-  }
-  const root = path.resolve(cwd);
-  if (!existsSync(root)) {
-    return `Allowed root does not exist: ${root}.`;
-  }
-
-  const normalized = normalizeLockPath(rawPath);
-  const wildcardIndex = normalized.search(/[*?[\]{}!]/);
-  const staticValue = wildcardIndex === -1 ? normalized : normalized.slice(0, wildcardIndex).replace(/[\\/]+$/, "");
-  const candidate = path.resolve(root, staticValue || ".");
-  let nearest = candidate;
-  while (!existsSync(nearest) && nearest !== path.parse(nearest).root) {
-    nearest = path.dirname(nearest);
-  }
-
-  try {
-    const realRoot = realpathSync(root);
-    const realNearest = realpathSync(nearest);
-    const relativeReal = path.relative(realRoot, realNearest);
-    if (relativeReal.startsWith("..") || path.isAbsolute(relativeReal)) {
-      return `Path ${JSON.stringify(rawPath)} resolves through a symlink or junction outside the allowed root ${realRoot}.`;
-    }
-
-    const relativeLexical = path.relative(root, nearest);
-    let current = root;
-    for (const segment of relativeLexical.split(path.sep).filter(Boolean)) {
-      current = path.join(current, segment);
-      if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
-        return `Path ${JSON.stringify(rawPath)} traverses a symbolic link or junction at ${current}.`;
-      }
-    }
-  } catch (error) {
-    return `Path ${JSON.stringify(rawPath)} could not be safely resolved: ${error.message || String(error)}.`;
-  }
-
-  return "";
-}
-
-function unsafePathReason(paths, cwd = "") {
-  const root = cwd ? path.resolve(cwd) : "";
-  for (const rawPath of normalizeList(paths)) {
-    const raw = String(rawPath || "");
-    const normalized = normalizeLockPath(raw);
-    const label = JSON.stringify(raw);
-
-    if (!normalized) {
-      return `Unsafe path ${label} is empty.`;
-    }
-
-    if (/[\0\r\n]/.test(raw)) {
-      return `Unsafe path ${label} contains control characters.`;
-    }
-
-    if (normalized === "~" || normalized.startsWith("~/")) {
-      return `Unsafe path ${label} uses a home-directory shortcut. Use an explicit path.`;
-    }
-
-    if (normalized === "." || normalized === "/" || /^[A-Za-z]:\/?$/.test(normalized)) {
-      return `Unsafe path ${label} targets a filesystem root. Use a bounded file or directory.`;
-    }
-
-    if (normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
-      return `Unsafe path ${label} includes parent traversal.`;
-    }
-
-    if (isAbsolutePathLike(normalized) && root) {
-      const resolved = path.resolve(normalized);
-      const relative = path.relative(root, resolved);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-        return `Unsafe path ${label} resolves outside the allowed root ${root}.`;
-      }
-    }
-
-    const realBoundaryError = realPathBoundaryReason(normalized, root);
-    if (realBoundaryError) {
-      return realBoundaryError;
-    }
-  }
-
-  return "";
-}
-
-function normalizeLockPathList(values) {
-  return [...new Set(uniqueList(values).map(normalizeLockPath).filter(Boolean))];
-}
-
-function normalizeLockPathForCwd(value, cwd = "") {
-  const normalized = normalizeLockPath(value);
-  if (!normalized || !cwd || !isAbsolutePathLike(normalized)) {
-    return normalized;
-  }
-
-  const root = path.resolve(cwd);
-  const relative = path.relative(root, path.resolve(normalized));
-  return normalizeLockPath(relative || ".");
-}
-
-function normalizeLockPathListForCwd(values, cwd = "") {
-  return [
-    ...new Set(
-      uniqueList(values)
-        .map((value) => normalizeLockPathForCwd(value, cwd))
-        .filter(Boolean)
-    ),
-  ];
-}
-
-function mergePathLists(...values) {
-  return normalizeLockPathList(values.flatMap((value) => normalizeList(value)));
-}
-
-function normalizeScopeMode(mode) {
-  const raw = String(mode || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  if (!raw) {
-    return "";
-  }
-  if (raw === "readonly" || raw === "read_only") {
-    return "read";
-  }
-  if (raw === "write" || raw === "read") {
-    return raw;
-  }
-  return raw;
-}
-
-function rawScopeContractInput(job) {
-  if (job?.scopeContract) {
-    return job.scopeContract;
-  }
-
-  if (job?.delegation?.scopeContract) {
-    return job.delegation.scopeContract;
-  }
-
-  if (job?.scope && !Array.isArray(job.scope) && typeof job.scope === "object") {
-    return {
-      agent: job.agent,
-      role: job.role,
-      mode: job.mode,
-      scope: job.scope,
-      actions: job.actions,
-      validation: job.validation,
-      timeoutMs: job.timeoutMs,
-      timeoutPolicy: job.timeoutPolicy,
-    };
-  }
-
-  if (job?.delegation?.scope && !Array.isArray(job.delegation.scope) && typeof job.delegation.scope === "object") {
-    return {
-      agent: job.agent,
-      role: job.delegation.role,
-      mode: job.delegation.mode,
-      scope: job.delegation.scope,
-      actions: job.delegation.actions,
-      validation: job.delegation.validation,
-      timeoutMs: job.delegation.timeoutMs,
-      timeoutPolicy: job.delegation.timeoutPolicy,
-    };
-  }
-
-  return null;
-}
-
-function normalizeScopeContract(job) {
-  const raw = rawScopeContractInput(job);
-  if (!raw) {
-    return null;
-  }
-
-  const normalized = {
-    agent: String(raw.agent || job.agent || "").trim(),
-    role: String(raw.role || "").trim(),
-    mode: normalizeScopeMode(raw.mode),
-    scope: {
-      read: mergePathLists(raw.scope?.read, raw.read),
-      write: mergePathLists(raw.scope?.write, raw.write),
-      forbidden: mergePathLists(raw.scope?.forbidden, raw.forbidden),
-    },
-    allowedEdits: normalizeLockPathList(raw.allowedEdits),
-    shared: normalizeLockPathList(raw.shared),
-    serialOnly: normalizeLockPathList(raw.serialOnly),
-    validationCommand: String(raw.validationCommand || "").trim(),
-    actions: uniqueList(raw.actions).map((action) => String(action).trim()).filter(Boolean),
-    validation: {
-      changedFilesMustBeWithinWriteScope: raw.validation?.changedFilesMustBeWithinWriteScope !== false,
-      forbiddenFilesMustNotChange: raw.validation?.forbiddenFilesMustNotChange !== false,
-      readOnlyMustNotChangeFiles: raw.validation?.readOnlyMustNotChangeFiles !== false,
-    },
-    timeoutMs: raw.timeoutMs || raw.timeoutPolicy?.timeoutMs || null,
-    timeoutPolicy: {
-      readOnlyTimeoutMs: raw.timeoutPolicy?.readOnlyTimeoutMs || null,
-      writeTimeoutMs: raw.timeoutPolicy?.writeTimeoutMs || null,
-    },
-  };
-
-  if (!normalized.mode) {
-    normalized.mode = normalized.scope.write.length ? "write" : "read";
-  }
-
-  const scopeRoot = job.cwd || "";
-  normalized.scope.read = normalizeLockPathListForCwd(normalized.scope.read, scopeRoot);
-  normalized.scope.write = normalizeLockPathListForCwd(normalized.scope.write, scopeRoot);
-  normalized.scope.forbidden = normalizeLockPathListForCwd(normalized.scope.forbidden, scopeRoot);
-  normalized.allowedEdits = normalizeLockPathListForCwd(normalized.allowedEdits, scopeRoot);
-  normalized.shared = normalizeLockPathListForCwd(normalized.shared, scopeRoot);
-  normalized.serialOnly = normalizeLockPathListForCwd(normalized.serialOnly, scopeRoot);
-
-  return normalized;
-}
-
-function ownerMatchesPolicyValue(owner, value) {
-  if (!owner) {
-    return false;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).includes(owner);
-  }
-
-  return String(value || "").trim() === owner;
-}
-
-function normalizeProjectAgentPolicy(raw = {}) {
-  const parsed = projectAgentPolicySchema.parse(raw);
-  const owners = parsed.owners && typeof parsed.owners === "object" && !Array.isArray(parsed.owners) ? parsed.owners : {};
-  return {
-    owners: Object.fromEntries(
-      Object.entries(owners)
-        .map(([pathKey, owner]) => [normalizeLockPath(pathKey), owner])
-        .filter(([pathKey]) => Boolean(pathKey))
-    ),
-    sharedFiles: mergePathLists(DEFAULT_SHARED_FILE_PATHS, parsed.sharedFiles, parsed.contracts),
-    serialOnly: mergePathLists(SERIAL_ONLY_PATHS, parsed.serialOnly),
-    forbiddenEdits: mergePathLists(DEFAULT_FORBIDDEN_EDIT_PATHS, parsed.forbiddenEdits),
-    finalValidationCommand: String(parsed.finalValidationCommand || "").trim(),
-    requiresWorktrees: parsed.requiresWorktrees === true ? true : null,
-  };
-}
-
 async function loadProjectAgentPolicy(
   cwd = "",
   policyPath = ".mcp/agent-policy.json",
@@ -3485,192 +3198,6 @@ async function loadProjectAgentPolicy(
       path: resolved,
     };
   }
-}
-
-function applyProjectPolicyToJobs(jobs = [], policy = null, { allowOwnershipInference = false } = {}) {
-  if (!policy) {
-    return jobs.map((job) => ({ ...job }));
-  }
-
-  return jobs.map((job) => {
-    const owner = String(job.owner || job.role || job.agent || "").trim();
-    const ownedPaths = Object.entries(policy.owners)
-      .filter(([, value]) => ownerMatchesPolicyValue(owner, value))
-      .map(([ownedPath]) => ownedPath);
-    const otherOwnerPaths = Object.entries(policy.owners)
-      .filter(([, value]) => !ownerMatchesPolicyValue(owner, value))
-      .map(([ownedPath]) => ownedPath);
-    const writeScope = normalizeLockPathList(job.scope?.write || job.scopeContract?.scope?.write || job.delegation?.scopeContract?.scope?.write);
-    const shouldInferWriteScope = allowOwnershipInference && (job.write === true || writeScope.length) && ownedPaths.length;
-    const inferredWritePaths = shouldInferWriteScope ? ownedPaths : [];
-    const lockedPaths = firstNonEmptyList(job.lockedPaths, job.ownedPaths, job.delegation?.lockedPaths, inferredWritePaths);
-    const allowedEdits = firstNonEmptyList(job.allowedEdits, job.delegation?.allowedEdits, writeScope, inferredWritePaths);
-    const forbiddenEdits = mergePathLists(
-      job.forbiddenEdits,
-      job.delegation?.forbiddenEdits,
-      policy.forbiddenEdits,
-      policy.sharedFiles,
-      policy.serialOnly,
-      otherOwnerPaths
-    );
-    const sharedFiles = mergePathLists(job.sharedFiles, job.delegation?.sharedFiles, policy.sharedFiles);
-    const serialOnly = mergePathLists(job.serialOnly, job.delegation?.serialOnly, policy.serialOnly);
-    const scopeContract = rawScopeContractInput(job)
-      ? job.scopeContract
-      : shouldInferWriteScope
-        ? {
-            agent: job.agent,
-            role: owner,
-            mode: "write",
-            read: mergePathLists(ownedPaths, sharedFiles),
-            write: allowedEdits,
-            allowedEdits,
-            forbidden: forbiddenEdits,
-            shared: sharedFiles,
-            serialOnly,
-            validationCommand: job.validationCommand || job.delegation?.validationCommand || "",
-          }
-        : job.scopeContract;
-
-    return {
-      ...job,
-      lockedPaths,
-      allowedEdits,
-      forbiddenEdits,
-      sharedFiles,
-      serialOnly,
-      scopeContract,
-      policyOwner: owner,
-      policyOwnedPaths: ownedPaths,
-    };
-  });
-}
-
-function scopeContractPathInputs(scopeContract) {
-  return scopeContract
-    ? scopeContract.scope.read.concat(
-      scopeContract.scope.write,
-      scopeContract.scope.forbidden,
-      scopeContract.allowedEdits,
-      scopeContract.shared,
-      scopeContract.serialOnly
-    )
-    : [];
-}
-
-function scopeContractTimeout(scopeContract, lockType) {
-  if (!scopeContract) {
-    return null;
-  }
-  if (scopeContract.timeoutMs) {
-    return scopeContract.timeoutMs;
-  }
-  return lockType === "read"
-    ? scopeContract.timeoutPolicy.readOnlyTimeoutMs
-    : scopeContract.timeoutPolicy.writeTimeoutMs;
-}
-
-function formatScopeContractForPrompt(scopeContract) {
-  if (!scopeContract) {
-    return "";
-  }
-
-  return [
-    `Agent: ${scopeContract.agent || "not specified"}`,
-    `Role: ${scopeContract.role || "not specified"}`,
-    `Mode: ${scopeContract.mode}`,
-    `Read paths: ${scopeContract.scope.read.length ? scopeContract.scope.read.join(", ") : "not specified"}`,
-    `Write paths: ${scopeContract.scope.write.length ? scopeContract.scope.write.join(", ") : "none"}`,
-    `Allowed edits: ${scopeContract.allowedEdits.length ? scopeContract.allowedEdits.join(", ") : "not specified"}`,
-    `Forbidden paths: ${scopeContract.scope.forbidden.length ? scopeContract.scope.forbidden.join(", ") : "none"}`,
-    `Shared/frozen paths: ${scopeContract.shared.length ? scopeContract.shared.join(", ") : "none"}`,
-    `Serial-only paths: ${scopeContract.serialOnly.length ? scopeContract.serialOnly.join(", ") : "none"}`,
-    `Validation command: ${scopeContract.validationCommand || "not specified"}`,
-    `Allowed actions: ${scopeContract.actions.length ? scopeContract.actions.join(", ") : "not specified"}`,
-    `Validation changedFilesMustBeWithinWriteScope: ${scopeContract.validation.changedFilesMustBeWithinWriteScope ? "yes" : "no"}`,
-    `Validation forbiddenFilesMustNotChange: ${scopeContract.validation.forbiddenFilesMustNotChange ? "yes" : "no"}`,
-    `Validation readOnlyMustNotChangeFiles: ${scopeContract.validation.readOnlyMustNotChangeFiles ? "yes" : "no"}`,
-  ].join("\n");
-}
-
-function escapeRegex(value) {
-  return String(value).replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-}
-
-function globToRegex(pattern, matchDescendants = false) {
-  const normalized = normalizeLockPath(pattern);
-  let regex = "";
-  for (let index = 0; index < normalized.length; index += 1) {
-    const char = normalized[index];
-    const next = normalized[index + 1];
-    if (char === "*" && next === "*") {
-      regex += ".*";
-      index += 1;
-    } else if (char === "*") {
-      regex += "[^/]*";
-    } else {
-      regex += escapeRegex(char);
-    }
-  }
-  return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
-}
-
-function serialPatternStaticPrefix(pattern) {
-  const normalized = normalizeLockPath(pattern);
-  const wildcardIndex = normalized.search(/[*?[\]{}!]/);
-  const prefix = wildcardIndex === -1 ? normalized : normalized.slice(0, wildcardIndex);
-  return normalizeLockPath(prefix.replace(/\/[^/]*$/, ""));
-}
-
-function pathOverlapsSerialPattern(candidate, pattern) {
-  const normalizedCandidate = normalizeLockPath(candidate);
-  const normalizedPattern = normalizeLockPath(pattern);
-  if (!normalizedCandidate || !normalizedPattern) {
-    return false;
-  }
-
-  if (globToRegex(normalizedPattern).test(normalizedCandidate)) {
-    return true;
-  }
-
-  const staticPrefix = serialPatternStaticPrefix(normalizedPattern);
-  if (normalizedPattern.includes("**") && staticPrefix && overlaps([normalizedCandidate], [staticPrefix])) {
-    return true;
-  }
-
-  if (!/[*?[\]{}!]/.test(normalizedPattern)) {
-    return Boolean(overlaps([normalizedCandidate], [normalizedPattern]));
-  }
-
-  return false;
-}
-
-function findSerialOnlyMatches(paths, serialOnlyPaths = []) {
-  const matches = [];
-  const seen = new Set();
-  const patterns = mergePathLists(SERIAL_ONLY_PATHS, serialOnlyPaths);
-  for (const candidate of normalizeLockPathList(paths)) {
-    for (const pattern of patterns) {
-      if (pathOverlapsSerialPattern(candidate, pattern)) {
-        const label = `${candidate} (${pattern})`;
-        if (!seen.has(label)) {
-          matches.push(label);
-          seen.add(label);
-        }
-      }
-    }
-  }
-  return matches;
-}
-
-function firstNonEmptyList(...values) {
-  for (const value of values) {
-    const list = normalizeLockPathList(value);
-    if (list.length) {
-      return list;
-    }
-  }
-  return [];
 }
 
 function buildCompactPrompt(agent, task, delegation = {}) {
@@ -4600,59 +4127,6 @@ function snapshotIdentitySha256(snapshot) {
   return hash.digest("hex");
 }
 
-function isAbsolutePathLike(value) {
-  const raw = String(value || "");
-  return /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\") || raw.startsWith("/");
-}
-
-function normalizeFilesystemCase(value) {
-  const normalized = String(value || "");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function comparePathCandidates(value, cwd = "") {
-  const raw = normalizeLockPath(value);
-  if (!raw) {
-    return [];
-  }
-
-  const candidates = [raw];
-  if (cwd && !isAbsolutePathLike(raw)) {
-    candidates.push(path.resolve(cwd, raw));
-  }
-
-  return [
-    ...new Set(
-      candidates.map((candidate) =>
-        normalizeFilesystemCase(candidate.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, ""))
-      )
-    ),
-  ];
-}
-
-function isWithinAnyPath(file, allowedPaths = [], cwd = "") {
-  const fileCandidates = comparePathCandidates(file, cwd);
-  return allowedPaths.some((allowed) => {
-    const allowedCandidates = comparePathCandidates(allowed, cwd);
-    const rawAllowed = String(allowed || "").replace(/\\/g, "/").replace(/\/+$/, "");
-    const matchDescendants = rawAllowed.endsWith("/**");
-    return fileCandidates.some((normalizedFile) =>
-      allowedCandidates.some(
-        (normalizedAllowed) => /[*?[\]{}!]/.test(normalizedAllowed)
-          ? globToRegex(normalizedAllowed, matchDescendants).test(normalizedFile)
-          : normalizedFile === normalizedAllowed || normalizedFile.startsWith(`${normalizedAllowed}/`)
-      )
-    );
-  });
-}
-
-function unsafeChangedFiles(changedFiles, allowedPaths = [], cwd = "") {
-  if (!allowedPaths.length) {
-    return changedFiles;
-  }
-  return changedFiles.filter((file) => !isWithinAnyPath(file, allowedPaths, cwd));
-}
-
 async function readFileIfExists(filePath) {
   try {
     const details = await lstat(filePath);
@@ -4894,92 +4368,6 @@ async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapsho
   };
 }
 
-function scopeChangedFileViolations(changedFiles = [], lockPlan) {
-  const scopeContract = lockPlan.scopeContract;
-  if (!scopeContract) {
-    return {
-      outsideWriteScope: [],
-      forbiddenFiles: [],
-      readOnlyChangedFiles: [],
-    };
-  }
-
-  const readOnlyChangedFiles = scopeContract.validation.readOnlyMustNotChangeFiles
-    && (scopeContract.mode === "read" || lockPlan.lockType === "read")
-    ? normalizeLockPathList(changedFiles)
-    : [];
-  const outsideWriteScope = scopeContract.validation.changedFilesMustBeWithinWriteScope
-    && scopeContract.mode === "write"
-    ? unsafeChangedFiles(changedFiles, scopeContract.scope.write, lockPlan.cwd)
-    : [];
-  const forbiddenFiles = scopeContract.validation.forbiddenFilesMustNotChange
-    ? changedFiles.filter((file) => isWithinAnyPath(file, scopeContract.scope.forbidden, lockPlan.cwd))
-    : [];
-
-  return {
-    outsideWriteScope: normalizeLockPathList(outsideWriteScope),
-    forbiddenFiles: normalizeLockPathList(forbiddenFiles),
-    readOnlyChangedFiles: normalizeLockPathList(readOnlyChangedFiles),
-  };
-}
-
-function changedFileValidationErrorType(validation) {
-  if (validation.scopeViolations?.forbiddenFiles?.length) {
-    return "forbidden_file_changed";
-  }
-  if (validation.scopeViolations?.outsideWriteScope?.length || validation.scopeViolations?.readOnlyChangedFiles?.length) {
-    return "changed_file_validation_error";
-  }
-  if (validation.forbiddenFiles?.length) {
-    return "forbidden_file_changed";
-  }
-  if (validation.sharedFiles?.length) {
-    return "shared_file_parallel_write";
-  }
-  if (validation.serialOnlyMatches?.length) {
-    return "serial_only_parallel_write";
-  }
-  if (validation.readOnlyChangedFiles?.length) {
-    return "changed_file_validation_error";
-  }
-  return "changed_file_validation_error";
-}
-
-function validateChangedFilesForPlan({ changedFiles = [], lockPlan, parallel = false }) {
-  const disallowedFiles = [];
-  const serialOnlyMatches = parallel ? findSerialOnlyMatches(changedFiles, lockPlan.serialOnly) : [];
-  const scopeViolations = scopeChangedFileViolations(changedFiles, lockPlan);
-  const readOnlyChangedFiles = lockPlan.lockType === "read" && changedFiles.length
-    ? normalizeLockPathList(changedFiles)
-    : [];
-  const forbiddenFiles = normalizeLockPathList(changedFiles.filter((file) => isWithinAnyPath(file, lockPlan.forbiddenEdits, lockPlan.cwd)));
-  const sharedFiles = normalizeLockPathList(changedFiles.filter((file) => isWithinAnyPath(file, lockPlan.sharedFiles, lockPlan.cwd)));
-
-  if (lockPlan.lockType === "read" && changedFiles.length) {
-    disallowedFiles.push(...changedFiles);
-  }
-
-  if (lockPlan.lockType === "write") {
-    disallowedFiles.push(...unsafeChangedFiles(changedFiles, lockPlan.allowedEdits, lockPlan.cwd));
-  }
-
-  disallowedFiles.push(...forbiddenFiles);
-  disallowedFiles.push(...scopeViolations.outsideWriteScope, ...scopeViolations.forbiddenFiles, ...scopeViolations.readOnlyChangedFiles);
-  disallowedFiles.push(...sharedFiles);
-  if (serialOnlyMatches.length) {
-    disallowedFiles.push(...changedFiles.filter((file) => findSerialOnlyMatches([file], lockPlan.serialOnly).length));
-  }
-
-  return {
-    disallowedFiles: normalizeLockPathList(disallowedFiles),
-    serialOnlyMatches,
-    forbiddenFiles,
-    sharedFiles,
-    readOnlyChangedFiles,
-    scopeViolations,
-  };
-}
-
 function safeNamePart(value, fallback = "item") {
   const safe = String(value || "")
     .trim()
@@ -5083,11 +4471,6 @@ async function decryptQueueRequest(envelope, jobId) {
     decipher.update(Buffer.from(parsed.ciphertext, "base64")),
     decipher.final(),
   ]).toString("utf8"));
-}
-
-function isPathInside(parent, candidate) {
-  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function truncateText(value, limit = 12000) {
@@ -9841,27 +9224,6 @@ function orchestratorPolicyError(job, lockPlan, executionMode = "single") {
     error: `Invalid orchestratorMode "${mode}". Use planning-only or explicitly authorized contractor mode.`,
     suggestedFix: "Use planning-only by default. Use contractor mode with userAuthorizedOrchestrator true only after an explicit user request by name.",
   };
-}
-
-function normalizePathForCompare(path) {
-  return normalizeFilesystemCase(normalizeLockPath(path));
-}
-
-function hasAmbiguousPathPattern(paths) {
-  return normalizeList(paths).some((path) => /[*?[\]{}!]/.test(path));
-}
-
-function overlaps(pathsA, pathsB) {
-  for (const a of pathsA) {
-    for (const b of pathsB) {
-      const left = normalizePathForCompare(a);
-      const right = normalizePathForCompare(b);
-      if (left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)) {
-        return [a, b];
-      }
-    }
-  }
-  return null;
 }
 
 function normalizeLockType(lockType, job) {
