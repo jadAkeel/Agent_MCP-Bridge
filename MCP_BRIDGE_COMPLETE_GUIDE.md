@@ -311,7 +311,7 @@ acquire_agent_lock
 -> release_agent_lock
 ```
 
-Manual locks exist only for exceptional cleanup/debugging. Misuse is reported as `manual_lock_misuse`.
+Manual locks exist only for exceptional cleanup/debugging. A manual lock that blocks a normal run is reported as `manual_lock_misuse`; contention with a lock held automatically by another active write job is reported as `write_lock_conflict` so the caller can wait, retry, or choose a non-overlapping scope.
 
 Lock modes:
 

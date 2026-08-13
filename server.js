@@ -7056,6 +7056,7 @@ function conflictsWithActiveLock(request, activeLock) {
         lockId: activeLock.id,
         owner: activeLock.owner,
         agent: activeLock.agent,
+        origin: activeLock.origin || "legacy",
         lockType: activeLock.lockType,
         paths: activePaths,
         overlap,
@@ -7338,6 +7339,7 @@ function ensureLockTableSchema(db) {
         CREATE TABLE locks (
           normalized_path TEXT NOT NULL,
           owner_agent TEXT NOT NULL,
+          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
           run_id TEXT NOT NULL,
           token TEXT NOT NULL,
           lock_mode TEXT NOT NULL,
@@ -7431,6 +7433,7 @@ async function openLockDb(cwd = "") {
         CREATE TABLE IF NOT EXISTS locks (
           normalized_path TEXT NOT NULL,
           owner_agent TEXT NOT NULL,
+          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
           run_id TEXT NOT NULL,
           token TEXT NOT NULL,
           lock_mode TEXT NOT NULL,
@@ -7485,6 +7488,7 @@ async function openLockDb(cwd = "") {
         );
       `);
       ensureLockTableSchema(db);
+      ensureTableColumn(db, "locks", "acquisition_origin", "TEXT NOT NULL DEFAULT 'legacy'");
       ensureQueueLeaseSchema(db);
       ensurePipelineRevisionSchema(db);
       scrubLegacyLockSecrets(db);
@@ -7537,6 +7541,7 @@ function rowsToLocks(rows) {
       runId: row.run_id,
       owner: row.owner_agent,
       agent: row.owner_agent,
+      origin: row.acquisition_origin || "legacy",
       lockType: row.lock_mode,
       lockMode: row.lock_mode,
       paths: [],
@@ -7577,6 +7582,7 @@ async function listLocks(cwd = "") {
 async function acquireHardLock({
   owner = "codex",
   agent = "opencode",
+  origin = "internal",
   task = "",
   cwd = "",
   lockType = "write",
@@ -7584,6 +7590,7 @@ async function acquireHardLock({
   ttlMs = DEFAULT_LOCK_TTL_MS,
 }) {
   const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  const normalizedOrigin = origin === "manual" ? "manual" : "internal";
   const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
   const unsafeReason = unsafePathReason(paths, projectRoot);
   const lockPathsRequested = normalizeLockPathListForCwd(paths, projectRoot);
@@ -7644,10 +7651,10 @@ async function acquireHardLock({
       "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
     ).run(runId, agent, "running", normalizedLockType, now);
     const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
+      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
     }
     db.exec("COMMIT");
 
@@ -7657,6 +7664,7 @@ async function acquireHardLock({
       token,
       owner,
       agent,
+      origin: normalizedOrigin,
       taskSha256,
       cwd: projectRoot,
       lockType: normalizedLockType,
@@ -7873,7 +7881,7 @@ server.tool(
     ttlMs: z.number().int().positive().optional().describe("Lease duration in milliseconds. Defaults to 30 minutes."),
   },
   async ({ owner = "codex", agent = "opencode", task = "", cwd = "", lockType = "write", paths, ttlMs = DEFAULT_LOCK_TTL_MS }) => {
-    const result = await acquireHardLock({ owner, agent, task, cwd, lockType, paths, ttlMs });
+    const result = await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
     return {
       content: [
         {
@@ -10024,6 +10032,28 @@ function createLockPlan(job, index) {
   };
 }
 
+function directExecutionLockConflictDetails(lockResult, queueConflict = false) {
+  if (queueConflict) {
+    return {
+      headline: "Queued write job is waiting for an active lock.",
+      errorType: "queue_lock_conflict",
+      suggestedFix: "The queue will retry after the active write lock is released.",
+    };
+  }
+  if (lockResult?.conflict?.origin === "internal") {
+    return {
+      headline: "Write job is waiting for an active writer.",
+      errorType: "write_lock_conflict",
+      suggestedFix: "Wait for the active writer to finish, retry later, or choose a non-overlapping lockedPaths scope.",
+    };
+  }
+  return {
+    headline: "Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.",
+    errorType: "manual_lock_misuse",
+    suggestedFix: "Release the existing manual lock or wait for it to expire, then call run_opencode_agent with lockedPaths only.",
+  };
+}
+
 function validateScopeContract(job, lockPlan) {
   const scopeContract = lockPlan.scopeContract;
   if (!scopeContract) {
@@ -10776,27 +10806,28 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
       if (!lockResult.ok) {
         const conflictingPaths = conflictPathsFromConflict(lockResult.conflict);
         const queueConflict = fromQueue && effectiveQueueWriteConflictPolicy() === "wait";
+        const conflictDetails = directExecutionLockConflictDetails(lockResult, queueConflict);
         return {
           response: {
             content: [
               {
                 type: "text",
                 text: formatRejectedExecution({
-                  headline: queueConflict ? "Queued write job is waiting for an active lock." : "Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.",
-                  errorType: queueConflict ? "queue_lock_conflict" : "manual_lock_misuse",
+                  headline: conflictDetails.headline,
+                  errorType: conflictDetails.errorType,
                   reason: lockResult.error,
                   requestedAgent: resolution.requestedAgent,
                   actualAgent: resolution.actualAgent,
                   lockMode: lockPlan.lockMode,
                   durationMs: nowMs() - toolStarted,
                   conflictingPaths,
-                  suggestedFix: queueConflict ? "The queue will retry after the active write lock is released." : "Release the existing manual lock or wait for it to expire, then call run_opencode_agent with lockedPaths only.",
+                  suggestedFix: conflictDetails.suggestedFix,
                 }),
               },
             ],
           },
           result: {
-            errorType: queueConflict ? "queue_lock_conflict" : "manual_lock_misuse",
+            errorType: conflictDetails.errorType,
             changedFiles: [],
           },
           lockPlan,
@@ -14237,6 +14268,17 @@ async function runSelfTests() {
   assert.equal(independentSettled[0].status, "rejected");
   assert.equal(independentSettled[1].status, "fulfilled");
   assert.equal(independentSiblingCompleted, true);
+  assert.deepEqual(
+    directExecutionLockConflictDetails({ conflict: { origin: "internal" } }),
+    {
+      headline: "Write job is waiting for an active writer.",
+      errorType: "write_lock_conflict",
+      suggestedFix: "Wait for the active writer to finish, retry later, or choose a non-overlapping lockedPaths scope.",
+    }
+  );
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "manual" } }).errorType, "manual_lock_misuse");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "legacy" } }).errorType, "manual_lock_misuse");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "internal" } }, true).errorType, "queue_lock_conflict");
   const disjointDirtyDetails = dirtyCheckpointDetails({
     dirtyFiles: ["src/disjoint.txt"],
     overlappingFiles: [],
@@ -16022,6 +16064,7 @@ async function runSelfTests() {
         .run("src", "builder", "legacy-run", legacyRawToken, "write", Date.now() + 60000, Date.now(), tempDir, secretSentinel);
       ensureLockTableSchema(legacyLockDb);
       assert.equal(lockTableHasCompositePrimaryKey(legacyLockDb), true);
+      assert.equal(legacyLockDb.prepare("SELECT acquisition_origin FROM locks WHERE run_id = ?").get("legacy-run").acquisition_origin, "legacy");
       scrubLegacyLockSecrets(legacyLockDb);
       const scrubbedLegacyLock = legacyLockDb.prepare("SELECT token, task FROM locks WHERE run_id = ?").get("legacy-run");
       assert.match(scrubbedLegacyLock.token, /^sha256:[a-f0-9]{64}$/);

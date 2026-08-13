@@ -327,6 +327,30 @@ async function release(client, cwd, lock) {
   assert.match(text, /Temporary lock released\./i);
 }
 
+function directWriteJob(cwd, file, task) {
+  return {
+    agent: "builder",
+    task,
+    cwd,
+    write: true,
+    lockMode: "simple",
+    lockType: "write",
+    lockedPaths: [file],
+    allowedEdits: [file],
+    timeoutMs: 1000,
+    scopeContract: {
+      mode: "write",
+      read: [file],
+      write: [file],
+      allowedEdits: [file],
+      forbidden: [],
+      shared: [],
+      serialOnly: [],
+      validationCommand: "",
+    },
+  };
+}
+
 async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extraEnv = {} }) {
   const client = new Client({ name, version: "1.0.0" });
   const transport = new StdioClientTransport({
@@ -597,6 +621,37 @@ async function main() {
 
     const remaining = await callTool(clientA, "list_agent_locks", { cwd: repo });
     assert.match(remaining, /No active temporary locks\./i);
+
+    const automaticConflictPath = "src/automatic-conflict.txt";
+    const activeAutomaticWriter = callTool(
+      clientA,
+      "run_opencode_agent",
+      directWriteJob(repo, automaticConflictPath, "FAKE_TIMEOUT: hold the automatic writer lock.")
+    );
+    await waitFor(async () => {
+      const locks = await callTool(clientB, "list_agent_locks", { cwd: repo });
+      return locks.includes(automaticConflictPath) ? locks : null;
+    }, "The automatic writer lock did not become visible cross-process.");
+    const automaticConflict = await callTool(
+      clientB,
+      "run_opencode_agent",
+      directWriteJob(repo, automaticConflictPath, "FAKE_INDEPENDENT_SUCCESS")
+    );
+    assert.match(automaticConflict, /(?:Error type|errorType):\s*write_lock_conflict/i, automaticConflict);
+    assert.doesNotMatch(automaticConflict, /manual_lock_misuse|Manual lock already exists/i, automaticConflict);
+    await activeAutomaticWriter;
+
+    const manualConflictPath = "src/manual-conflict.txt";
+    const manualLock = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: [manualConflictPath] });
+    assert.ok(manualLock.credentials, manualLock.text);
+    const manualConflict = await callTool(
+      clientB,
+      "run_opencode_agent",
+      directWriteJob(repo, manualConflictPath, "FAKE_INDEPENDENT_SUCCESS")
+    );
+    assert.match(manualConflict, /(?:Error type|errorType):\s*manual_lock_misuse/i, manualConflict);
+    assert.match(manualConflict, /Manual lock already exists/i, manualConflict);
+    await release(clientA, repo, manualLock);
 
     const dbPath = await projectDbPath(stateDir);
     const instanceRows = withDatabase(dbPath, (db) => db.prepare(
