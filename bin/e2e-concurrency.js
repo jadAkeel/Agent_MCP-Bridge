@@ -9,10 +9,12 @@ import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
 const execFileAsync = promisify(execFile);
 const TOOL_TIMEOUT_MS = 60_000;
 const ACTIVE_QUEUE_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
+const serverEntrypoint = resolveServerEntrypoint();
 
 const FAKE_OPENCODE_SOURCE = String.raw`
 #include <stdio.h>
@@ -355,11 +357,11 @@ async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extra
   const client = new Client({ name, version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: "node",
-    args: [path.resolve("server.js")],
+    args: [serverEntrypoint],
     cwd: process.cwd(),
     stderr: "pipe",
     env: {
-      ...process.env,
+      ...serverChildEnvironment(),
       CODEX_OPENCODE_QUEUE_MODE: "sqlite",
       CODEX_OPENCODE_STATE_DIR: stateDir,
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
@@ -864,13 +866,13 @@ async function main() {
     const providerHoldMs = 700;
     const providerWorkers = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
       process.execPath,
-      [path.resolve("server.js"), "--provider-lease-worker", String(providerHoldMs)],
+      [serverEntrypoint, "--provider-lease-worker", String(providerHoldMs)],
       {
         cwd: process.cwd(),
         windowsHide: true,
         timeout: 30_000,
         env: {
-          ...process.env,
+          ...serverChildEnvironment(),
           CODEX_OPENCODE_STATE_DIR: stateDir,
           CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT: "2",
           CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY: "concurrency-e2e-account",

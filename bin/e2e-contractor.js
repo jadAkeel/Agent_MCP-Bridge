@@ -9,10 +9,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { resolveServerEntrypoint } from "./server-entry.js";
 
 const execFileAsync = promisify(execFile);
 const keepFixture = process.argv.includes("--keep");
 const MCP_TOOL_TIMEOUT_MS = 25 * 60 * 1000;
+const serverEntrypoint = resolveServerEntrypoint();
 
 function resultText(result) {
   return (result?.content || [])
@@ -150,7 +152,7 @@ async function main() {
     client = new Client({ name: "codex-opencode-contractor-e2e", version: "1.0.0" });
     const transport = new StdioClientTransport({
       command: "node",
-      args: [path.resolve("server.js")],
+      args: [serverEntrypoint],
       cwd: process.cwd(),
       stderr: "pipe",
       env: {
