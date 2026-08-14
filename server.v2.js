@@ -61,6 +61,7 @@ import { createIsolatedOpenCodeRuntimeManager } from "./src/v2/runtime/isolated-
 import { createProcessRunner } from "./src/v2/runtime/process-runner.js";
 import { createProviderDiagnostics } from "./src/v2/runtime/provider-diagnostics.js";
 import { delayWithSignal, nowMs, retryAfterMsFromText } from "./src/v2/runtime/timing.js";
+import { assertNoLinkedPath, sha256File } from "./src/v2/security/filesystem-integrity.js";
 import { redactSensitiveText, sanitizeLogValue, sanitizePersistedValue } from "./src/v2/security/redaction.js";
 import { createValidationTrust } from "./src/v2/security/validation-trust.js";
 import { createEventLogger } from "./src/v2/telemetry/event-logger.js";
@@ -1393,19 +1394,6 @@ async function enumerateSanitizedTree(root) {
   }
   await walk(absoluteRoot);
   return { files, directories: directories.sort(), totalBytes };
-}
-
-async function assertNoLinkedPath(absolutePath, label = "Path") {
-  const resolved = path.resolve(absolutePath);
-  const parsed = path.parse(resolved);
-  let current = parsed.root;
-  for (const segment of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
-    current = path.join(current, segment);
-    const details = await lstat(current);
-    if (details.isSymbolicLink()) {
-      throw new Error(`${label} traverses a symbolic link or junction: ${current}`);
-    }
-  }
 }
 
 async function verifySanitizedWorkspace(contract, phase = "manual") {
@@ -15996,10 +15984,6 @@ async function runSelfTests() {
 
   selfTestProgress("end");
   console.log("Self tests passed.");
-}
-
-async function sha256File(filePath) {
-  return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
 
 async function listReleaseFiles(root, current = root) {
