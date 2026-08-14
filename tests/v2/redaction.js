@@ -72,6 +72,92 @@ assert.equal("cookieJar" in persisted, false);
 assert.equal(JSON.stringify(persisted).includes(secrets.bearer), false);
 assert.equal(JSON.stringify(persisted).includes(secrets.google), false);
 
+function hostileStructuralValue() {
+  return JSON.parse(`{
+    "__proto__":{"recordPrototypeChanged":true},
+    "constructor":{"prototype":{"globalPrototypeChanged":true}},
+    "prototype":{"ignored":true},
+    "safe":"Authorization: Bearer ${secrets.bearer}",
+    "nested":{
+      "__proto__":{"nestedPrototypeChanged":true},
+      "constructor":{"prototype":{"globalPrototypeChanged":true}},
+      "prototype":{"ignored":true},
+      "sibling":"nested sibling"
+    },
+    "items":[{
+      "__proto__":{"arrayPrototypeChanged":true},
+      "constructor":{"prototype":{"globalPrototypeChanged":true}},
+      "prototype":{"ignored":true},
+      "sibling":"array sibling",
+      "text":"Authorization: Bearer ${secrets.bearer}"
+    }]
+  }`);
+}
+
+function assertNoStructuralKeys(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertNoStructuralKeys(item);
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  assert.equal(Object.hasOwn(value, "__proto__"), false);
+  assert.equal(Object.hasOwn(value, "constructor"), false);
+  assert.equal(Object.hasOwn(value, "prototype"), false);
+  for (const child of Object.values(value)) {
+    assertNoStructuralKeys(child);
+  }
+}
+
+function assertOrdinaryObjectTree(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertOrdinaryObjectTree(item);
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  assert.equal(Object.getPrototypeOf(value), Object.prototype);
+  for (const child of Object.values(value)) {
+    assertOrdinaryObjectTree(child);
+  }
+}
+
+function mergeRecursively(target, source) {
+  for (const [key, child] of Object.entries(source)) {
+    if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+      const destination = target[key] ?? {};
+      target[key] = destination;
+      mergeRecursively(destination, child);
+      continue;
+    }
+    target[key] = child;
+  }
+  return target;
+}
+
+const persistedHostile = sanitizePersistedValue(hostileStructuralValue());
+assertNoStructuralKeys(persistedHostile);
+assertOrdinaryObjectTree(persistedHostile);
+assert.equal(persistedHostile.safe.includes(secrets.bearer), false);
+assert.equal(persistedHostile.nested.sibling, "nested sibling");
+assert.equal(persistedHostile.items[0].sibling, "array sibling");
+assert.equal(persistedHostile.items[0].text.includes(secrets.bearer), false);
+assert.deepEqual(sanitizePersistedValue(persistedHostile), persistedHostile);
+
+const globalPrototypeBefore = Object.getPrototypeOf(Object.prototype);
+assert.equal(Object.hasOwn(Object.prototype, "globalPrototypeChanged"), false);
+const persistedMergeTarget = mergeRecursively({}, persistedHostile);
+assert.equal(Object.getPrototypeOf(persistedMergeTarget), Object.prototype);
+assert.equal(Object.getPrototypeOf(persistedMergeTarget.nested), Object.prototype);
+assert.equal(Object.hasOwn(Object.prototype, "globalPrototypeChanged"), false);
+assert.equal(Object.getPrototypeOf(Object.prototype), globalPrototypeBefore);
+
 const longText = "x".repeat(1001);
 const logged = sanitizeLogValue({
   prompt: secrets.named,
@@ -94,5 +180,20 @@ assert.equal(logged.longText, `${"x".repeat(1000)}...`);
 assert.equal(logged.level1.level2.level3Object, "[object]");
 assert.equal(logged.level1.level2.level3Array, "[3 items]");
 assert.equal(sanitizeLogValue(12n), "12");
+
+const loggedHostile = sanitizeLogValue(hostileStructuralValue());
+assertNoStructuralKeys(loggedHostile);
+assertOrdinaryObjectTree(loggedHostile);
+assert.equal(loggedHostile.safe.includes(secrets.bearer), false);
+assert.equal(loggedHostile.nested.sibling, "nested sibling");
+assert.equal(loggedHostile.items[0].sibling, "array sibling");
+assert.equal(loggedHostile.items[0].text.includes(secrets.bearer), false);
+assert.deepEqual(sanitizeLogValue(loggedHostile), loggedHostile);
+
+const loggedMergeTarget = mergeRecursively({}, loggedHostile);
+assert.equal(Object.getPrototypeOf(loggedMergeTarget), Object.prototype);
+assert.equal(Object.getPrototypeOf(loggedMergeTarget.nested), Object.prototype);
+assert.equal(Object.hasOwn(Object.prototype, "globalPrototypeChanged"), false);
+assert.equal(Object.getPrototypeOf(Object.prototype), globalPrototypeBefore);
 
 console.log("V2 redaction and sanitization tests passed.");

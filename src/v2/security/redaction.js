@@ -31,6 +31,9 @@ export function sanitizePersistedValue(value, depth = 0) {
   if (typeof value === "object") {
     const safe = {};
     for (const [key, child] of Object.entries(value)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       if (/token|secret|password|credential|api[-_]?key|authorization|cookie/i.test(key)) {
         continue;
       }
@@ -71,6 +74,9 @@ export function sanitizeLogValue(value, depth = 0) {
 
     const safe = {};
     for (const [key, childValue] of Object.entries(value)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       if (/prompt|stdout|stderr|env|token|secret|password|api[-_]?key/i.test(key)) {
         continue;
       }
