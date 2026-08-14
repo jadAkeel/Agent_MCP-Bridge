@@ -10,6 +10,88 @@ function defaultTruncateText(value, limit = 12000) {
   return text.length > limit ? `${text.slice(0, limit)}\n... [truncated]` : text;
 }
 
+const QUEUE_RECORD_SNAPSHOT_KEYS = Object.freeze([
+  "jobId",
+  "parentJobId",
+  "idempotencyKey",
+  "requestFingerprint",
+  "agent",
+  "taskSha256",
+  "taskChars",
+  "cwd",
+  "mode",
+  "scopeContract",
+  "sanitizedWorkspace",
+  "sanitizedWorkspaceVerification",
+  "lockMode",
+  "lockedPaths",
+  "allowedEdits",
+  "worktreePath",
+  "worktreeBranch",
+  "worktreeBaseCommit",
+  "worktreeBaseTree",
+  "worktreePatchSha256",
+  "worktreeSourceStateSha256",
+  "status",
+  "createdAt",
+  "startedAt",
+  "finishedAt",
+  "durationMs",
+  "retryCount",
+  "maxRetries",
+  "errorType",
+  "errorReason",
+  "completionOutcome",
+  "changedFiles",
+  "noChanges",
+  "dirtyFiles",
+  "overlappingFiles",
+  "disjointFiles",
+  "validationResult",
+  "configuredProvider",
+  "configuredModel",
+  "configuredVariant",
+  "runtimeObservedProvider",
+  "runtimeObservedModel",
+  "actualProvider",
+  "actualModel",
+  "actualModelEvidence",
+  "cancellationRequested",
+  "cancellationRequestedAt",
+  "ownerInstanceId",
+  "ownerProcessId",
+  "ownerGeneration",
+  "heartbeatAt",
+  "leaseExpiresAt",
+  "childProcessId",
+  "childProcessStartedAt",
+  "revision",
+  "resultText",
+  "resultTextChars",
+  "resultTextSha256",
+  "resultTextTruncated",
+  "orphanChildProcessId",
+  "orphanChildProcessStartedAt",
+  "orphanChildProcessAlive",
+]);
+
+function defineEnumerableDataProperty(target, key, value) {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+function isPlainRecord(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 export function createQueueRecordCodec({
   config,
   redactSensitiveText = defaultRedactSensitiveText,
@@ -106,35 +188,70 @@ export function createQueueRecordCodec({
     return record;
   }
 
-  function persistedQueueRecordFromRow(row) {
-    let snapshot = {};
+  function tryPersistedQueueRecordFromRow(row) {
+    let decoded = null;
+    let ok = false;
     try {
-      snapshot = row?.record_json ? JSON.parse(row.record_json) : {};
+      decoded = row?.record_json ? JSON.parse(row.record_json) : null;
+      ok = isPlainRecord(decoded);
     } catch {
-      snapshot = {};
+      decoded = null;
     }
-    return {
-      ...snapshot,
-      status: row ? row.status : snapshot.status || "",
-      startedAt: row ? row.started_at || "" : snapshot.startedAt || "",
-      finishedAt: row ? row.finished_at || "" : snapshot.finishedAt || "",
-      ownerInstanceId: row ? row.owner_instance_id || "" : snapshot.ownerInstanceId || "",
-      ownerProcessId: row ? row.owner_process_id || 0 : snapshot.ownerProcessId || 0,
-      ownerGeneration: row ? row.owner_generation || "" : snapshot.ownerGeneration || "",
-      heartbeatAt: row ? row.heartbeat_at || "" : snapshot.heartbeatAt || "",
-      leaseExpiresAt: row ? row.lease_expires_at || "" : snapshot.leaseExpiresAt || "",
-      cancellationRequested: row ? Boolean(row.cancellation_requested_at) : Boolean(snapshot.cancellationRequestedAt),
-      cancellationRequestedAt: row ? row.cancellation_requested_at || "" : snapshot.cancellationRequestedAt || "",
-      childProcessId: row ? row.child_process_id || 0 : snapshot.childProcessId || 0,
-      childProcessStartedAt: row ? row.child_process_started_at || "" : snapshot.childProcessStartedAt || "",
-      revision: row ? row.revision || 0 : snapshot.revision || 0,
-      idempotencyKey: row ? row.idempotency_key || snapshot.idempotencyKey || "" : snapshot.idempotencyKey || "",
-    };
+
+    const selected = {};
+    if (ok) {
+      for (const key of QUEUE_RECORD_SNAPSHOT_KEYS) {
+        if (Object.hasOwn(decoded, key)) {
+          defineEnumerableDataProperty(selected, key, decoded[key]);
+        }
+      }
+    }
+    const sanitized = sanitizePersistedValue(selected);
+    const record = {};
+    for (const [key, value] of Object.entries(sanitized)) {
+      defineEnumerableDataProperty(record, key, value);
+    }
+
+    const hasColumn = (column) => Boolean(row && Object.hasOwn(row, column));
+    if (hasColumn("job_id")) defineEnumerableDataProperty(record, "jobId", row.job_id || "");
+    if (hasColumn("cwd")) defineEnumerableDataProperty(record, "cwd", row.cwd || "");
+    if (hasColumn("agent")) defineEnumerableDataProperty(record, "agent", row.agent || "");
+    if (hasColumn("mode")) defineEnumerableDataProperty(record, "mode", row.mode || "");
+    if (hasColumn("created_at")) defineEnumerableDataProperty(record, "createdAt", row.created_at || "");
+    defineEnumerableDataProperty(record, "status", hasColumn("status") ? row.status || "" : record.status || "");
+    defineEnumerableDataProperty(record, "startedAt", hasColumn("started_at") ? row.started_at || "" : record.startedAt || "");
+    defineEnumerableDataProperty(record, "finishedAt", hasColumn("finished_at") ? row.finished_at || "" : record.finishedAt || "");
+    defineEnumerableDataProperty(record, "ownerInstanceId", hasColumn("owner_instance_id") ? row.owner_instance_id || "" : record.ownerInstanceId || "");
+    defineEnumerableDataProperty(record, "ownerProcessId", hasColumn("owner_process_id") ? row.owner_process_id || 0 : record.ownerProcessId || 0);
+    defineEnumerableDataProperty(record, "ownerGeneration", hasColumn("owner_generation") ? row.owner_generation || "" : record.ownerGeneration || "");
+    defineEnumerableDataProperty(record, "heartbeatAt", hasColumn("heartbeat_at") ? row.heartbeat_at || "" : record.heartbeatAt || "");
+    defineEnumerableDataProperty(record, "leaseExpiresAt", hasColumn("lease_expires_at") ? row.lease_expires_at || "" : record.leaseExpiresAt || "");
+    defineEnumerableDataProperty(record, "cancellationRequested", hasColumn("cancellation_requested_at")
+      ? Boolean(row.cancellation_requested_at)
+      : Boolean(record.cancellationRequestedAt));
+    defineEnumerableDataProperty(record, "cancellationRequestedAt", hasColumn("cancellation_requested_at")
+      ? row.cancellation_requested_at || ""
+      : record.cancellationRequestedAt || "");
+    defineEnumerableDataProperty(record, "childProcessId", hasColumn("child_process_id") ? row.child_process_id || 0 : record.childProcessId || 0);
+    defineEnumerableDataProperty(record, "childProcessStartedAt", hasColumn("child_process_started_at")
+      ? row.child_process_started_at || ""
+      : record.childProcessStartedAt || "");
+    defineEnumerableDataProperty(record, "revision", hasColumn("revision") ? row.revision || 0 : record.revision || 0);
+    defineEnumerableDataProperty(record, "idempotencyKey", hasColumn("idempotency_key")
+      ? row.idempotency_key || record.idempotencyKey || ""
+      : record.idempotencyKey || "");
+    return { ok, record };
+  }
+
+  function persistedQueueRecordFromRow(row) {
+    return tryPersistedQueueRecordFromRow(row).record;
   }
 
   function loadPersistedQueueRecord(record, row) {
     if (row) {
-      Object.assign(record, persistedQueueRecordFromRow(row));
+      for (const [key, value] of Object.entries(persistedQueueRecordFromRow(row))) {
+        defineEnumerableDataProperty(record, key, value);
+      }
     }
     return record;
   }
@@ -142,6 +259,7 @@ export function createQueueRecordCodec({
   return {
     queueRecordSnapshot,
     enforceQueueResultEvidence,
+    tryPersistedQueueRecordFromRow,
     persistedQueueRecordFromRow,
     loadPersistedQueueRecord,
   };

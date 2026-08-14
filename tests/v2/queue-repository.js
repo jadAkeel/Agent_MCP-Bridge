@@ -269,7 +269,7 @@ await withTemporaryState(async ({ stateDirectory, projectRoot }) => {
   const runningBeforeMalformed = await repository.persistedRunningQueueRecords(projectRoot);
   assert.equal(runningBeforeMalformed.length, 1);
   assert.equal(runningBeforeMalformed[0].jobId, first.jobId);
-  assert.equal(runningBeforeMalformed[0].status, "pending", "Running-row enumeration intentionally returns the stored JSON snapshot.");
+  assert.equal(runningBeforeMalformed[0].status, "validating", "Running-row enumeration must use the authoritative SQL status.");
 
   const second = createRecord(projectRoot, {
     jobId: "newer",
@@ -284,16 +284,43 @@ await withTemporaryState(async ({ stateDirectory, projectRoot }) => {
 
   const malformedDb = new DatabaseSync(dbPath);
   try {
-    malformedDb.prepare(`
+    const insertHostile = malformedDb.prepare(`
       INSERT INTO opencode_jobs
         (job_id, cwd, status, agent, mode, created_at, record_json, owner_instance_id, owner_generation, revision)
-      VALUES (?, ?, 'running', 'build', 'read', ?, '{malformed', ?, 'generation-malformed', 0)
-    `).run("malformed", projectRoot, "2026-08-13T22:00:00.000Z", BRIDGE_INSTANCE_ID);
+      VALUES (?, ?, 'running', 'build', 'read', ?, ?, ?, ?, 0)
+    `);
+    insertHostile.run("malformed", projectRoot, "2026-08-13T22:00:00.000Z", "{malformed", BRIDGE_INSTANCE_ID, "generation-malformed");
+    insertHostile.run("null-running", projectRoot, "2026-08-13T22:01:00.000Z", "null", BRIDGE_INSTANCE_ID, "generation-null");
+    insertHostile.run(
+      "tampered-running",
+      projectRoot,
+      "2026-08-13T22:02:00.000Z",
+      `{"jobId":"spoofed-job","status":"pending","safeField":"drop","task":"raw-task-canary","request_encrypted":"ciphertext-canary","__proto__":{"polluted":true}}`,
+      BRIDGE_INSTANCE_ID,
+      "generation-tampered"
+    );
   } finally {
     closeDb(malformedDb);
   }
   const running = await repository.persistedRunningQueueRecords(projectRoot);
   assert.equal(running.some((record) => record.jobId === "malformed"), false, "Unreadable running snapshots must be skipped.");
+  assert.equal(running.some((record) => record.jobId === "null-running"), false, "Non-object running snapshots must be skipped.");
+  const tamperedRunning = running.find((record) => record.jobId === "tampered-running");
+  assert.equal(tamperedRunning.status, "running");
+  assert.equal(Object.hasOwn(tamperedRunning, "safeField"), false);
+  assert.equal(Object.hasOwn(tamperedRunning, "task"), false);
+  assert.equal(Object.hasOwn(tamperedRunning, "request_encrypted"), false);
+  assert.equal(Object.getPrototypeOf(tamperedRunning), Object.prototype);
+
+  const invalidRead = await repository.readPersistedQueueRecord("null-running", projectRoot);
+  assert.equal(invalidRead.jobId, "null-running", "Only a missing database row may decode as null.");
+  assert.equal(invalidRead.status, "running");
+  assert.equal(Object.getPrototypeOf(invalidRead), Object.prototype);
+
+  const hostileListed = (await repository.listPersistedQueueRecords(projectRoot)).find((record) => record.jobId === "tampered-running");
+  assert.equal(hostileListed.status, "running");
+  assert.equal(Object.hasOwn(hostileListed, "safeField"), false);
+  assert.doesNotMatch(JSON.stringify(hostileListed), /raw-task-canary|ciphertext-canary/);
 });
 
 await withTemporaryState(async ({ stateDirectory, projectRoot }) => {
@@ -329,6 +356,23 @@ await withTemporaryState(async ({ stateDirectory, projectRoot }) => {
 
   const stored = await repository.listPersistedQueueRecords(projectRoot);
   assert.deepEqual(stored.map((record) => record.jobId), [original.jobId]);
+
+  const db = new DatabaseSync(path.join(stateDirectory, "queue-repository.sqlite"));
+  try {
+    db.prepare("UPDATE opencode_jobs SET record_json = 'null' WHERE job_id = ?").run(original.jobId);
+  } finally {
+    closeDb(db);
+  }
+  const invalidEvidence = createRecord(projectRoot, {
+    jobId: "idempotency-invalid-evidence",
+    idempotencyKey: "shared-key",
+    requestFingerprint: "same-fingerprint",
+  });
+  assert.deepEqual(await repository.persistQueueRecord(invalidEvidence), {
+    persisted: false,
+    idempotencyConflict: true,
+    jobId: original.jobId,
+  }, "Invalid durable fingerprint evidence must fail closed as a conflict.");
 });
 
 for (const [existingFingerprint, expected, finalTransaction] of [
@@ -338,10 +382,11 @@ for (const [existingFingerprint, expected, finalTransaction] of [
   let idempotencyReads = 0;
   let closeCalls = 0;
   const transactions = [];
+  const raceCodec = createQueueRecordCodec({ config: CONFIG });
   const fakeDb = {
     exec(statement) { transactions.push(statement); },
     prepare(statement) {
-      if (/SELECT status, started_at/.test(statement)) return { get: () => null };
+      if (/SELECT job_id, cwd, status/.test(statement)) return { get: () => null };
       if (statement === "SELECT job_id, record_json FROM opencode_jobs WHERE idempotency_key = ?") {
         return {
           get() {
@@ -365,6 +410,8 @@ for (const [existingFingerprint, expected, finalTransaction] of [
     bridgeInstanceId: BRIDGE_INSTANCE_ID,
     queueRecordSnapshot: (record) => ({ requestFingerprint: record.requestFingerprint }),
     enforceQueueResultEvidence: (record) => record,
+    tryPersistedQueueRecordFromRow: raceCodec.tryPersistedQueueRecordFromRow,
+    persistedQueueRecordFromRow: raceCodec.persistedQueueRecordFromRow,
     loadPersistedQueueRecord: (record) => record,
     closeDb: () => { closeCalls += 1; },
   });
@@ -392,10 +439,29 @@ await withTemporaryState(async ({ stateDirectory, projectRoot }) => {
   });
   assert.equal(current.revision, 1);
 
+  const identityDb = new DatabaseSync(dbPath);
+  try {
+    identityDb.prepare("UPDATE opencode_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify({
+      jobId: "spoofed-job",
+      cwd: "spoofed-cwd",
+      agent: "spoofed-agent",
+      mode: "spoofed-mode",
+      status: "spoofed-status",
+      ownerGeneration: "spoofed-generation",
+    }), current.jobId);
+  } finally {
+    closeDb(identityDb);
+  }
+
   const staleResult = await repository.updateQueueRecordDurable(stale, { status: "blocked" });
   assert.deepEqual(staleResult, { persisted: false, status: "planned", revision: 1 });
   assert.equal(stale.status, "planned", "A lost CAS must reload the authoritative row.");
   assert.equal(stale.revision, 1);
+  assert.equal(stale.jobId, current.jobId);
+  assert.equal(stale.cwd, projectRoot);
+  assert.equal(stale.agent, "build");
+  assert.equal(stale.mode, "read");
+  assert.equal(stale.ownerGeneration, current.ownerGeneration);
 
   const foreignOwner = structuredClone(current);
   foreignOwner.ownerGeneration = "foreign-generation";

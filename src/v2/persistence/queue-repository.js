@@ -12,6 +12,8 @@ export function createQueueRepository({
   randomBytes = cryptoRandomBytes,
   queueRecordSnapshot,
   enforceQueueResultEvidence,
+  tryPersistedQueueRecordFromRow,
+  persistedQueueRecordFromRow,
   loadPersistedQueueRecord,
   closeDb = defaultCloseDb,
 } = {}) {
@@ -33,7 +35,8 @@ export function createQueueRepository({
   function persistTerminalQueueRecord(db, record) {
     const activeStatuses = "'running', 'validating', 'reviewing', 'testing'";
     const selectCurrent = db.prepare(`
-      SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
+      SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+             owner_instance_id, owner_process_id, owner_generation,
              heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
              child_process_started_at, revision, idempotency_key, request_encrypted, record_json
       FROM opencode_jobs WHERE job_id = ?
@@ -204,7 +207,8 @@ export function createQueueRepository({
       db.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
       const selectCurrent = db.prepare(`
-        SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
+        SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+               owner_instance_id, owner_process_id, owner_generation,
                heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
                child_process_started_at, revision, idempotency_key, request_encrypted, record_json
         FROM opencode_jobs WHERE job_id = ?
@@ -214,9 +218,8 @@ export function createQueueRepository({
         if (record.idempotencyKey) {
           const existing = db.prepare("SELECT job_id, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(record.idempotencyKey);
           if (existing) {
-            let existingSnapshot = {};
-            try { existingSnapshot = JSON.parse(existing.record_json || "{}"); } catch { /* Treat unreadable evidence as a mismatch. */ }
-            if (!existingSnapshot.requestFingerprint || existingSnapshot.requestFingerprint !== record.requestFingerprint) {
+            const decoded = tryPersistedQueueRecordFromRow(existing);
+            if (!decoded.ok || !decoded.record.requestFingerprint || decoded.record.requestFingerprint !== record.requestFingerprint) {
               db.exec("ROLLBACK");
               transactionOpen = false;
               return { persisted: false, idempotencyConflict: true, jobId: existing.job_id };
@@ -259,9 +262,8 @@ export function createQueueRepository({
         } catch (error) {
           if (record.idempotencyKey && /UNIQUE constraint failed: opencode_jobs\.idempotency_key/i.test(error.message || String(error))) {
             const existing = db.prepare("SELECT job_id, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(record.idempotencyKey);
-            let existingSnapshot = {};
-            try { existingSnapshot = JSON.parse(existing?.record_json || "{}"); } catch { /* Treat unreadable evidence as a mismatch. */ }
-            if (!existingSnapshot.requestFingerprint || existingSnapshot.requestFingerprint !== record.requestFingerprint) {
+            const decoded = tryPersistedQueueRecordFromRow(existing);
+            if (!decoded.ok || !decoded.record.requestFingerprint || decoded.record.requestFingerprint !== record.requestFingerprint) {
               db.exec("ROLLBACK");
               transactionOpen = false;
               return { persisted: false, idempotencyConflict: true, jobId: existing?.job_id || "" };
@@ -363,14 +365,15 @@ export function createQueueRepository({
     const db = await openLockDb(cwd);
     try {
       const rows = db.prepare(
-        "SELECT record_json FROM opencode_jobs WHERE status IN ('running', 'validating', 'reviewing', 'testing')"
+        `SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+                owner_instance_id, owner_process_id, owner_generation, heartbeat_at, lease_expires_at,
+                cancellation_requested_at, child_process_id, child_process_started_at, revision,
+                idempotency_key, record_json
+         FROM opencode_jobs WHERE status IN ('running', 'validating', 'reviewing', 'testing')`
       ).all();
       return rows.flatMap((row) => {
-        try {
-          return row.record_json ? [JSON.parse(row.record_json)] : [];
-        } catch {
-          return [];
-        }
+        const decoded = tryPersistedQueueRecordFromRow(row);
+        return decoded.ok ? [decoded.record] : [];
       });
     } finally {
       closeDb(db);
@@ -463,22 +466,13 @@ export function createQueueRepository({
     const db = await openLockDb(cwd);
     try {
       const row = db.prepare(`
-        SELECT status, finished_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
-               child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, record_json
+        SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+               owner_instance_id, owner_process_id, owner_generation, heartbeat_at, lease_expires_at,
+               cancellation_requested_at, child_process_id, child_process_started_at, revision,
+               idempotency_key, record_json
         FROM opencode_jobs WHERE job_id = ?
       `).get(jobId);
-      return row?.record_json ? {
-        ...JSON.parse(row.record_json),
-        status: row.status,
-        finishedAt: row.finished_at || "",
-        heartbeatAt: row.heartbeat_at || "",
-        leaseExpiresAt: row.lease_expires_at || "",
-        cancellationRequested: Boolean(row.cancellation_requested_at),
-        cancellationRequestedAt: row.cancellation_requested_at || "",
-        childProcessId: row.child_process_id || 0,
-        childProcessStartedAt: row.child_process_started_at || "",
-        revision: row.revision || 0,
-      } : null;
+      return row ? persistedQueueRecordFromRow(row) : null;
     } finally {
       closeDb(db);
     }
@@ -491,22 +485,11 @@ export function createQueueRepository({
 
     const db = await openLockDb(cwd);
     try {
-      const fields = "status, finished_at, heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, record_json";
+      const fields = "job_id, cwd, status, agent, mode, created_at, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation, heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at, revision, idempotency_key, record_json";
       const rows = status
         ? db.prepare(`SELECT ${fields} FROM opencode_jobs WHERE status = ? ORDER BY created_at DESC`).all(status)
         : db.prepare(`SELECT ${fields} FROM opencode_jobs ORDER BY created_at DESC`).all();
-      return rows.map((row) => ({
-        ...JSON.parse(row.record_json),
-        status: row.status,
-        finishedAt: row.finished_at || "",
-        heartbeatAt: row.heartbeat_at || "",
-        leaseExpiresAt: row.lease_expires_at || "",
-        cancellationRequested: Boolean(row.cancellation_requested_at),
-        cancellationRequestedAt: row.cancellation_requested_at || "",
-        childProcessId: row.child_process_id || 0,
-        childProcessStartedAt: row.child_process_started_at || "",
-        revision: row.revision || 0,
-      }));
+      return rows.map((row) => persistedQueueRecordFromRow(row));
     } finally {
       closeDb(db);
     }

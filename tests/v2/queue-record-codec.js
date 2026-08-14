@@ -18,6 +18,7 @@ const codec = createCodec();
 assert.deepEqual(Object.keys(codec), [
   "queueRecordSnapshot",
   "enforceQueueResultEvidence",
+  "tryPersistedQueueRecordFromRow",
   "persistedQueueRecordFromRow",
   "loadPersistedQueueRecord",
 ]);
@@ -184,6 +185,11 @@ const snapshotKeys = [
     assert.equal(Object.hasOwn(snapshot, forbiddenKey), false);
   }
 
+  const roundTrip = codec.tryPersistedQueueRecordFromRow({ record_json: serialized });
+  assert.equal(roundTrip.ok, true);
+  assert.deepEqual(Object.keys(roundTrip.record), snapshotKeys, "Writer snapshot order must remain stable after decoding.");
+  assert.deepEqual(roundTrip.record, snapshot);
+
   const withoutResult = codec.queueRecordSnapshot(record, false);
   assert.deepEqual(Object.keys(withoutResult), snapshotKeys);
   assert.equal(withoutResult.completionOutcome, "completed_with_truncated_output");
@@ -266,7 +272,11 @@ const snapshotKeys = [
 {
   const encryptedCanary = "encrypted-request-canary-7ad2b9";
   const snapshot = {
-    jobId: "row-job",
+    jobId: "snapshot-job",
+    cwd: "snapshot-cwd",
+    agent: "snapshot-agent",
+    mode: "snapshot-mode",
+    createdAt: "snapshot-created",
     status: "held",
     startedAt: "snapshot-start",
     finishedAt: "snapshot-finish",
@@ -281,10 +291,15 @@ const snapshotKeys = [
     childProcessStartedAt: "snapshot-child-start",
     revision: 12,
     idempotencyKey: "snapshot-idempotency",
-    safeField: "preserved",
+    safeField: "must-be-dropped",
   };
   const row = {
     record_json: JSON.stringify(snapshot),
+    job_id: "row-job",
+    cwd: "row-cwd",
+    agent: "row-agent",
+    mode: "row-mode",
+    created_at: "row-created",
     status: "running",
     started_at: "row-start",
     finished_at: "row-finish",
@@ -300,26 +315,32 @@ const snapshotKeys = [
     idempotency_key: "row-idempotency",
     request_encrypted: encryptedCanary,
   };
+  const decoded = codec.tryPersistedQueueRecordFromRow(row);
+  assert.equal(decoded.ok, true);
   const persisted = codec.persistedQueueRecordFromRow(row);
-  assert.deepEqual(persisted, {
-    ...snapshot,
-    status: "running",
-    startedAt: "row-start",
-    finishedAt: "row-finish",
-    ownerInstanceId: "row-owner",
-    ownerProcessId: 20,
-    ownerGeneration: "row-generation",
-    heartbeatAt: "row-heartbeat",
-    leaseExpiresAt: "row-expiry",
-    cancellationRequested: true,
-    cancellationRequestedAt: "row-cancellation",
-    childProcessId: 21,
-    childProcessStartedAt: "row-child-start",
-    revision: 22,
-    idempotencyKey: "row-idempotency",
-  });
+  assert.equal(persisted.jobId, "row-job");
+  assert.equal(persisted.cwd, "row-cwd");
+  assert.equal(persisted.agent, "row-agent");
+  assert.equal(persisted.mode, "row-mode");
+  assert.equal(persisted.createdAt, "row-created");
+  assert.equal(persisted.status, "running");
+  assert.equal(persisted.startedAt, "row-start");
+  assert.equal(persisted.finishedAt, "row-finish");
+  assert.equal(persisted.ownerInstanceId, "row-owner");
+  assert.equal(persisted.ownerProcessId, 20);
+  assert.equal(persisted.ownerGeneration, "row-generation");
+  assert.equal(persisted.heartbeatAt, "row-heartbeat");
+  assert.equal(persisted.leaseExpiresAt, "row-expiry");
+  assert.equal(persisted.cancellationRequested, true);
+  assert.equal(persisted.cancellationRequestedAt, "row-cancellation");
+  assert.equal(persisted.childProcessId, 21);
+  assert.equal(persisted.childProcessStartedAt, "row-child-start");
+  assert.equal(persisted.revision, 22);
+  assert.equal(persisted.idempotencyKey, "row-idempotency");
+  assert.equal(Object.hasOwn(persisted, "safeField"), false);
   assert.equal(Object.hasOwn(persisted, "request_encrypted"), false);
   assert.equal(Object.hasOwn(persisted, "requestEncrypted"), false);
+  assert.equal(Object.getPrototypeOf(persisted), Object.prototype);
   assert.doesNotMatch(JSON.stringify(persisted), new RegExp(encryptedCanary));
 
   const snapshotFallback = codec.persistedQueueRecordFromRow({
@@ -331,22 +352,84 @@ const snapshotKeys = [
   assert.equal(snapshotFallback.cancellationRequested, false);
   assert.equal(snapshotFallback.revision, 0);
 
-  const malformedCanary = "malformed-record-canary-8e0c31";
-  const malformed = codec.persistedQueueRecordFromRow({
-    record_json: `{"task":"${malformedCanary}`,
-    status: "failed",
-    request_encrypted: encryptedCanary,
-  });
-  assert.equal(malformed.status, "failed");
-  assert.equal(malformed.startedAt, "");
-  assert.equal(malformed.idempotencyKey, "");
-  assert.doesNotMatch(JSON.stringify(malformed), new RegExp(`${malformedCanary}|${encryptedCanary}`));
+  const invalidRecordJsonValues = [
+    "",
+    `{"task":"malformed-record-canary-8e0c31"`,
+    "null",
+    "0",
+    "true",
+    '"text"',
+    "[]",
+  ];
+  for (const recordJson of invalidRecordJsonValues) {
+    const invalid = codec.tryPersistedQueueRecordFromRow({
+      record_json: recordJson,
+      status: "failed",
+      request_encrypted: encryptedCanary,
+    });
+    assert.equal(invalid.ok, false, `Expected invalid queue JSON shape: ${recordJson}`);
+    assert.equal(invalid.record.status, "failed");
+    assert.equal(invalid.record.startedAt, "");
+    assert.equal(invalid.record.idempotencyKey, "");
+    assert.equal(Object.hasOwn(invalid.record, "0"), false);
+    assert.equal(Object.getPrototypeOf(invalid.record), Object.prototype);
+    assert.doesNotMatch(JSON.stringify(invalid.record), /malformed-record-canary|encrypted-request-canary/);
+    assert.doesNotThrow(() => codec.persistedQueueRecordFromRow({ record_json: recordJson, status: "failed" }));
+  }
 
-  const target = { localOnly: true, status: "local" };
+  const hostileCanary = "hostile-queue-record-canary-5c9f21";
+  const hostileRow = {
+    record_json: `{
+      "jobId":"hostile-job",
+      "safeField":"drop-me",
+      "task":"${hostileCanary}",
+      "request":{"task":"${hostileCanary}"},
+      "request_encrypted":"${hostileCanary}",
+      "requestEncrypted":"${hostileCanary}",
+      "internalQueueContractorProof":"${hostileCanary}",
+      "password":"${hostileCanary}",
+      "__proto__":{"polluted":true},
+      "constructor":{"prototype":{"polluted":true}},
+      "prototype":{"polluted":true},
+      "scopeContract":{"safe":"kept","__proto__":{"nestedPolluted":true},"constructor":{"prototype":{"polluted":true}}},
+      "orphanChildProcessId":41,
+      "orphanChildProcessStartedAt":"orphan-start",
+      "orphanChildProcessAlive":true
+    }`,
+    status: "interrupted",
+  };
+  const hostile = codec.tryPersistedQueueRecordFromRow(hostileRow);
+  assert.equal(hostile.ok, true);
+  assert.equal(hostile.record.jobId, "hostile-job");
+  assert.deepEqual(hostile.record.scopeContract, { safe: "kept" });
+  assert.equal(hostile.record.orphanChildProcessId, 41);
+  assert.equal(hostile.record.orphanChildProcessStartedAt, "orphan-start");
+  assert.equal(hostile.record.orphanChildProcessAlive, true);
+  for (const key of ["safeField", "task", "request", "request_encrypted", "requestEncrypted", "internalQueueContractorProof", "password", "__proto__", "constructor", "prototype"]) {
+    assert.equal(Object.hasOwn(hostile.record, key), false, `Decoded queue record retained ${key}.`);
+  }
+  assert.equal(Object.getPrototypeOf(hostile.record), Object.prototype);
+  assert.equal(Object.getPrototypeOf(hostile.record.scopeContract), Object.prototype);
+  assert.doesNotMatch(JSON.stringify(hostile.record), new RegExp(hostileCanary));
+
+  const hostileTargetPrototype = { originalPrototype: true };
+  const hostileTarget = Object.create(hostileTargetPrototype);
+  hostileTarget.localOnly = true;
+  codec.loadPersistedQueueRecord(hostileTarget, hostileRow);
+  assert.equal(Object.getPrototypeOf(hostileTarget), hostileTargetPrototype);
+  assert.equal(hostileTarget.polluted, undefined);
+  assert.equal(hostileTarget.localOnly, true);
+  assert.equal(Object.hasOwn(hostileTarget, "__proto__"), false);
+
+  const targetPrototype = { originalPrototype: true };
+  const target = Object.create(targetPrototype);
+  target.localOnly = true;
+  target.status = "local";
   assert.equal(codec.loadPersistedQueueRecord(target, row), target);
+  assert.equal(Object.getPrototypeOf(target), targetPrototype);
   assert.equal(target.localOnly, true);
   assert.equal(target.status, "running");
-  assert.equal(target.safeField, "preserved");
+  assert.equal(Object.hasOwn(target, "safeField"), false);
   assert.equal(Object.hasOwn(target, "request_encrypted"), false);
 
   const untouched = { status: "local", marker: 1 };

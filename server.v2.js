@@ -2109,6 +2109,7 @@ const {
 const {
   queueRecordSnapshot,
   enforceQueueResultEvidence,
+  tryPersistedQueueRecordFromRow,
   persistedQueueRecordFromRow,
   loadPersistedQueueRecord,
 } = createQueueRecordCodec({
@@ -2134,6 +2135,8 @@ const {
   randomBytes,
   queueRecordSnapshot,
   enforceQueueResultEvidence,
+  tryPersistedQueueRecordFromRow,
+  persistedQueueRecordFromRow,
   loadPersistedQueueRecord,
   closeDb,
 });
@@ -4002,7 +4005,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
   const nonTerminalStatuses = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
   const placeholders = nonTerminalStatuses.map(() => "?").join(", ");
   const rows = db.prepare(
-    `SELECT job_id, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
+    `SELECT job_id, cwd, status, agent, mode, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
             heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at, request_encrypted, record_json
      FROM opencode_jobs
      WHERE status IN (${placeholders})`
@@ -4021,12 +4024,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       continue;
     }
 
-    let snapshot;
-    try {
-      snapshot = row.record_json ? JSON.parse(row.record_json) : {};
-    } catch {
-      snapshot = {};
-    }
+    let snapshot = persistedQueueRecordFromRow(row);
     const activityAt = Date.parse(
       row.heartbeat_at
       || row.lease_expires_at
@@ -5528,11 +5526,16 @@ server.tool(
       if (effectiveQueueMode() === "sqlite" && cwd) {
         const db = await openLockDb(cwd);
         try {
-          const row = db.prepare("SELECT status, cancellation_requested_at, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+          const row = db.prepare(`
+            SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+                   owner_instance_id, owner_process_id, owner_generation, heartbeat_at, lease_expires_at,
+                   cancellation_requested_at, child_process_id, child_process_started_at, revision,
+                   idempotency_key, record_json
+            FROM opencode_jobs WHERE job_id = ?
+          `).get(jobId);
           if (row && !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(row.status)) {
             const requestedAt = row.cancellation_requested_at || new Date().toISOString();
-            let snapshot = {};
-            try { snapshot = JSON.parse(row.record_json || "{}"); } catch { snapshot = {}; }
+            let snapshot = persistedQueueRecordFromRow(row);
             if (["held", "pending", "planned", "blocked"].includes(row.status)) {
               snapshot = sanitizePersistedValue({
                 ...snapshot,
@@ -12267,8 +12270,19 @@ async function runSelfTests() {
           JSON.stringify(snapshot)
         );
       }
+      insertQueueRecord.run(
+        "stale-invalid-self-test",
+        tempDir,
+        "pending",
+        "reviewer",
+        "read",
+        oldCreatedAt,
+        "",
+        "",
+        "null"
+      );
 
-      assert.deepEqual(reconcileStaleQueueRecords(staleQueueDb), ["stale-self-test"]);
+      assert.deepEqual(reconcileStaleQueueRecords(staleQueueDb), ["stale-self-test", "stale-invalid-self-test"]);
       const staleRow = staleQueueDb.prepare(
         "SELECT status, record_json FROM opencode_jobs WHERE job_id = ?"
       ).get("stale-self-test");
@@ -12277,6 +12291,12 @@ async function runSelfTests() {
       ).get("recent-self-test");
       assert.equal(staleRow.status, "not_resumable");
       assert.equal(JSON.parse(staleRow.record_json).errorType, "queue_job_not_resumable");
+      const staleInvalidRow = staleQueueDb.prepare(
+        "SELECT status, record_json FROM opencode_jobs WHERE job_id = ?"
+      ).get("stale-invalid-self-test");
+      assert.equal(staleInvalidRow.status, "not_resumable");
+      assert.equal(JSON.parse(staleInvalidRow.record_json).jobId, "stale-invalid-self-test");
+      assert.equal(JSON.parse(staleInvalidRow.record_json).errorType, "queue_job_not_resumable");
       assert.equal(recentRow.status, "running");
       assert.equal(JSON.parse(recentRow.record_json).errorType, undefined);
       const expiredLease = new Date(Date.now() - 1000).toISOString();
@@ -12447,8 +12467,9 @@ async function runSelfTests() {
       assert.equal(currentOwnerTerminal.cancellationWon, false);
       assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(currentOwnerRecord.jobId).status, "completed");
 
-      staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?)").run(
+      staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
         "stale-self-test",
+        "stale-invalid-self-test",
         "recent-self-test",
         "crashed-self-test",
         "crashed-live-child-self-test",
@@ -14326,7 +14347,10 @@ async function reconcileQueueStateAtStartup() {
       KNOWN_STATE_DB_PATHS.add(dbPath);
       reconcileStaleQueueRecords(db);
       const resumableRows = db.prepare(`
-        SELECT job_id, status, revision, owner_instance_id, lease_expires_at, record_json, idempotency_key, request_encrypted
+        SELECT job_id, cwd, status, agent, mode, created_at, started_at, finished_at,
+               owner_instance_id, owner_process_id, owner_generation, heartbeat_at, lease_expires_at,
+               cancellation_requested_at, child_process_id, child_process_started_at, revision,
+               idempotency_key, record_json, request_encrypted
         FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked')
           AND request_encrypted IS NOT NULL AND request_encrypted <> ''
@@ -14342,7 +14366,24 @@ async function reconcileQueueStateAtStartup() {
           const ownerLeaseExpiresAt = Date.parse(owner?.lease_expires_at || "");
           if ((Number.isFinite(jobLeaseExpiresAt) && jobLeaseExpiresAt > now)
             || (Number.isFinite(ownerLeaseExpiresAt) && ownerLeaseExpiresAt > now)) continue;
-          const snapshot = persistedQueueRecordFromRow(row);
+          const decoded = tryPersistedQueueRecordFromRow(row);
+          if (!decoded.ok) {
+            const failedAt = new Date().toISOString();
+            const invalidRecord = {
+              ...decoded.record,
+              status: "failed",
+              finishedAt: failedAt,
+              errorType: "queue_record_invalid",
+              errorReason: "The persisted queue record was invalid and could not be resumed.",
+            };
+            db.prepare(`
+              UPDATE opencode_jobs SET status = 'failed', finished_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
+              WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
+            `).run(failedAt, failedAt, JSON.stringify(sanitizePersistedValue(invalidRecord)), row.job_id, Number(row.revision || 0));
+            logEvent("warn", "queue.record_invalid", { jobId: row.job_id, dbPath });
+            continue;
+          }
+          const snapshot = decoded.record;
           const request = await decryptQueueRequest(row.request_encrypted, row.job_id);
           if (request?.internalQueueContractorProof) {
             request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id);
@@ -14377,14 +14418,13 @@ async function reconcileQueueStateAtStartup() {
         } catch (error) {
           logEvent("warn", "queue.request_resume_failed", { jobId: row.job_id, dbPath, error: redactSensitiveText(error.message || String(error)) });
           const failedAt = new Date().toISOString();
-          let snapshot = {};
-          try { snapshot = JSON.parse(row.record_json || "{}"); } catch { /* Preserve only bounded failure evidence. */ }
-          Object.assign(snapshot, {
+          const snapshot = {
+            ...persistedQueueRecordFromRow(row),
             status: "failed",
             finishedAt: failedAt,
             errorType: "queue_request_recovery_failed",
             errorReason: "The encrypted queue request could not be recovered. Restore the matching queue-request.key backup before retrying.",
-          });
+          };
           db.prepare(`
             UPDATE opencode_jobs SET status = 'failed', finished_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
             WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
