@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { createAgentAttestation } from "./src/v2/agents/attestation.js";
 import { createAgentMetadataPolicy } from "./src/v2/agents/metadata-policy.js";
 import { readBridgeConfig, resolveBridgePaths } from "./src/v2/config/bridge-config.js";
+import { createHardLockService } from "./src/v2/persistence/hard-locks.js";
 import { createProviderLeaseService } from "./src/v2/persistence/provider-leases.js";
 import { createQueueRequestCrypto } from "./src/v2/persistence/queue-request-crypto.js";
 import {
@@ -225,6 +226,21 @@ const { buildOpenCodeEnv, buildValidationEnv } = createChildEnvBuilders({
 const { logEvent } = createEventLogger({
   logLevel: CONFIG.logLevel,
   sanitizeLogValue,
+});
+
+const {
+  recordChangedFiles,
+  conflictsWithActiveLock,
+  cleanupExpiredLocks,
+  listLocks,
+  acquireHardLock,
+  releaseHardLock,
+  startHardLockHeartbeat,
+} = createHardLockService({
+  openLockDb,
+  resolveProjectStateRoot,
+  defaultLockTtlMs: DEFAULT_LOCK_TTL_MS,
+  logEvent,
 });
 
 const {
@@ -3937,70 +3953,6 @@ async function cleanupIntegratedWorktreeWhileLocked({
   }
 }
 
-async function recordChangedFiles(runId, cwd, changedFiles, disallowedFiles = []) {
-  if (!runId) {
-    return;
-  }
-
-  const db = await openLockDb(cwd);
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    const disallowed = new Set(normalizeLockPathList(disallowedFiles));
-    const insert = db.prepare("INSERT INTO changed_files (run_id, path, allowed) VALUES (?, ?, ?)");
-    for (const file of normalizeLockPathList(changedFiles)) {
-      insert.run(runId, file, disallowed.has(file) ? 0 : 1);
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* Preserve the original audit persistence error. */ }
-    throw error;
-  } finally {
-    closeDb(db);
-  }
-}
-
-function lockPaths(lock) {
-  return normalizeLockPathList(lock.paths || lock.lockedPaths || lock.allowedEdits || []);
-}
-
-function conflictsWithActiveLock(request, activeLock) {
-  const requestType = request.lockType;
-  const activeType = activeLock.lockType;
-
-  if (requestType === "read" && activeType === "read") {
-    return null;
-  }
-
-  const requestPaths = lockPaths(request);
-  const activePaths = lockPaths(activeLock);
-  const requiresRepositorySerialization = requestType === "serial_integration" || activeType === "serial_integration";
-  const overlap = requiresRepositorySerialization
-    ? overlaps(requestPaths, activePaths) || [requestPaths[0], activePaths[0]]
-    : overlaps(requestPaths, activePaths);
-  return overlap
-    ? {
-        lockId: activeLock.id,
-        owner: activeLock.owner,
-        agent: activeLock.agent,
-        origin: activeLock.origin || "legacy",
-        lockType: activeLock.lockType,
-        paths: activePaths,
-        overlap,
-        expiresAt: activeLock.expiresAt,
-      }
-    : null;
-}
-
-function makeLockId(owner, agent) {
-  const safeOwner = String(owner || "unknown").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
-  const safeAgent = String(agent || "agent").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
-  return `${safeOwner}-${safeAgent}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function makeLockToken() {
-  return randomBytes(32).toString("hex");
-}
-
 function stateDbPath(cwd = "") {
   const root = cwd ? path.resolve(cwd) : "";
   const stateRoot = effectiveBridgeStateDirectory();
@@ -4458,203 +4410,6 @@ function closeDb(db) {
   }
 }
 
-function rowsToLocks(rows) {
-  const grouped = new Map();
-  for (const row of rows) {
-    const key = row.run_id;
-    const lock = grouped.get(key) || {
-      id: row.run_id,
-      runId: row.run_id,
-      owner: row.owner_agent,
-      agent: row.owner_agent,
-      origin: row.acquisition_origin || "legacy",
-      lockType: row.lock_mode,
-      lockMode: row.lock_mode,
-      paths: [],
-      cwd: row.cwd || "",
-      taskSha256: String(row.task || "").replace(/^sha256:/i, ""),
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-    };
-    lock.paths.push(row.normalized_path);
-    grouped.set(key, lock);
-  }
-  return [...grouped.values()].map((lock) => ({ ...lock, paths: normalizeLockPathList(lock.paths) }));
-}
-
-function listLocksFromDb(db, now = Date.now()) {
-  db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(now);
-  return rowsToLocks(db.prepare("SELECT * FROM locks WHERE expires_at > ? ORDER BY created_at, run_id, normalized_path").all(now));
-}
-
-async function cleanupExpiredLocks(cwd = "") {
-  const db = await openLockDb(cwd);
-  try {
-    db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(Date.now());
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function listLocks(cwd = "") {
-  const db = await openLockDb(cwd);
-  try {
-    return listLocksFromDb(db);
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function acquireHardLock({
-  owner = "codex",
-  agent = "opencode",
-  origin = "internal",
-  task = "",
-  cwd = "",
-  lockType = "write",
-  paths = [],
-  ttlMs = DEFAULT_LOCK_TTL_MS,
-}) {
-  const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  const normalizedOrigin = origin === "manual" ? "manual" : "internal";
-  const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
-  const unsafeReason = unsafePathReason(paths, projectRoot);
-  const lockPathsRequested = normalizeLockPathListForCwd(paths, projectRoot);
-
-  if (!PARALLEL_LOCK_TYPES.has(normalizedLockType)) {
-    return {
-      ok: false,
-      error: `Invalid lockType "${lockType}". Use read, write, or serial_integration.`,
-    };
-  }
-
-  if (!lockPathsRequested.length) {
-    return {
-      ok: false,
-      error: "Write lock rejected: paths are required.",
-    };
-  }
-
-  if (unsafeReason) {
-    return {
-      ok: false,
-      error: `Write lock rejected: ${unsafeReason}`,
-    };
-  }
-
-  if (hasAmbiguousPathPattern(lockPathsRequested)) {
-    return {
-      ok: false,
-      error: "Write lock rejected: wildcard or ambiguous paths are not allowed.",
-    };
-  }
-
-  const db = await openLockDb(projectRoot);
-  const now = Date.now();
-  const runId = makeLockId(owner, agent);
-  const token = makeLockToken();
-  const tokenSha256 = `sha256:${createHash("sha256").update(token).digest("hex")}`;
-  const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
-  const expiresAt = now + Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
-  const request = { lockType: normalizedLockType, paths: lockPathsRequested };
-
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    const keptLocks = listLocksFromDb(db, now);
-    const conflict = keptLocks.map((lock) => conflictsWithActiveLock(request, lock)).find(Boolean);
-    if (conflict) {
-      db.exec("ROLLBACK");
-      const conflictPath = normalizeLockPath(conflict.overlap?.[0] || conflict.overlap?.[1] || conflict.paths?.[0] || "");
-      return {
-        ok: false,
-        error: `Write lock conflict on: ${conflictPath || "unknown"}`,
-        conflict,
-        activeLocks: keptLocks,
-      };
-    }
-
-    db.prepare(
-      "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
-    ).run(runId, agent, "running", normalizedLockType, now);
-    const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    );
-    for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
-    }
-    db.exec("COMMIT");
-
-    const lock = {
-      id: runId,
-      runId,
-      token,
-      owner,
-      agent,
-      origin: normalizedOrigin,
-      taskSha256,
-      cwd: projectRoot,
-      lockType: normalizedLockType,
-      lockMode: normalizedLockType,
-      paths: lockPathsRequested,
-      createdAt: now,
-      expiresAt,
-      pid: process.pid,
-    };
-    return { ok: true, lock, activeLocks: listLocksFromDb(db) };
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
-    }
-    return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
-  if (!lockId) {
-    return { ok: false, released: false, error: "lockId is required." };
-  }
-
-  if (!token) {
-    return { ok: false, released: false, error: "Lock release token is required." };
-  }
-
-  const db = await openLockDb(cwd);
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    const requestedPaths = normalizeLockPathList(paths);
-    const tokenSha256 = `sha256:${createHash("sha256").update(String(token)).digest("hex")}`;
-    const rows = requestedPaths.length
-      ? db.prepare(`SELECT * FROM locks WHERE run_id = ? AND token = ? AND normalized_path IN (${requestedPaths.map(() => "?").join(",")})`).all(lockId, tokenSha256, ...requestedPaths)
-      : db.prepare("SELECT * FROM locks WHERE run_id = ? AND token = ?").all(lockId, tokenSha256);
-    if (!rows.length) {
-      db.exec("ROLLBACK");
-      return { ok: false, released: false, error: "No active lock matched that run_id and token." };
-    }
-
-    if (requestedPaths.length) {
-      db.prepare(`DELETE FROM locks WHERE run_id = ? AND token = ? AND normalized_path IN (${requestedPaths.map(() => "?").join(",")})`).run(lockId, tokenSha256, ...requestedPaths);
-    } else {
-      db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(lockId, tokenSha256);
-    }
-    db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
-    db.exec("COMMIT");
-    return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
-    }
-    return { ok: false, released: false, error: error.message || String(error) };
-  } finally {
-    closeDb(db);
-  }
-}
-
 function hardLockPathsForPlan(lockPlan) {
   return firstNonEmptyList(lockPlan.allowedEdits, lockPlan.lockedPaths);
 }
@@ -4663,30 +4418,6 @@ function hardLockTtlForPlan(lockPlan) {
   const executionTimeoutMs = timeoutForAgent(lockPlan?.agent, lockPlan, lockPlan?.timeoutMs);
   const safetyMarginMs = CONFIG.validationCommandTimeoutMs + 1000 * 60 * 5;
   return Math.max(DEFAULT_LOCK_TTL_MS, executionTimeoutMs + safetyMarginMs);
-}
-
-function startHardLockHeartbeat(lock, ttlMs) {
-  if (!lock?.id || !lock?.token) return () => {};
-  const intervalMs = Math.max(1000, Math.min(1000 * 30, Math.floor(ttlMs / 3)));
-  const timer = setInterval(async () => {
-    try {
-      const db = await openLockDb(lock.cwd);
-      try {
-        const expiresAt = Date.now() + ttlMs;
-        const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-        const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ?").run(expiresAt, lock.id, tokenSha256);
-        if (Number(updated.changes || 0) === 0) {
-          logEvent("warn", "lock.heartbeat_lost", { lockId: lock.id });
-        }
-      } finally {
-        closeDb(db);
-      }
-    } catch (error) {
-      logEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: error.message || String(error) });
-    }
-  }, intervalMs);
-  timer.unref?.();
-  return () => clearInterval(timer);
 }
 
 function hardLockSummary(acquiredLock) {
