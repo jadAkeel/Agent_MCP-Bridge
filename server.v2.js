@@ -244,6 +244,7 @@ const {
   resolveProjectStateRoot,
   defaultLockTtlMs: DEFAULT_LOCK_TTL_MS,
   logEvent,
+  redactSensitiveText,
 });
 
 const {
@@ -4525,7 +4526,7 @@ server.tool(
                 result.released ? "Temporary lock released." : "No active temporary lock matched that id.",
                 "",
                 `Lock id: ${lockId}`,
-                `Active locks remaining: ${result.activeLocks.length}`,
+                `Active locks remaining: ${result.activeLocksUnavailable ? "unavailable" : result.activeLocks.length}`,
               ].join("\n")
             : ["Temporary lock release failed.", "", result.error].join("\n"),
         },

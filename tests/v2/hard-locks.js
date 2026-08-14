@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { createHardLockService } from "../../src/v2/persistence/hard-locks.js";
 import { closeDb } from "../../src/v2/persistence/sqlite-utils.js";
+import { redactSensitiveText } from "../../src/v2/security/redaction.js";
 
 const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "hard-lock-worker.js");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
@@ -422,15 +423,19 @@ await withTemporaryProject(async ({ projectRoot, stateDirectory }) => {
 });
 
 {
-  const sentinelRootError = new Error("root resolution sentinel");
-  const sentinelOpenError = new Error("database opener sentinel");
+  const secret = "opaqueHardLockSecret123456789";
+  const sentinelRootError = new Error(`root resolution Authorization: Bearer ${secret}`);
+  const sentinelOpenError = new Error(`database opener Authorization: Bearer ${secret}`);
+  const sanitizedRootError = redactSensitiveText(sentinelRootError.message);
+  const sanitizedOpenError = redactSensitiveText(sentinelOpenError.message);
   const rootFailure = createHardLockService({
     resolveProjectStateRoot: async () => { throw sentinelRootError; },
     openLockDb: async () => { throw new Error("must not open"); },
+    redactSensitiveText,
   });
   await assert.rejects(
     rootFailure.acquireHardLock({ cwd: "root-input", paths: ["src/a.js"] }),
-    (error) => error === sentinelRootError
+    (error) => error.message === sanitizedRootError
   );
 
   const openedCwds = [];
@@ -444,12 +449,21 @@ await withTemporaryProject(async ({ projectRoot, stateDirectory }) => {
       openedCwds.push(cwd);
       throw sentinelOpenError;
     },
+    redactSensitiveText,
   });
-  await assert.rejects(openFailure.acquireHardLock({ cwd: "acquire-input", paths: ["src/a.js"] }), (error) => error === sentinelOpenError);
-  await assert.rejects(openFailure.releaseHardLock("id", "token", [], "release-input"), (error) => error === sentinelOpenError);
-  await assert.rejects(openFailure.listLocks("list-input"), (error) => error === sentinelOpenError);
-  await assert.rejects(openFailure.cleanupExpiredLocks("cleanup-input"), (error) => error === sentinelOpenError);
-  await assert.rejects(openFailure.recordChangedFiles("run", "audit-input", ["src/a.js"]), (error) => error === sentinelOpenError);
+  await assert.rejects(
+    openFailure.acquireHardLock({ cwd: "acquire-input", paths: ["src/a.js"] }),
+    (error) => error.message === sanitizedOpenError
+  );
+  await assert.rejects(
+    openFailure.releaseHardLock("id", "token", [], "release-input"),
+    (error) => error.message === sanitizedOpenError
+  );
+  await assert.rejects(openFailure.listLocks("list-input"), (error) => error.message === sanitizedOpenError);
+  await assert.rejects(openFailure.cleanupExpiredLocks("cleanup-input"), (error) => error.message === sanitizedOpenError);
+  await assert.rejects(openFailure.recordChangedFiles("run", "audit-input", ["src/a.js"]), (error) => error.message === sanitizedOpenError);
+  assert.equal(sanitizedRootError.includes(secret), false);
+  assert.equal(sanitizedOpenError.includes(secret), false);
   const beforeNoRun = openedCwds.length;
   await openFailure.recordChangedFiles("", "ignored", ["src/a.js"]);
   assert.equal(openedCwds.length, beforeNoRun, "An empty run id must not open the database.");
@@ -465,14 +479,126 @@ await withTemporaryProject(async ({ projectRoot, stateDirectory }) => {
       return { unref() {} };
     },
     logEvent: (level, event, data) => heartbeatEvents.push({ level, event, data }),
+    redactSensitiveText,
   });
   heartbeatFailure.startHardLockHeartbeat({ id: "lock-a", token: "token-a", cwd: "heartbeat-input" }, 3000);
   await heartbeatCallback();
   assert.deepEqual(heartbeatEvents, [{
     level: "warn",
     event: "lock.heartbeat_failed",
-    data: { lockId: "lock-a", error: "database opener sentinel" },
+    data: { lockId: "lock-a", error: sanitizedOpenError },
   }]);
+
+  let throwingLoggerHeartbeat = null;
+  const defaultRedactionFailure = createHardLockService({
+    resolveProjectStateRoot: async () => existingResolvedRoot,
+    openLockDb: async () => { throw sentinelOpenError; },
+    setIntervalFn: (callback) => {
+      throwingLoggerHeartbeat = callback;
+      return { unref() {} };
+    },
+    logEvent: () => { throw new Error("telemetry unavailable"); },
+  });
+  await assert.rejects(
+    defaultRedactionFailure.acquireHardLock({ cwd: "default-redactor", paths: ["src/a.js"] }),
+    (error) => error.message === sanitizedOpenError && !error.message.includes(secret)
+  );
+  defaultRedactionFailure.startHardLockHeartbeat({ id: "lock-b", token: "token-b", cwd: "heartbeat-input" }, 3000);
+  await assert.doesNotReject(throwingLoggerHeartbeat());
+}
+
+{
+  const secret = "opaquePostCommitSecret123456789";
+  const rawError = `post-commit Authorization: Bearer ${secret}`;
+  const sanitizedError = redactSensitiveText(rawError);
+  const projectRoot = path.resolve(process.cwd());
+  const events = [];
+  const execCalls = [];
+  let activeLockSelects = 0;
+  const acquireDb = {
+    exec(sql) { execCalls.push(sql); },
+    close() {},
+    prepare(sql) {
+      if (sql.startsWith("SELECT * FROM locks WHERE expires_at")) {
+        return {
+          all() {
+            activeLockSelects += 1;
+            if (activeLockSelects > 1) throw new Error(rawError);
+            return [];
+          },
+        };
+      }
+      return { run() { return { changes: 1 }; }, all() { return []; } };
+    },
+  };
+  const acquireService = createHardLockService({
+    resolveProjectStateRoot: async () => projectRoot,
+    openLockDb: async () => acquireDb,
+    clockNow: () => 1000,
+    random: () => 0.5,
+    randomBytes: () => Buffer.alloc(32, 3),
+    getProcessId: () => 4242,
+    redactSensitiveText,
+    logEvent: (level, event, data) => {
+      events.push({ level, event, data });
+      throw new Error("telemetry failure after commit");
+    },
+  });
+  const acquired = await acquireService.acquireHardLock({ cwd: projectRoot, paths: ["src/a.js"] });
+  assert.equal(acquired.ok, true, "A committed acquisition must remain successful when its follow-up snapshot fails.");
+  assert.equal(acquired.activeLocksUnavailable, true);
+  assert.deepEqual(acquired.activeLocks, []);
+  assert.equal(execCalls.filter((sql) => sql === "COMMIT").length, 1);
+  assert.equal(execCalls.includes("ROLLBACK"), false, "A post-commit failure must never trigger rollback or a false failure result.");
+  assert.deepEqual(events, [{
+    level: "warn",
+    event: "lock.post_commit_snapshot_failed",
+    data: { operation: "acquire", lockId: acquired.lock.id, error: sanitizedError },
+  }]);
+  assert.equal(JSON.stringify(events).includes(secret), false);
+
+  const releaseExecCalls = [];
+  let releasedLockSelects = 0;
+  const releaseDb = {
+    exec(sql) { releaseExecCalls.push(sql); },
+    close() {},
+    prepare(sql) {
+      if (sql === "SELECT * FROM locks WHERE run_id = ? AND token = ?") {
+        return { all() { return [{ run_id: "lock-a", normalized_path: "src/a.js" }]; } };
+      }
+      if (sql.startsWith("SELECT * FROM locks WHERE expires_at")) {
+        return {
+          all() {
+            releasedLockSelects += 1;
+            throw new Error(rawError);
+          },
+        };
+      }
+      return { run() { return { changes: 1 }; }, all() { return []; } };
+    },
+  };
+  const releaseEvents = [];
+  const releaseService = createHardLockService({
+    resolveProjectStateRoot: async () => projectRoot,
+    openLockDb: async () => releaseDb,
+    clockNow: () => 1000,
+    redactSensitiveText,
+    logEvent: (level, event, data) => releaseEvents.push({ level, event, data }),
+  });
+  const released = await releaseService.releaseHardLock("lock-a", "token-a", [], projectRoot);
+  assert.equal(released.ok, true, "A committed release must remain successful when its follow-up snapshot fails.");
+  assert.equal(released.released, true);
+  assert.equal(released.activeLocksUnavailable, true);
+  assert.deepEqual(released.activeLocks, []);
+  assert.equal(releasedLockSelects, 1);
+  assert.equal(releaseExecCalls.filter((sql) => sql === "COMMIT").length, 1);
+  assert.equal(releaseExecCalls.includes("ROLLBACK"), false);
+  assert.deepEqual(releaseEvents, [{
+    level: "warn",
+    event: "lock.post_commit_snapshot_failed",
+    data: { operation: "release", lockId: "lock-a", error: sanitizedError },
+  }]);
+  assert.equal(JSON.stringify(releaseEvents).includes(secret), false);
 }
 
 await withTemporaryProject(async ({ projectRoot, stateDirectory }) => {

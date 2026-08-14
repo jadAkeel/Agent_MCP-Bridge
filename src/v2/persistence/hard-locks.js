@@ -8,6 +8,7 @@ import {
   normalizeLockPathListForCwd,
   overlaps,
 } from "../policy/paths.js";
+import { redactSensitiveText as defaultRedactSensitiveText } from "../security/redaction.js";
 import { closeDb } from "./sqlite-utils.js";
 
 const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
@@ -17,6 +18,7 @@ export function createHardLockService({
   resolveProjectStateRoot,
   defaultLockTtlMs = 1000 * 60 * 30,
   logEvent = () => {},
+  redactSensitiveText = defaultRedactSensitiveText,
   clockNow = () => Date.now(),
   random = () => Math.random(),
   randomBytes = cryptoRandomBytes,
@@ -24,12 +26,44 @@ export function createHardLockService({
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
 } = {}) {
+  function operationalErrorText(error) {
+    return redactSensitiveText(error?.message || String(error));
+  }
+
+  function sanitizedOperationalError(error) {
+    return new Error(operationalErrorText(error));
+  }
+
+  function safeLogEvent(level, event, data) {
+    try {
+      logEvent(level, event, data);
+    } catch {
+      // Lock ownership and timer callbacks must not depend on telemetry availability.
+    }
+  }
+
+  function reportPostCommitSnapshotFailure(operation, lockId, error) {
+    safeLogEvent("warn", "lock.post_commit_snapshot_failed", {
+      operation,
+      lockId,
+      error: operationalErrorText(error),
+    });
+  }
+
+  async function openHardLockDb(cwd) {
+    try {
+      return await openLockDb(cwd);
+    } catch (error) {
+      throw sanitizedOperationalError(error);
+    }
+  }
+
   async function recordChangedFiles(runId, cwd, changedFiles, disallowedFiles = []) {
     if (!runId) {
       return;
     }
 
-    const db = await openLockDb(cwd);
+    const db = await openHardLockDb(cwd);
     try {
       db.exec("BEGIN IMMEDIATE");
       const disallowed = new Set(normalizeLockPathList(disallowedFiles));
@@ -40,7 +74,7 @@ export function createHardLockService({
       db.exec("COMMIT");
     } catch (error) {
       try { db.exec("ROLLBACK"); } catch { /* Preserve the original audit persistence error. */ }
-      throw error;
+      throw sanitizedOperationalError(error);
     } finally {
       closeDb(db);
     }
@@ -118,18 +152,22 @@ export function createHardLockService({
   }
 
   async function cleanupExpiredLocks(cwd = "") {
-    const db = await openLockDb(cwd);
+    const db = await openHardLockDb(cwd);
     try {
       db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(clockNow());
+    } catch (error) {
+      throw sanitizedOperationalError(error);
     } finally {
       closeDb(db);
     }
   }
 
   async function listLocks(cwd = "") {
-    const db = await openLockDb(cwd);
+    const db = await openHardLockDb(cwd);
     try {
       return listLocksFromDb(db);
+    } catch (error) {
+      throw sanitizedOperationalError(error);
     } finally {
       closeDb(db);
     }
@@ -147,7 +185,12 @@ export function createHardLockService({
   }) {
     const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
     const normalizedOrigin = origin === "manual" ? "manual" : "internal";
-    const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
+    let projectRoot;
+    try {
+      projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
+    } catch (error) {
+      throw sanitizedOperationalError(error);
+    }
     const unsafeReason = unsafePathReason(paths, projectRoot);
     const lockPathsRequested = normalizeLockPathListForCwd(paths, projectRoot);
 
@@ -179,7 +222,7 @@ export function createHardLockService({
       };
     }
 
-    const db = await openLockDb(projectRoot);
+    const db = await openHardLockDb(projectRoot);
     const now = clockNow();
     const runId = makeLockId(owner, agent);
     const token = makeLockToken();
@@ -187,13 +230,16 @@ export function createHardLockService({
     const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
     const expiresAt = now + Math.max(1000, Number(ttlMs) || defaultLockTtlMs);
     const request = { lockType: normalizedLockType, paths: lockPathsRequested };
+    let transactionOpen = false;
 
     try {
       db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
       const keptLocks = listLocksFromDb(db, now);
       const conflict = keptLocks.map((lock) => conflictsWithActiveLock(request, lock)).find(Boolean);
       if (conflict) {
         db.exec("ROLLBACK");
+        transactionOpen = false;
         const conflictPath = normalizeLockPath(conflict.overlap?.[0] || conflict.overlap?.[1] || conflict.paths?.[0] || "");
         return {
           ok: false,
@@ -212,8 +258,6 @@ export function createHardLockService({
       for (const requestedPath of lockPathsRequested) {
         insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
       }
-      db.exec("COMMIT");
-
       const lock = {
         id: runId,
         runId,
@@ -230,14 +274,23 @@ export function createHardLockService({
         expiresAt,
         pid: getProcessId(),
       };
-      return { ok: true, lock, activeLocks: listLocksFromDb(db) };
-    } catch (error) {
+      db.exec("COMMIT");
+      transactionOpen = false;
       try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback errors after failed begin/commit.
+        return { ok: true, lock, activeLocks: listLocksFromDb(db) };
+      } catch (error) {
+        reportPostCommitSnapshotFailure("acquire", lock.id, error);
+        return { ok: true, lock, activeLocks: [], activeLocksUnavailable: true };
       }
-      return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
+    } catch (error) {
+      if (transactionOpen) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Ignore rollback errors after failed begin/commit.
+        }
+      }
+      return { ok: false, error: `Write lock rejected: ${operationalErrorText(error)}` };
     } finally {
       closeDb(db);
     }
@@ -252,9 +305,11 @@ export function createHardLockService({
       return { ok: false, released: false, error: "Lock release token is required." };
     }
 
-    const db = await openLockDb(cwd);
+    const db = await openHardLockDb(cwd);
+    let transactionOpen = false;
     try {
       db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
       const requestedPaths = normalizeLockPathList(paths);
       const tokenSha256 = `sha256:${createHash("sha256").update(String(token)).digest("hex")}`;
       const rows = requestedPaths.length
@@ -262,6 +317,7 @@ export function createHardLockService({
         : db.prepare("SELECT * FROM locks WHERE run_id = ? AND token = ?").all(lockId, tokenSha256);
       if (!rows.length) {
         db.exec("ROLLBACK");
+        transactionOpen = false;
         return { ok: false, released: false, error: "No active lock matched that run_id and token." };
       }
 
@@ -272,14 +328,22 @@ export function createHardLockService({
       }
       db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", clockNow(), lockId);
       db.exec("COMMIT");
-      return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
-    } catch (error) {
+      transactionOpen = false;
       try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback errors after failed begin/commit.
+        return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
+      } catch (error) {
+        reportPostCommitSnapshotFailure("release", lockId, error);
+        return { ok: true, released: true, activeLocks: [], activeLocksUnavailable: true };
       }
-      return { ok: false, released: false, error: error.message || String(error) };
+    } catch (error) {
+      if (transactionOpen) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Ignore rollback errors after failed begin/commit.
+        }
+      }
+      return { ok: false, released: false, error: operationalErrorText(error) };
     } finally {
       closeDb(db);
     }
@@ -290,19 +354,19 @@ export function createHardLockService({
     const intervalMs = Math.max(1000, Math.min(1000 * 30, Math.floor(ttlMs / 3)));
     const timer = setIntervalFn(async () => {
       try {
-        const db = await openLockDb(lock.cwd);
+        const db = await openHardLockDb(lock.cwd);
         try {
           const expiresAt = clockNow() + ttlMs;
           const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
           const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ?").run(expiresAt, lock.id, tokenSha256);
           if (Number(updated.changes || 0) === 0) {
-            logEvent("warn", "lock.heartbeat_lost", { lockId: lock.id });
+            safeLogEvent("warn", "lock.heartbeat_lost", { lockId: lock.id });
           }
         } finally {
           closeDb(db);
         }
       } catch (error) {
-        logEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: error.message || String(error) });
+        safeLogEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: operationalErrorText(error) });
       }
     }, intervalMs);
     timer.unref?.();
