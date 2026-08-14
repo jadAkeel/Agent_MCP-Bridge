@@ -59,6 +59,7 @@ import {
 } from "./src/v2/policy/scope-results.js";
 import { createChildEnvBuilders } from "./src/v2/runtime/child-env.js";
 import { createIsolatedOpenCodeRuntimeManager } from "./src/v2/runtime/isolated-opencode-runtime.js";
+import { createOpenCodeProbe } from "./src/v2/runtime/opencode-probe.js";
 import { createProcessRunner } from "./src/v2/runtime/process-runner.js";
 import { createProviderDiagnostics } from "./src/v2/runtime/provider-diagnostics.js";
 import { delayWithSignal, nowMs, retryAfterMsFromText } from "./src/v2/runtime/timing.js";
@@ -315,6 +316,16 @@ const { createIsolatedOpenCodeRuntime, wipeIsolatedOpenCodeRuntime } = createIso
   sanitizedReaderAgent: MCP_SANITIZED_READER_AGENT,
   sanitizedReaderProfile: MCP_SANITIZED_READER_PROFILE,
   sanitizedReaderPrompt: MCP_SANITIZED_READER_PROMPT,
+});
+
+const { safeOpenCodeCommand } = createOpenCodeProbe({
+  allowExternalPlugins: CONFIG.allowExternalPlugins,
+  verifyExternalPluginPolicy,
+  createIsolatedOpenCodeRuntime,
+  wipeIsolatedOpenCodeRuntime,
+  buildOpenCodeEnv,
+  runCommand,
+  opencodeExecutable: OPENCODE_EXE,
 });
 
 const {
@@ -602,33 +613,6 @@ async function attestContractorNestedAgents(cwd, { forcePure = false } = {}) {
 
 function availableAgentLabels(agents) {
   return [...agents.entries()].map(([name, mode]) => `${name} (${mode})`).sort();
-}
-
-async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure = false, runtimeContext = null } = {}) {
-  const pure = forcePure || !CONFIG.allowExternalPlugins;
-  if (!pure) {
-    const pluginPolicy = await verifyExternalPluginPolicy(cwd);
-    if (!pluginPolicy.ok) {
-      return { stdout: "", stderr: pluginPolicy.error, exitCode: "plugin_policy_rejected", pluginPolicy };
-    }
-  }
-  const commandArgs = pure && !args.includes("--pure") ? ["--pure", ...args] : args;
-  let ownedRuntime = null;
-  let result = null;
-  let cleanup = { ok: true, error: "" };
-  try {
-    ownedRuntime = forcePure && !runtimeContext ? await createIsolatedOpenCodeRuntime() : null;
-    const isolatedRuntime = runtimeContext || ownedRuntime;
-    const executionEnv = isolatedRuntime?.env || buildOpenCodeEnv();
-    result = { ...(await runCommand(OPENCODE_EXE, commandArgs, cwd, timeoutMs, executionEnv)), isolatedRuntimeRoot: isolatedRuntime?.root || "" };
-  } finally {
-    if (ownedRuntime) {
-      cleanup = await wipeIsolatedOpenCodeRuntime(ownedRuntime.root);
-    }
-  }
-  return cleanup.ok
-    ? result
-    : { stdout: "", stderr: `Isolated OpenCode runtime cleanup failed: ${cleanup.error}`, exitCode: "isolated_runtime_cleanup_failed", isolatedRuntimeRoot: ownedRuntime?.root || "" };
 }
 
 function normalizedManifestRelativePath(value) {
