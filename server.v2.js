@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { createAgentAttestation } from "./src/v2/agents/attestation.js";
 import { createAgentMetadataPolicy } from "./src/v2/agents/metadata-policy.js";
 import { readBridgeConfig, resolveBridgePaths } from "./src/v2/config/bridge-config.js";
+import { createGitEvidenceService } from "./src/v2/integration/git-evidence.js";
 import { createHardLockService } from "./src/v2/persistence/hard-locks.js";
 import { createProviderLeaseService } from "./src/v2/persistence/provider-leases.js";
 import { createQueueRecordCodec } from "./src/v2/persistence/queue-record-codec.js";
@@ -312,6 +313,15 @@ const { runCommand, runSpawnCommand } = createProcessRunner({
   logEvent,
   providerErrorTypeFromStructuredEvent,
   providerErrorTypeFromStderr: (stderr) => providerErrorTypeFromText(providerDiagnosticTextFromStderr(stderr)),
+});
+
+const {
+  runGitReadOnlyCommand,
+  gitChangedFiles,
+} = createGitEvidenceService({
+  runCommand,
+  buildValidationEnv,
+  summarizeStderr,
 });
 
 const {
@@ -1594,61 +1604,6 @@ function formatRejectedExecution({
     rollbackFiles.length ? `rollbackFiles: ${normalizeLockPathList(rollbackFiles).join(", ")}` : null,
     unresolvedFiles.length ? `unresolvedFiles: ${normalizeLockPathList(unresolvedFiles).join(", ")}` : null,
   ].filter(Boolean).join("\n");
-}
-
-function transientGitIndexReadError(result) {
-  return /(?:\.git[\\/]index|index file open failed|index\.lock).*(?:permission denied|used by another process|file exists)/i
-    .test([result?.stderr, result?.stdout].filter(Boolean).join("\n"));
-}
-
-async function runGitReadOnlyCommand(args, cwd, timeoutMs = 1000 * 15, commandRunner = runCommand) {
-  let result = null;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    result = await commandRunner(
-      "git",
-      args,
-      cwd,
-      timeoutMs,
-      buildValidationEnv({ GIT_OPTIONAL_LOCKS: "0" })
-    );
-    if (result.exitCode === 0 || !transientGitIndexReadError(result) || attempt === 3) return result;
-    await new Promise((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
-  }
-  return result;
-}
-
-async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
-  const commands = [
-    runGitReadOnlyCommand(["diff", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["diff", "--cached", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard"], cwd, 1000 * 15),
-  ];
-  if (includeIgnored) {
-    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard"], cwd, 1000 * 30));
-  }
-  const [workingTreeDiff, stagedDiff, untracked, ignored] = await Promise.all(commands);
-  const failedChecks = [
-    ["working tree", workingTreeDiff],
-    ["staged files", stagedDiff],
-    ["untracked files", untracked],
-    ...(ignored ? [["ignored files", ignored]] : []),
-  ].filter(([, result]) => result.exitCode !== 0);
-  if (failedChecks.length) {
-    const details = failedChecks
-      .map(([label, result]) => `${label}: ${summarizeStderr(result.stderr || result.stdout) || `exit ${result.exitCode}`}`)
-      .join("; ");
-    throw new Error(`Git changed-file inspection failed closed (${details}).`);
-  }
-
-  return [
-    ...new Set(
-      [workingTreeDiff.stdout, stagedDiff.stdout, untracked.stdout, ignored?.stdout || ""]
-        .join("\n")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-    ),
-  ].sort();
 }
 
 async function verifyProtectedGitRoot(cwd) {
@@ -9982,8 +9937,6 @@ async function runSelfTests() {
     INTEGRATION_PREVIEW_TTL_MS
   );
   INTEGRATION_PREVIEWS.delete(previewTimingFixture.previewId);
-  assert.equal(transientGitIndexReadError({ stderr: "fatal: .git/index: index file open failed: Permission denied" }), true);
-  assert.equal(transientGitIndexReadError({ stderr: "fatal: not a git repository" }), false);
   let gitIndexReadAttempts = 0;
   const retriedGitIndexRead = await runGitReadOnlyCommand(["diff", "--cached", "--name-only"], process.cwd(), 1000, async () => {
     gitIndexReadAttempts += 1;
@@ -9993,6 +9946,13 @@ async function runSelfTests() {
   });
   assert.equal(retriedGitIndexRead.exitCode, 0);
   assert.equal(gitIndexReadAttempts, 3);
+  let nonTransientGitReadAttempts = 0;
+  const nonTransientGitRead = await runGitReadOnlyCommand(["status"], process.cwd(), 1000, async () => {
+    nonTransientGitReadAttempts += 1;
+    return { exitCode: 128, stdout: "", stderr: "fatal: not a git repository" };
+  });
+  assert.equal(nonTransientGitRead.exitCode, 128);
+  assert.equal(nonTransientGitReadAttempts, 1);
   assert.deepEqual(parallelExecutionOverlapEvidence([
     { result: { childExecutionIntervals: [{ startedAtMs: 10, finishedAtMs: 20 }] } },
     { result: { childExecutionIntervals: [{ startedAtMs: 20, finishedAtMs: 30 }] } },
