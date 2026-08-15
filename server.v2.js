@@ -22,6 +22,7 @@ import { createQueueRecordCodec } from "./src/v2/persistence/queue-record-codec.
 import { createQueueRecoveryPrimitives } from "./src/v2/persistence/queue-recovery-primitives.js";
 import { createQueueRepository } from "./src/v2/persistence/queue-repository.js";
 import { createQueueRequestCrypto } from "./src/v2/persistence/queue-request-crypto.js";
+import { createStateRetentionService } from "./src/v2/persistence/state-retention.js";
 import {
   integrationPreviewReceiptSchema,
   sanitizedWorkspaceSchema,
@@ -229,6 +230,15 @@ const { buildOpenCodeEnv, buildValidationEnv } = createChildEnvBuilders({
 const { logEvent } = createEventLogger({
   logLevel: CONFIG.logLevel,
   sanitizeLogValue,
+});
+
+const {
+  pruneInMemoryState,
+  prunePersistedState,
+} = createStateRetentionService({
+  config: CONFIG,
+  queueJobs: QUEUE_JOBS,
+  pipelineRuns: PIPELINE_RUNS,
 });
 
 const {
@@ -4014,8 +4024,6 @@ function stateDbPath(cwd = "") {
   return path.join(stateRoot, "bridge-state.sqlite");
 }
 
-const statePruneTimes = new Map();
-
 function heartbeatKnownQueueState() {
   const heartbeatAt = new Date().toISOString();
   const leaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
@@ -4077,40 +4085,6 @@ function ensureQueueHeartbeatTimer() {
   if (queueHeartbeatTimer) return;
   queueHeartbeatTimer = setInterval(heartbeatKnownQueueState, CONFIG.queueHeartbeatMs);
   queueHeartbeatTimer.unref?.();
-}
-
-function pruneInMemoryState(now = Date.now()) {
-  if (CONFIG.queueRetentionDays <= 0) return;
-  const cutoff = now - CONFIG.queueRetentionDays * 24 * 60 * 60 * 1000;
-  const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted", "not_resumable"]);
-  for (const [jobId, record] of QUEUE_JOBS) {
-    const createdAt = Date.parse(record.createdAt || "");
-    if (terminalStatuses.has(record.status) && Number.isFinite(createdAt) && createdAt < cutoff) {
-      QUEUE_JOBS.delete(jobId);
-    }
-  }
-  for (const [pipelineId, record] of PIPELINE_RUNS) {
-    const createdAt = Date.parse(record.createdAt || "");
-    if (terminalStatuses.has(record.status) && Number.isFinite(createdAt) && createdAt < cutoff) {
-      PIPELINE_RUNS.delete(pipelineId);
-    }
-  }
-}
-
-function prunePersistedState(db, dbPath) {
-  if (CONFIG.queueRetentionDays <= 0) return;
-  const now = Date.now();
-  const lastPruned = statePruneTimes.get(dbPath) || 0;
-  if (now - lastPruned < 1000 * 60 * 5) {
-    return;
-  }
-  pruneInMemoryState(now);
-  const cutoff = new Date(now - CONFIG.queueRetentionDays * 24 * 60 * 60 * 1000).toISOString();
-  const terminalStatuses = ["completed", "failed", "cancelled", "interrupted", "not_resumable"];
-  const placeholders = terminalStatuses.map(() => "?").join(", ");
-  db.prepare(`DELETE FROM opencode_jobs WHERE status IN (${placeholders}) AND created_at < ?`).run(...terminalStatuses, cutoff);
-  db.prepare(`DELETE FROM opencode_pipelines WHERE status IN (${placeholders}) AND created_at < ?`).run(...terminalStatuses, cutoff);
-  statePruneTimes.set(dbPath, now);
 }
 
 async function resolveProjectStateRoot(cwd = "") {
