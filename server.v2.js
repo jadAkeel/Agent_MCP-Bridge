@@ -39,6 +39,7 @@ import {
   findSerialOnlyMatches,
   firstNonEmptyList,
   hasAmbiguousPathPattern,
+  isAbsolutePathLike,
   isPathInside,
   isWithinAnyPath,
   mergePathLists,
@@ -322,6 +323,10 @@ const {
   runCommand,
   buildValidationEnv,
   summarizeStderr,
+  normalizeLockPath,
+  hasAmbiguousPathPattern,
+  isAbsolutePathLike,
+  maxEvidencePaths: CONFIG.maxSnapshotFiles,
 });
 
 const {
