@@ -5,10 +5,12 @@
   "private": true,
   "main": "server.js",
   "scripts": {
-    "test": "node --check server.js && node --check bin/tui.js && node --check bin/e2e.js && node --check bin/e2e-contractor.js && node --check bin/e2e-concurrency.js && node --check bin/build-release.js && node --check bin/fresh-healthcheck.js && node bin/build-release.js --self-test && node bin/fresh-healthcheck.js --self-test && node bin/tui.js --smoke && node server.js --self-test",
+    "test": "node --check server.js && node --check bin/process-supervisor.js && node --check bin/tui.js && node --check bin/e2e.js && node --check bin/e2e-contractor.js && node --check bin/e2e-concurrency.js && node --check bin/mcp-robustness.js && node --check bin/state-audit.js && node --check bin/build-release.js && node --check bin/fresh-healthcheck.js && node bin/process-supervisor.js --self-test && node bin/build-release.js --self-test && node bin/fresh-healthcheck.js --self-test && node bin/tui.js --smoke && node bin/state-audit.js --self-test && node bin/mcp-robustness.js && node server.js --self-test",
     "test:e2e": "node bin/e2e.js",
     "test:e2e:contractor": "node bin/e2e-contractor.js",
     "test:concurrency": "node bin/e2e-concurrency.js",
+    "test:assurance": "npm test && npm run test:concurrency && npm audit --omit=dev",
+    "audit:state": "node bin/state-audit.js",
     "release:build": "node bin/build-release.js",
     "tui": "node bin/tui.js"
   },

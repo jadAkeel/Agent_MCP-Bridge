@@ -21,7 +21,7 @@ Every write job must have an explicit Scope Contract. Locks are not the primary 
 
 | Task type | Tool | Lock | Queue | Worktree | Pipeline |
 | --- | --- | --- | --- | --- | --- |
-| Read-only review | `run_opencode_agent` reviewer/planner/tester/architect | off | no | no | no |
+| Read-only review | `run_opencode_agent` reviewer/planner/tester/architect | shared consistency lease | no | no | no |
 | Single small write | `validate_delegation_plan` + `run_opencode_agent` builder/debugger | simple | no | optional | no |
 | Single risky write | validate + builder/debugger + reviewer/tester | simple | optional | recommended | no |
 | Parallel independent writes | pipeline + queue | strict | yes | yes | yes |
@@ -122,7 +122,7 @@ integrate_opencode_worktree(dryRun: true)
 -> source is re-hashed; cleanup occurs only after an explicit passing gate
 ```
 
-Non-dry-run integration without both `reviewed: true` and the exact unexpired preview receipt is rejected. Any source or target mutation after preview returns `integration_preview_stale`. Source cleanup is opt-in, requires `validationGate.status === "passed"`, and rechecks the source patch immediately before removal. Pipeline cleanup is deferred until final validation, reviewer, and tester gates all succeed. Failed, partial, unreviewed, and not-yet-integrated worktrees are retained.
+Non-dry-run integration without both `reviewed: true` and the exact unexpired preview receipt is rejected. Any source or target mutation after preview returns `integration_preview_stale`. Source cleanup is opt-in, requires `validationGate.status === "passed"`, and rechecks the source patch immediately before removal. Branch cleanup uses an exact expected-object `update-ref` deletion; a branch moved or recreated during cleanup is retained and reported as partial. Pipeline cleanup is deferred until final validation, reviewer, and tester gates all succeed. Failed, partial, unreviewed, and not-yet-integrated worktrees are retained.
 
 Before creating any writer worktree, the bridge rejects staged, unstaged, untracked, conflicted, or dirty-submodule state with `dirty_worktree_requires_checkpoint`—including dirt unrelated to the requested scope. A worktree starts from a pinned commit/tree and cannot safely reproduce uncheckpointed prerequisites. The bridge never stashes, resets, commits, or overlays the source checkout; create or select an external checkpoint and retry.
 
@@ -173,7 +173,7 @@ Recommended policy:
 
 The policy schema is strict and repository policy is tightening-only: it cannot disable required worktrees. A caller-supplied `trustedPolicySha256` is diagnostic only and grants no authority. A policy containing `finalValidationCommand` is accepted only when the operator environment pins its canonical repository root, exact repo-relative path, and bytes through `CODEX_OPENCODE_TRUSTED_POLICY_ROOT`, `CODEX_OPENCODE_TRUSTED_POLICY_PATH`, and `CODEX_OPENCODE_TRUSTED_POLICY_SHA256`, and pins the canonical Git executable hash in `CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST`. Copying approved bytes into another repository or path grants no authority. Repository policy may use only bounded, read/check Git vectors; package scripts and repository interpreters require an explicitly trusted coordinator command or an external sandbox. The executable, exact argument vector, policy bytes, and provenance are revalidated before each execution. Changing or revoking any pin fails closed.
 
-The bridge also applies conservative defaults for env/secrets, manifests, lockfiles, shared packages, schemas, and migrations. Lock paths are canonicalized to repository-relative form before SQLite coordination, so absolute and relative spellings of the same path cannot bypass overlap checks. Multiple readers may share one path; writers remain exclusive. Reviewed integration takes a repository-wide `serial_integration` lease and waits for every reader, writer, or other integration to finish.
+The bridge also applies conservative defaults for env/secrets, manifests, lockfiles, shared packages, schemas, and migrations. Lock paths are resolved against the canonical repository root and stored in repository-relative form, so absolute paths plus redundant separators and `.` segments cannot bypass overlap checks; parent-traversal segments remain rejected. Filesystem case behavior is probed read-only from existing root entries and cached for the process; when it cannot be determined, lock identity conservatively folds case. Multiple readers may share a scope, overlapping readers/writers exclude each other, and an unscoped reader holds a repository-wide shared lease. Reviewed integration is repository-wide exclusive, while pipeline final validation/reviewer/tester gates hold a repository-wide shared consistency lease.
 
 ## LangGraph TUI
 
@@ -204,7 +204,8 @@ CODEX_OPENCODE_WORKTREE_CLEANUP=never
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT=2
 CODEX_OPENCODE_QUEUE_HEARTBEAT_MS=15000
 CODEX_OPENCODE_QUEUE_LEASE_MS=60000
-CODEX_OPENCODE_QUEUE_RETENTION_DAYS=0
+CODEX_OPENCODE_QUEUE_RETENTION_DAYS=30
+CODEX_OPENCODE_AUDIT_RETENTION_DAYS=90
 CODEX_OPENCODE_PROVIDER_LEASE_MS=240000
 CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS=20000
 CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS=8000
@@ -253,6 +254,8 @@ For production, point the Codex MCP entry at a new published snapshot outside th
 
 `CODEX_OPENCODE_WORKTREE_ROOT=global` keeps generated worktrees under the bridge state directory instead of adding `.codex-worktrees/` to each repository. SQLite lock, queue, and pipeline state is also stored under the bridge state directory in per-repository hashed databases; `.mcp/` remains reserved for an optional repository policy file and is not used for runtime databases.
 
+`lockMode: off` on a read-only job means the agent has no write lock or write authority; the bridge still acquires a shared consistency lease. Durable queued write jobs require `CODEX_OPENCODE_WORKTREE_MODE=write` or `all` and are rejected with `queue_write_requires_worktree` otherwise.
+
 ## Sanitized Workspaces
 
 `verify_sanitized_workspace` and the optional per-job `sanitizedWorkspace` contract support exact, read-only workspace waves without widening the declared root to a Git repository:
@@ -297,12 +300,21 @@ Useful defaults:
 | `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Generated worktree root under the bridge state directory; set an explicit path only when needed. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `2` | Cross-process provider/account lease limit shared by direct, queued, and parallel calls. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` | `opencode-default-account` | Operator-defined account-pool key used by the global provider lease. |
+| `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable default with restart recovery and cross-process idempotency; use `memory` only for explicitly ephemeral single-process experiments. |
 | `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Per-process queue scheduling limit; provider/account leases impose the cross-process execution cap. |
 | `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY` | `wait` | `wait` or `reject`. |
 | `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` | `2000` | Retry interval for jobs blocked by a lock held by another bridge process. |
 | `CODEX_OPENCODE_QUEUE_HEARTBEAT_MS` | `15000` | Owner-instance/job heartbeat interval. |
 | `CODEX_OPENCODE_QUEUE_LEASE_MS` | `60000` | Queue ownership lease; reconciliation also requires an expired instance lease and dead PID where verifiable. |
 | `CODEX_OPENCODE_QUEUE_STALE_AFTER_MS` | `7200000` | Legacy/unowned pending-record age before explicit startup/operator reconciliation as `not_resumable`. |
+| `CODEX_OPENCODE_QUEUE_RETENTION_DAYS` | `30` | Strictly positive terminal job/pipeline retention; `0` is rejected because no durable archive mode exists. |
+| `CODEX_OPENCODE_AUDIT_RETENTION_DAYS` | `90` | Retention for finished lock/run and integration audit evidence, while active, quarantined, cleanup-pending, and referenced rows are preserved. |
+| `CODEX_OPENCODE_STATE_DB_MAX_BYTES` | `2147483648` | Soft per-database live-page cap; terminal updates and cancellation remain admitted. Use an OS quota for a hard disk boundary. |
+| `CODEX_OPENCODE_RETAINED_WORKTREE_MAX_COUNT` | `64` | Backpressure limit for retained worktree recovery artifacts. |
+| `CODEX_OPENCODE_RETAINED_WORKTREE_MAX_BYTES` | `21474836480` | Soft retained-worktree byte cap; worktrees are never age-deleted automatically. |
+| `CODEX_OPENCODE_INTEGRATION_PREVIEW_GLOBAL_MAX` | `256` | Maximum live single-use previews across this bridge process. |
+| `CODEX_OPENCODE_INTEGRATION_PREVIEW_PROJECT_MAX` | `64` | Maximum live single-use previews for one canonical project. |
+| `CODEX_OPENCODE_CALLER_MODEL` | `trusted_stdio` | Only the single trusted stdio principal is supported; shared/multiplexed caller configurations are rejected. |
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git` | Operator allowlist for validation executables; add `npm` deliberately when reviewed project scripts are required. |
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST` | unset | Canonical executable SHA-256 pins required for repository-policy validation. |
 | `CODEX_OPENCODE_TRUSTED_POLICY_ROOT` | unset | Canonical repository root approved for policy authority. Required with the policy path and hash. |
@@ -311,15 +323,18 @@ Useful defaults:
 
 ## Operational Boundaries
 
-- Worktrees start from a pinned committed `HEAD` and tree. Any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; no source bytes/index/HEAD are changed by that preflight.
-- Executed writer worktrees are never removed by the job/queue/parallel cleanup setting. They remain the review and recovery source until receipt-bound integration and explicit validated cleanup.
-- SQLite queue acceptance persists an AES-256-GCM encrypted replay request before publishing the job to the in-process scheduler. The separate 32-byte `queue-request.key` in the state root is required for restart recovery and backup; contractor capability tokens are removed before encryption. Supply a stable `idempotencyKey` so an identical resubmission returns the original job and a changed request fails with `queue_idempotency_conflict`. Startup takes over queued work only after both the job and bridge-owner leases expire. Legacy rows without encrypted payloads remain explicitly `not_resumable`.
-- Terminal retention defaults to unlimited (`0`) so accepted job history does not disappear. Set a positive retention only when an external archive exists. Provider leases heartbeat every 20 seconds and expire after four minutes without renewal, keeping crash recovery within the five-minute objective while tolerating short local stalls.
+- Bridge-owned Git commands run with a reduced environment, system/global configuration disabled, credential prompting disabled, and a process-unique nonexistent `core.hooksPath`. Repository-local filter/diff/merge drivers, credential/header rewrites, executable core controls, and config includes are rejected as `git_repository_config_unsafe` before worktree creation or patch capture. Worktrees start from a pinned committed `HEAD` and tree. Any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; a newly created worktree that is not immediately clean is rejected as `worktree_created_dirty` and retained as evidence.
+- Executed writer worktrees are never removed by the job/queue/parallel cleanup setting. They remain the review and recovery source until receipt-bound integration and explicit validated cleanup. Every durable queued writer is worktree-isolated so a child that survives an owner crash cannot modify the target checkout.
+- SQLite queue acceptance persists an AES-256-GCM encrypted replay request before publishing the job to the in-process scheduler. Job results, pipeline details, and integration rollback preimages are encrypted with the same state-root key while list records keep hashes/lengths only. The separate 32-byte `queue-request.key` is required for restart recovery and backup; contractor capability tokens are removed before encryption. Rotating legacy backups/WAL copies remains an operator responsibility. Supply a stable `idempotencyKey` so an identical resubmission returns the original job and a changed request fails with `queue_idempotency_conflict`. Startup and periodic recovery take over only after both durable owner leases expire, and integration journal recovery runs before project jobs are scheduled. Legacy rows without encrypted payloads remain explicitly `not_resumable`.
+- Terminal retention defaults to 30 days and audit retention to 90 days; both must be positive. Row/live-byte/preview/worktree caps apply backpressure without deleting active, quarantined, cleanup-pending, referenced, or retained recovery evidence. Provider leases heartbeat every 20 seconds and expire after four minutes without renewal, keeping crash recovery within the five-minute objective while tolerating short local stalls.
 - A successful OpenCode process must emit a non-empty terminal JSON text event. Exit code 0 without a final response is rejected as `agent_empty_final_response`.
 - Transient 429/5xx/transport/timeouts are retried only for read-only work with no completed tool outcome, using one bounded exponential-backoff/jitter/Retry-After controller and one elapsed-time budget. Writes, hard quota, auth/OAuth refresh, billing, model/configuration errors, truncation, and structured terminal errors are never retried. Queue retries do not multiply the inner policy.
 - The active agent debug record is used to pin `--model provider/model` and `--variant`; configured and runtime-observed evidence are reported separately. Silent bridge fallback is disabled.
 - Raw process-capture or assistant-final truncation is terminal `essential_output_truncated`; bounded head/tail evidence and stream hashes/counts are retained rather than reporting a false success. If only durable queue-result storage exceeds `CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS`, the job remains `completed` with `completionOutcome: "completed_with_truncated_output"`, and the bounded text, original character count, SHA-256, and truncation flag are retained.
-- Running queue cancellation owned by a live bridge terminates the exact spawned OpenCode process tree, then records `agent_cancelled`. A dead-owner orphan is terminalized from lease evidence without blindly killing a possibly reused PID.
+- Running queue cancellation owned by a live bridge terminates the exact spawned OpenCode process tree through an independently heartbeated supervisor, then records `agent_cancelled`. Hard-lock, queue-ownership, and provider-capacity renewal failures abort active children before the last confirmed lease expires; a single transient failure is tolerated. If containment cannot be confirmed, the provider lease and hard lock are durably quarantined instead of being released. POSIX uses a verified process group; Windows `taskkill /T /F` remains best-effort without a native Job Object helper. A dead-owner orphan is terminalized from lease evidence without blindly killing a possibly reused PID, and any orphaned writer remains confined to its retained worktree.
+- Cross-process cancellation uses a bounded revision/owner CAS loop: a claim race is reloaded as an active cancellation request, and a stale cancellation snapshot cannot replace newer worktree or containment evidence. A terminal pipeline child transactionally fails/cancels its parent, cancels inactive siblings, requests cancellation of active siblings, and later claims reject children whose released parent is no longer running.
+- Every non-read hard-lock acquisition checks the durable integration journal in the same SQLite transaction. An unresolved or quarantined operation blocks writers until recovery reaches `committed`, `rolled_back`, or `recovered_noop`. Queue heartbeats touch only databases with locally owned active jobs/pipelines, and periodic maintenance processes one known database per tick to avoid cumulative event-loop stalls.
+- `cwd` scopes project state but is not caller authorization. This release supports one trusted stdio principal only and rejects a shared/multiplexed caller model; deploy separate OS principals/bridge instances if callers do not mutually trust one another.
 - Path-only change evidence is never enough to overwrite a user or concurrent process. Ordinary job/parallel violations retain affected workspace/worktree files as unresolved evidence. Receipt-bound integration rolls back only bytes that still exactly match the bridge-owned post-patch snapshot; ambiguous mutations are retained and reported.
 - Validation commands use a minimal credential-free environment and an operator executable allowlist. An approved `npm test` still executes repository code and therefore remains an authorization decision, not a sandbox.
 - The bridge is a coordination and change-scope boundary, not an operating-system sandbox. Do not use it to execute untrusted or malicious repositories outside an appropriate VM/container.
@@ -339,11 +354,15 @@ node --check bin/tui.js
 node --check bin/e2e.js
 node --check bin/e2e-contractor.js
 node --check bin/e2e-concurrency.js
+node --check bin/mcp-robustness.js
+node --check bin/state-audit.js
 node --check bin/build-release.js
 node --check bin/fresh-healthcheck.js
 node bin/build-release.js --self-test
 node bin/fresh-healthcheck.js --self-test
 node bin/tui.js --smoke
+node bin/state-audit.js --self-test
+node bin/mcp-robustness.js
 node server.js --self-test
 ```
 
@@ -368,7 +387,23 @@ Run the cross-process concurrency stress without invoking models:
 npm run test:concurrency
 ```
 
-This starts independent MCP server processes against temporary repositories and shared SQLite state. It verifies shared readers, exclusive writers, absolute/relative path canonicalization, repository-wide serial integration, overlapping/disjoint writer races, release cleanup, SQLite busy retry behavior, and the cross-process provider/account concurrency ceiling.
+This starts independent MCP server processes against temporary repositories and shared SQLite state. It verifies normal-job shared readers, reader/writer exclusion, disjoint read/write concurrency, absolute/relative/dot/separator/case path identity, rejected traversal aliases, repository-wide serial integration, overlapping/disjoint writer races, crash-orphan worktree isolation, release cleanup, SQLite busy retry behavior, and the cross-process provider/account concurrency ceiling.
+
+For the complete deterministic local assurance suite, including dependency auditing, run:
+
+```powershell
+npm run test:assurance
+```
+
+`npm test` now includes a protocol-robustness fixture. It sends malformed MCP frames and invalid tool arguments, confirms the bridge remains alive, proves rejected input creates no locks, crashes a process holding a short lock lease, restarts a second bridge, and verifies SQLite integrity plus foreign-key consistency. `npm run test:concurrency` also runs those SQLite checks after its multi-process stress workload.
+
+To inspect real durable state without modifying it, run:
+
+```powershell
+npm run audit:state
+```
+
+It opens only regular top-level bridge databases plus `projects/*.sqlite` under `CODEX_OPENCODE_STATE_DIR` (or the default bridge state directory) in read-only mode and reports `integrity_check`, `foreign_key_check`, and active jobs/pipelines whose owner leases have expired. Add `-- --strict` to make expired active rows fail the command; use `-- --json` for automation. An expired row is an operational warning, not database corruption: allow normal deferred recovery to run before manual investigation.
 
 ## Full Guide
 

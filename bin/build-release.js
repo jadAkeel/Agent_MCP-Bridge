@@ -246,6 +246,7 @@ async function runSelfTest() {
       "server.js",
       "package.json",
       "package-lock.json",
+      "bin/process-supervisor.js",
       "bin/tui.js",
       "bin/e2e.js",
       "bin/e2e-contractor.js",

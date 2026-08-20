@@ -8,7 +8,7 @@ Codex is the primary orchestrator, the MCP Bridge is the safety/routing/scheduli
 
 | Task type | Tool | Lock | Queue | Worktree | Pipeline |
 | --- | --- | --- | --- | --- | --- |
-| Read-only review | `run_opencode_agent` reviewer/planner/tester/architect | off | no | no | no |
+| Read-only review | `run_opencode_agent` reviewer/planner/tester/architect | shared consistency lease | no | no | no |
 | Single small write | `validate_delegation_plan` + `run_opencode_agent` builder/debugger | simple | no | optional | no |
 | Single risky write | validate + builder/debugger + reviewer/tester | simple | optional | recommended | no |
 | Parallel independent writes | pipeline + queue | strict | yes | yes | yes |
@@ -24,12 +24,12 @@ Flow:
 ```text
 Codex
 -> run_opencode_agent(planner/reviewer/tester/architect)
--> lockMode: off
+-> lockMode: off (no write authority; MCP still holds a shared consistency lease)
 -> MCP verifies no files changed
 -> Codex final answer
 ```
 
-Do not use queue, worktree, pipeline, or manual locks for this level.
+Do not use queue, worktree, pipeline, or manual locks for this level. The bridge automatically acquires and renews the read consistency lease.
 
 ### Level 2: Single Write Task
 
@@ -128,7 +128,7 @@ Use `get_opencode_bridge_status` before the first production run or after changi
 
 ## 5. Read-Only Jobs
 
-Read-only jobs use `lockMode: "off"`. They may inspect files, propose changes, review architecture, or analyze tests.
+Read-only jobs use `lockMode: "off"` to deny write authority. They still acquire a shared durable consistency lease: `scope.read` (or explicit `lockedPaths`) defines the read scope, and an omitted scope becomes repository-wide. Multiple readers may share a scope; an overlapping writer waits or rejects, while a writer on a disjoint explicit read scope may proceed.
 
 Example:
 
@@ -193,11 +193,13 @@ Rules:
 
 The queue is a scheduler, not a safety replacement.
 
+`CODEX_OPENCODE_QUEUE_MODE` defaults to `sqlite`. Set `memory` only for explicitly ephemeral single-process experiments where crash recovery, durable audit, pipelines, and cross-process idempotency are not required.
+
 Queue responsibilities:
 
 - schedule jobs
 - track `pending`, `blocked`, `running`, `completed`, `failed`, and `cancelled`
-- wait on conflicting write scopes
+- wait on conflicting reader/writer scopes
 - cancel pending or blocked jobs
 - preserve audit trail
 - coordinate large tasks
@@ -210,9 +212,11 @@ Queue does not replace:
 - changed-file validation
 - Codex review
 
-Read-only queued jobs can run in parallel. Write jobs with overlapping normalized write scopes wait or reject depending on `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY`.
+Read-only queued jobs can run in parallel with readers and disjoint writers. Any overlapping read/write or write/write scope waits or rejects depending on `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY`. Durable queued writers are accepted only when `CODEX_OPENCODE_WORKTREE_MODE=write` or `all`; otherwise `queue_write_requires_worktree` prevents a crash-surviving child from writing to the target checkout.
 
-Jobs blocked by a lock in another bridge process are polled again every `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` (default 2000 ms), so they resume after that external lock is released. SQLite acceptance commits an AES-256-GCM encrypted replay request before exposing the job to the scheduler; the separate state-root `queue-request.key` must be backed up with the databases. Contractor capability tokens are never persisted. A stable caller `idempotencyKey` deduplicates an identical request and rejects changed content. Each owned job records an opaque process instance, owner generation/PID, child PID evidence, heartbeat, and lease expiry; automatic locks are renewed with that heartbeat. Startup takes over queued work only after both durable owner leases expire. Legacy rows without encrypted payloads remain explicitly `not_resumable`; expired active work remains `interrupted` for manual inspection rather than unsafe automatic re-execution.
+Jobs blocked by a lock in another bridge process are polled again every `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` (default 2000 ms), so they resume after that external lock is released. SQLite acceptance commits an AES-256-GCM encrypted replay request before exposing the job to the scheduler; the separate state-root `queue-request.key` must be backed up with the databases. Contractor capability tokens are never persisted. A stable caller `idempotencyKey` deduplicates an identical request and rejects changed content. Each owned job records an opaque process instance, owner generation/PID, child PID evidence, heartbeat, and lease expiry. A transient renewal failure is tolerated, but sustained failure aborts the exact live child before the last confirmed lease expires; successful in-memory renewal timestamps are never fabricated. Startup takes over queued work only after both durable owner leases expire. Legacy rows without encrypted payloads remain explicitly `not_resumable`; expired active work remains `interrupted` for manual inspection rather than unsafe automatic re-execution.
+
+Cross-process cancellation is revision- and owner-fenced. If cancellation races a claim, the bridge reloads the current generation and records an active cancellation request instead of returning a false “not found”; it never replaces newer durable evidence with stale JSON. When a pipeline child fails or is cancelled, the same terminal transaction updates the parent, cancels inactive siblings, and requests cancellation of active siblings. A child cannot be claimed after its released parent leaves `running`.
 
 ## 9. Worktree Behavior
 
@@ -227,10 +231,10 @@ Worktrees are configurable, but write isolation is the professional default for 
 
 Rules:
 
-- Write jobs run in generated worktrees when worktree mode is enabled.
+- Direct write jobs run in generated worktrees when worktree mode is enabled; durable queued writers always require it.
 - Worktree output is never merged automatically.
 - Every executed writer worktree and local branch is retained for review, regardless of job success or the legacy cleanup setting.
-- Before creating a writer worktree, any staged, unstaged, untracked, conflicted, or dirty-submodule source state fails closed as `dirty_worktree_requires_checkpoint`; the bridge never stashes, commits, resets, or overlays user changes.
+- Bridge-owned Git runs with a reduced environment, disabled system/global configuration and prompts, and a process-unique disabled hooks path. Repository-local executable filter/diff/merge drivers, credential/header rewrites, executable core controls, and config includes fail closed as `git_repository_config_unsafe` before worktree creation or patch capture. Before creating a writer worktree, any staged, unstaged, untracked, conflicted, or dirty-submodule source state fails closed as `dirty_worktree_requires_checkpoint`; a worktree that is dirty immediately after creation fails as `worktree_created_dirty` and is retained without launching an agent.
 - MCP returns pinned base commit/tree, patch SHA-256, changed files, diff stat, branch, and worktree path.
 - Codex reviews the patch before integration.
 - Integration is serial.
@@ -254,7 +258,7 @@ integrate_opencode_worktree(dryRun: true)
 -> source is re-hashed and is removed only after an explicit passing validation gate
 ```
 
-Non-dry-run integration without `reviewed: true` and the exact unexpired single-use receipt is rejected. Source, target, or contract drift after preview returns `integration_preview_stale`; oversized or credential-redacted preview evidence never receives a receipt. After apply, every reviewed file must byte-match the isolated simulation, and validation must preserve that exact snapshot. `cleanupAfterSuccess` is opt-in and is ignored unless reviewed integration and validation both succeed. Pipeline cleanup is deferred until final validation, reviewer, and tester gates pass. Failed integration or validation preserves the source worktree and never overwrites an ambiguous concurrent edit.
+Non-dry-run integration without `reviewed: true` and the exact unexpired single-use receipt is rejected. Source, target, or contract drift after preview returns `integration_preview_stale`; oversized or credential-redacted preview evidence never receives a receipt. After apply, every reviewed file must byte-match the isolated simulation, and validation must preserve that exact snapshot. `cleanupAfterSuccess` is opt-in and is ignored unless reviewed integration and validation both succeed. Local branch deletion is compare-and-delete against the exact pre-removal ref OID; a moved/recreated branch is retained as partial cleanup. Pipeline cleanup is deferred until final validation, reviewer, and tester gates pass. Failed integration or validation preserves the source worktree and never overwrites an ambiguous concurrent edit.
 
 ## 11. Pipeline Usage
 
@@ -311,16 +315,18 @@ acquire_agent_lock
 -> release_agent_lock
 ```
 
-Manual locks exist only for exceptional cleanup/debugging. Misuse is reported as `manual_lock_misuse`.
+Manual locks exist only for exceptional cleanup/debugging. A manual lock that blocks a normal run is reported as `manual_lock_misuse`; contention with a lock held automatically by another active write job is reported as `write_lock_conflict` so the caller can wait, retry, or choose a non-overlapping scope.
 
-Lock modes:
+Lock modes and lease behavior:
 
-- `off`: read-only agents
+- `off`: read-only agents have no write authority, while MCP automatically holds a shared read consistency lease
 - `simple`: one writer
 - `strict`: parallel write preflight validation
 - `serial_integration`: repository-wide exclusive integration; it conflicts with readers, writers, and other integrations even when their paths are disjoint
 
-All manual and automatic lock paths are canonicalized to repository-relative form. Absolute and relative spellings of the same repository path therefore conflict. SQLite uses a composite path/run primary key so multiple readers can share a path while writers remain exclusive. These are renewable coordination leases, not operating-system filesystem locks; preview identity and before/after state checks reject external edits that occur outside the bridge.
+All manual and automatic lock paths are resolved against the canonical repository root and stored in repository-relative form. Absolute paths plus redundant separators and `.` segments therefore conflict; `..` traversal remains rejected. The bridge probes actual root case behavior using existing filesystem entries and conservatively folds case when probing is inconclusive, so a case-insensitive filesystem cannot split lock identity merely because Node reports a different platform. Case mode is cached until bridge restart. SQLite uses a composite path/run primary key so multiple readers can share a scope while writers remain exclusive. Hard-lock, queue-ownership, and provider-capacity renewal have a pre-expiry fail-closed fence: missing ownership aborts immediately, sustained persistence failure aborts before expiry, and one transient failure may recover. These are coordination leases, not operating-system filesystem locks; preview identity and before/after state checks reject external edits that occur outside the bridge.
+
+Every non-read lock acquisition also checks `integration_operations` in the same immediate SQLite transaction. Any unresolved or quarantined integration blocks writers until fenced recovery reaches `committed`, `rolled_back`, or `recovered_noop`; a process-local cache is only an optimization. Queue heartbeats scan only databases with locally owned active records, and maintenance processes one known database per interval so historical project databases do not accumulate in one synchronous heartbeat pause.
 
 ## 13. Orchestrator Modes
 
@@ -450,6 +456,9 @@ CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT=2
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY=opencode-default-account
 CODEX_OPENCODE_QUEUE_HEARTBEAT_MS=15000
 CODEX_OPENCODE_QUEUE_LEASE_MS=60000
+CODEX_OPENCODE_QUEUE_RETENTION_DAYS=30
+CODEX_OPENCODE_AUDIT_RETENTION_DAYS=90
+CODEX_OPENCODE_CALLER_MODEL=trusted_stdio
 CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS=1200000
 CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST=git
 CODEX_OPENCODE_TRUSTED_POLICY_ROOT=C:\\absolute\\reviewed-repository
@@ -497,6 +506,22 @@ Check syntax and self-tests:
 ```powershell
 npm test
 ```
+
+For the deterministic local assurance gate, including the dependency advisory database, run:
+
+```powershell
+npm run test:assurance
+```
+
+The standard test suite includes malformed-MCP-frame and invalid-tool-argument resilience, crash/restart lock recovery, and SQLite integrity/foreign-key assertions. The concurrency suite repeats SQLite integrity assertions after its multi-process workload.
+
+Audit an operator state directory without changing it:
+
+```powershell
+npm run audit:state
+```
+
+The state audit opens only the top-level bridge databases and direct `projects/*.sqlite` records in read-only mode. It reports corruption, foreign-key violations, and owner-expired active jobs or pipelines; `npm run audit:state -- --strict` treats the latter operational warnings as a failing result.
 
 The standard test command must also pass from a published release with both hashes, `XDG_CONFIG_HOME` at the release root, pure mode, and immutable release-local agent/skill/plugin-manifest paths. Build a new non-overwriting snapshot with `npm run release:build -- <absolute-new-directory>`. Then follow [docs/SAFE_PUBLISH_MANIFEST.md](docs/SAFE_PUBLISH_MANIFEST.md): complete the mandatory live/concurrency/audit matrix; validate the exact candidate TOML; run pinned tests and fresh health; apply and verify read/execute-only release ACLs; atomically replace only Codex config; run active fresh health; and atomically restore the old config on failure. No global OpenCode tree is staged or replaced. Effective managed skill names and canonical origins come from OpenCode `debug skill`, while complete effective tree hashes must match release-pinned sources immediately before affected roles spawn. OpenCode JSON mode is parsed into a bounded final response plus tool outcomes; tool-only exit 0, hard quota, authentication, and billing failures are terminal errors rather than successful or generic timeout results.
 

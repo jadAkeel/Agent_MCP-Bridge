@@ -8,7 +8,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PROCESS_SUPERVISOR_PATH = path.join(BRIDGE_RUNTIME_DIR, "bin", "process-supervisor.js");
 const USER_HOME_DIR = homedir();
 const DEFAULT_OPENCODE_CONFIG_DIR = process.env.XDG_CONFIG_HOME
   ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
@@ -119,6 +120,10 @@ const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
 const GLOBAL_BRIDGE_STATE_DIR = path.resolve(
   String(process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
 );
+const DISABLED_GIT_HOOKS_PATH = path.join(
+  GLOBAL_BRIDGE_STATE_DIR,
+  `git-hooks-disabled-${process.pid}-${randomBytes(8).toString("hex")}`
+);
 const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
 const CONFIG = Object.freeze({
@@ -146,7 +151,7 @@ const CONFIG = Object.freeze({
   worktreeRoot: String(process.env.CODEX_OPENCODE_WORKTREE_ROOT || "global").trim() || "global",
   worktreeCleanup: readChoiceEnv("CODEX_OPENCODE_WORKTREE_CLEANUP", ["always", "on_success", "never"], "never"),
   worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
-  queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "memory"),
+  queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
   queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
@@ -155,9 +160,18 @@ const CONFIG = Object.freeze({
   queueWriteRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_WRITE_RETRIES", 0),
   queueHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_HEARTBEAT_MS", 1000 * 15),
   queueLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_LEASE_MS", 1000 * 60),
-  queueRetentionDays: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_RETENTION_DAYS", 0),
+  queueRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_QUEUE_RETENTION_DAYS", 30),
+  auditRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_AUDIT_RETENTION_DAYS", 90),
+  stateDbMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_STATE_DB_MAX_BYTES", 1024 * 1024 * 1024 * 2),
+  terminalJobMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_JOB_MAX_ROWS", 50000),
+  terminalPipelineMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_PIPELINE_MAX_ROWS", 10000),
+  terminalIntegrationMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_INTEGRATION_MAX_ROWS", 10000),
+  retainedWorktreeMaxCount: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_COUNT", 64),
+  retainedWorktreeMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_BYTES", 1024 * 1024 * 1024 * 20),
   queueResultMaxChars: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS", 8000),
   integrationPreviewMaxChars: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS", 12000),
+  integrationPreviewGlobalMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_GLOBAL_MAX", 256),
+  integrationPreviewProjectMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_PROJECT_MAX", 64),
   allowExternalPlugins: readChoiceEnv("CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS", ["false", "true"], "false") === "true",
   externalPluginAllowlist: readCsvEnv("CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST"),
   externalPluginManifestPath: String(process.env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || "").trim(),
@@ -176,7 +190,10 @@ const CONFIG = Object.freeze({
   sanitizedMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_BYTES", 1024 * 1024 * 1024),
   policyMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_POLICY_MAX_BYTES", 1024 * 128),
   contractorAuthorizationSha256: String(process.env.CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 || "").trim().toLowerCase(),
+  callerModel: readChoiceEnv("CODEX_OPENCODE_CALLER_MODEL", ["trusted_stdio"], "trusted_stdio"),
 });
+assertSupportedQueueRetryConfig(CONFIG);
+assertSupportedCallerModel();
 const SERIAL_ONLY_PATHS = Object.freeze([
   "package.json",
   "package-lock.json",
@@ -254,10 +271,19 @@ const QUEUE_CAPABILITY_KEY = randomBytes(32);
 const INTEGRATION_PREVIEW_KEY = randomBytes(32);
 const INTEGRATION_PREVIEWS = new Map();
 const KNOWN_STATE_DB_PATHS = new Set();
+const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new Set();
+const PRIVATE_STATE_VACUUMED_DB_PATHS = new Set();
 const INTEGRATION_PREVIEW_TTL_MS = 1000 * 60 * 60;
+const REPOSITORY_SCOPE_LOCK_PATH = ".";
+const FILESYSTEM_CASE_MODE_CACHE = new Map();
 let queueSchedulerActive = false;
 let queueWakeTimer = null;
 let queueHeartbeatTimer = null;
+let integrationPreviewSweepTimer = null;
+let stateMaintenanceTimer = null;
+let stateMaintenanceCursor = 0;
+let deferredRecoveryTimer = null;
+let deferredRecoveryRunning = false;
 const QUEUE_REQUEST_KEY_PROMISES = new Map();
 let stateDirectoryOverride = "";
 let queueModeOverride = "";
@@ -272,6 +298,8 @@ function effectiveQueueWriteConflictPolicy() {
 }
 let selfTestContractorAuthorizationSha256 = "";
 let pipelinePersistenceTestHook = null;
+let queueCancellationTestHook = null;
+let worktreeCleanupTestHook = null;
 
 const server = new McpServer({
   name: "codex-opencode-bridge",
@@ -367,6 +395,29 @@ function readPositiveIntEnv(name, fallback) {
 function readNonNegativeIntEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function readStrictPositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
+  const value = Number(raw);
+  if (Number.isInteger(value) && value > 0) return value;
+  throw new Error(`${name} must be a positive integer; zero disables required state-retention bounds.`);
+}
+
+function assertSupportedQueueRetryConfig(config) {
+  if (Number(config?.queueReadOnlyRetries || 0) === 0 && Number(config?.queueWriteRetries || 0) === 0) return;
+  throw new Error(
+    "CODEX_OPENCODE_QUEUE_READONLY_RETRIES and CODEX_OPENCODE_QUEUE_WRITE_RETRIES are unsupported and must remain 0; bounded provider retries are managed inside read-only execution."
+  );
+}
+
+function assertSupportedCallerModel() {
+  const configured = String(process.env.CODEX_OPENCODE_CALLER_MODEL || "trusted_stdio").trim().toLowerCase();
+  if (configured === "trusted_stdio") return;
+  throw new Error(
+    "CODEX_OPENCODE_CALLER_MODEL only supports trusted_stdio. Shared or multiplexed callers require an external per-project capability/authentication boundary and are rejected by this bridge."
+  );
 }
 
 function readCsvEnv(name, fallback = []) {
@@ -630,6 +681,105 @@ function buildValidationEnv(extra = {}) {
   return env;
 }
 
+const TRUSTED_GIT_EXTRA_ENV_KEYS = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_WORK_TREE",
+]);
+
+function isGitExecutable(command) {
+  const executable = path.basename(String(command || "")).toLowerCase();
+  return executable === "git" || executable === "git.exe";
+}
+
+function buildTrustedGitEnv(extra = null) {
+  const env = buildValidationEnv();
+  for (const key of TRUSTED_GIT_EXTRA_ENV_KEYS) {
+    if (extra && extra[key] !== undefined) env[key] = extra[key];
+  }
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.GCM_INTERACTIVE = "Never";
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
+  env.GIT_CONFIG_COUNT = "5";
+  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+  env.GIT_CONFIG_VALUE_0 = DISABLED_GIT_HOOKS_PATH;
+  env.GIT_CONFIG_KEY_1 = "core.fsmonitor";
+  env.GIT_CONFIG_VALUE_1 = "false";
+  env.GIT_CONFIG_KEY_2 = "core.untrackedCache";
+  env.GIT_CONFIG_VALUE_2 = "false";
+  env.GIT_CONFIG_KEY_3 = "credential.helper";
+  env.GIT_CONFIG_VALUE_3 = "";
+  env.GIT_CONFIG_KEY_4 = "diff.external";
+  env.GIT_CONFIG_VALUE_4 = "";
+  return env;
+}
+
+function trustedGitArgs(args = []) {
+  const trusted = [...args];
+  let subcommandIndex = 0;
+  const pairedGlobalOptions = new Set(["-c", "-C", "--config-env", "--exec-path", "--git-dir", "--namespace", "--super-prefix", "--work-tree"]);
+  while (subcommandIndex < trusted.length) {
+    const argument = trusted[subcommandIndex];
+    if (pairedGlobalOptions.has(argument)) {
+      subcommandIndex += 2;
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      subcommandIndex += 1;
+      continue;
+    }
+    break;
+  }
+  if (subcommandIndex >= trusted.length) return trusted;
+  const enforcedConfig = [
+    "-c", `core.hooksPath=${DISABLED_GIT_HOOKS_PATH}`,
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+    "-c", "credential.helper=",
+    "-c", "diff.external=",
+  ];
+  trusted.splice(subcommandIndex, 0, ...enforcedConfig);
+  const actualSubcommandIndex = subcommandIndex + enforcedConfig.length;
+  if (trusted[actualSubcommandIndex] === "diff") {
+    if (!trusted.includes("--no-ext-diff")) trusted.splice(actualSubcommandIndex + 1, 0, "--no-ext-diff");
+    if (!trusted.includes("--no-textconv")) trusted.splice(actualSubcommandIndex + 1, 0, "--no-textconv");
+  }
+  return trusted;
+}
+
+async function inspectRepositoryGitControlSurface(cwd) {
+  const listed = await runCommand("git", ["config", "--local", "--name-only", "--list"], cwd, 1000 * 15);
+  if (listed.exitCode !== 0) {
+    return {
+      ok: false,
+      errorType: "git_repository_config_unreadable",
+      error: listed.stderr || listed.stdout || "Could not inspect repository-local Git configuration.",
+      unsafeKeys: [],
+    };
+  }
+  const unsafePattern = /^(?:filter\..*|diff\..*\.(?:command|textconv)|merge\..*\.driver|core\.(?:attributesfile|sshcommand)|credential\..*|http\..*\.extraheader|url\..*\.insteadof|include(?:if)?\..*)$/i;
+  const unsafeKeys = [...new Set(
+    String(listed.stdout || "")
+      .split(/\r?\n/)
+      .map((key) => key.trim())
+      .filter((key) => unsafePattern.test(key))
+  )].sort();
+  return unsafeKeys.length
+    ? {
+        ok: false,
+        errorType: "git_repository_config_unsafe",
+        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${unsafeKeys.join(", ")}.`,
+        unsafeKeys,
+      }
+    : { ok: true, errorType: null, error: "", unsafeKeys: [] };
+}
+
 function redactSensitiveText(value) {
   let text = String(value || "");
   const replacements = [
@@ -704,6 +854,11 @@ function sanitizeLogValue(value, depth = 0) {
       if (/prompt|stdout|stderr|env|token|secret|password|api[-_]?key/i.test(key)) {
         continue;
       }
+      if (/^(?:error|detail|reason|message)$/i.test(key) && typeof childValue === "string") {
+        safe[`${key}Sha256`] = createHash("sha256").update(childValue).digest("hex");
+        safe[`${key}Chars`] = childValue.length;
+        continue;
+      }
       safe[key] = sanitizeLogValue(childValue, depth + 1);
     }
     return safe;
@@ -729,12 +884,13 @@ function logEvent(level, event, data = {}) {
 
 async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null } = {}) {
   try {
-    const result = await execFileAsync(command, args, {
+    const gitCommand = isGitExecutable(command);
+    const result = await execFileAsync(command, gitCommand ? trustedGitArgs(args) : args, {
       cwd: cwd || process.cwd(),
       shell: false,
       timeout: timeoutMs,
       maxBuffer: 1024 * 1024 * 30,
-      env: env === null ? process.env : env,
+      env: gitCommand ? buildTrustedGitEnv(env) : (env === null ? process.env : env),
       ...(signal ? { signal } : {}),
     });
 
@@ -752,7 +908,12 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
   }
 }
 
-async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null, terminateOnProviderError = false, onSpawn = null } = {}) {
+async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, {
+  signal = null,
+  terminateOnProviderError = false,
+  onSpawn = null,
+  beforeHeartbeat = null,
+} = {}) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -761,52 +922,63 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let stdoutChars = 0;
     let stderrChars = 0;
     let stdoutLineBuffer = "";
+    let controlLineBuffer = "";
     const stdoutHash = createHash("sha256");
     const stderrHash = createHash("sha256");
     let stdoutTruncated = false;
     let stderrTruncated = false;
+    let settled = false;
+    let supervisorReady = false;
+    let identityPersisted = typeof onSpawn !== "function";
+    let launchSent = false;
+    let terminationRequested = false;
+    let terminationReason = "";
     let timedOut = false;
     let cancelled = false;
+    let cancellationErrorType = "";
     let providerTerminated = false;
-    let settled = false;
-    let timer = null;
-    let killGraceTimer = null;
+    let startupTimer = null;
+    let heartbeatTimer = null;
+    let terminationFallbackTimer = null;
+    let controlExitEvent = null;
+    let controlTerminationUnconfirmed = false;
+    let controlProtocolCompromised = false;
+    let gateFailureType = "";
+    let launchAuthorityDeadlineAt = 0;
+    let heartbeatInFlight = false;
+    const supervisorIdentity = randomBytes(32).toString("hex");
+    const supervisorStartedAt = new Date().toISOString();
+    const supervisorStartedAtMs = nowMs();
+    const supervisorWatchdogMs = Math.max(
+      100,
+      Math.min(45_000, Math.floor(CONFIG.queueLeaseMs * 0.75), Math.floor(CONFIG.providerLeaseMs * 0.75))
+    );
+    const supervisorHeartbeatMs = Math.max(50, Math.min(5_000, Math.floor(supervisorWatchdogMs / 3)));
 
-    const child = spawn(command, args, {
-      cwd: cwd || process.cwd(),
+    const supervisor = spawn(process.execPath, [PROCESS_SUPERVISOR_PATH, "--identity", supervisorIdentity], {
+      cwd: BRIDGE_RUNTIME_DIR,
       shell: false,
       windowsHide: true,
-      env: env === null ? process.env : env,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: process.platform !== "win32",
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      detached: false,
     });
-    const childStartedAtMs = child.pid ? nowMs() : 0;
-    if (typeof onSpawn === "function") {
-      Promise.resolve(onSpawn({ pid: child.pid || 0, startedAt: new Date().toISOString() })).catch((error) => {
-        logEvent("warn", "opencode.child_pid_persist_failed", { error: error.message || String(error) });
-      });
-    }
 
-    const abortHandler = () => {
-      if (settled || cancelled) {
-        return;
-      }
-      cancelled = true;
-      terminate("cancelled");
+    const clearTimers = () => {
+      if (startupTimer) clearTimeout(startupTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (terminationFallbackTimer) clearTimeout(terminationFallbackTimer);
+      startupTimer = null;
+      heartbeatTimer = null;
+      terminationFallbackTimer = null;
     };
 
     const finish = (result) => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      if (killGraceTimer) {
-        clearTimeout(killGraceTimer);
-      }
+      clearTimers();
       signal?.removeEventListener("abort", abortHandler);
+      try { supervisor.stdin.end(); } catch { /* The result is already authoritative. */ }
       if (stdoutTruncated) {
         result.stdout = `${result.stdout.slice(0, Math.floor(CONFIG.maxProcessOutputChars / 2))}\n... [stdout truncated by bridge; terminal tail preserved] ...\n${stdoutTail}`;
       }
@@ -817,79 +989,233 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       result.stderrChars = stderrChars;
       result.stdoutSha256 = stdoutHash.digest("hex");
       result.stderrSha256 = stderrHash.digest("hex");
-      result.childStartedAtMs = childStartedAtMs;
-      result.childFinishedAtMs = childStartedAtMs ? nowMs() : 0;
+      result.supervisorProcessId = Number(supervisor.pid || 0);
+      result.supervisorIdentity = supervisorIdentity;
+      result.childStartedAtMs = Date.parse(controlExitEvent?.payloadStartedAt || "") || supervisorStartedAtMs;
+      result.childFinishedAtMs = nowMs();
       resolve(result);
     };
 
-    const terminationResult = () => finish({
-      stdout,
-      stderr,
-      exitCode: cancelled ? 130 : timedOut ? 124 : 1,
-      timedOut,
-      cancelled,
-      providerTerminated,
-      stdoutTruncated,
-      stderrTruncated,
-    });
-
-    const terminate = (reason) => {
-      if (reason === "timeout") {
-        timedOut = true;
-      } else if (reason === "provider_error") {
-        providerTerminated = true;
-      }
-      if (process.platform === "win32" && child.pid) {
-        const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-          shell: false,
-          windowsHide: true,
-          stdio: "ignore",
-        });
-        killer.on("error", () => {
-          child.kill();
-          terminationResult();
-        });
-        killer.on("close", terminationResult);
-        killGraceTimer = setTimeout(() => {
-          child.kill();
-          terminationResult();
-        }, 1000 * 10);
-        return;
-      }
-
+    const sendControl = (message) => {
+      if (settled || supervisor.stdin.destroyed || !supervisor.stdin.writable) return false;
       try {
-        if (child.pid) process.kill(-child.pid, "SIGTERM");
-        else child.kill("SIGTERM");
+        supervisor.stdin.write(`${JSON.stringify(message)}\n`);
+        return true;
       } catch {
-        child.kill("SIGTERM");
+        return false;
       }
-      killGraceTimer = setTimeout(() => {
-        try {
-          if (child.pid) process.kill(-child.pid, "SIGKILL");
-          else child.kill("SIGKILL");
-        } catch {
-          child.kill("SIGKILL");
-        }
-        terminationResult();
-      }, 1000 * 5);
     };
 
-    timer = setTimeout(() => terminate("timeout"), timeoutMs);
-    signal?.addEventListener("abort", abortHandler, { once: true });
-    if (signal?.aborted) {
-      abortHandler();
-    }
+    const finishInfrastructureFailure = (errorType, detail = "The process supervisor failed before returning a verified payload result.") => {
+      finish({
+        stdout,
+        stderr: [stderr, detail].filter(Boolean).join("\n"),
+        exitCode: errorType,
+        timedOut,
+        cancelled,
+        cancellationErrorType,
+        providerTerminated,
+        treeTerminationConfirmed: false,
+        terminationErrorType: errorType,
+        containmentGuarantee: "supervisor_unavailable",
+        stdoutTruncated,
+        stderrTruncated,
+      });
+    };
 
-    child.stdin.end();
-    child.stdout.on("data", (chunk) => {
+    const requestTermination = (reason) => {
+      if (settled || terminationRequested) return;
+      terminationRequested = true;
+      terminationReason = reason;
+      if (reason === "timeout") timedOut = true;
+      if (reason === "provider_error") providerTerminated = true;
+      if (!launchSent) {
+        try { supervisor.stdin.end(); } catch { /* Close is the pre-launch cancellation signal. */ }
+      } else if (!sendControl({ type: "terminate", reason })) {
+        try { supervisor.stdin.end(); } catch { /* Pipe closure asks the supervisor to contain the payload. */ }
+      }
+      terminationFallbackTimer = setTimeout(() => {
+        try { supervisor.kill("SIGKILL"); } catch { /* The explicit unconfirmed result below remains authoritative. */ }
+        finishInfrastructureFailure(
+          "process_tree_termination_unconfirmed",
+          "The process supervisor did not confirm containment termination before the bounded deadline."
+        );
+      }, 15_000);
+      terminationFallbackTimer.unref?.();
+    };
+
+    const abortHandler = () => {
+      if (settled || cancelled) return;
+      cancelled = true;
+      cancellationErrorType = abortSignalErrorType(signal);
+      requestTermination("cancelled");
+    };
+
+    const maybeLaunch = () => {
+      if (settled || launchSent || terminationRequested || gateFailureType || !supervisorReady || !identityPersisted) return;
+      const watchdogDeadlineAt = Math.min(
+        Date.now() + supervisorWatchdogMs,
+        launchAuthorityDeadlineAt > 0 ? launchAuthorityDeadlineAt : Number.POSITIVE_INFINITY
+      );
+      if (!Number.isFinite(watchdogDeadlineAt) || watchdogDeadlineAt <= Date.now()) {
+        gateFailureType = "durable_launch_authority_expired";
+        requestTermination("launch_gate_expired");
+        return;
+      }
+      launchSent = sendControl({
+        type: "launch",
+        command,
+        args,
+        cwd: cwd || process.cwd(),
+        env: env === null ? process.env : env,
+        timeoutMs,
+        watchdogMs: supervisorWatchdogMs,
+        watchdogDeadlineAt,
+        killGraceMs: 5_000,
+        terminationConfirmMs: 5_000,
+      });
+      if (!launchSent) {
+        finishInfrastructureFailure("process_supervisor_control_failed");
+        return;
+      }
+      if (startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = null;
+      }
+      heartbeatTimer = setInterval(() => {
+        if (heartbeatInFlight || settled || terminationRequested) return;
+        heartbeatInFlight = true;
+        Promise.resolve().then(async () => {
+          const proof = typeof beforeHeartbeat === "function"
+            ? await beforeHeartbeat()
+            : { ok: true, deadlineAt: Date.now() + supervisorWatchdogMs };
+          const provenDeadlineAt = Number(proof?.deadlineAt || Date.now() + supervisorWatchdogMs);
+          const deadlineAt = Math.min(
+            Date.now() + supervisorWatchdogMs,
+            provenDeadlineAt
+          );
+          if (proof === false || proof?.ok === false || !Number.isFinite(deadlineAt) || deadlineAt <= Date.now()) {
+            requestTermination("durable_lease_renewal_failed");
+            return;
+          }
+          if (!sendControl({ type: "heartbeat", deadlineAt })) requestTermination("control_channel_failed");
+        }).catch(() => {
+          requestTermination("durable_lease_renewal_failed");
+        }).finally(() => {
+          heartbeatInFlight = false;
+        });
+      }, supervisorHeartbeatMs);
+      heartbeatTimer.unref?.();
+    };
+
+    const finishFromControlExit = (event) => {
+      controlExitEvent = event;
+      if (gateFailureType) {
+        finishInfrastructureFailure(
+          gateFailureType,
+          "The payload was not launched because its supervisor identity could not be persisted durably."
+        );
+        return;
+      }
+      const reason = String(event.reason || terminationReason || "payload_closed");
+      timedOut ||= reason === "timeout";
+      const watchdogExpired = reason === "watchdog_expired";
+      const terminationUnconfirmed = controlTerminationUnconfirmed || event.errorType === "termination_unconfirmed";
+      const terminationErrorType = terminationUnconfirmed
+        ? "process_tree_termination_unconfirmed"
+        : watchdogExpired
+          ? "process_supervisor_watchdog_expired"
+          : "";
+      const verifiedTermination = Boolean(event.treeTerminationConfirmed);
+      const exitCode = cancelled
+        ? 130
+        : timedOut
+          ? 124
+          : providerTerminated
+            ? 1
+            : Number.isInteger(event.payloadExitCode)
+              ? event.payloadExitCode
+              : Number.isInteger(event.supervisorExitCode)
+                ? event.supervisorExitCode
+                : 1;
+      finish({
+        stdout,
+        stderr,
+        exitCode,
+        timedOut,
+        cancelled,
+        cancellationErrorType,
+        providerTerminated,
+        directChildClosed: Boolean(event.payloadExitCode !== null || event.payloadSignal),
+        treeTerminationConfirmed: verifiedTermination,
+        terminationErrorType,
+        containmentGuarantee: event.containmentGuarantee || "process_supervisor",
+        terminationBestEffortSucceeded: Boolean(event.terminationBestEffortSucceeded),
+        stdoutTruncated,
+        stderrTruncated,
+      });
+    };
+
+    const handleControlEvent = (event) => {
+      if (settled || !event || typeof event !== "object") return;
+      if (String(event.supervisorIdentity || "").toLowerCase() !== supervisorIdentity) {
+        gateFailureType = "process_supervisor_identity_mismatch";
+        requestTermination("protocol_error");
+        return;
+      }
+      if (event.type === "ready") {
+        if (Number(event.protocolVersion) !== 1 || Number(event.supervisorPid) !== Number(supervisor.pid || 0)) {
+          gateFailureType = "process_supervisor_identity_mismatch";
+          requestTermination("protocol_error");
+          return;
+        }
+        supervisorReady = true;
+        maybeLaunch();
+        return;
+      }
+      if (event.type === "termination_unconfirmed") {
+        controlTerminationUnconfirmed = true;
+        return;
+      }
+      if (event.type === "protocol_error") {
+        if (!gateFailureType) gateFailureType = "process_supervisor_protocol_error";
+        return;
+      }
+      if (event.type === "exit") finishFromControlExit(event);
+    };
+
+    supervisor.stdio[3].setEncoding("utf8");
+    supervisor.stdio[3].on("data", (chunk) => {
+      if (settled || controlProtocolCompromised) return;
+      controlLineBuffer += chunk;
+      if (controlLineBuffer.length > 1024 * 1024) {
+        controlLineBuffer = "";
+        controlProtocolCompromised = true;
+        gateFailureType = "process_supervisor_protocol_error";
+        requestTermination("protocol_error");
+        return;
+      }
+      const lines = controlLineBuffer.split(/\r?\n/);
+      controlLineBuffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          handleControlEvent(JSON.parse(line));
+        } catch {
+          gateFailureType = "process_supervisor_protocol_error";
+          requestTermination("protocol_error");
+        }
+      }
+    });
+
+    supervisor.stdout.on("data", (chunk) => {
+      if (settled) return;
       const text = chunk.toString();
       stdoutChars += text.length;
       stdoutHash.update(chunk);
       stdoutTail = `${stdoutTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stdout.length);
-      if (remaining) {
-        stdout += text.slice(0, remaining);
-      }
+      if (remaining) stdout += text.slice(0, remaining);
       stdoutTruncated ||= text.length > remaining;
       stdoutLineBuffer += text;
       if (stdoutLineBuffer.length > CONFIG.maxProcessOutputChars) {
@@ -905,7 +1231,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
             if (event?.type !== "error" && event?.type !== "session.error" && !event?.error && !event?.data?.error && !event?.properties?.error) continue;
             const type = providerErrorTypeFromStructuredEvent(event);
             if (["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(type)) {
-              terminate("provider_error");
+              requestTermination("provider_error");
               break;
             }
           } catch {
@@ -914,15 +1240,15 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         }
       }
     });
-    child.stderr.on("data", (chunk) => {
+
+    supervisor.stderr.on("data", (chunk) => {
+      if (settled) return;
       const text = chunk.toString();
       stderrChars += text.length;
       stderrHash.update(chunk);
       stderrTail = `${stderrTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stderr.length);
-      if (remaining) {
-        stderr += text.slice(0, remaining);
-      }
+      if (remaining) stderr += text.slice(0, remaining);
       stderrTruncated ||= text.length > remaining;
       const recentErrorLines = text.split(/\r?\n/)
         .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
@@ -930,32 +1256,56 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         .slice(-20)
         .join("\n");
       if (terminateOnProviderError && !providerTerminated && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
-        terminate("provider_error");
+        requestTermination("provider_error");
       }
     });
-    child.on("error", (error) => {
-      finish({
-        stdout,
-        stderr: [stderr, String(error)].filter(Boolean).join("\n"),
-        exitCode: error.code || 1,
-        cancelled,
-        providerTerminated,
-        stdoutTruncated,
-        stderrTruncated,
-      });
+
+    supervisor.once("error", () => {
+      finishInfrastructureFailure("process_supervisor_spawn_failed", "The bridge could not start its process supervisor.");
     });
-    child.on("close", (code, signal) => {
-      finish({
-        stdout,
-        stderr,
-        exitCode: cancelled ? 130 : timedOut ? 124 : providerTerminated ? 1 : code ?? signal ?? 1,
-        timedOut,
-        cancelled,
-        providerTerminated,
-        stdoutTruncated,
-        stderrTruncated,
-      });
+    supervisor.stdin.on("error", () => {
+      if (!settled) requestTermination("control_channel_failed");
     });
+    supervisor.once("close", () => {
+      if (settled) return;
+      if (controlExitEvent) finishFromControlExit(controlExitEvent);
+      else finishInfrastructureFailure(
+        gateFailureType || "process_supervisor_exited_without_result",
+        launchSent
+          ? "The process supervisor exited without a verified payload result."
+          : "The process supervisor exited before the payload launch gate opened."
+      );
+    });
+
+    startupTimer = setTimeout(() => {
+      if (settled || launchSent) return;
+      gateFailureType = "child_identity_persistence_failed";
+      requestTermination("launch_gate_timeout");
+    }, 15_000);
+    startupTimer.unref?.();
+
+    if (typeof onSpawn === "function") {
+      Promise.resolve().then(() => onSpawn({
+        pid: Number(supervisor.pid || 0),
+        startedAt: supervisorStartedAt,
+        processRole: "supervisor",
+        containmentIdentity: supervisorIdentity,
+      })).then((authority) => {
+        launchAuthorityDeadlineAt = Number(authority?.deadlineAt || Date.now() + supervisorWatchdogMs);
+        identityPersisted = true;
+        maybeLaunch();
+      }).catch((error) => {
+        gateFailureType = "child_identity_persistence_failed";
+        logEvent("warn", "opencode.supervisor_identity_persist_failed", {
+          errorSha256: createHash("sha256").update(error?.message || String(error)).digest("hex"),
+        });
+        requestTermination("launch_gate_rejected");
+      });
+    }
+
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    if (signal?.aborted) abortHandler();
+    maybeLaunch();
   });
 }
 
@@ -1378,7 +1728,14 @@ function delayWithSignal(delayMs, signal = null) {
 
 async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal = null } = {}) {
   const dbPath = path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite");
-  await mkdir(path.dirname(dbPath), { recursive: true });
+  await mkdir(path.dirname(dbPath), { recursive: true, mode: 0o700 });
+  await assertNoLinkedPath(path.dirname(dbPath), "Provider concurrency state directory");
+  if (existsSync(dbPath)) {
+    const details = await lstat(dbPath);
+    if (details.isSymbolicLink() || !details.isFile()) {
+      throw new Error("Provider concurrency database must be a regular file, not a link or special entry.");
+    }
+  }
   for (let attempt = 0; attempt < 8; attempt += 1) {
     if (signal?.aborted) {
       const error = new Error("Cancelled while opening the provider concurrency database.");
@@ -1394,6 +1751,10 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
     let db = null;
     try {
       db = new DatabaseSync(dbPath);
+      const openedDetails = await lstat(dbPath);
+      if (openedDetails.isSymbolicLink() || !openedDetails.isFile()) {
+        throw new Error("Provider concurrency database identity changed during open.");
+      }
       db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, remainingMs))};`);
       db.exec("PRAGMA journal_mode = WAL;");
       db.exec("PRAGMA synchronous = FULL;");
@@ -1505,32 +1866,91 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   return { ok: false, errorType: "provider_concurrency_timeout", error: "Timed out waiting for the operator-configured provider/account concurrency limit." };
 }
 
-function startProviderLeaseHeartbeat(lease) {
-  if (!lease?.id) return () => {};
-  const intervalMs = Math.max(1000, Math.min(CONFIG.providerHeartbeatMs, Math.floor(CONFIG.providerLeaseMs / 3)));
-  const timer = setInterval(async () => {
-    let db = null;
-    try {
-      db = await openProviderLeaseDb({ deadlineAt: Date.now() + Math.min(10000, intervalMs) });
-      const now = Date.now();
-      const expiresAt = now + CONFIG.providerLeaseMs;
-      const result = db.prepare(`
-        UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
-        WHERE lease_id = ? AND owner_instance_id = ?
-      `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID);
-      if (Number(result.changes || 0) === 1) {
+function providerLeaseOwnershipLossError(detail = "Durable provider-capacity ownership could not be renewed before expiry.") {
+  const error = new Error(detail);
+  error.errorType = "provider_lease_ownership_lost";
+  return error;
+}
+
+function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 0, refreshLease = null } = {}) {
+  const controller = new AbortController();
+  const inertStop = Object.assign(() => {}, { signal: controller.signal, pulse: async () => false });
+  if (!lease?.id) return inertStop;
+  const effectiveLeaseMs = Math.max(250, Number(CONFIG.providerLeaseMs) || 250);
+  const intervalMs = requestedIntervalMs > 0
+    ? Math.max(20, Math.min(requestedIntervalMs, Math.floor(effectiveLeaseMs / 2)))
+    : Math.max(1000, Math.min(CONFIG.providerHeartbeatMs, Math.floor(effectiveLeaseMs / 3)));
+  const expiryGuardMs = Math.max(20, Math.min(intervalMs, Math.floor(effectiveLeaseMs / 4)));
+  let lastConfirmedExpiresAt = Number(lease.expiresAt) || Date.now() + effectiveLeaseMs;
+  let fenceTimer = null;
+  let refreshPromise = null;
+  let stopped = false;
+
+  const loseOwnership = (detail) => {
+    if (stopped || controller.signal.aborted) return;
+    const error = providerLeaseOwnershipLossError(detail);
+    logEvent("error", "provider.lease_ownership_lost", { leaseId: lease.id, detail });
+    controller.abort(error);
+  };
+  const scheduleFence = () => {
+    if (fenceTimer) clearTimeout(fenceTimer);
+    fenceTimer = setTimeout(() => {
+      loseOwnership("The provider-capacity lease was not durably renewed before the fail-closed deadline.");
+    }, Math.max(0, lastConfirmedExpiresAt - Date.now() - expiryGuardMs));
+    fenceTimer.unref?.();
+  };
+  const pulse = async () => {
+    if (stopped || controller.signal.aborted) return false;
+    if (refreshPromise) return await refreshPromise;
+    refreshPromise = (async () => {
+      let db = null;
+      try {
+        const now = Date.now();
+        if (lastConfirmedExpiresAt <= now) {
+          loseOwnership("The provider-capacity lease expired before its heartbeat could run.");
+          return false;
+        }
+        const expiresAt = now + effectiveLeaseMs;
+        let renewed = false;
+        if (typeof refreshLease === "function") {
+          renewed = (await refreshLease({ lease, heartbeatAt: now, expiresAt })) !== false;
+        } else {
+          db = await openProviderLeaseDb({ deadlineAt: Date.now() + Math.min(10000, intervalMs) });
+          const result = db.prepare(`
+            UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
+            WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
+          `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID, now);
+          renewed = Number(result.changes || 0) === 1;
+        }
+        if (!renewed) {
+          loseOwnership("The durable provider-capacity lease no longer belongs to this execution.");
+          return false;
+        }
         lease.expiresAt = expiresAt;
-      } else {
-        logEvent("warn", "provider.lease_heartbeat_lost", { leaseId: lease.id });
+        lastConfirmedExpiresAt = expiresAt;
+        scheduleFence();
+        return true;
+      } catch (error) {
+        logEvent("warn", "provider.lease_heartbeat_failed", { leaseId: lease.id, error: error.message || String(error) });
+        return false;
+      } finally {
+        if (db) closeDb(db);
       }
-    } catch (error) {
-      logEvent("warn", "provider.lease_heartbeat_failed", { leaseId: lease.id, error: error.message || String(error) });
+    })();
+    try {
+      return await refreshPromise;
     } finally {
-      if (db) closeDb(db);
+      refreshPromise = null;
     }
-  }, intervalMs);
+  };
+  scheduleFence();
+  const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  return Object.assign(() => {
+    stopped = true;
+    clearInterval(timer);
+    if (fenceTimer) clearTimeout(fenceTimer);
+  }, { signal: controller.signal, pulse });
 }
 
 async function releaseProviderLease(lease) {
@@ -1541,6 +1961,28 @@ async function releaseProviderLease(lease) {
     db.prepare("DELETE FROM provider_leases WHERE lease_id = ? AND owner_instance_id = ?").run(lease.id, BRIDGE_INSTANCE_ID);
   } catch (error) {
     logEvent("warn", "provider.lease_release_failed", { leaseId: lease.id, error: error.message || String(error) });
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+async function quarantineProviderLease(lease) {
+  if (!lease?.id) return { ok: false };
+  let db = null;
+  try {
+    const now = Date.now();
+    db = await openProviderLeaseDb({ deadlineAt: now + 1000 * 30 });
+    const quarantined = db.prepare(`
+      UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
+      WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
+    `).run(now, Number.MAX_SAFE_INTEGER, lease.id, BRIDGE_INSTANCE_ID, now);
+    return { ok: Number(quarantined.changes || 0) === 1 };
+  } catch (error) {
+    logEvent("error", "provider.containment_quarantine_failed", {
+      leaseId: lease.id,
+      error: error.message || String(error),
+    });
+    return { ok: false };
   } finally {
     if (db) closeDb(db);
   }
@@ -3201,14 +3643,73 @@ function normalizeLockPath(value) {
     return "";
   }
 
-  return raw
+  const slashNormalized = raw
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
-    .replace(/^\.\//, "")
+    .replace(/^(?:\.\/)+/, "")
+    .replace(/\/\.(?=\/|$)/g, "")
+    .replace(/\/+/g, "/");
+  const normalized = slashNormalized
     .replace(/\/+$/, "")
     .replace(/\/\*\*$/, "")
     .replace(/\/\*$/, "")
     .replace(/\/+$/, "");
+  return normalized || (slashNormalized.startsWith("/") ? "/" : "");
+}
+
+function hasParentTraversalSegment(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .some((segment) => segment === "..");
+}
+
+function toggledAsciiCase(value) {
+  const input = String(value || "");
+  const index = input.search(/[A-Za-z]/);
+  if (index < 0) return "";
+  const character = input[index];
+  const toggled = character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase();
+  return `${input.slice(0, index)}${toggled}${input.slice(index + 1)}`;
+}
+
+function sameFilesystemObject(leftPath, rightPath) {
+  const left = lstatSync(leftPath, { bigint: true });
+  const right = lstatSync(rightPath, { bigint: true });
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function filesystemCaseModeForRoot(cwd = "") {
+  if (!cwd) return process.platform === "win32" ? "insensitive" : "sensitive";
+  const root = path.resolve(cwd);
+  const cached = FILESYSTEM_CASE_MODE_CACHE.get(root);
+  if (cached) return cached;
+
+  let mode = "conservative_insensitive";
+  try {
+    const realRoot = realpathSync(root);
+    const entries = readdirSync(realRoot);
+    const exactNames = new Set(entries);
+    for (const entry of entries) {
+      const toggled = toggledAsciiCase(entry);
+      if (!toggled || exactNames.has(toggled)) continue;
+      try {
+        mode = sameFilesystemObject(path.join(realRoot, entry), path.join(realRoot, toggled))
+          ? "insensitive"
+          : "sensitive";
+        break;
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          mode = "sensitive";
+          break;
+        }
+      }
+    }
+  } catch {
+    // Unknown filesystem semantics fail safely by folding case for lock identity.
+  }
+  FILESYSTEM_CASE_MODE_CACHE.set(root, mode);
+  return mode;
 }
 
 function realPathBoundaryReason(rawPath, cwd) {
@@ -3275,7 +3776,7 @@ function unsafePathReason(paths, cwd = "") {
       return `Unsafe path ${label} targets a filesystem root. Use a bounded file or directory.`;
     }
 
-    if (normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
+    if (hasParentTraversalSegment(raw) || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
       return `Unsafe path ${label} includes parent traversal.`;
     }
 
@@ -3301,14 +3802,19 @@ function normalizeLockPathList(values) {
 }
 
 function normalizeLockPathForCwd(value, cwd = "") {
+  const raw = String(value || "").trim();
   const normalized = normalizeLockPath(value);
-  if (!normalized || !cwd || !isAbsolutePathLike(normalized)) {
+  if (!normalized || !cwd) {
     return normalized;
   }
+  if (hasParentTraversalSegment(raw)) return normalized;
 
   const root = path.resolve(cwd);
-  const relative = path.relative(root, path.resolve(normalized));
-  return normalizeLockPath(relative || ".");
+  const resolved = isAbsolutePathLike(raw)
+    ? path.resolve(raw)
+    : path.resolve(root, normalized);
+  const relative = normalizeLockPath(path.relative(root, resolved) || REPOSITORY_SCOPE_LOCK_PATH);
+  return normalizeFilesystemCase(relative, root);
 }
 
 function normalizeLockPathListForCwd(values, cwd = "") {
@@ -3855,8 +4361,12 @@ function classifyResultError(result) {
     return null;
   }
 
+  if (result.terminationErrorType) {
+    return result.terminationErrorType;
+  }
+
   if (result.cancelled) {
-    return "agent_cancelled";
+    return result.cancellationErrorType || "agent_cancelled";
   }
 
   if (result.rawOutputTruncated || result.assistantResponseTruncated) {
@@ -3890,7 +4400,14 @@ function classifyResultError(result) {
   return null;
 }
 
-async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defaultWriteAgentTimeoutMs, { signal = null, agentMetadata = null, metadataPolicyOptions = {}, forcePure = false, onSpawn = null } = {}) {
+async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defaultWriteAgentTimeoutMs, {
+  signal = null,
+  agentMetadata = null,
+  metadataPolicyOptions = {},
+  forcePure = false,
+  onSpawn = null,
+  onSupervisorHeartbeat = null,
+} = {}) {
   const workDir = cwd || process.cwd();
   const started = nowMs();
   const metadataResult = agentMetadata || await readAgentDebugMetadata(agent, workDir, { forcePure });
@@ -3967,6 +4484,31 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
   const stopProviderLeaseHeartbeat = startProviderLeaseHeartbeat(providerLease.lease);
+  const providerExecutionSignal = combineAbortSignals([signal, stopProviderLeaseHeartbeat.signal]);
+  const persistSupervisorAuthority = async (spawnIdentity) => {
+    const outer = typeof onSpawn === "function" ? await onSpawn(spawnIdentity) : { ok: true };
+    return {
+      ok: outer?.ok !== false,
+      deadlineAt: Math.min(
+        Number(providerLease.lease.expiresAt || 0),
+        Number(outer?.deadlineAt || Number.POSITIVE_INFINITY)
+      ),
+    };
+  };
+  const renewSupervisorAuthority = async () => {
+    const providerRenewed = await stopProviderLeaseHeartbeat.pulse();
+    if (!providerRenewed) return { ok: false };
+    const outer = typeof onSupervisorHeartbeat === "function"
+      ? await onSupervisorHeartbeat()
+      : { ok: true, deadlineAt: Number.POSITIVE_INFINITY };
+    return {
+      ok: outer?.ok !== false,
+      deadlineAt: Math.min(
+        Number(providerLease.lease.expiresAt || 0),
+        Number(outer?.deadlineAt || Number.POSITIVE_INFINITY)
+      ),
+    };
+  };
 
   let remainingRunMs = timeoutMs - (nowMs() - started);
   if (remainingRunMs <= 0) {
@@ -4097,6 +4639,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   let result;
   let isolatedRuntimeCleanup = { ok: true, error: "" };
+  let containmentUnconfirmed = false;
   try {
     result = await runSpawnCommand(
       OPENCODE_EXE,
@@ -4104,12 +4647,27 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       workDir,
       remainingRunMs,
       isolatedRuntime?.env || buildOpenCodeEnv(),
-      { signal, terminateOnProviderError: true, onSpawn }
+      {
+        signal: providerExecutionSignal,
+        terminateOnProviderError: true,
+        onSpawn: persistSupervisorAuthority,
+        beforeHeartbeat: renewSupervisorAuthority,
+      }
     );
+    containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
   } finally {
     stopProviderLeaseHeartbeat();
-    await releaseProviderLease(providerLease.lease);
-    if (isolatedRuntime) isolatedRuntimeCleanup = await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root);
+    if (containmentUnconfirmed) {
+      const quarantined = await quarantineProviderLease(providerLease.lease);
+      if (!quarantined.ok) {
+        logEvent("error", "provider.containment_quarantine_unconfirmed", { leaseId: providerLease.lease.id });
+      }
+    } else {
+      await releaseProviderLease(providerLease.lease);
+    }
+    if (isolatedRuntime && !containmentUnconfirmed) {
+      isolatedRuntimeCleanup = await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root);
+    }
   }
   if (!isolatedRuntimeCleanup.ok) {
     result = {
@@ -4131,7 +4689,10 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     timeoutMs,
     timedOut: isTimeoutResult(result),
     cancelled: Boolean(result.cancelled),
+    cancellationErrorType: result.cancellationErrorType || "",
     providerTerminated: Boolean(result.providerTerminated),
+    treeTerminationConfirmed: result.treeTerminationConfirmed !== false,
+    terminationErrorType: result.terminationErrorType || "",
     openCodeFallbackDetected,
     openCodeApiErrorDetected: inspection.apiErrorDetected,
     providerErrorType: inspection.providerErrorType,
@@ -4200,7 +4761,12 @@ function readOnlyResultRetryable(result, agent = "", agentMetadata = null) {
   ].includes(result.providerErrorType || result.errorType || "");
 }
 
-async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, requestedTimeoutMs = null, { signal = null, agentMetadata = null, onSpawn = null } = {}) {
+async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, requestedTimeoutMs = null, {
+  signal = null,
+  agentMetadata = null,
+  onSpawn = null,
+  onSupervisorHeartbeat = null,
+} = {}) {
   const timeoutMs = timeoutForAgent(agent, lockPlan, requestedTimeoutMs);
   const forcePure = Boolean(lockPlan?.sanitizedWorkspace);
   const metadataPolicyOptions = {
@@ -4213,7 +4779,14 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   };
 
   if (lockPlan?.lockType !== "read") {
-    const result = await runOpenCode(agent, prompt, cwd, dryRun, timeoutMs, { signal, agentMetadata, metadataPolicyOptions, forcePure, onSpawn });
+    const result = await runOpenCode(agent, prompt, cwd, dryRun, timeoutMs, {
+      signal,
+      agentMetadata,
+      metadataPolicyOptions,
+      forcePure,
+      onSpawn,
+      onSupervisorHeartbeat,
+    });
     result.retryAttempt = 0;
     result.maxRetries = 0;
     logOpenCodeResult(agent, result, lockPlan);
@@ -4227,7 +4800,14 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     const elapsedMs = nowMs() - policyStarted;
     const remainingBudgetMs = CONFIG.readOnlyRetryMaxElapsedMs - elapsedMs;
     if (remainingBudgetMs <= 0) break;
-    lastResult = await runOpenCode(agent, prompt, cwd, dryRun, Math.min(timeoutMs, remainingBudgetMs), { signal, agentMetadata, metadataPolicyOptions, forcePure, onSpawn });
+    lastResult = await runOpenCode(agent, prompt, cwd, dryRun, Math.min(timeoutMs, remainingBudgetMs), {
+      signal,
+      agentMetadata,
+      metadataPolicyOptions,
+      forcePure,
+      onSpawn,
+      onSupervisorHeartbeat,
+    });
     childExecutionIntervals.push(...(lastResult.childExecutionIntervals || []));
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
     lastResult.retryAttempt = attempt;
@@ -4494,6 +5074,10 @@ async function fileFingerprint(cwd, file, { metadataOnly = false } = {}) {
   }
 }
 
+function durableFileMode(details) {
+  return process.platform === "win32" ? details.mode & 0o111 : details.mode & 0o7777;
+}
+
 async function exactIntegrationFileSnapshot(cwd, files) {
   const snapshot = new Map();
   let totalBytes = 0;
@@ -4522,7 +5106,7 @@ async function exactIntegrationFileSnapshot(cwd, files) {
         throw error;
       }
       const content = await readFile(absolute);
-      snapshot.set(file, `file:${details.mode & 0o111}:${createHash("sha256").update(content).digest("hex")}`);
+      snapshot.set(file, `file:${durableFileMode(details)}:${createHash("sha256").update(content).digest("hex")}`);
     } catch (error) {
       if (error?.code === "ENOENT") {
         snapshot.set(file, "missing");
@@ -4611,8 +5195,8 @@ async function integrationContentMismatches(cwd, expected, actual, files, { eolR
 function changedPathSetEvidence(expectedFiles, actualFiles) {
   const expected = normalizeLockPathList(expectedFiles);
   const actual = normalizeLockPathList(actualFiles);
-  const expectedKeys = new Set(expected.map(normalizeFilesystemCase));
-  const actualKeys = new Set(actual.map(normalizeFilesystemCase));
+  const expectedKeys = new Set(expected.map((file) => normalizeFilesystemCase(file)));
+  const actualKeys = new Set(actual.map((file) => normalizeFilesystemCase(file)));
   return {
     missingFiles: expected.filter((file) => !actualKeys.has(normalizeFilesystemCase(file))),
     unexpectedFiles: actual.filter((file) => !expectedKeys.has(normalizeFilesystemCase(file))),
@@ -4677,26 +5261,26 @@ function isAbsolutePathLike(value) {
   return /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\") || raw.startsWith("/");
 }
 
-function normalizeFilesystemCase(value) {
+function normalizeFilesystemCase(value, cwd = "") {
   const normalized = String(value || "");
+  if (cwd) {
+    return filesystemCaseModeForRoot(cwd) === "sensitive" ? normalized : normalized.toLowerCase();
+  }
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function comparePathCandidates(value, cwd = "") {
-  const raw = normalizeLockPath(value);
+  const raw = cwd ? normalizeLockPathForCwd(value, cwd) : normalizeLockPath(value);
   if (!raw) {
     return [];
   }
 
   const candidates = [raw];
-  if (cwd && !isAbsolutePathLike(raw)) {
-    candidates.push(path.resolve(cwd, raw));
-  }
 
   return [
     ...new Set(
       candidates.map((candidate) =>
-        normalizeFilesystemCase(candidate.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, ""))
+        normalizeFilesystemCase(candidate.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, ""), cwd)
       )
     ),
   ];
@@ -4729,7 +5313,7 @@ async function readFileIfExists(filePath) {
   try {
     const details = await lstat(filePath);
     if (details.isSymbolicLink() || !details.isFile()) return { exists: true, content: null, restorable: false };
-    return { exists: true, content: await readFile(filePath), mode: details.mode & 0o111, restorable: true };
+    return { exists: true, content: await readFile(filePath), mode: durableFileMode(details), restorable: true };
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     return { exists: false, content: null };
@@ -4810,8 +5394,12 @@ async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
     if (kind === "link") {
       await symlink(String(content), temporary, process.platform === "win32" ? "file" : undefined);
     } else {
-      await writeFile(temporary, content, { flag: "wx", mode: mode ? 0o755 : 0o644 });
-      await chmod(temporary, mode ? 0o755 : 0o644);
+      const recordedMode = Number.isInteger(Number(mode)) ? Number(mode) : 0o600;
+      const exactMode = process.platform === "win32"
+        ? (recordedMode & 0o111 ? 0o755 : 0o644)
+        : recordedMode & 0o7777;
+      await writeFile(temporary, content, { flag: "wx", mode: exactMode });
+      await chmod(temporary, exactMode);
     }
     await assertNoLinkedPath(parent, "Rollback parent");
     await rename(temporary, target);
@@ -4843,13 +5431,16 @@ async function restoreFromGitHead(cwd, file, baseCommit = "HEAD") {
       target,
       kind: gitMode === "120000" ? "link" : "file",
       content: gitMode === "120000" ? result.stdout.toString("utf8") : result.stdout,
-      mode: gitMode === "100755" ? 0o111 : 0,
+      mode: gitMode === "100755" ? 0o755 : 0o644,
     });
     if (!restored) return false;
     const actual = await exactIntegrationFileSnapshot(cwd || process.cwd(), [file]);
+    const restoredMode = process.platform === "win32"
+      ? durableFileMode(await lstat(target))
+      : gitMode === "100755" ? 0o755 : 0o644;
     const expected = gitMode === "120000"
       ? `link:${result.stdout.toString("utf8")}`
-      : `file:${gitMode === "100755" ? 0o111 : 0}:${createHash("sha256").update(result.stdout).digest("hex")}`;
+      : `file:${restoredMode}:${createHash("sha256").update(result.stdout).digest("hex")}`;
     return actual.get(normalizeLockPath(file)) === expected;
   } catch {
     return false;
@@ -4884,7 +5475,7 @@ async function rollbackUnsafeChanges({ cwd, baseline, files }) {
             continue;
           }
           await ensureParentDir(target);
-          if (!await replaceRollbackLeaf({ cwd: base, target, kind: "file", content: before.content, mode: before.mode || 0 })) {
+          if (!await replaceRollbackLeaf({ cwd: base, target, kind: "file", content: before.content, mode: before.mode ?? 0 })) {
             unresolvedFiles.push(file);
             continue;
           }
@@ -5064,7 +5655,8 @@ function safeNamePart(value, fallback = "item") {
 
 function projectStateKey(cwd) {
   const resolved = path.resolve(cwd || process.cwd());
-  const normalized = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  const canonical = existsSync(resolved) ? realpathSync(resolved) : resolved;
+  const normalized = normalizeFilesystemCase(canonical, canonical);
   return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
 }
 
@@ -5073,8 +5665,9 @@ function recordMatchesProject(record, projectRoot = "") {
     return true;
   }
 
-  return normalizeFilesystemCase(path.resolve(record?.cwd || process.cwd()))
-    === normalizeFilesystemCase(path.resolve(projectRoot));
+  const normalizedProjectRoot = path.resolve(projectRoot);
+  return normalizeFilesystemCase(path.resolve(record?.cwd || process.cwd()), normalizedProjectRoot)
+    === normalizeFilesystemCase(normalizedProjectRoot, normalizedProjectRoot);
 }
 
 function effectiveBridgeStateDirectory() {
@@ -5100,9 +5693,19 @@ async function queueRequestKey() {
   if (!QUEUE_REQUEST_KEY_PROMISES.has(keyPath)) {
     const promise = (async () => {
       await mkdir(path.dirname(keyPath), { recursive: true });
+      await assertNoLinkedPath(path.dirname(keyPath), "Queue state-key directory");
       try {
+        const details = await lstat(keyPath);
+        if (details.isSymbolicLink() || !details.isFile()) {
+          throw new Error("Queue request key must be a regular file, not a link or special entry.");
+        }
         const existing = await readFile(keyPath);
         if (existing.length !== 32) throw new Error("Queue request key must be exactly 32 bytes.");
+        if (process.platform !== "win32" && (details.mode & 0o077) !== 0) {
+          await chmod(keyPath, 0o600);
+          const tightened = await lstat(keyPath);
+          if ((tightened.mode & 0o077) !== 0) throw new Error("Queue request key permissions must be 0600.");
+        }
         return existing;
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
@@ -5114,6 +5717,11 @@ async function queueRequestKey() {
         return key;
       } catch (error) {
         if (error?.code !== "EEXIST") throw error;
+        await assertNoLinkedPath(keyPath, "Queue request key");
+        const details = await lstat(keyPath);
+        if (details.isSymbolicLink() || !details.isFile()) {
+          throw new Error("Queue request key must be a regular file, not a link or special entry.");
+        }
         const existing = await readFile(keyPath);
         if (existing.length !== 32) throw new Error("Queue request key must be exactly 32 bytes.");
         return existing;
@@ -5155,6 +5763,580 @@ async function decryptQueueRequest(envelope, jobId) {
     decipher.update(Buffer.from(parsed.ciphertext, "base64")),
     decipher.final(),
   ]).toString("utf8"));
+}
+
+function integrationJournalAad(operationId, file, kind) {
+  return `integration-journal\0${operationId}\0${kind}\0${file}`;
+}
+
+async function encryptIntegrationJournalBytes(value, aad) {
+  const key = await queueRequestKey();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(String(aad), "utf8"));
+  const plaintext = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return JSON.stringify({
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  });
+}
+
+async function decryptIntegrationJournalBytes(envelope, aad) {
+  const parsed = JSON.parse(String(envelope || ""));
+  if (parsed?.v !== 1 || parsed?.alg !== "aes-256-gcm") {
+    throw new Error("Unsupported integration journal envelope.");
+  }
+  const iv = Buffer.from(String(parsed.iv || ""), "base64");
+  const tag = Buffer.from(String(parsed.tag || ""), "base64");
+  const ciphertext = Buffer.from(String(parsed.ciphertext || ""), "base64");
+  if (iv.length !== 12 || tag.length !== 16 || ciphertext.length > CONFIG.maxSnapshotFileBytes + 1024) {
+    throw new Error("Invalid integration journal envelope bounds.");
+  }
+  const key = await queueRequestKey();
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAAD(Buffer.from(String(aad), "utf8"));
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function integrationJournalTargetPath(cwd, file) {
+  const base = path.resolve(cwd || process.cwd());
+  const target = path.resolve(base, file);
+  if (target === base || !isPathInside(base, target)) {
+    const error = new Error("Integration journal path escaped the repository root.");
+    error.errorType = "integration_journal_path_invalid";
+    throw error;
+  }
+  return target;
+}
+
+function integrationJournalFingerprintSha256(value) {
+  return createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+async function captureIntegrationJournalEvidence({ cwd, files, expectedPostSnapshot, operationId }) {
+  if (!(expectedPostSnapshot instanceof Map)) {
+    throw new Error("Integration journal requires an exact expected post-apply snapshot.");
+  }
+  const evidence = [];
+  let totalBytes = 0;
+  for (const [ordinal, file] of normalizeLockPathList(files).entries()) {
+    const target = integrationJournalTargetPath(cwd, file);
+    let preKind = "missing";
+    let preMode = 0;
+    let preContent = Buffer.alloc(0);
+    try {
+      const details = await lstat(target);
+      if (details.isSymbolicLink()) {
+        preKind = "link";
+        preContent = Buffer.from(await readlink(target), "utf8");
+      } else if (details.isFile()) {
+        if (details.size > CONFIG.maxSnapshotFileBytes) {
+          const error = new Error("Integration journal preimage exceeds the per-file safety limit.");
+          error.errorType = "snapshot_safety_limit_exceeded";
+          throw error;
+        }
+        preKind = "file";
+        preMode = durableFileMode(details);
+        preContent = await readFile(target);
+      } else {
+        const error = new Error("Integration journal cannot capture a non-file path.");
+        error.errorType = "snapshot_safety_limit_exceeded";
+        throw error;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    totalBytes += preContent.length;
+    if (totalBytes > CONFIG.maxSnapshotTotalBytes) {
+      const error = new Error("Integration journal preimages exceed the total snapshot safety limit.");
+      error.errorType = "snapshot_safety_limit_exceeded";
+      throw error;
+    }
+
+    const postFingerprint = expectedPostSnapshot.get(file);
+    if (typeof postFingerprint !== "string") {
+      throw new Error("Integration journal expected post-apply evidence is incomplete.");
+    }
+    evidence.push({
+      ordinal,
+      path: file,
+      preKind,
+      preMode,
+      preSha256: createHash("sha256").update(preKind === "missing" ? Buffer.from("missing") : preContent).digest("hex"),
+      preEncrypted: preKind === "missing"
+        ? null
+        : await encryptIntegrationJournalBytes(preContent, integrationJournalAad(operationId, file, "pre")),
+      postSha256: integrationJournalFingerprintSha256(postFingerprint),
+      postEncrypted: await encryptIntegrationJournalBytes(
+        Buffer.from(postFingerprint, "utf8"),
+        integrationJournalAad(operationId, file, "post")
+      ),
+    });
+  }
+  return evidence;
+}
+
+function assertIntegrationLockOwned(db, cwd, lock) {
+  if (!lock) return;
+  const now = Date.now();
+  const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token || "")).digest("hex")}`;
+  const owned = db.prepare(`
+    SELECT 1 FROM locks
+    WHERE run_id = ? AND token = ? AND cwd = ? AND lock_mode = 'serial_integration' AND expires_at > ?
+    LIMIT 1
+  `).get(lock.id || "", tokenSha256, path.resolve(cwd), now);
+  if (!owned) {
+    const error = new Error("The durable serial integration lock is no longer owned.");
+    error.errorType = "integration_lock_ownership_lost";
+    throw error;
+  }
+}
+
+async function prepareIntegrationOperation({
+  cwd,
+  pipelineId = "",
+  pipelineJobId = "",
+  targetState,
+  patch,
+  contractSha256,
+  expectedPostSnapshot,
+  integrationLock = null,
+}) {
+  const operationId = `integration-${Date.now()}-${randomBytes(8).toString("hex")}`;
+  const ownerGeneration = randomBytes(16).toString("hex");
+  const affectedPaths = normalizeLockPathList(patch.changedFiles || []);
+  const evidence = await captureIntegrationJournalEvidence({
+    cwd,
+    files: affectedPaths,
+    expectedPostSnapshot,
+    operationId,
+  });
+  const createdAt = new Date().toISOString();
+  const db = await openLockDb(cwd);
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    assertIntegrationLockOwned(db, cwd, integrationLock);
+    const quarantine = db.prepare(`
+      SELECT operation_id FROM integration_operations
+      WHERE cwd = ? AND status = 'quarantined'
+      ORDER BY updated_at LIMIT 1
+    `).get(path.resolve(cwd));
+    if (quarantine) {
+      const error = new Error("A quarantined integration operation blocks further repository mutation.");
+      error.errorType = "integration_recovery_quarantined";
+      error.operationId = quarantine.operation_id;
+      throw error;
+    }
+    const capacity = stateCapacityError(db);
+    if (capacity) {
+      const error = new Error(capacity.error);
+      error.errorType = capacity.errorType;
+      throw error;
+    }
+    db.prepare(`
+      INSERT INTO integration_operations
+        (operation_id, cwd, pipeline_id, pipeline_job_id, owner_instance_id, owner_generation,
+         revision, status, target_head, target_state_sha256, pre_index_sha256, patch_sha256,
+         source_base_commit, source_state_sha256, contract_sha256, affected_paths_json,
+         result_json, created_at, updated_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
+    `).run(
+      operationId,
+      path.resolve(cwd),
+      String(pipelineId || ""),
+      String(pipelineJobId || ""),
+      BRIDGE_INSTANCE_ID,
+      ownerGeneration,
+      targetState.targetHead,
+      targetState.targetStateSha256,
+      targetState.indexSha256,
+      patch.patchSha256,
+      patch.sourceBaseCommit,
+      patch.sourceStateSha256,
+      contractSha256,
+      JSON.stringify(affectedPaths),
+      createdAt,
+      createdAt
+    );
+    const insertFile = db.prepare(`
+      INSERT INTO integration_operation_files
+        (operation_id, ordinal, path, pre_kind, pre_mode, pre_sha256, pre_encrypted, post_sha256, post_encrypted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const item of evidence) {
+      insertFile.run(
+        operationId,
+        item.ordinal,
+        item.path,
+        item.preKind,
+        item.preMode,
+        item.preSha256,
+        item.preEncrypted,
+        item.postSha256,
+        item.postEncrypted
+      );
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return { operationId, ownerGeneration };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the journal error. */ }
+    }
+    throw error;
+  } finally {
+    closeDb(db);
+  }
+}
+
+const INTEGRATION_JOURNAL_TERMINAL = new Set(["committed", "rolled_back", "recovered_noop", "quarantined"]);
+
+async function transitionIntegrationOperation(cwd, operationId, expectedStatuses, status, result = {}, authority = null) {
+  const allowed = [...new Set((Array.isArray(expectedStatuses) ? expectedStatuses : [expectedStatuses]).filter(Boolean))];
+  if (!allowed.length) throw new Error("Integration journal transition requires an expected status.");
+  const updatedAt = new Date().toISOString();
+  const finishedAt = INTEGRATION_JOURNAL_TERMINAL.has(status) ? updatedAt : null;
+  const safeResult = JSON.stringify(sanitizePersistedValue(result || {}));
+  const placeholders = allowed.map(() => "?").join(", ");
+  const db = await openLockDb(cwd);
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    assertIntegrationLockOwned(db, cwd, authority?.lock || null);
+    let current = db.prepare(`
+      SELECT revision, status, owner_instance_id, owner_generation
+      FROM integration_operations WHERE operation_id = ? AND cwd = ?
+    `).get(operationId, path.resolve(cwd));
+    if (!current) throw new Error("Integration journal operation is missing.");
+    if (authority?.ownerGeneration
+      && (current.owner_instance_id !== BRIDGE_INSTANCE_ID || current.owner_generation !== authority.ownerGeneration)) {
+      if (!authority.allowTakeover) {
+        const error = new Error("Integration journal ownership generation changed before transition.");
+        error.errorType = "integration_journal_cas_rejected";
+        throw error;
+      }
+      const claimed = db.prepare(`
+        UPDATE integration_operations
+        SET owner_instance_id = ?, owner_generation = ?, updated_at = ?, revision = revision + 1
+        WHERE operation_id = ? AND cwd = ? AND revision = ? AND status = ?
+      `).run(
+        BRIDGE_INSTANCE_ID,
+        authority.ownerGeneration,
+        updatedAt,
+        operationId,
+        path.resolve(cwd),
+        Number(current.revision || 0),
+        current.status
+      );
+      if (Number(claimed.changes || 0) !== 1) {
+        const error = new Error("Integration journal recovery ownership claim was lost.");
+        error.errorType = "integration_journal_cas_rejected";
+        throw error;
+      }
+      current = { ...current, revision: Number(current.revision || 0) + 1, owner_instance_id: BRIDGE_INSTANCE_ID, owner_generation: authority.ownerGeneration };
+    }
+    if (current.status === status) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      return { ok: true, status, revision: Number(current.revision || 0) };
+    }
+    if (!allowed.includes(current.status)) {
+      const error = new Error(`Integration journal transition rejected from ${current.status} to ${status}.`);
+      error.errorType = "integration_journal_cas_rejected";
+      throw error;
+    }
+    const changed = db.prepare(`
+      UPDATE integration_operations
+      SET status = ?, result_json = ?, updated_at = ?, finished_at = ?, revision = revision + 1
+      WHERE operation_id = ? AND cwd = ? AND revision = ? AND status IN (${placeholders})
+        AND (? = '' OR (owner_instance_id = ? AND owner_generation = ?))
+    `).run(
+      status,
+      safeResult,
+      updatedAt,
+      finishedAt,
+      operationId,
+      path.resolve(cwd),
+      Number(current.revision || 0),
+      ...allowed,
+      authority?.ownerGeneration || "",
+      BRIDGE_INSTANCE_ID,
+      authority?.ownerGeneration || ""
+    );
+    if (Number(changed.changes || 0) !== 1) {
+      const error = new Error("Integration journal compare-and-swap was lost.");
+      error.errorType = "integration_journal_cas_rejected";
+      throw error;
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return { ok: true, status, revision: Number(current.revision || 0) + 1 };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the journal error. */ }
+    }
+    throw error;
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function readIntegrationJournalFileEvidence(operation, row) {
+  let preContent = Buffer.alloc(0);
+  if (row.pre_kind !== "missing") {
+    preContent = await decryptIntegrationJournalBytes(
+      row.pre_encrypted,
+      integrationJournalAad(operation.operation_id, row.path, "pre")
+    );
+  }
+  const expectedPreSha256 = createHash("sha256")
+    .update(row.pre_kind === "missing" ? Buffer.from("missing") : preContent)
+    .digest("hex");
+  if (expectedPreSha256 !== row.pre_sha256) throw new Error("Integration journal preimage hash mismatch.");
+  const postFingerprint = (await decryptIntegrationJournalBytes(
+    row.post_encrypted,
+    integrationJournalAad(operation.operation_id, row.path, "post")
+  )).toString("utf8");
+  if (integrationJournalFingerprintSha256(postFingerprint) !== row.post_sha256) {
+    throw new Error("Integration journal post-state hash mismatch.");
+  }
+  const preFingerprint = row.pre_kind === "missing"
+    ? "missing"
+    : row.pre_kind === "link"
+      ? `link:${preContent.toString("utf8")}`
+      : `file:${Number(row.pre_mode || 0)}:${createHash("sha256").update(preContent).digest("hex")}`;
+  return { ...row, preContent, preFingerprint, postFingerprint };
+}
+
+async function restoreIntegrationJournalFile(cwd, evidence) {
+  const target = integrationJournalTargetPath(cwd, evidence.path);
+  if (evidence.pre_kind === "missing") {
+    await safeRollbackParent(cwd, target);
+    if (!await removeRollbackLeaf(target)) throw new Error("Integration journal rollback target is a directory.");
+    return;
+  }
+  await ensureParentDir(target);
+  const restored = await replaceRollbackLeaf({
+    cwd,
+    target,
+    kind: evidence.pre_kind,
+    content: evidence.pre_kind === "link" ? evidence.preContent.toString("utf8") : evidence.preContent,
+    mode: Number(evidence.pre_mode || 0),
+  });
+  if (!restored) throw new Error("Integration journal could not restore an exact preimage.");
+}
+
+async function quarantineIntegrationOperation(cwd, operationId, expectedStatuses, reason, authority = null) {
+  try {
+    await transitionIntegrationOperation(cwd, operationId, expectedStatuses, "quarantined", {
+      outcome: "quarantined",
+      reason: String(reason || "integration_recovery_ambiguous"),
+    }, authority);
+  } catch (error) {
+    logEvent("error", "integration.journal_quarantine_failed", {
+      operationId,
+      errorType: error?.errorType || "integration_journal_persistence_failed",
+    });
+  }
+}
+
+async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, fileRows, authority = null) {
+  const recoverableStatuses = [
+    "prepared",
+    "applying",
+    "applied_unvalidated",
+    "validating",
+    "validated",
+    "rolling_back",
+    "recovering",
+  ];
+  try {
+    if (!recoverableStatuses.includes(operation.status)) {
+      throw new Error("Integration journal contains an unknown nonterminal status.");
+    }
+    if (operation.status !== "recovering") {
+      await transitionIntegrationOperation(cwd, operation.operation_id, operation.status, "recovering", {
+        outcome: "recovery_started",
+      }, authority);
+    }
+    const expectedPaths = JSON.parse(operation.affected_paths_json || "[]");
+    const normalizedPaths = normalizeLockPathList(expectedPaths);
+    if (!Array.isArray(expectedPaths)
+      || normalizedPaths.length !== expectedPaths.length
+      || fileRows.length !== normalizedPaths.length
+      || fileRows.some((row, ordinal) => row.ordinal !== ordinal || row.path !== normalizedPaths[ordinal])) {
+      throw new Error("Integration journal path cardinality is inconsistent.");
+    }
+    const evidence = [];
+    for (const row of fileRows) evidence.push(await readIntegrationJournalFileEvidence(operation, row));
+
+    const currentTargetState = await captureIntegrationTargetState(cwd);
+    if (!currentTargetState.ok
+      || currentTargetState.targetHead !== operation.target_head
+      || currentTargetState.indexSha256 !== operation.pre_index_sha256) {
+      await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "target_head_or_index_drift", authority);
+      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+    }
+
+    const currentSnapshot = await exactIntegrationFileSnapshot(cwd, normalizedPaths);
+    const classifications = new Map();
+    for (const item of evidence) {
+      const current = currentSnapshot.get(item.path);
+      if (current === item.preFingerprint) {
+        classifications.set(item.path, "pre");
+        continue;
+      }
+      const postMismatches = await integrationContentMismatches(
+        cwd,
+        new Map([[item.path, item.postFingerprint]]),
+        new Map([[item.path, current]]),
+        [item.path]
+      );
+      classifications.set(item.path, postMismatches.length ? "third" : "post");
+    }
+    if ([...classifications.values()].includes("third")) {
+      await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "affected_path_drift", authority);
+      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+    }
+
+    if ([...classifications.values()].every((value) => value === "pre")) {
+      if (currentTargetState.targetStateSha256 !== operation.target_state_sha256) {
+        await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "repository_state_drift", authority);
+        return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+      }
+      await transitionIntegrationOperation(cwd, operation.operation_id, "recovering", "recovered_noop", {
+        outcome: "pre_state_verified",
+      }, authority);
+      return { ok: true, operationId: operation.operation_id, status: "recovered_noop" };
+    }
+
+    await transitionIntegrationOperation(cwd, operation.operation_id, "recovering", "rolling_back", {
+      outcome: "exact_preimage_rollback_started",
+    }, authority);
+    for (const item of evidence) {
+      if (classifications.get(item.path) === "post") await restoreIntegrationJournalFile(cwd, item);
+    }
+    const restoredSnapshot = await exactIntegrationFileSnapshot(cwd, normalizedPaths);
+    const restoreMismatches = evidence.filter((item) => restoredSnapshot.get(item.path) !== item.preFingerprint);
+    const restoredTargetState = await captureIntegrationTargetState(cwd);
+    if (restoreMismatches.length
+      || !restoredTargetState.ok
+      || restoredTargetState.targetHead !== operation.target_head
+      || restoredTargetState.indexSha256 !== operation.pre_index_sha256
+      || restoredTargetState.targetStateSha256 !== operation.target_state_sha256) {
+      await quarantineIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rollback_verification_failed", authority);
+      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+    }
+    await transitionIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rolled_back", {
+      outcome: "exact_pre_state_restored",
+    }, authority);
+    return { ok: true, operationId: operation.operation_id, status: "rolled_back" };
+  } catch {
+    await quarantineIntegrationOperation(
+      cwd,
+      operation.operation_id,
+      [operation.status, "recovering", "rolling_back"],
+      "journal_evidence_unreadable",
+      authority
+    );
+    return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+  }
+}
+
+async function recoverIntegrationOperationsWhileLocked(cwd, { operationId = "", integrationLock = null } = {}) {
+  const canonicalCwd = path.resolve(cwd || process.cwd());
+  const recoveryAuthority = integrationLock ? {
+    lock: integrationLock,
+    ownerGeneration: randomBytes(16).toString("hex"),
+    allowTakeover: true,
+  } : null;
+  const db = await openLockDb(canonicalCwd);
+  let operations;
+  let files;
+  try {
+    const filter = operationId ? "AND operation_id = ?" : "";
+    const args = operationId ? [canonicalCwd, operationId] : [canonicalCwd];
+    operations = db.prepare(`
+      SELECT * FROM integration_operations
+      WHERE cwd = ? ${filter}
+        AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      ORDER BY created_at, operation_id
+    `).all(...args);
+    const ids = operations.map((row) => row.operation_id);
+    files = ids.length
+      ? db.prepare(`
+          SELECT * FROM integration_operation_files
+          WHERE operation_id IN (${ids.map(() => "?").join(", ")})
+          ORDER BY operation_id, ordinal
+        `).all(...ids)
+      : [];
+  } finally {
+    closeDb(db);
+  }
+
+  const existingQuarantine = operations.filter((row) => row.status === "quarantined");
+  if (existingQuarantine.length) {
+    return {
+      ok: false,
+      errorType: "integration_recovery_quarantined",
+      operationIds: existingQuarantine.map((row) => row.operation_id),
+      recovered: [],
+    };
+  }
+  const recovered = [];
+  for (const operation of operations) {
+    const result = await recoverSingleIntegrationOperationWhileLocked(
+      canonicalCwd,
+      operation,
+      files.filter((row) => row.operation_id === operation.operation_id),
+      recoveryAuthority
+    );
+    recovered.push(result);
+    if (!result.ok) {
+      return {
+        ok: false,
+        errorType: "integration_recovery_quarantined",
+        operationIds: [result.operationId],
+        recovered,
+      };
+    }
+  }
+  return { ok: true, recovered };
+}
+
+async function readIntegrationOperationSummary(cwd, operationId) {
+  if (!operationId) return null;
+  const db = await openLockDb(cwd);
+  try {
+    const row = db.prepare(`
+      SELECT operation_id, pipeline_id, pipeline_job_id, status, patch_sha256,
+             source_state_sha256, contract_sha256, created_at, updated_at, finished_at
+      FROM integration_operations
+      WHERE operation_id = ? AND cwd = ?
+    `).get(operationId, path.resolve(cwd || process.cwd()));
+    return row ? {
+      operationId: row.operation_id,
+      pipelineId: row.pipeline_id || "",
+      pipelineJobId: row.pipeline_job_id || "",
+      status: row.status,
+      patchSha256: row.patch_sha256,
+      sourceStateSha256: row.source_state_sha256,
+      contractSha256: row.contract_sha256,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      finishedAt: row.finished_at || "",
+    } : null;
+  } finally {
+    closeDb(db);
+  }
 }
 
 function isPathInside(parent, candidate) {
@@ -5308,6 +6490,231 @@ function dirtyCheckpointDetails(checkpoint = {}) {
   return { dirtyFiles, overlappingFiles, disjointFiles, conflictingPaths };
 }
 
+const RETAINED_WORKTREE_STATUSES = Object.freeze(["creating", "retained", "cleanup_failed"]);
+
+async function reconcileWorktreeArtifactRegistry(cwd) {
+  const canonicalCwd = path.resolve(cwd || process.cwd());
+  const knownDb = await openLockDb(canonicalCwd);
+  let knownPaths;
+  try {
+    knownPaths = new Set(
+      knownDb.prepare(`
+        SELECT worktree_path FROM worktree_artifacts
+        WHERE cwd = ? AND status IN ('creating', 'retained', 'cleanup_failed')
+      `)
+        .all(canonicalCwd)
+        .map((row) => path.resolve(row.worktree_path))
+    );
+  } finally {
+    closeDb(knownDb);
+  }
+  const root = generatedWorktreeRootForCwd(canonicalCwd);
+  const discovered = [];
+  if (root) {
+    try {
+      for (const entry of await readdir(root, { withFileTypes: true })) {
+        const absolute = path.resolve(root, entry.name);
+        if (!isPathInside(root, absolute)) continue;
+        if (knownPaths.has(absolute)) continue;
+        const details = await lstat(absolute);
+        if (details.isDirectory() && !details.isSymbolicLink()) {
+          discovered.push({
+            path: absolute,
+            status: "retained",
+            measuredBytes: await measureRetainedWorktreeBytes(absolute),
+          });
+        } else if (details.isSymbolicLink()) {
+          discovered.push({
+            path: absolute,
+            status: "cleanup_failed",
+            measuredBytes: CONFIG.retainedWorktreeMaxBytes + 1,
+          });
+        }
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+
+  const db = await openLockDb(canonicalCwd);
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const now = new Date().toISOString();
+    const insert = db.prepare(`
+      INSERT INTO worktree_artifacts
+        (worktree_path, cwd, branch, job_id, status, measured_bytes, created_at, updated_at, cleaned_at)
+      VALUES (?, ?, '', ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(worktree_path) DO UPDATE SET
+        cwd = excluded.cwd,
+        job_id = excluded.job_id,
+        status = excluded.status,
+        measured_bytes = excluded.measured_bytes,
+        updated_at = excluded.updated_at,
+        cleaned_at = NULL
+      WHERE worktree_artifacts.status IN ('cleaned', 'cleaned_branch_retained')
+    `);
+    for (const item of discovered) {
+      insert.run(item.path, canonicalCwd, path.basename(item.path), item.status, item.measuredBytes, now, now);
+    }
+    const activeRows = db.prepare(`
+      SELECT worktree_path FROM worktree_artifacts
+      WHERE cwd = ? AND status IN ('creating', 'retained', 'cleanup_failed')
+    `).all(canonicalCwd);
+    const markMissing = db.prepare(`
+      UPDATE worktree_artifacts
+      SET status = 'cleaned', cleaned_at = ?, updated_at = ?
+      WHERE worktree_path = ? AND cwd = ?
+    `);
+    for (const row of activeRows) {
+      if (!existsSync(row.worktree_path)) markMissing.run(now, now, row.worktree_path, canonicalCwd);
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the registry error. */ }
+    }
+    throw error;
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function reserveWorktreeArtifact({ cwd, worktreePath, branch, jobId }) {
+  await reconcileWorktreeArtifactRegistry(cwd);
+  const db = await openLockDb(cwd);
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const stateCapacity = stateCapacityError(db);
+    if (stateCapacity) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return { ok: false, ...stateCapacity };
+    }
+    const placeholders = RETAINED_WORKTREE_STATUSES.map(() => "?").join(", ");
+    const capacity = db.prepare(`
+      SELECT COUNT(*) AS count, COALESCE(SUM(measured_bytes), 0) AS bytes
+      FROM worktree_artifacts
+      WHERE cwd = ? AND status IN (${placeholders})
+    `).get(path.resolve(cwd), ...RETAINED_WORKTREE_STATUSES);
+    if (Number(capacity?.count || 0) >= CONFIG.retainedWorktreeMaxCount
+      || Number(capacity?.bytes || 0) >= CONFIG.retainedWorktreeMaxBytes) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        ok: false,
+        errorType: "worktree_capacity_exceeded",
+        error: "Retained worktree recovery evidence reached its configured count or measured-byte capacity.",
+      };
+    }
+    const now = new Date().toISOString();
+    const inserted = db.prepare(`
+      INSERT INTO worktree_artifacts
+        (worktree_path, cwd, branch, job_id, status, measured_bytes, created_at, updated_at, cleaned_at)
+      VALUES (?, ?, ?, ?, 'creating', 0, ?, ?, NULL)
+      ON CONFLICT(worktree_path) DO NOTHING
+    `).run(path.resolve(worktreePath), path.resolve(cwd), branch, jobId, now, now);
+    if (Number(inserted.changes || 0) !== 1) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        ok: false,
+        errorType: "worktree_identity_conflict",
+        error: "The generated worktree path already has durable artifact ownership.",
+      };
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return { ok: true };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the reservation error. */ }
+    }
+    throw error;
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function markWorktreeArtifactState(worktree, status, measuredBytes = null) {
+  if (!worktree?.path || !worktree?.repoRoot) return;
+  const db = await openLockDb(worktree.repoRoot);
+  try {
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE worktree_artifacts
+      SET status = ?, measured_bytes = COALESCE(?, measured_bytes), updated_at = ?,
+          cleaned_at = CASE WHEN ? IN ('cleaned', 'cleaned_branch_retained') THEN ? ELSE cleaned_at END
+      WHERE worktree_path = ? AND cwd = ?
+    `).run(
+      status,
+      measuredBytes === null ? null : Math.max(0, Math.trunc(measuredBytes)),
+      now,
+      status,
+      now,
+      path.resolve(worktree.path),
+      path.resolve(worktree.repoRoot)
+    );
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function releaseFailedWorktreeReservation(worktree) {
+  if (!worktree?.path || !worktree?.repoRoot) return;
+  if (existsSync(worktree.path)) {
+    await updateRetainedWorktreeMeasurement(worktree);
+    return;
+  }
+  const db = await openLockDb(worktree.repoRoot);
+  try {
+    db.prepare(`
+      DELETE FROM worktree_artifacts
+      WHERE worktree_path = ? AND cwd = ? AND status = 'creating'
+    `).run(path.resolve(worktree.path), path.resolve(worktree.repoRoot));
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function measureRetainedWorktreeBytes(worktreePath) {
+  const root = path.resolve(worktreePath);
+  const rootDetails = await lstat(root);
+  if (rootDetails.isSymbolicLink() || !rootDetails.isDirectory()) throw new Error("Retained worktree root is not a real directory.");
+  const stack = [root];
+  let bytes = 0;
+  let entriesSeen = 0;
+  const maxEntries = Math.max(CONFIG.maxSnapshotFiles * 4, 100000);
+  while (stack.length) {
+    const directory = stack.pop();
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      entriesSeen += 1;
+      if (entriesSeen > maxEntries) return CONFIG.retainedWorktreeMaxBytes + 1;
+      const absolute = path.resolve(directory, entry.name);
+      if (!isPathInside(root, absolute)) return CONFIG.retainedWorktreeMaxBytes + 1;
+      const details = await lstat(absolute);
+      if (details.isDirectory() && !details.isSymbolicLink()) stack.push(absolute);
+      else bytes += Number(details.size || 0);
+      if (bytes > CONFIG.retainedWorktreeMaxBytes) return bytes;
+    }
+  }
+  return bytes;
+}
+
+async function updateRetainedWorktreeMeasurement(worktree) {
+  if (!worktree?.path || !worktree?.repoRoot || !existsSync(worktree.path)) return;
+  try {
+    const bytes = await measureRetainedWorktreeBytes(worktree.path);
+    await markWorktreeArtifactState(worktree, "retained", bytes);
+  } catch {
+    await markWorktreeArtifactState(worktree, "cleanup_failed", CONFIG.retainedWorktreeMaxBytes + 1);
+  }
+}
+
 async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allowedEdits = [], scopeContract = null }) {
   const baseCwd = cwd || process.cwd();
   const gitVersion = await runCommand("git", ["--version"], baseCwd, 1000 * 15);
@@ -5329,6 +6736,8 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
   }
 
   const repoRoot = path.resolve(repoRootResult.stdout.trim());
+  const gitControlSurface = await inspectRepositoryGitControlSurface(repoRoot);
+  if (!gitControlSurface.ok) return gitControlSurface;
   const checkpointState = await inspectSourceCheckpointState(repoRoot, { lockedPaths, allowedEdits, scopeContract });
   if (!checkpointState.ok) {
     return checkpointState;
@@ -5365,9 +6774,18 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
     };
   }
 
+  const reservation = await reserveWorktreeArtifact({
+    cwd: repoRoot,
+    worktreePath,
+    branch,
+    jobId,
+  });
+  if (!reservation.ok) return reservation;
+
   await mkdir(rootResult.root, { recursive: true });
   const branchExists = await runCommand("git", ["show-ref", "--verify", `refs/heads/${branch}`], repoRoot, 1000 * 15);
   if (branchExists.exitCode === 0) {
+    await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
     return {
       ok: false,
       errorType: "worktree_checkout_failed",
@@ -5377,6 +6795,7 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
 
   const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, 1000 * 60);
   if (created.exitCode !== 0) {
+    await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
     return {
       ok: false,
       errorType: "worktree_create_failed",
@@ -5392,22 +6811,31 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
     runCommand("git", ["rev-parse", "HEAD"], repoRoot, 1000 * 15, buildValidationEnv()),
     inspectSourceCheckpointState(worktreePath),
   ]);
-  if (!postCheckpointState.ok || postHead.exitCode !== 0 || postHead.stdout.trim() !== baseCommit) {
+  if (!postCheckpointState.ok || postHead.exitCode !== 0 || postHead.stdout.trim() !== baseCommit || !createdWorktreeState.ok) {
     let preExecutionCleanup = { cleanup: "retained", reason: "new worktree was not proven clean" };
     if (createdWorktreeState.ok) {
       preExecutionCleanup = await cleanupWorktree({ repoRoot, path: worktreePath, branch }, "always", true);
     }
+    if (preExecutionCleanup.cleanup !== "success") {
+      await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
+    }
     return {
       ok: false,
-      errorType: !postCheckpointState.ok ? postCheckpointState.errorType : "worktree_source_checkpoint_changed",
+      errorType: !postCheckpointState.ok
+        ? postCheckpointState.errorType
+        : !createdWorktreeState.ok
+          ? "worktree_created_dirty"
+          : "worktree_source_checkpoint_changed",
       error: !postCheckpointState.ok
         ? `${postCheckpointState.error} The source changed during worktree creation, so no agent was started.`
+        : !createdWorktreeState.ok
+          ? "The new worktree was not clean immediately after creation. It was retained as evidence and no agent was started."
         : "Repository HEAD changed during worktree creation, so the new worktree no longer represents the current source checkpoint.",
-      dirtyEntries: postCheckpointState.dirtyEntries || [],
-      dirtyFiles: postCheckpointState.dirtyFiles || [],
-      overlappingFiles: postCheckpointState.overlappingFiles || [],
-      disjointFiles: postCheckpointState.disjointFiles || [],
-      conflictingPaths: dirtyCheckpointDetails(postCheckpointState).conflictingPaths,
+      dirtyEntries: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).dirtyEntries || [],
+      dirtyFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).dirtyFiles || [],
+      overlappingFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).overlappingFiles || [],
+      disjointFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).disjointFiles || [],
+      conflictingPaths: dirtyCheckpointDetails(!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).conflictingPaths,
       repoRoot,
       path: worktreePath,
       branch,
@@ -5415,6 +6843,8 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
       preExecutionCleanup,
     };
   }
+
+  await markWorktreeArtifactState({ repoRoot, path: worktreePath, branch }, "retained", 0);
 
   return {
     ok: true,
@@ -5477,8 +6907,18 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
   }
   removeArgs.push(worktree.path);
 
+  const branchRef = worktree.branch && worktree.branch !== "HEAD"
+    ? `refs/heads/${worktree.branch}`
+    : "";
+  const expectedBranch = branchRef
+    ? await runCommand("git", ["show-ref", "--hash", "--verify", branchRef], worktree.repoRoot, 1000 * 15)
+    : null;
+  const expectedBranchOid = expectedBranch?.exitCode === 0 ? expectedBranch.stdout.trim() : "";
+
   const removed = await runCommand("git", removeArgs, worktree.repoRoot, 1000 * 60);
   if (removed.exitCode !== 0) {
+    await updateRetainedWorktreeMeasurement(worktree);
+    await markWorktreeArtifactState(worktree, "cleanup_failed");
     return {
       cleanup: "failed",
       errorType: "worktree_cleanup_failed",
@@ -5487,6 +6927,7 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
   }
 
   if (!worktree.branch || worktree.branch === "HEAD") {
+    await markWorktreeArtifactState(worktree, "cleaned");
     return {
       cleanup: "success",
       branchCleanup: "skipped",
@@ -5494,7 +6935,17 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
     };
   }
 
-  const deletedBranch = await runCommand("git", ["branch", "-D", worktree.branch], worktree.repoRoot, 1000 * 30);
+  if (typeof worktreeCleanupTestHook === "function") {
+    await worktreeCleanupTestHook({ worktree, branchRef, expectedBranchOid });
+  }
+
+  const deletedBranch = expectedBranchOid
+    ? await runCommand("git", ["update-ref", "-d", branchRef, expectedBranchOid], worktree.repoRoot, 1000 * 30)
+    : { exitCode: 1, stdout: "", stderr: "The source branch identity could not be captured before worktree removal." };
+  await markWorktreeArtifactState(
+    worktree,
+    deletedBranch.exitCode === 0 ? "cleaned" : "cleaned_branch_retained"
+  );
   return {
     cleanup: deletedBranch.exitCode === 0 ? "success" : "partial",
     branchCleanup: deletedBranch.exitCode === 0 ? "success" : "failed",
@@ -5599,11 +7050,26 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
   let scratch = "";
   try {
     const sourcePath = path.resolve(cwd || process.cwd());
+    const gitControlSurface = await inspectRepositoryGitControlSurface(sourcePath);
+    if (!gitControlSurface.ok) return gitControlSurface;
+    const requestedBase = String(baseCommit || "HEAD").trim();
+    if (requestedBase !== "HEAD" && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(requestedBase)) {
+      return {
+        ok: false,
+        errorType: "integration_source_invalid",
+        error: "The source base commit must be an exact SHA-1 or SHA-256 object id.",
+      };
+    }
     scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-index-"));
     const indexPath = path.join(scratch, "index");
     const gitEnv = { ...process.env, GIT_INDEX_FILE: indexPath };
-    const base = await runCommand("git", ["rev-parse", baseCommit], sourcePath, 1000 * 15);
-    const head = await runCommand("git", ["rev-parse", "HEAD"], sourcePath, 1000 * 15);
+    const base = await runCommand(
+      "git",
+      ["rev-parse", "--verify", "--end-of-options", `${requestedBase}^{commit}`],
+      sourcePath,
+      1000 * 15
+    );
+    const head = await runCommand("git", ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], sourcePath, 1000 * 15);
     if (base.exitCode !== 0 || head.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: base.stderr || head.stderr || "Could not resolve source commits." };
     }
@@ -5672,6 +7138,14 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
 
 async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", sourceBaseCommit = "" }) {
   const repoRoot = path.resolve(cwd || process.cwd());
+  const requestedSourceBaseCommit = String(sourceBaseCommit || "").trim();
+  if (requestedSourceBaseCommit && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(requestedSourceBaseCommit)) {
+    return {
+      ok: false,
+      errorType: "integration_source_invalid",
+      error: "sourceBaseCommit must be an exact SHA-1 or SHA-256 commit object id.",
+    };
+  }
   if (worktreePath) {
     const sourcePath = path.resolve(worktreePath);
     if (path.resolve(sourcePath) === path.resolve(repoRoot)) {
@@ -5723,7 +7197,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       };
     }
 
-    let baseCommit = String(sourceBaseCommit || "").trim();
+    let baseCommit = requestedSourceBaseCommit;
     if (!baseCommit) {
       const targetHead = await runCommand("git", ["rev-parse", "HEAD"], repoRoot, 1000 * 15);
       const mergeBase = targetHead.exitCode === 0
@@ -5757,7 +7231,12 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       };
     }
 
-    const base = await runCommand("git", ["rev-parse", sourceBaseCommit || "HEAD"], repoRoot, 1000 * 15);
+    const base = await runCommand(
+      "git",
+      ["rev-parse", "--verify", "--end-of-options", `${requestedSourceBaseCommit || "HEAD"}^{commit}`],
+      repoRoot,
+      1000 * 15
+    );
     if (base.exitCode !== 0) {
       return { ok: false, errorType: "integration_source_invalid", error: base.stderr || "Could not resolve the reviewed branch base commit." };
     }
@@ -5808,7 +7287,7 @@ async function checkPatchApplies({ cwd, patchFile }) {
   };
 }
 
-async function applyPatchFile({ cwd, patchFile, targetHead, files = [] }) {
+async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal = null }) {
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
   try {
@@ -5816,7 +7295,7 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [] }) {
       return { exitCode: 1, stdout: "", stderr: "Temporary integration index escaped its bounded root." };
     }
     const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
-    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), 1000 * 30, env);
+    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), 1000 * 30, env, { signal });
     if (seeded.exitCode !== 0) {
       return { exitCode: seeded.exitCode, stdout: seeded.stdout || "", stderr: seeded.stderr || "Could not seed the isolated integration index." };
     }
@@ -5827,7 +7306,8 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [] }) {
         ["ls-tree", "-r", "--name-only", "-z", targetHead, "--", ...refreshPaths],
         cwd || process.cwd(),
         1000 * 30,
-        env
+        env,
+        { signal }
       );
       if (trackedAtTarget.exitCode !== 0) {
         return {
@@ -5843,7 +7323,8 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [] }) {
         ["update-index", "--refresh", "--ignore-submodules", "--", ...trackedRefreshPaths],
         cwd || process.cwd(),
         1000 * 30,
-        env
+        env,
+        { signal }
       );
       // `update-index --refresh` may report an unrelated dirty path even with a
       // pathspec. The reviewed-path snapshots and target receipt were already
@@ -5852,9 +7333,9 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [] }) {
       void refreshed;
       }
     }
-    const applied = await runCommand("git", ["apply", "--3way", patchFile], cwd || process.cwd(), 1000 * 60, env);
+    const applied = await runCommand("git", ["apply", "--3way", patchFile], cwd || process.cwd(), 1000 * 60, env, { signal });
     if (applied.exitCode !== 0) return applied;
-    const eol = await runCommand("git", ["ls-files", "--eol", "-z", "--", ...normalizeLockPathList(files)], cwd || process.cwd(), 1000 * 30, env);
+    const eol = await runCommand("git", ["ls-files", "--eol", "-z", "--", ...normalizeLockPathList(files)], cwd || process.cwd(), 1000 * 30, env, { signal });
     return {
       ...applied,
       isolatedEolRecords: eol.exitCode === 0 ? gitEolRecordsFromOutput(eol.stdout) : new Map(),
@@ -6085,8 +7566,35 @@ function integrationContractSha256({ cwd, worktreePath, branch, allowedEdits, fo
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256 }) {
+function sweepIntegrationPreviews(now = Date.now()) {
+  for (const [previewId, entry] of INTEGRATION_PREVIEWS) {
+    if (!Number.isFinite(entry?.expiresAt) || entry.expiresAt <= now) INTEGRATION_PREVIEWS.delete(previewId);
+  }
+}
+
+function ensureIntegrationPreviewSweepTimer() {
+  if (integrationPreviewSweepTimer || process.argv.includes("--self-test")) return;
+  integrationPreviewSweepTimer = setInterval(sweepIntegrationPreviews, Math.min(INTEGRATION_PREVIEW_TTL_MS, 1000 * 60 * 5));
+  integrationPreviewSweepTimer.unref?.();
+}
+
+function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, projectKey = "" }) {
+  const normalizedProjectKey = path.resolve(projectKey || process.cwd());
   const createdAtMs = Date.now();
+  sweepIntegrationPreviews(createdAtMs);
+  const projectPreviewCount = [...INTEGRATION_PREVIEWS.values()]
+    .filter((entry) => entry.projectKey === normalizedProjectKey)
+    .length;
+  if (INTEGRATION_PREVIEWS.size >= CONFIG.integrationPreviewGlobalMax) {
+    const error = new Error(`The bridge already holds ${CONFIG.integrationPreviewGlobalMax} active integration previews.`);
+    error.errorType = "integration_preview_capacity_exceeded";
+    throw error;
+  }
+  if (projectPreviewCount >= CONFIG.integrationPreviewProjectMax) {
+    const error = new Error(`This project already holds ${CONFIG.integrationPreviewProjectMax} active integration previews.`);
+    error.errorType = "integration_preview_project_capacity_exceeded";
+    throw error;
+  }
   const createdAt = new Date(createdAtMs).toISOString();
   const expiresAt = new Date(createdAtMs + INTEGRATION_PREVIEW_TTL_MS).toISOString();
   const identity = {
@@ -6104,12 +7612,14 @@ function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256 }) {
     previewId,
     ...identity,
   };
-  INTEGRATION_PREVIEWS.set(previewId, { identity, expiresAt: Date.parse(expiresAt) });
+  INTEGRATION_PREVIEWS.set(previewId, { identity, expiresAt: Date.parse(expiresAt), projectKey: normalizedProjectKey });
+  ensureIntegrationPreviewSweepTimer();
   return receipt;
 }
 
 function integrationPreviewReceiptError(receipt, expected, consume = false) {
   if (!receipt) return "A reviewed apply requires the exact previewReceipt returned by a prior dry run.";
+  sweepIntegrationPreviews();
   let parsed;
   try {
     parsed = integrationPreviewReceiptSchema.parse(receipt);
@@ -6146,9 +7656,6 @@ function integrationPreviewReceiptError(receipt, expected, consume = false) {
     return "Integration preview receipt was not issued by this bridge process or was already consumed.";
   }
   if (consume) INTEGRATION_PREVIEWS.delete(parsed.previewId);
-  for (const [previewId, entry] of INTEGRATION_PREVIEWS) {
-    if (entry.expiresAt <= Date.now()) INTEGRATION_PREVIEWS.delete(previewId);
-  }
   return "";
 }
 
@@ -6191,12 +7698,32 @@ async function integratePatchSerially(options) {
   const integrationLockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10);
   const stopIntegrationHeartbeat = startHardLockHeartbeat(lockResult.lock, integrationLockTtlMs);
   try {
-    const result = await integratePatchWithoutSerialLock({
-      ...options,
-      cwd: targetCwd,
-      allowedEdits: normalizedAllowed,
-    });
-    if (options.cleanupAfterSuccess && options.worktreePath) {
+    const recovery = await recoverIntegrationOperationsWhileLocked(targetCwd, { integrationLock: lockResult.lock });
+    let result = recovery.ok
+      ? await integratePatchWithoutSerialLock({
+          ...options,
+          cwd: targetCwd,
+          allowedEdits: normalizedAllowed,
+          signal: stopIntegrationHeartbeat.signal,
+          integrationLock: lockResult.lock,
+        })
+      : {
+          ok: false,
+          errorType: recovery.errorType || "integration_recovery_quarantined",
+          error: "A prior integration has ambiguous durable recovery evidence. The repository is quarantined from further bridge mutation until the recorded operation is inspected.",
+          operationIds: recovery.operationIds || [],
+        };
+    if (recovery.recovered?.length) result.recoveredIntegrationOperations = recovery.recovered;
+    if (stopIntegrationHeartbeat.signal.aborted && result.ok && result.journalStatus !== "committed") {
+      result = {
+        ...result,
+        ok: false,
+        status: "ownership_lost",
+        errorType: abortSignalErrorType(stopIntegrationHeartbeat.signal, "integration_lock_ownership_lost"),
+        error: stopIntegrationHeartbeat.signal.reason?.message || "The serial integration lease was lost before completion could be accepted.",
+      };
+    }
+    if (result.ok && options.cleanupAfterSuccess && options.worktreePath) {
       await cleanupIntegratedWorktreeWhileLocked({
         result,
         cwd: targetCwd,
@@ -6228,6 +7755,48 @@ async function integratePatchSerially(options) {
   }
 }
 
+async function recoverIntegrationRepositorySerially(cwd) {
+  const targetCwd = path.resolve(cwd || process.cwd());
+  const lockResult = await acquireHardLock({
+    owner: "codex",
+    agent: "integration_recovery",
+    task: "Recover durable integration journal",
+    cwd: targetCwd,
+    lockType: "serial_integration",
+    paths: [REPOSITORY_SCOPE_LOCK_PATH],
+    repositoryScope: true,
+    ttlMs: Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10),
+  });
+  if (!lockResult.ok) {
+    return {
+      ok: false,
+      errorType: "integration_recovery_lock_conflict",
+      error: "Durable integration recovery could not acquire the repository-wide serial lock.",
+    };
+  }
+  const stopHeartbeat = startHardLockHeartbeat(
+    lockResult.lock,
+    Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10)
+  );
+  try {
+    return await recoverIntegrationOperationsWhileLocked(targetCwd, { integrationLock: lockResult.lock });
+  } finally {
+    stopHeartbeat();
+    const released = await releaseHardLock(
+      lockResult.lock.id,
+      lockResult.lock.token,
+      lockResult.lock.paths,
+      lockResult.lock.cwd
+    );
+    if (!released.ok) {
+      logEvent("warn", "integration.recovery_lock_release_failed", {
+        lockId: lockResult.lock.id,
+        errorType: "integration_recovery_lock_release_failed",
+      });
+    }
+  }
+}
+
 async function integratePatchWithoutSerialLock({
   cwd,
   worktreePath = "",
@@ -6246,6 +7815,11 @@ async function integratePatchWithoutSerialLock({
   expectedSourceIdentity = null,
   beforeApplyHook = null,
   beforeValidationHook = null,
+  onIntegrationPrepared = null,
+  pipelineId = "",
+  pipelineJobId = "",
+  signal = null,
+  integrationLock = null,
 }) {
   const requestedCwd = path.resolve(cwd || process.cwd());
   const targetRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
@@ -6257,6 +7831,13 @@ async function integratePatchWithoutSerialLock({
     };
   }
   const targetCwd = path.resolve(targetRoot.stdout.trim());
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      errorType: abortSignalErrorType(signal, "integration_lock_ownership_lost"),
+      error: signal.reason?.message || "The serial integration lease was lost before target inspection.",
+    };
+  }
 
   const targetState = await captureIntegrationTargetState(targetCwd);
   if (!targetState.ok) return targetState;
@@ -6399,6 +7980,18 @@ async function integratePatchWithoutSerialLock({
   let preApplyFullIndexSha256 = "";
   let expectedPostApplySnapshot = null;
   let ownedPostApplySnapshot = null;
+  let integrationOperationId = "";
+  let integrationOperationCommitted = false;
+  let integrationAuthority = null;
+  const ownershipLostResult = (phase) => ({
+    ok: false,
+    status: "ownership_lost",
+    errorType: abortSignalErrorType(signal, "integration_lock_ownership_lost"),
+    error: signal?.reason?.message || `The serial integration lease was lost ${phase}.`,
+    changedFiles: patch.changedFiles,
+    operationId: integrationOperationId,
+    recoveryRequired: Boolean(integrationOperationId),
+  });
   try {
     const applyCheck = await checkPatchApplies({ cwd: targetCwd, patchFile });
     if (!applyCheck.ok) {
@@ -6449,7 +8042,25 @@ async function integratePatchWithoutSerialLock({
           previewReceipt: null,
         };
       }
-      const generatedReceipt = makeIntegrationPreviewReceipt({ patch, targetState, contractSha256 });
+      let generatedReceipt;
+      try {
+        generatedReceipt = makeIntegrationPreviewReceipt({
+          patch,
+          targetState,
+          contractSha256,
+          projectKey: targetCwd,
+        });
+      } catch (error) {
+        return {
+          ok: false,
+          status: "preview_rejected",
+          errorType: error?.errorType || "integration_preview_capacity_exceeded",
+          error: error?.message || "The bridge cannot retain another integration preview safely.",
+          changedFiles: patch.changedFiles,
+          patchSha256: patch.patchSha256,
+          previewReceipt: null,
+        };
+      }
       return {
         ok: true,
         status: "dry_run_passed",
@@ -6583,7 +8194,50 @@ async function integratePatchWithoutSerialLock({
         },
       };
     }
-    const applied = await applyPatchFile({ cwd: targetCwd, patchFile, targetHead: previewReceipt.targetHead, files: patch.changedFiles });
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        errorType: abortSignalErrorType(signal, "integration_lock_ownership_lost"),
+        error: signal.reason?.message || "The serial integration lease was lost before patch application.",
+        changedFiles: patch.changedFiles,
+      };
+    }
+    const preparedOperation = await prepareIntegrationOperation({
+      cwd: targetCwd,
+      pipelineId,
+      pipelineJobId,
+      targetState: immediatePreApplyState,
+      patch,
+      contractSha256,
+      expectedPostSnapshot: expectedPostApplySnapshot,
+      integrationLock,
+    });
+    integrationOperationId = preparedOperation.operationId;
+    integrationAuthority = {
+      lock: integrationLock,
+      ownerGeneration: preparedOperation.ownerGeneration,
+      allowTakeover: false,
+    };
+    if (typeof onIntegrationPrepared === "function") {
+      await onIntegrationPrepared({
+        operationId: integrationOperationId,
+        targetCwd,
+        patch,
+      });
+    }
+    if (signal?.aborted) return ownershipLostResult("after journal preparation");
+    await transitionIntegrationOperation(targetCwd, integrationOperationId, "prepared", "applying", {
+      outcome: "patch_apply_started",
+    }, integrationAuthority);
+    if (signal?.aborted) return ownershipLostResult("before patch application");
+    const applied = await applyPatchFile({
+      cwd: targetCwd,
+      patchFile,
+      targetHead: previewReceipt.targetHead,
+      files: patch.changedFiles,
+      signal,
+    });
+    if (signal?.aborted) return ownershipLostResult("during patch application");
     if (applied.exitCode !== 0) {
       const indexReset = await isolatedIndexPreservationEvidence({ cwd: targetCwd, files: patch.changedFiles, baselineSnapshot: preApplyIndexSnapshot });
       let changedSincePreApply = patch.changedFiles;
@@ -6659,6 +8313,9 @@ async function integratePatchWithoutSerialLock({
         rollback,
       };
     }
+    await transitionIntegrationOperation(targetCwd, integrationOperationId, "applying", "applied_unvalidated", {
+      outcome: "exact_post_state_verified",
+    }, integrationAuthority);
 
     const after = await gitChangedFileSnapshot(targetCwd);
     const appliedFiles = changedFilesBetween(before, after);
@@ -6718,10 +8375,14 @@ async function integratePatchWithoutSerialLock({
       }
     }
 
+    await transitionIntegrationOperation(targetCwd, integrationOperationId, "applied_unvalidated", "validating", {
+      outcome: "validation_started",
+    }, integrationAuthority);
     if (typeof beforeValidationHook === "function") {
       await beforeValidationHook({ targetCwd, patch, appliedFiles });
     }
-    const validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec });
+    let validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec, signal });
+    if (signal?.aborted) return ownershipLostResult("during validation");
     const afterValidation = await gitChangedFileSnapshot(targetCwd);
     const postValidationIndex = await captureGitIndexIdentity(targetCwd);
     const validationIndexChanged = !postValidationIndex.ok || postValidationIndex.indexSha256 !== preApplyFullIndexSha256;
@@ -6862,6 +8523,21 @@ async function integratePatchWithoutSerialLock({
       };
     }
 
+    if (signal?.aborted) return ownershipLostResult("before validation acceptance");
+    await transitionIntegrationOperation(targetCwd, integrationOperationId, "validating", "validated", {
+      outcome: "validation_passed",
+      integratedTargetStateSha256: integratedTargetState.targetStateSha256,
+    }, integrationAuthority);
+    if (signal?.aborted) return ownershipLostResult("before durable integration commit");
+    await transitionIntegrationOperation(targetCwd, integrationOperationId, "validated", "committed", {
+      outcome: "integration_committed",
+      patchSha256: patch.patchSha256,
+      sourceStateSha256: patch.sourceStateSha256,
+      integratedTargetStateSha256: integratedTargetState.targetStateSha256,
+      contractSha256,
+    }, integrationAuthority);
+    integrationOperationCommitted = true;
+
     return {
       ok: true,
       status: "applied",
@@ -6880,6 +8556,8 @@ async function integratePatchWithoutSerialLock({
       previewId: previewReceipt.previewId,
       preExistingTargetChanges: targetChanges,
       allowDirtyTarget: Boolean(allowDirtyTarget),
+      operationId: integrationOperationId,
+      journalStatus: "committed",
     };
   } catch (error) {
     let indexReset = null;
@@ -6914,6 +8592,32 @@ async function integratePatchWithoutSerialLock({
       rollback,
     };
   } finally {
+    if (integrationOperationId && !integrationOperationCommitted && !signal?.aborted) {
+      try {
+        const recovered = await recoverIntegrationOperationsWhileLocked(targetCwd, {
+          operationId: integrationOperationId,
+          integrationLock,
+        });
+        if (!recovered.ok) {
+          logEvent("error", "integration.journal_quarantined", {
+            operationId: integrationOperationId,
+            errorType: recovered.errorType || "integration_recovery_quarantined",
+          });
+        }
+      } catch (error) {
+        await quarantineIntegrationOperation(
+          targetCwd,
+          integrationOperationId,
+          ["prepared", "applying", "applied_unvalidated", "validating", "validated", "rolling_back", "recovering"],
+          "recovery_finalizer_failed",
+          integrationAuthority
+        );
+        logEvent("error", "integration.journal_recovery_failed", {
+          operationId: integrationOperationId,
+          errorType: error?.errorType || "integration_journal_recovery_failed",
+        });
+      }
+    }
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -7006,8 +8710,10 @@ async function cleanupIntegratedWorktreeWhileLocked({
     "always",
     true
   );
-  if (result.sourceCleanup.cleanup === "failed") {
-    result.cleanupWarning = result.sourceCleanup.error || "Integrated source worktree could not be removed.";
+  if (["failed", "partial"].includes(result.sourceCleanup.cleanup)) {
+    result.cleanupWarning = result.sourceCleanup.error || (result.sourceCleanup.cleanup === "partial"
+      ? "The integrated worktree was removed, but its local source branch was retained."
+      : "Integrated source worktree could not be removed.");
   }
 }
 
@@ -7019,9 +8725,9 @@ async function recordChangedFiles(runId, cwd, changedFiles, disallowedFiles = []
   const db = await openLockDb(cwd);
   try {
     db.exec("BEGIN IMMEDIATE");
-    const disallowed = new Set(normalizeLockPathList(disallowedFiles));
+    const disallowed = new Set(normalizeLockPathListForCwd(disallowedFiles, cwd));
     const insert = db.prepare("INSERT INTO changed_files (run_id, path, allowed) VALUES (?, ?, ?)");
-    for (const file of normalizeLockPathList(changedFiles)) {
+    for (const file of normalizeLockPathListForCwd(changedFiles, cwd)) {
       insert.run(runId, file, disallowed.has(file) ? 0 : 1);
     }
     db.exec("COMMIT");
@@ -7056,6 +8762,7 @@ function conflictsWithActiveLock(request, activeLock) {
         lockId: activeLock.id,
         owner: activeLock.owner,
         agent: activeLock.agent,
+        origin: activeLock.origin || "legacy",
         lockType: activeLock.lockType,
         paths: activePaths,
         overlap,
@@ -7088,78 +8795,113 @@ const statePruneTimes = new Map();
 function reconcileStaleQueueRecords(db, now = Date.now()) {
   const nonTerminalStatuses = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
   const placeholders = nonTerminalStatuses.map(() => "?").join(", ");
-  const rows = db.prepare(
-    `SELECT job_id, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
-            heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at, request_encrypted, record_json
-     FROM opencode_jobs
-     WHERE status IN (${placeholders})`
-  ).all(...nonTerminalStatuses);
   const finishedAt = new Date(now).toISOString();
-  const update = db.prepare(
-    "UPDATE opencode_jobs SET status = ?, finished_at = ?, record_json = ? WHERE job_id = ? AND status = ? AND (owner_generation = ? OR (owner_generation IS NULL AND ? = ''))"
-  );
   const reconciled = [];
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const rows = db.prepare(
+      `SELECT job_id, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
+              heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at,
+              request_encrypted, revision, record_json
+       FROM opencode_jobs
+       WHERE status IN (${placeholders})`
+    ).all(...nonTerminalStatuses);
+    const update = db.prepare(`
+      UPDATE opencode_jobs
+      SET status = ?, finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
+          record_json = ?, revision = revision + 1
+      WHERE job_id = ? AND status = ? AND revision = ?
+        AND (owner_generation = ? OR (owner_generation IS NULL AND ? = ''))
+        AND (lease_expires_at IS NULL OR lease_expires_at = '' OR julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
+    `);
 
-  for (const row of rows) {
-    if (QUEUE_JOBS.has(row.job_id)) {
-      continue;
-    }
-    if (["held", "pending", "planned", "blocked"].includes(row.status) && row.request_encrypted) {
-      continue;
-    }
+    for (const row of rows) {
+      if (QUEUE_JOBS.has(row.job_id)) {
+        continue;
+      }
+      if (["held", "pending", "planned", "blocked"].includes(row.status) && row.request_encrypted) {
+        continue;
+      }
 
-    let snapshot;
-    try {
-      snapshot = row.record_json ? JSON.parse(row.record_json) : {};
-    } catch {
-      snapshot = {};
+      let snapshot;
+      try {
+        snapshot = row.record_json ? JSON.parse(row.record_json) : {};
+      } catch {
+        snapshot = {};
+      }
+      const activityAt = Date.parse(
+        row.heartbeat_at
+        || row.lease_expires_at
+        || row.started_at
+        || snapshot.startedAt
+        || row.created_at
+        || snapshot.createdAt
+        || ""
+      );
+      const wasActive = ["running", "validating", "reviewing", "testing"].includes(row.status);
+      const cancellationRequested = Boolean(row.cancellation_requested_at || snapshot.cancellationRequestedAt);
+      const hasOwner = Boolean(row.owner_instance_id || row.owner_process_id || row.owner_generation);
+      const leaseExpiresAt = Date.parse(row.lease_expires_at || snapshot.leaseExpiresAt || "");
+      if (hasOwner) {
+        if (Number.isFinite(leaseExpiresAt) && leaseExpiresAt > now) continue;
+        if (!Number.isFinite(leaseExpiresAt) && Number.isFinite(activityAt) && now - activityAt < CONFIG.queueStaleAfterMs) continue;
+        const instance = row.owner_instance_id
+          ? db.prepare("SELECT heartbeat_at, lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
+          : null;
+        const instanceLease = Date.parse(instance?.lease_expires_at || "");
+        if (Number.isFinite(instanceLease) && instanceLease > now) continue;
+        // Once both durable owner leases have expired, PID liveness cannot prove
+        // ownership: operating systems reuse PIDs after crashes. Reconcile the
+        // record without killing any process; retain child identity as evidence.
+      } else if (Number.isFinite(activityAt) && now - activityAt < CONFIG.queueStaleAfterMs) {
+        continue;
+      }
+      const orphanChildProcessId = Number(row.child_process_id || snapshot.childProcessId || 0);
+      const orphanChildProcessAlive = wasActive && processIsAlive(orphanChildProcessId);
+      const terminalStatus = cancellationRequested ? "cancelled" : wasActive ? "interrupted" : "not_resumable";
+      snapshot = {
+        ...snapshot,
+        status: terminalStatus,
+        finishedAt,
+        heartbeatAt: "",
+        leaseExpiresAt: "",
+        revision: Number(row.revision || 0) + 1,
+        errorType: cancellationRequested ? "agent_cancelled" : wasActive ? "queue_job_interrupted" : "queue_job_not_resumable",
+        orphanChildProcessId: orphanChildProcessAlive ? orphanChildProcessId : 0,
+        orphanChildProcessStartedAt: orphanChildProcessAlive ? (row.child_process_started_at || snapshot.childProcessStartedAt || "") : "",
+        orphanChildProcessAlive,
+      };
+      const changed = update.run(
+        terminalStatus,
+        finishedAt,
+        finishedAt,
+        JSON.stringify(sanitizePersistedValue(snapshot)),
+        row.job_id,
+        row.status,
+        Number(row.revision || 0),
+        row.owner_generation || "",
+        row.owner_generation || "",
+        finishedAt,
+        finishedAt
+      );
+      if (Number(changed.changes || 0) > 0) {
+        propagatePipelineTerminalInTransaction(db, row.job_id, terminalStatus, finishedAt);
+        reconciled.push(row.job_id);
+      }
     }
-    const activityAt = Date.parse(
-      row.heartbeat_at
-      || row.lease_expires_at
-      || row.started_at
-      || snapshot.startedAt
-      || row.created_at
-      || snapshot.createdAt
-      || ""
-    );
-    const wasActive = ["running", "validating", "reviewing", "testing"].includes(row.status);
-    const cancellationRequested = Boolean(row.cancellation_requested_at || snapshot.cancellationRequestedAt);
-    const hasOwner = Boolean(row.owner_instance_id || row.owner_process_id || row.owner_generation);
-    const leaseExpiresAt = Date.parse(row.lease_expires_at || snapshot.leaseExpiresAt || "");
-    if (hasOwner) {
-      if (Number.isFinite(leaseExpiresAt) && leaseExpiresAt > now) continue;
-      if (!Number.isFinite(leaseExpiresAt) && Number.isFinite(activityAt) && now - activityAt < CONFIG.queueStaleAfterMs) continue;
-      const instance = row.owner_instance_id
-        ? db.prepare("SELECT heartbeat_at, lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
-        : null;
-      const instanceLease = Date.parse(instance?.lease_expires_at || "");
-      if (Number.isFinite(instanceLease) && instanceLease > now) continue;
-      // Once both durable owner leases have expired, PID liveness cannot prove
-      // ownership: operating systems reuse PIDs after crashes. Reconcile the
-      // record without killing any process; retain child identity as evidence.
-    } else if (Number.isFinite(activityAt) && now - activityAt < CONFIG.queueStaleAfterMs) {
-      continue;
+    db.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the reconciliation error. */ }
     }
-    const orphanChildProcessId = Number(row.child_process_id || snapshot.childProcessId || 0);
-    const orphanChildProcessAlive = wasActive && processIsAlive(orphanChildProcessId);
-    const terminalStatus = cancellationRequested ? "cancelled" : wasActive ? "interrupted" : "not_resumable";
-    snapshot = {
-      ...snapshot,
-      status: terminalStatus,
-      finishedAt,
-      errorType: cancellationRequested ? "agent_cancelled" : wasActive ? "queue_job_interrupted" : "queue_job_not_resumable",
-      errorReason: cancellationRequested
-        ? `Cancellation is terminal because the durable owner leases expired.${orphanChildProcessAlive ? " The recorded child PID still appears alive; the bridge retained its identity for explicit OS-level inspection rather than risk killing a reused PID." : ""}`
-        : wasActive
-        ? `The durable owner leases expired, so this job was marked interrupted; a live numeric PID is not trusted as ownership because PIDs can be reused, and jobs are never resumed across bridge instances.${orphanChildProcessAlive ? " The recorded child PID still appears alive; the bridge retained its identity for explicit OS-level inspection rather than risk killing a reused PID." : ""}`
-        : "The bridge restarted with a queued job whose full execution request is intentionally not persisted. Re-enqueue the job explicitly.",
-      orphanChildProcessId: orphanChildProcessAlive ? orphanChildProcessId : 0,
-      orphanChildProcessStartedAt: orphanChildProcessAlive ? (row.child_process_started_at || snapshot.childProcessStartedAt || "") : "",
-      orphanChildProcessAlive,
-    };
-    const changed = update.run(terminalStatus, finishedAt, JSON.stringify(sanitizePersistedValue(snapshot)), row.job_id, row.status, row.owner_generation || "", row.owner_generation || "");
-    if (Number(changed.changes || 0) > 0) reconciled.push(row.job_id);
+    throw error;
   }
 
   if (reconciled.length) {
@@ -7187,21 +8929,141 @@ function renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt)
     UPDATE opencode_jobs
     SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?, revision = revision + 1
     WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
+      AND lease_expires_at > ?
       AND status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
+      AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+      AND EXISTS (
+        SELECT 1 FROM bridge_instances
+        WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+      )
     RETURNING revision
-  `).get(heartbeatAt, leaseExpiresAt, heartbeatAt, record.jobId, BRIDGE_INSTANCE_ID, record.ownerGeneration || "");
+  `).get(
+    heartbeatAt,
+    leaseExpiresAt,
+    heartbeatAt,
+    record.jobId,
+    BRIDGE_INSTANCE_ID,
+    record.ownerGeneration || "",
+    heartbeatAt,
+    heartbeatAt
+  );
   if (!renewed) return false;
   record.heartbeatAt = heartbeatAt;
   record.leaseExpiresAt = leaseExpiresAt;
   record.revision = Number(renewed.revision || record.revision || 0);
+  resetQueueLeaseFence(record);
   return true;
+}
+
+function queueOwnershipLossError(detail = "Durable queue ownership could not be renewed before lease expiry.") {
+  const error = new Error(detail);
+  error.errorType = "queue_ownership_lost";
+  return error;
+}
+
+function clearQueueLeaseFence(record) {
+  if (record?.queueLeaseFenceTimer) clearTimeout(record.queueLeaseFenceTimer);
+  if (record) record.queueLeaseFenceTimer = null;
+}
+
+function loseQueueOwnership(record, detail) {
+  if (!record || record.queueOwnershipLost) return;
+  record.queueOwnershipLost = true;
+  const error = queueOwnershipLossError(detail);
+  logEvent("error", "queue.ownership_lost", { jobId: record.jobId, ownerGeneration: record.ownerGeneration || "", detail });
+  record.abortController?.abort(error);
+}
+
+function resetQueueLeaseFence(record) {
+  clearQueueLeaseFence(record);
+  if (!record?.abortController || !["running", "validating", "reviewing", "testing"].includes(record.status)) return;
+  const leaseExpiresAt = Date.parse(record.leaseExpiresAt || "");
+  if (!Number.isFinite(leaseExpiresAt)) {
+    loseQueueOwnership(record, "The durable queue lease has no valid expiry timestamp.");
+    return;
+  }
+  const guardMs = Math.max(20, Math.min(CONFIG.queueHeartbeatMs, Math.floor(CONFIG.queueLeaseMs / 4)));
+  record.queueLeaseFenceTimer = setTimeout(() => {
+    loseQueueOwnership(record, "The queue lease was not durably renewed before the fail-closed deadline.");
+  }, Math.max(0, leaseExpiresAt - Date.now() - guardMs));
+  record.queueLeaseFenceTimer.unref?.();
+}
+
+function noteQueueLeaseRenewalFailure(record, { definitive = false, detail = "Queue heartbeat persistence failed." } = {}) {
+  const leaseExpiresAt = Date.parse(record?.leaseExpiresAt || "");
+  if (definitive || !Number.isFinite(leaseExpiresAt) || Date.now() + CONFIG.queueHeartbeatMs >= leaseExpiresAt) {
+    loseQueueOwnership(record, detail);
+  }
+}
+
+async function assertQueueRecordDurableOwnership(record) {
+  if (effectiveQueueMode() !== "sqlite") return { ok: true };
+  const db = await openLockDb(record.cwd);
+  try {
+    const row = db.prepare(`
+      SELECT status, owner_instance_id, owner_generation, lease_expires_at
+      FROM opencode_jobs WHERE job_id = ?
+    `).get(record.jobId);
+    const owned = row
+      && ["running", "validating", "reviewing", "testing"].includes(row.status)
+      && row.owner_instance_id === BRIDGE_INSTANCE_ID
+      && String(row.owner_generation || "") === String(record.ownerGeneration || "")
+      && Date.parse(row.lease_expires_at || "") > Date.now();
+    return owned
+      ? { ok: true }
+      : { ok: false, error: queueOwnershipLossError("The durable queue generation or lease is no longer owned immediately before agent spawn.") };
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function renewQueueRecordDurableOwnership(record) {
+  if (effectiveQueueMode() !== "sqlite") return { ok: true, deadlineAt: Date.now() + CONFIG.queueLeaseMs };
+  const heartbeatAt = new Date().toISOString();
+  const leaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
+  const db = await openLockDb(record.cwd);
+  try {
+    const renewed = renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt);
+    if (!renewed) {
+      noteQueueLeaseRenewalFailure(record, {
+        definitive: true,
+        detail: "The queue lease could not be renewed for the external process watchdog.",
+      });
+      return { ok: false };
+    }
+    return { ok: true, deadlineAt: Date.parse(record.leaseExpiresAt) };
+  } finally {
+    closeDb(db);
+  }
 }
 
 function heartbeatKnownQueueState() {
   const heartbeatAt = new Date().toISOString();
   const leaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
-  for (const dbPath of KNOWN_STATE_DB_PATHS) {
+  const recordsByDbPath = new Map();
+  const pipelinesByDbPath = new Map();
+  for (const record of QUEUE_JOBS.values()) {
+    if (record.ownerInstanceId !== BRIDGE_INSTANCE_ID
+      || !["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"].includes(record.status)) continue;
+    const dbPath = stateDbPath(record.cwd);
+    const records = recordsByDbPath.get(dbPath) || [];
+    records.push(record);
+    recordsByDbPath.set(dbPath, records);
+  }
+  for (const record of PIPELINE_RUNS.values()) {
+    if (record.ownerInstanceId !== BRIDGE_INSTANCE_ID
+      || !record.ownerGeneration
+      || ["completed", "failed", "cancelled"].includes(record.status)) continue;
+    const dbPath = stateDbPath(record.cwd);
+    const pipelines = pipelinesByDbPath.get(dbPath) || [];
+    pipelines.push(record);
+    pipelinesByDbPath.set(dbPath, pipelines);
+  }
+  const activeDbPaths = new Set([...recordsByDbPath.keys(), ...pipelinesByDbPath.keys()]);
+  for (const dbPath of activeDbPaths) {
     let db = null;
+    const localRecords = recordsByDbPath.get(dbPath) || [];
+    const localPipelines = pipelinesByDbPath.get(dbPath) || [];
     try {
       db = new DatabaseSync(dbPath);
       db.exec("PRAGMA busy_timeout = 5000;");
@@ -7216,13 +9078,40 @@ function heartbeatKnownQueueState() {
           lease_expires_at = excluded.lease_expires_at
       `).run(BRIDGE_INSTANCE_ID, process.pid, heartbeatAt, heartbeatAt, leaseExpiresAt);
       db.prepare("DELETE FROM bridge_instances WHERE lease_expires_at < ?").run(new Date(Date.now() - CONFIG.queueStaleAfterMs).toISOString());
-      const localRecords = [...QUEUE_JOBS.values()].filter((record) =>
-        record.ownerInstanceId === BRIDGE_INSTANCE_ID
-        && ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"].includes(record.status)
-        && stateDbPath(record.cwd) === dbPath
-      );
       for (const record of localRecords) {
-        renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt);
+        if (!renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt)) {
+          noteQueueLeaseRenewalFailure(record, {
+            definitive: true,
+            detail: "The durable queue row no longer matches this owner generation.",
+          });
+        }
+      }
+      const renewPipeline = db.prepare(`
+        UPDATE opencode_pipelines
+        SET owner_heartbeat_at = ?, owner_lease_expires_at = ?
+        WHERE pipeline_id = ? AND owner_instance_id = ? AND owner_generation = ?
+          AND owner_lease_expires_at > ?
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+      `);
+      for (const record of localPipelines) {
+        const renewed = renewPipeline.run(
+          heartbeatAt,
+          leaseExpiresAt,
+          record.pipelineId,
+          BRIDGE_INSTANCE_ID,
+          record.ownerGeneration,
+          heartbeatAt
+        );
+        if (Number(renewed.changes || 0) === 1) {
+          record.ownerHeartbeatAt = heartbeatAt;
+          record.ownerLeaseExpiresAt = leaseExpiresAt;
+        } else {
+          record.pipelineOwnershipLost = true;
+          logEvent("warn", "pipeline.ownership_lost", {
+            pipelineId: record.pipelineId,
+            ownerGeneration: record.ownerGeneration,
+          });
+        }
       }
       const cancellationRows = db.prepare(`
         SELECT job_id, revision, cancellation_requested_at FROM opencode_jobs
@@ -7241,14 +9130,11 @@ function heartbeatKnownQueueState() {
       reconcileStaleQueueRecords(db, Date.now());
     } catch (error) {
       logEvent("warn", "queue.heartbeat_failed", { dbPath, error: error.message || String(error) });
+      for (const record of localRecords) {
+        noteQueueLeaseRenewalFailure(record, { detail: error.message || String(error) });
+      }
     } finally {
       if (db) closeDb(db);
-    }
-  }
-  for (const record of QUEUE_JOBS.values()) {
-    if (["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"].includes(record.status) && record.ownerInstanceId === BRIDGE_INSTANCE_ID) {
-      record.heartbeatAt = heartbeatAt;
-      record.leaseExpiresAt = leaseExpiresAt;
     }
   }
 }
@@ -7261,45 +9147,225 @@ function ensureQueueHeartbeatTimer() {
 }
 
 function pruneInMemoryState(now = Date.now()) {
-  if (CONFIG.queueRetentionDays <= 0) return;
   const cutoff = now - CONFIG.queueRetentionDays * 24 * 60 * 60 * 1000;
   const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted", "not_resumable"]);
-  for (const [jobId, record] of QUEUE_JOBS) {
-    const createdAt = Date.parse(record.createdAt || "");
-    if (terminalStatuses.has(record.status) && Number.isFinite(createdAt) && createdAt < cutoff) {
-      QUEUE_JOBS.delete(jobId);
+  for (const [pipelineId, record] of PIPELINE_RUNS) {
+    const terminalAt = Date.parse(record.finishedAt || record.updatedAt || record.createdAt || "");
+    if (terminalStatuses.has(record.status) && Number.isFinite(terminalAt) && terminalAt < cutoff) {
+      PIPELINE_RUNS.delete(pipelineId);
     }
   }
-  for (const [pipelineId, record] of PIPELINE_RUNS) {
-    const createdAt = Date.parse(record.createdAt || "");
-    if (terminalStatuses.has(record.status) && Number.isFinite(createdAt) && createdAt < cutoff) {
-      PIPELINE_RUNS.delete(pipelineId);
+  const referencedJobIds = new Set(
+    [...PIPELINE_RUNS.values()].flatMap((record) => Array.isArray(record.queueJobIds) ? record.queueJobIds : [])
+  );
+  for (const [jobId, record] of QUEUE_JOBS) {
+    const terminalAt = Date.parse(record.finishedAt || record.updatedAt || record.createdAt || "");
+    if (terminalStatuses.has(record.status) && !referencedJobIds.has(jobId) && Number.isFinite(terminalAt) && terminalAt < cutoff) {
+      QUEUE_JOBS.delete(jobId);
     }
   }
 }
 
+function sqliteUsedBytes(db) {
+  const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count || 0);
+  const freePages = Number(db.prepare("PRAGMA freelist_count").get()?.freelist_count || 0);
+  const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size || 0);
+  return Math.max(0, (pageCount - freePages) * pageSize);
+}
+
+function stateCapacityError(db, incomingBytes = 0) {
+  const usedBytes = sqliteUsedBytes(db);
+  const projectedBytes = usedBytes + Math.max(0, Number(incomingBytes || 0));
+  return projectedBytes >= CONFIG.stateDbMaxBytes
+    ? {
+        errorType: "state_capacity_exceeded",
+        error: `Project state database reached its configured soft capacity (${projectedBytes} projected live bytes). Terminal and cancellation updates remain enabled; prune/archive old state before creating new work.`,
+        usedBytes,
+        projectedBytes,
+      }
+    : null;
+}
+
 function prunePersistedState(db, dbPath) {
-  if (CONFIG.queueRetentionDays <= 0) return;
   const now = Date.now();
   const lastPruned = statePruneTimes.get(dbPath) || 0;
   if (now - lastPruned < 1000 * 60 * 5) {
     return;
   }
   pruneInMemoryState(now);
-  const cutoff = new Date(now - CONFIG.queueRetentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const queueCutoff = new Date(now - CONFIG.queueRetentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const auditCutoff = now - CONFIG.auditRetentionDays * 24 * 60 * 60 * 1000;
+  const auditCutoffIso = new Date(auditCutoff).toISOString();
   const terminalStatuses = ["completed", "failed", "cancelled", "interrupted", "not_resumable"];
   const placeholders = terminalStatuses.map(() => "?").join(", ");
-  db.prepare(`DELETE FROM opencode_jobs WHERE status IN (${placeholders}) AND created_at < ?`).run(...terminalStatuses, cutoff);
-  db.prepare(`DELETE FROM opencode_pipelines WHERE status IN (${placeholders}) AND created_at < ?`).run(...terminalStatuses, cutoff);
-  statePruneTimes.set(dbPath, now);
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    expireLocksFromDb(db, now);
+    db.prepare(`
+      DELETE FROM changed_files
+      WHERE run_id IN (
+        SELECT run_id FROM runs
+        WHERE status IN ('released', 'expired') AND finished_at IS NOT NULL AND finished_at < ?
+      )
+    `).run(auditCutoff);
+    db.prepare(`
+      DELETE FROM runs
+      WHERE status IN ('released', 'expired') AND finished_at IS NOT NULL AND finished_at < ?
+        AND NOT EXISTS (SELECT 1 FROM locks WHERE locks.run_id = runs.run_id)
+    `).run(auditCutoff);
+    db.prepare(`
+      DELETE FROM opencode_pipelines
+      WHERE status IN (${placeholders}) AND updated_at < ?
+    `).run(...terminalStatuses, queueCutoff);
+    db.prepare(`
+      DELETE FROM opencode_jobs AS job
+      WHERE job.status IN (${placeholders})
+        AND COALESCE(NULLIF(job.finished_at, ''), NULLIF(job.updated_at, ''), job.created_at) < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM opencode_pipeline_children AS relation
+          WHERE relation.job_id = job.job_id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM opencode_pipelines AS pipeline,
+               json_each(CASE WHEN json_valid(pipeline.record_json) THEN pipeline.record_json ELSE '{}' END, '$.queueJobIds') AS child
+          WHERE CAST(child.value AS TEXT) = job.job_id
+      )
+    `).run(...terminalStatuses, queueCutoff);
+    db.prepare(`
+      DELETE FROM integration_operation_files
+      WHERE operation_id IN (
+        SELECT operation_id FROM integration_operations
+        WHERE status IN ('committed', 'rolled_back', 'recovered_noop')
+          AND finished_at IS NOT NULL AND finished_at < ?
+          AND NOT EXISTS (
+            SELECT 1 FROM opencode_pipelines AS pipeline
+            WHERE pipeline.pipeline_id = integration_operations.pipeline_id
+              AND pipeline.status NOT IN ('completed', 'failed', 'cancelled')
+          )
+      )
+    `).run(auditCutoffIso);
+    db.prepare(`
+      DELETE FROM integration_operations
+      WHERE status IN ('committed', 'rolled_back', 'recovered_noop')
+        AND finished_at IS NOT NULL AND finished_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM opencode_pipelines AS pipeline
+          WHERE pipeline.pipeline_id = integration_operations.pipeline_id
+            AND pipeline.status NOT IN ('completed', 'failed', 'cancelled')
+        )
+    `).run(auditCutoffIso);
+    db.prepare(`
+      DELETE FROM opencode_pipelines
+      WHERE pipeline_id IN (
+        SELECT pipeline_id FROM opencode_pipelines
+        WHERE status IN ('completed', 'failed', 'cancelled')
+        ORDER BY updated_at DESC, pipeline_id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(CONFIG.terminalPipelineMaxRows);
+    db.prepare(`
+      DELETE FROM opencode_jobs
+      WHERE job_id IN (
+        SELECT job.job_id FROM opencode_jobs AS job
+        WHERE job.status IN ('completed', 'failed', 'cancelled', 'interrupted', 'not_resumable')
+          AND NOT EXISTS (
+            SELECT 1 FROM opencode_pipeline_children AS relation WHERE relation.job_id = job.job_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM opencode_pipelines AS pipeline,
+                 json_each(CASE WHEN json_valid(pipeline.record_json) THEN pipeline.record_json ELSE '{}' END, '$.queueJobIds') AS child
+            WHERE CAST(child.value AS TEXT) = job.job_id
+          )
+        ORDER BY COALESCE(NULLIF(job.finished_at, ''), NULLIF(job.updated_at, ''), job.created_at) DESC, job.job_id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(CONFIG.terminalJobMaxRows);
+    db.prepare(`
+      DELETE FROM integration_operation_files
+      WHERE operation_id IN (
+        SELECT operation_id FROM integration_operations
+        WHERE status IN ('committed', 'rolled_back', 'recovered_noop')
+          AND NOT EXISTS (
+            SELECT 1 FROM opencode_pipelines AS pipeline
+            WHERE pipeline.pipeline_id = integration_operations.pipeline_id
+              AND pipeline.status NOT IN ('completed', 'failed', 'cancelled')
+          )
+        ORDER BY COALESCE(finished_at, updated_at) DESC, operation_id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(CONFIG.terminalIntegrationMaxRows);
+    db.prepare(`
+      DELETE FROM integration_operations
+      WHERE operation_id IN (
+        SELECT operation_id FROM integration_operations
+        WHERE status IN ('committed', 'rolled_back', 'recovered_noop')
+          AND NOT EXISTS (
+            SELECT 1 FROM opencode_pipelines AS pipeline
+            WHERE pipeline.pipeline_id = integration_operations.pipeline_id
+              AND pipeline.status NOT IN ('completed', 'failed', 'cancelled')
+          )
+        ORDER BY COALESCE(finished_at, updated_at) DESC, operation_id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(CONFIG.terminalIntegrationMaxRows);
+    db.prepare(`
+      DELETE FROM worktree_artifacts
+      WHERE status IN ('cleaned', 'cleaned_branch_retained') AND cleaned_at IS NOT NULL AND cleaned_at < ?
+    `).run(auditCutoffIso);
+    db.exec("COMMIT");
+    transactionOpen = false;
+    statePruneTimes.set(dbPath, now);
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the pruning error. */ }
+    }
+    throw error;
+  }
+}
+
+function maintainKnownStateDatabases() {
+  for (const dbPath of [...KNOWN_STATE_DB_PATHS]) {
+    if (!existsSync(dbPath)) KNOWN_STATE_DB_PATHS.delete(dbPath);
+  }
+  const dbPaths = [...KNOWN_STATE_DB_PATHS];
+  if (!dbPaths.length) return;
+  const dbPath = dbPaths[stateMaintenanceCursor % dbPaths.length];
+  stateMaintenanceCursor = (stateMaintenanceCursor + 1) % Math.max(1, dbPaths.length);
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA busy_timeout = 5000;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    db.exec("PRAGMA synchronous = FULL;");
+    db.exec("PRAGMA secure_delete = ON;");
+    prunePersistedState(db, dbPath);
+  } catch (error) {
+    logEvent("warn", "state.maintenance_failed", {
+      dbPathSha256: createHash("sha256").update(dbPath).digest("hex"),
+      errorType: /^[A-Z0-9_]+$/.test(String(error?.code || "")) ? String(error.code) : "sqlite_state_maintenance_failed",
+    });
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+function ensureStateMaintenanceTimer() {
+  if (stateMaintenanceTimer || process.argv.includes("--self-test")) return;
+  stateMaintenanceTimer = setInterval(maintainKnownStateDatabases, 1000 * 60 * 5);
+  stateMaintenanceTimer.unref?.();
 }
 
 async function resolveProjectStateRoot(cwd = "") {
   const base = path.resolve(cwd || process.cwd());
   const repoRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], base, 1000 * 15);
-  return repoRoot.exitCode === 0 && repoRoot.stdout.trim()
+  const resolved = repoRoot.exitCode === 0 && repoRoot.stdout.trim()
     ? path.resolve(repoRoot.stdout.trim())
     : base;
+  return existsSync(resolved) ? realpathSync(resolved) : resolved;
 }
 
 async function normalizeJobCwd(job) {
@@ -7338,6 +9404,7 @@ function ensureLockTableSchema(db) {
         CREATE TABLE locks (
           normalized_path TEXT NOT NULL,
           owner_agent TEXT NOT NULL,
+          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
           run_id TEXT NOT NULL,
           token TEXT NOT NULL,
           lock_mode TEXT NOT NULL,
@@ -7389,12 +9456,197 @@ function ensureQueueLeaseSchema(db) {
   ensureTableColumn(db, "opencode_jobs", "revision", "INTEGER NOT NULL DEFAULT 0");
   ensureTableColumn(db, "opencode_jobs", "idempotency_key", "TEXT");
   ensureTableColumn(db, "opencode_jobs", "request_encrypted", "TEXT");
+  ensureTableColumn(db, "opencode_jobs", "result_encrypted", "TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS opencode_jobs_idempotency_idx ON opencode_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';");
 }
 
 function ensurePipelineRevisionSchema(db) {
   ensureTableColumn(db, "opencode_pipelines", "revision", "INTEGER NOT NULL DEFAULT 0");
   ensureTableColumn(db, "opencode_pipelines", "request_encrypted", "TEXT");
+  ensureTableColumn(db, "opencode_pipelines", "details_encrypted", "TEXT");
+  ensureTableColumn(db, "opencode_pipelines", "owner_instance_id", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "opencode_pipelines", "owner_generation", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "opencode_pipelines", "owner_heartbeat_at", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "opencode_pipelines", "owner_lease_expires_at", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "opencode_pipelines", "expected_child_count", "INTEGER NOT NULL DEFAULT 0");
+  ensureTableColumn(db, "opencode_pipelines", "batch_state", "TEXT NOT NULL DEFAULT 'unstarted'");
+  ensureTableColumn(db, "opencode_pipelines", "cleanup_state", "TEXT NOT NULL DEFAULT 'none'");
+  ensureTableColumn(db, "opencode_pipelines", "queue_mode", "TEXT NOT NULL DEFAULT 'legacy'");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS opencode_pipeline_children (
+      pipeline_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      job_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (pipeline_id, ordinal),
+      UNIQUE (job_id),
+      FOREIGN KEY (pipeline_id) REFERENCES opencode_pipelines(pipeline_id) ON DELETE CASCADE,
+      FOREIGN KEY (job_id) REFERENCES opencode_jobs(job_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS opencode_pipeline_children_job_idx
+      ON opencode_pipeline_children (job_id);
+    CREATE INDEX IF NOT EXISTS opencode_pipelines_owner_lease_idx
+      ON opencode_pipelines (status, owner_lease_expires_at);
+    UPDATE opencode_pipelines
+    SET owner_instance_id = COALESCE(NULLIF(owner_instance_id, ''), json_extract(record_json, '$.ownerInstanceId'), ''),
+        owner_generation = COALESCE(NULLIF(owner_generation, ''), json_extract(record_json, '$.ownerGeneration'), ''),
+        owner_heartbeat_at = COALESCE(NULLIF(owner_heartbeat_at, ''), json_extract(record_json, '$.ownerHeartbeatAt'), ''),
+        owner_lease_expires_at = COALESCE(NULLIF(owner_lease_expires_at, ''), json_extract(record_json, '$.ownerLeaseExpiresAt'), ''),
+        expected_child_count = CASE
+          WHEN expected_child_count > 0 THEN expected_child_count
+          ELSE COALESCE(json_array_length(record_json, '$.queueJobIds'), 0)
+        END,
+        batch_state = CASE
+          WHEN batch_state <> 'unstarted' THEN batch_state
+          WHEN COALESCE(json_array_length(record_json, '$.queueJobIds'), 0) > 0
+            OR status = 'running'
+            OR EXISTS (
+              SELECT 1 FROM opencode_jobs AS legacy_child
+              WHERE json_valid(legacy_child.record_json)
+                AND json_extract(legacy_child.record_json, '$.parentJobId') = opencode_pipelines.pipeline_id
+            )
+          THEN 'legacy'
+          ELSE batch_state
+        END
+    WHERE json_valid(record_json);
+  `);
+}
+
+function ensureIntegrationJournalSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integration_operations (
+      operation_id TEXT PRIMARY KEY,
+      cwd TEXT NOT NULL,
+      pipeline_id TEXT NOT NULL DEFAULT '',
+      pipeline_job_id TEXT NOT NULL DEFAULT '',
+      owner_instance_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      target_head TEXT NOT NULL,
+      target_state_sha256 TEXT NOT NULL,
+      pre_index_sha256 TEXT NOT NULL,
+      patch_sha256 TEXT NOT NULL,
+      source_base_commit TEXT NOT NULL,
+      source_state_sha256 TEXT NOT NULL,
+      contract_sha256 TEXT NOT NULL,
+      affected_paths_json TEXT NOT NULL,
+      result_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS integration_operation_files (
+      operation_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      path TEXT NOT NULL,
+      pre_kind TEXT NOT NULL,
+      pre_mode INTEGER NOT NULL DEFAULT 0,
+      pre_sha256 TEXT NOT NULL,
+      pre_encrypted TEXT,
+      post_sha256 TEXT NOT NULL,
+      post_encrypted TEXT NOT NULL,
+      PRIMARY KEY (operation_id, ordinal),
+      UNIQUE (operation_id, path),
+      FOREIGN KEY (operation_id) REFERENCES integration_operations(operation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS integration_operations_recovery_idx
+      ON integration_operations (cwd, status, updated_at);
+    CREATE INDEX IF NOT EXISTS integration_operations_pipeline_idx
+      ON integration_operations (pipeline_id, pipeline_job_id);
+    CREATE INDEX IF NOT EXISTS integration_operation_files_operation_idx
+      ON integration_operation_files (operation_id, ordinal);
+  `);
+}
+
+function ensureWorktreeArtifactSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS worktree_artifacts (
+      worktree_path TEXT PRIMARY KEY,
+      cwd TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      measured_bytes INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      cleaned_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS worktree_artifacts_capacity_idx
+      ON worktree_artifacts (cwd, status, updated_at);
+  `);
+}
+
+async function migrateLegacyEncryptedState(db, dbPath) {
+  const legacyJobs = db.prepare(`
+    SELECT job_id, revision, record_json FROM opencode_jobs
+    WHERE result_encrypted IS NULL OR result_encrypted = ''
+  `).all();
+  const legacyPipelines = db.prepare(`
+    SELECT pipeline_id, revision, record_json FROM opencode_pipelines
+    WHERE details_encrypted IS NULL OR details_encrypted = ''
+  `).all();
+  if (!legacyJobs.length && !legacyPipelines.length) return false;
+
+  const preparedJobs = [];
+  for (const row of legacyJobs) {
+    let snapshot = {};
+    try { snapshot = JSON.parse(row.record_json || "{}"); } catch { snapshot = {}; }
+    snapshot.jobId = snapshot.jobId || row.job_id;
+    preparedJobs.push({
+      ...row,
+      recordJson: JSON.stringify(queueRecordDurableSummary(snapshot)),
+      encrypted: await encryptQueuePrivateDetails(snapshot),
+    });
+  }
+  const preparedPipelines = [];
+  for (const row of legacyPipelines) {
+    let snapshot = {};
+    try { snapshot = JSON.parse(row.record_json || "{}"); } catch { snapshot = {}; }
+    snapshot.pipelineId = snapshot.pipelineId || row.pipeline_id;
+    preparedPipelines.push({
+      ...row,
+      recordJson: JSON.stringify(pipelineRecordDurableSummary(snapshot)),
+      encrypted: await encryptPipelinePrivateDetails(snapshot),
+    });
+  }
+
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const updateJob = db.prepare(`
+      UPDATE opencode_jobs SET record_json = ?, result_encrypted = ?
+      WHERE job_id = ? AND revision = ? AND (result_encrypted IS NULL OR result_encrypted = '')
+    `);
+    for (const row of preparedJobs) updateJob.run(row.recordJson, row.encrypted, row.job_id, Number(row.revision || 0));
+    const updatePipeline = db.prepare(`
+      UPDATE opencode_pipelines SET record_json = ?, details_encrypted = ?
+      WHERE pipeline_id = ? AND revision = ? AND (details_encrypted IS NULL OR details_encrypted = '')
+    `);
+    for (const row of preparedPipelines) {
+      updatePipeline.run(row.recordJson, row.encrypted, row.pipeline_id, Number(row.revision || 0));
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the migration error. */ }
+    }
+    throw error;
+  }
+
+  const remaining = Number(db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM opencode_jobs WHERE result_encrypted IS NULL OR result_encrypted = '') +
+      (SELECT COUNT(*) FROM opencode_pipelines WHERE details_encrypted IS NULL OR details_encrypted = '') AS count
+  `).get()?.count || 0);
+  if (remaining === 0 && !PRIVATE_STATE_VACUUMED_DB_PATHS.has(dbPath)) {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    db.exec("VACUUM;");
+    PRIVATE_STATE_VACUUMED_DB_PATHS.add(dbPath);
+  }
+  return true;
 }
 
 function scrubLegacyLockSecrets(db) {
@@ -7415,13 +9667,26 @@ function scrubLegacyLockSecrets(db) {
 
 async function openLockDb(cwd = "") {
   const dbPath = stateDbPath(await resolveProjectStateRoot(cwd));
-  await mkdir(path.dirname(dbPath), { recursive: true });
+  await mkdir(path.dirname(dbPath), { recursive: true, mode: 0o700 });
+  await assertNoLinkedPath(path.dirname(dbPath), "Bridge state directory");
+  if (existsSync(dbPath)) {
+    const details = await lstat(dbPath);
+    if (details.isSymbolicLink() || !details.isFile()) {
+      throw new Error("Bridge state database must be a regular file, not a link or special entry.");
+    }
+  }
   const maxAttempts = 8;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     let db = null;
     try {
       db = new DatabaseSync(dbPath);
+      const openedDetails = await lstat(dbPath);
+      if (openedDetails.isSymbolicLink() || !openedDetails.isFile()) {
+        throw new Error("Bridge state database identity changed during open.");
+      }
       db.exec("PRAGMA busy_timeout = 5000;");
+      db.exec("PRAGMA foreign_keys = ON;");
+      db.exec("PRAGMA synchronous = FULL;");
       db.exec("PRAGMA secure_delete = ON;");
       const journalMode = String(db.prepare("PRAGMA journal_mode").get()?.journal_mode || "").toLowerCase();
       if (journalMode !== "wal") {
@@ -7431,6 +9696,7 @@ async function openLockDb(cwd = "") {
         CREATE TABLE IF NOT EXISTS locks (
           normalized_path TEXT NOT NULL,
           owner_agent TEXT NOT NULL,
+          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
           run_id TEXT NOT NULL,
           token TEXT NOT NULL,
           lock_mode TEXT NOT NULL,
@@ -7464,7 +9730,8 @@ async function openLockDb(cwd = "") {
           finished_at TEXT,
           record_json TEXT NOT NULL,
           idempotency_key TEXT,
-          request_encrypted TEXT
+          request_encrypted TEXT,
+          result_encrypted TEXT
         );
         CREATE TABLE IF NOT EXISTS opencode_pipelines (
           pipeline_id TEXT PRIMARY KEY,
@@ -7474,7 +9741,8 @@ async function openLockDb(cwd = "") {
           updated_at TEXT NOT NULL,
           record_json TEXT NOT NULL,
           revision INTEGER NOT NULL DEFAULT 0,
-          request_encrypted TEXT
+          request_encrypted TEXT,
+          details_encrypted TEXT
         );
         CREATE TABLE IF NOT EXISTS bridge_instances (
           instance_id TEXT PRIMARY KEY,
@@ -7485,8 +9753,12 @@ async function openLockDb(cwd = "") {
         );
       `);
       ensureLockTableSchema(db);
+      ensureTableColumn(db, "locks", "acquisition_origin", "TEXT NOT NULL DEFAULT 'legacy'");
       ensureQueueLeaseSchema(db);
       ensurePipelineRevisionSchema(db);
+      ensureIntegrationJournalSchema(db);
+      ensureWorktreeArtifactSchema(db);
+      await migrateLegacyEncryptedState(db, dbPath);
       scrubLegacyLockSecrets(db);
       const heartbeatAt = new Date().toISOString();
       const leaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
@@ -7499,9 +9771,14 @@ async function openLockDb(cwd = "") {
           lease_expires_at = excluded.lease_expires_at
       `).run(BRIDGE_INSTANCE_ID, process.pid, heartbeatAt, heartbeatAt, leaseExpiresAt);
       db.exec("CREATE INDEX IF NOT EXISTS locks_expires_at_idx ON locks (expires_at)");
+      db.exec("CREATE INDEX IF NOT EXISTS runs_retention_idx ON runs (status, finished_at)");
+      db.exec("CREATE INDEX IF NOT EXISTS changed_files_run_idx ON changed_files (run_id)");
       db.exec("CREATE INDEX IF NOT EXISTS opencode_jobs_lease_idx ON opencode_jobs (status, lease_expires_at)");
+      db.exec("CREATE INDEX IF NOT EXISTS opencode_jobs_retention_idx ON opencode_jobs (status, finished_at)");
+      db.exec("CREATE INDEX IF NOT EXISTS opencode_pipelines_retention_idx ON opencode_pipelines (status, updated_at)");
       KNOWN_STATE_DB_PATHS.add(dbPath);
       ensureQueueHeartbeatTimer();
+      ensureStateMaintenanceTimer();
       prunePersistedState(db, dbPath);
       return db;
     } catch (error) {
@@ -7537,6 +9814,7 @@ function rowsToLocks(rows) {
       runId: row.run_id,
       owner: row.owner_agent,
       agent: row.owner_agent,
+      origin: row.acquisition_origin || "legacy",
       lockType: row.lock_mode,
       lockMode: row.lock_mode,
       paths: [],
@@ -7551,15 +9829,35 @@ function rowsToLocks(rows) {
   return [...grouped.values()].map((lock) => ({ ...lock, paths: normalizeLockPathList(lock.paths) }));
 }
 
-function listLocksFromDb(db, now = Date.now()) {
+function expireLocksFromDb(db, now = Date.now()) {
+  const expiredRunIds = db.prepare("SELECT DISTINCT run_id FROM locks WHERE expires_at <= ?").all(now)
+    .map((row) => row.run_id)
+    .filter(Boolean);
   db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(now);
+  const markExpired = db.prepare(`
+    UPDATE runs
+    SET status = 'expired', finished_at = COALESCE(finished_at, ?)
+    WHERE run_id = ? AND status = 'running'
+      AND NOT EXISTS (SELECT 1 FROM locks WHERE locks.run_id = runs.run_id)
+  `);
+  for (const runId of expiredRunIds) markExpired.run(now, runId);
+  return expiredRunIds;
+}
+
+function listLocksFromDb(db, now = Date.now()) {
+  expireLocksFromDb(db, now);
   return rowsToLocks(db.prepare("SELECT * FROM locks WHERE expires_at > ? ORDER BY created_at, run_id, normalized_path").all(now));
 }
 
 async function cleanupExpiredLocks(cwd = "") {
   const db = await openLockDb(cwd);
   try {
-    db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(Date.now());
+    db.exec("BEGIN IMMEDIATE");
+    expireLocksFromDb(db, Date.now());
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the cleanup error. */ }
+    throw error;
   } finally {
     closeDb(db);
   }
@@ -7577,21 +9875,42 @@ async function listLocks(cwd = "") {
 async function acquireHardLock({
   owner = "codex",
   agent = "opencode",
+  origin = "internal",
   task = "",
   cwd = "",
   lockType = "write",
   paths = [],
+  repositoryScope = false,
   ttlMs = DEFAULT_LOCK_TTL_MS,
 }) {
   const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  const normalizedOrigin = origin === "manual" ? "manual" : "internal";
   const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
-  const unsafeReason = unsafePathReason(paths, projectRoot);
-  const lockPathsRequested = normalizeLockPathListForCwd(paths, projectRoot);
+  const requestedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : paths;
+  const unsafeReason = repositoryScope ? "" : unsafePathReason(requestedPaths, projectRoot);
+  const lockPathsRequested = normalizeLockPathListForCwd(requestedPaths, projectRoot);
+
+  if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(projectRoot))
+    && normalizedLockType !== "read"
+    && agent !== "integration_recovery") {
+    return {
+      ok: false,
+      errorType: "integration_recovery_pending",
+      error: "Repository mutation is blocked until the durable integration journal is recovered or explicitly quarantined.",
+    };
+  }
 
   if (!PARALLEL_LOCK_TYPES.has(normalizedLockType)) {
     return {
       ok: false,
       error: `Invalid lockType "${lockType}". Use read, write, or serial_integration.`,
+    };
+  }
+
+  if (repositoryScope && (normalizedOrigin !== "internal" || normalizedLockType === "write")) {
+    return {
+      ok: false,
+      error: "Repository-wide scope is reserved for internal read or serial-integration consistency leases.",
     };
   }
 
@@ -7627,6 +9946,25 @@ async function acquireHardLock({
 
   try {
     db.exec("BEGIN IMMEDIATE");
+    if (normalizedLockType !== "read" && agent !== "integration_recovery") {
+      const unresolvedIntegration = db.prepare(`
+        SELECT operation_id, status
+        FROM integration_operations
+        WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        ORDER BY updated_at, operation_id
+        LIMIT 1
+      `).get(path.resolve(projectRoot));
+      if (unresolvedIntegration) {
+        db.exec("ROLLBACK");
+        return {
+          ok: false,
+          errorType: "integration_recovery_pending",
+          error: "Repository mutation is blocked by an unresolved durable integration operation.",
+          operationId: unresolvedIntegration.operation_id,
+          operationStatus: unresolvedIntegration.status,
+        };
+      }
+    }
     const keptLocks = listLocksFromDb(db, now);
     const conflict = keptLocks.map((lock) => conflictsWithActiveLock(request, lock)).find(Boolean);
     if (conflict) {
@@ -7644,10 +9982,10 @@ async function acquireHardLock({
       "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
     ).run(runId, agent, "running", normalizedLockType, now);
     const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
+      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
     }
     db.exec("COMMIT");
 
@@ -7657,6 +9995,7 @@ async function acquireHardLock({
       token,
       owner,
       agent,
+      origin: normalizedOrigin,
       taskSha256,
       cwd: projectRoot,
       lockType: normalizedLockType,
@@ -7706,7 +10045,10 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
     } else {
       db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(lockId, tokenSha256);
     }
-    db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
+    const remaining = db.prepare("SELECT 1 FROM locks WHERE run_id = ? LIMIT 1").get(lockId);
+    if (!remaining) {
+      db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
+    }
     db.exec("COMMIT");
     return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
   } catch (error) {
@@ -7721,7 +10063,41 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
   }
 }
 
+async function quarantineHardLock(lock) {
+  if (!lock?.id || !lock?.token) return { ok: false };
+  const db = await openLockDb(lock.cwd);
+  try {
+    const now = Date.now();
+    const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
+    db.exec("BEGIN IMMEDIATE");
+    const quarantined = db.prepare(`
+      UPDATE locks SET expires_at = ?
+      WHERE run_id = ? AND token = ? AND expires_at > ?
+    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256, now);
+    if (Number(quarantined.changes || 0) < 1) {
+      db.exec("ROLLBACK");
+      return { ok: false };
+    }
+    db.prepare("UPDATE runs SET status = 'quarantined', finished_at = NULL WHERE run_id = ?").run(lock.id);
+    db.exec("COMMIT");
+    lock.expiresAt = Number.MAX_SAFE_INTEGER;
+    return { ok: true };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the containment error. */ }
+    logEvent("error", "lock.containment_quarantine_failed", {
+      lockId: lock.id,
+      error: error.message || String(error),
+    });
+    return { ok: false };
+  } finally {
+    closeDb(db);
+  }
+}
+
 function hardLockPathsForPlan(lockPlan) {
+  if (lockPlan?.lockType === "read") {
+    return firstNonEmptyList(lockPlan.lockedPaths, lockPlan.scopeContract?.scope?.read, [REPOSITORY_SCOPE_LOCK_PATH]);
+  }
   return firstNonEmptyList(lockPlan.allowedEdits, lockPlan.lockedPaths);
 }
 
@@ -7731,28 +10107,120 @@ function hardLockTtlForPlan(lockPlan) {
   return Math.max(DEFAULT_LOCK_TTL_MS, executionTimeoutMs + safetyMarginMs);
 }
 
-function startHardLockHeartbeat(lock, ttlMs) {
-  if (!lock?.id || !lock?.token) return () => {};
-  const intervalMs = Math.max(1000, Math.min(1000 * 30, Math.floor(ttlMs / 3)));
-  const timer = setInterval(async () => {
-    try {
-      const db = await openLockDb(lock.cwd);
+function lockOwnershipLossError(lock, detail = "Durable lock ownership could not be renewed before expiry.") {
+  const error = new Error(detail);
+  error.errorType = lock?.lockType === "read"
+    ? "read_lock_ownership_lost"
+    : lock?.lockType === "serial_integration"
+      ? "integration_lock_ownership_lost"
+      : "write_lock_ownership_lost";
+  error.lockId = lock?.id || "";
+  return error;
+}
+
+function abortSignalErrorType(signal, fallback = "agent_cancelled") {
+  return signal?.aborted && typeof signal.reason?.errorType === "string"
+    ? signal.reason.errorType
+    : fallback;
+}
+
+function combineAbortSignals(signals = []) {
+  const active = signals.filter(Boolean);
+  if (!active.length) return null;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
+
+function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs = 0, refreshLease = null } = {}) {
+  const controller = new AbortController();
+  const inertStop = Object.assign(() => {}, {
+    signal: controller.signal,
+    pulse: async () => false,
+    assertOwned: () => null,
+  });
+  if (!lock?.id || !lock?.token) return inertStop;
+
+  const effectiveTtlMs = Math.max(250, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
+  const intervalMs = requestedIntervalMs > 0
+    ? Math.max(20, Math.min(requestedIntervalMs, Math.floor(effectiveTtlMs / 2)))
+    : Math.max(100, Math.min(1000 * 30, Math.floor(effectiveTtlMs / 3)));
+  const expiryGuardMs = Math.max(20, Math.min(intervalMs, Math.floor(effectiveTtlMs / 4)));
+  let lastConfirmedExpiresAt = Number(lock.expiresAt) || Date.now() + effectiveTtlMs;
+  let fenceTimer = null;
+  let refreshPromise = null;
+  let stopped = false;
+
+  const loseOwnership = (detail) => {
+    if (controller.signal.aborted || stopped) return;
+    const error = lockOwnershipLossError(lock, detail);
+    logEvent("error", "lock.ownership_lost", { lockId: lock.id, errorType: error.errorType, detail });
+    controller.abort(error);
+  };
+  const scheduleFence = () => {
+    if (fenceTimer) clearTimeout(fenceTimer);
+    const delayMs = Math.max(0, lastConfirmedExpiresAt - Date.now() - expiryGuardMs);
+    fenceTimer = setTimeout(() => {
+      loseOwnership("Durable lock renewal did not complete before the fail-closed lease deadline.");
+    }, delayMs);
+    fenceTimer.unref?.();
+  };
+
+  const pulse = async () => {
+    if (stopped || controller.signal.aborted) return false;
+    if (refreshPromise) return await refreshPromise;
+    refreshPromise = (async () => {
+      let db = null;
       try {
-        const expiresAt = Date.now() + ttlMs;
-        const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-        const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ?").run(expiresAt, lock.id, tokenSha256);
-        if (Number(updated.changes || 0) === 0) {
-          logEvent("warn", "lock.heartbeat_lost", { lockId: lock.id });
+        const now = Date.now();
+        if (lastConfirmedExpiresAt <= now) {
+          loseOwnership("The durable lock expired before its heartbeat could run.");
+          return false;
         }
+        const expiresAt = now + effectiveTtlMs;
+        let renewed = false;
+        if (typeof refreshLease === "function") {
+          renewed = (await refreshLease({ lock, expiresAt })) !== false;
+        } else {
+          db = await openLockDb(lock.cwd);
+          const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
+          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ?").run(expiresAt, lock.id, tokenSha256, now);
+          renewed = Number(updated.changes || 0) === Math.max(1, lock.paths?.length || 0);
+        }
+        if (!renewed) {
+          loseOwnership("The durable lock row or fencing token no longer belongs to this execution.");
+          return false;
+        }
+        lock.expiresAt = expiresAt;
+        lastConfirmedExpiresAt = expiresAt;
+        scheduleFence();
+        return true;
+      } catch (error) {
+        logEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: error.message || String(error) });
+        return false;
       } finally {
-        closeDb(db);
+        if (db) closeDb(db);
       }
-    } catch (error) {
-      logEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: error.message || String(error) });
+    })();
+    try {
+      return await refreshPromise;
+    } finally {
+      refreshPromise = null;
     }
-  }, intervalMs);
+  };
+
+  scheduleFence();
+  const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  const stop = Object.assign(() => {
+    stopped = true;
+    clearInterval(timer);
+    if (fenceTimer) clearTimeout(fenceTimer);
+  }, {
+    signal: controller.signal,
+    pulse,
+    assertOwned: () => controller.signal.aborted ? controller.signal.reason : null,
+  });
+  return stop;
 }
 
 function hardLockSummary(acquiredLock) {
@@ -7846,7 +10314,7 @@ function formatDelegationPlanJob({ index, job, lockPlan, resolution }) {
     `Effective task permission: ${resolution?.agentMetadata ? (resolution.agentMetadata.canDelegate ? "enabled" : "denied") : "unattested"}`,
     `Effective external-directory permission denied: ${resolution?.agentMetadata?.externalDirectoryDenied ? "yes" : "no/unattested"}`,
     `Would run: ${resolution?.actualAgent ? commandShape(resolution.actualAgent, resolution.agentMetadata) : "no"}`,
-    `Would acquire lock: ${lockPlan.lockType === "read" ? "no" : "yes"}`,
+    "Would acquire consistency lock: yes (shared for reads, exclusive for writes/integration)",
     `Lock mode: ${lockPlan.lockMode}`,
     `Lock type: ${lockPlan.lockType}`,
     lockPlan.orchestratorMode ? `Orchestrator mode: ${lockPlan.orchestratorMode}` : null,
@@ -7867,13 +10335,13 @@ server.tool(
     owner: z.string().optional().describe("Lock owner, usually Codex."),
     agent: z.string().optional().describe("Agent receiving the lock."),
     task: z.string().optional().describe("Short task description."),
-    cwd: z.string().optional().describe("Repository path."),
+    cwd: z.string().min(1).describe("Canonical repository path."),
     lockType: z.enum(["read", "write", "serial_integration"]).optional(),
     paths: z.array(z.string()).min(1).describe("Concrete files or directories to lock."),
     ttlMs: z.number().int().positive().optional().describe("Lease duration in milliseconds. Defaults to 30 minutes."),
   },
   async ({ owner = "codex", agent = "opencode", task = "", cwd = "", lockType = "write", paths, ttlMs = DEFAULT_LOCK_TTL_MS }) => {
-    const result = await acquireHardLock({ owner, agent, task, cwd, lockType, paths, ttlMs });
+    const result = await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
     return {
       content: [
         {
@@ -7908,7 +10376,7 @@ server.tool(
   {
     lockId: z.string().describe("Lock id returned by acquire_agent_lock or an OpenCode run result."),
     token: z.string().optional().describe("Release token returned by acquire_agent_lock."),
-    cwd: z.string().optional().describe("Repository path for the lock registry."),
+    cwd: z.string().min(1).describe("Canonical repository path for the lock registry."),
   },
   async ({ lockId, token = "", cwd = "" }) => {
     const result = await releaseHardLock(lockId, token, [], cwd);
@@ -7934,7 +10402,7 @@ server.tool(
   "list_agent_locks",
   "List active temporary agent locks.",
   {
-    cwd: z.string().optional().describe("Repository path for the lock registry."),
+    cwd: z.string().min(1).describe("Canonical repository path for the lock registry."),
   },
   async ({ cwd = "" }) => {
     const locks = await listLocks(cwd);
@@ -7991,7 +10459,7 @@ server.tool(
   "list_opencode_agents",
   "List available OpenCode agents and subagents.",
   {
-    cwd: z.string().optional(),
+    cwd: z.string().min(1),
   },
   async ({ cwd }) => {
     const discovery = await listAvailableAgents(cwd);
@@ -8018,7 +10486,7 @@ server.tool(
   "get_opencode_bridge_status",
   "Check OpenCode, Git, agent discovery, and the bridge's effective safety configuration.",
   {
-    cwd: z.string().optional().describe("Repository path used for command and agent discovery checks."),
+    cwd: z.string().min(1).describe("Canonical repository path used for command and agent discovery checks."),
   },
   async ({ cwd }) => {
     const pluginPolicy = await verifyExternalPluginPolicy(cwd);
@@ -8204,7 +10672,7 @@ server.tool(
       z.object({
         agent: z.string(),
         task: z.string(),
-        cwd: z.string().optional(),
+        cwd: z.string().min(1),
         allowFallbackToBuild: z.boolean().optional(),
         subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
         proxyAgent: z.string().optional(),
@@ -8450,7 +10918,7 @@ server.tool(
   {
     agent: z.string().describe("Agent name, for example planner, architect, builder, reviewer, tester, or explore."),
     task: z.string().describe("Task prompt to send to the OpenCode agent."),
-    cwd: z.string().optional().describe("Repository path where OpenCode should run."),
+    cwd: z.string().min(1).describe("Canonical repository path where OpenCode should run."),
     allowFallbackToBuild: z.boolean().optional().describe("Use build only when the requested agent is missing. Defaults to false."),
     subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional().describe("How to handle OpenCode agents listed as subagent. Defaults to reject; proxy is an explicit compatibility opt-in."),
     proxyAgent: z.string().optional().describe("Primary/all OpenCode agent used when subagentStrategy is proxy. Defaults to the read-only planner."),
@@ -8579,7 +11047,7 @@ server.tool(
     idempotencyKey: z.string().min(1).max(200).optional().describe("Stable caller-generated key. Repeating it returns the original durable job instead of creating duplicate work."),
     agent: z.string().describe("Agent name, for example planner, architect, builder, reviewer, tester, or explore."),
     task: z.string().describe("Task prompt to send to the OpenCode agent."),
-    cwd: z.string().optional().describe("Repository path where OpenCode should run."),
+    cwd: z.string().min(1).describe("Canonical repository path where OpenCode should run."),
     allowFallbackToBuild: z.boolean().optional().describe("Use build only when the requested agent is missing. Defaults to false."),
     subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
     proxyAgent: z.string().optional(),
@@ -8690,21 +11158,18 @@ server.tool(
   "list_opencode_jobs",
   "List queued OpenCode jobs and their current state.",
   {
-    cwd: z.string().optional().describe("Optional repository path for sqlite-backed job listing."),
+    cwd: z.string().min(1).describe("Canonical repository path for project-scoped job listing."),
     status: z.enum(["pending", "planned", "blocked", "running", "validating", "reviewing", "testing", "completed", "failed", "cancelled", "interrupted", "not_resumable"]).optional(),
   },
   async ({ cwd = "", status = "" }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecords = [...QUEUE_JOBS.values()]
-      .filter((record) => recordMatchesProject(record, projectRoot))
-      .map((record) => queueRecordSnapshot(record, false))
-      .filter((record) => !status || record.status === status);
-    const persistedRecords = await listPersistedQueueRecords(projectRoot || cwd, status);
-    const byId = new Map();
-    for (const record of persistedRecords.concat(memoryRecords)) {
-      byId.set(record.jobId, record);
-    }
-    const records = [...byId.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const records = (effectiveQueueMode() === "sqlite"
+      ? await listPersistedQueueRecords(projectRoot || cwd, status)
+      : [...QUEUE_JOBS.values()]
+        .filter((record) => recordMatchesProject(record, projectRoot))
+        .map((record) => queueRecordSnapshot(record, false))
+        .filter((record) => !status || record.status === status)
+    ).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 
     return {
       content: [
@@ -8726,13 +11191,14 @@ server.tool(
   "Get one queued OpenCode job, including result text when available.",
   {
     jobId: z.string(),
-    cwd: z.string().optional().describe("Optional repository path for sqlite-backed job lookup."),
+    cwd: z.string().min(1).describe("Canonical repository path for project-scoped job lookup."),
   },
   async ({ jobId, cwd = "" }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecord = QUEUE_JOBS.get(jobId);
-    const record = memoryRecord && recordMatchesProject(memoryRecord, projectRoot) ? memoryRecord : null;
-    const snapshot = record ? queueRecordSnapshot(record) : await readPersistedQueueRecord(jobId, projectRoot || cwd);
+    const authoritative = await authoritativeQueueRecord(jobId, projectRoot || cwd);
+    const snapshot = authoritative
+      ? (effectiveQueueMode() === "sqlite" ? authoritative : queueRecordSnapshot(authoritative))
+      : null;
     if (!snapshot) {
       return {
         content: [
@@ -8821,49 +11287,45 @@ server.tool(
   "Cancel a queued OpenCode job. Pending and blocked jobs are cancelled immediately; active jobs terminate their exact OpenCode process tree.",
   {
     jobId: z.string(),
-    cwd: z.string().optional().describe("Repository path required to address a sqlite-backed job owned by another bridge instance."),
+    cwd: z.string().min(1).describe("Canonical repository path for the project-scoped cancellation."),
   },
   async ({ jobId, cwd = "" }) => {
-    const record = QUEUE_JOBS.get(jobId);
+    const projectRoot = await resolveProjectStateRoot(cwd);
+    let record = QUEUE_JOBS.get(jobId) || null;
+    if (record && !recordMatchesProject(record, projectRoot)) record = null;
+    if (effectiveQueueMode() === "sqlite") {
+      const durable = await readPersistedQueueRecord(jobId, projectRoot);
+      const exactLocalOwner = durable && record
+        && Number(record.revision || 0) === Number(durable.revision || 0)
+        && record.ownerInstanceId === durable.ownerInstanceId
+        && String(record.ownerGeneration || "") === String(durable.ownerGeneration || "");
+      if (exactLocalOwner) Object.assign(record, durable);
+      else record = null;
+    }
     if (!record) {
       if (effectiveQueueMode() === "sqlite" && cwd) {
-        const db = await openLockDb(cwd);
+        const db = await openLockDb(projectRoot);
         try {
-          const row = db.prepare("SELECT status, cancellation_requested_at, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
-          if (row && !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(row.status)) {
-            const requestedAt = row.cancellation_requested_at || new Date().toISOString();
-            let snapshot = {};
-            try { snapshot = JSON.parse(row.record_json || "{}"); } catch { snapshot = {}; }
-            if (["held", "pending", "planned", "blocked"].includes(row.status)) {
-              snapshot = sanitizePersistedValue({
-                ...snapshot,
-                status: "cancelled",
-                finishedAt: requestedAt,
-                cancellationRequested: true,
-                cancellationRequestedAt: requestedAt,
-                errorType: "agent_cancelled",
-                errorReason: "Cancelled before execution by an operator on another bridge instance.",
-              });
-              const changed = db.prepare(`
-                UPDATE opencode_jobs
-                SET status = 'cancelled', finished_at = ?, cancellation_requested_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
-                WHERE job_id = ? AND status = ?
-              `).run(requestedAt, requestedAt, requestedAt, JSON.stringify(snapshot), jobId, row.status);
-              if (Number(changed.changes || 0) > 0) {
-                return { content: [{ type: "text", text: `OpenCode job ${jobId} was cancelled atomically before execution.` }] };
-              }
-            } else {
-              snapshot = sanitizePersistedValue({ ...snapshot, cancellationRequested: true, cancellationRequestedAt: requestedAt });
-              const changed = stampPersistedQueueCancellation(db, {
+          const cancelled = await cancelPersistedQueueJob(db, jobId);
+          if (cancelled.outcome === "cancelled") {
+            if (cancelled.pipelinePropagation?.pipelineId) {
+              await reconcileParentPipelineAfterQueueTerminal({
                 jobId,
-                status: row.status,
-                requestedAt,
-                recordJson: JSON.stringify(snapshot),
+                parentJobId: cancelled.pipelinePropagation.pipelineId,
+                pipelinePropagation: cancelled.pipelinePropagation,
+                cwd: projectRoot,
               });
-              if (Number(changed.changes || 0) > 0) {
-                return { content: [{ type: "text", text: `Cross-process cancellation requested for OpenCode job ${jobId}; the owning bridge heartbeat will terminate its exact child process tree.` }] };
-              }
             }
+            return { content: [{ type: "text", text: `OpenCode job ${jobId} was cancelled atomically before execution.` }] };
+          }
+          if (cancelled.outcome === "cancellation_requested") {
+            return { content: [{ type: "text", text: `Cross-process cancellation requested for OpenCode job ${jobId}; the owning bridge heartbeat will terminate its exact child process tree.` }] };
+          }
+          if (cancelled.outcome === "already_terminal") {
+            return { content: [{ type: "text", text: `OpenCode queue job ${jobId} is already ${cancelled.status}.` }] };
+          }
+          if (cancelled.outcome === "contention") {
+            return { content: [{ type: "text", text: `OpenCode queue job ${jobId} changed repeatedly while cancellation was attempted; retry against its current status ${cancelled.status}.` }] };
           }
         } finally {
           closeDb(db);
@@ -8936,7 +11398,7 @@ server.tool(
   "Create a multi-agent execution pipeline with ownership, worktree, integration, and final-validation policy checks.",
   {
     name: z.string().optional(),
-    cwd: z.string().optional(),
+    cwd: z.string().min(1),
     usePolicy: z.boolean().optional().describe("Load and apply .mcp/agent-policy.json by default."),
     policyPath: z.string().optional().describe("Repo-relative policy path. Defaults to .mcp/agent-policy.json."),
     trustedPolicySha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional().describe("Deprecated diagnostic echo only. Policy trust is anchored exclusively in CODEX_OPENCODE_TRUSTED_POLICY_SHA256."),
@@ -8987,6 +11449,16 @@ server.tool(
     reviewerJob = null,
     testerJob = null,
   }) => {
+    if (effectiveQueueMode() !== "sqlite") {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline rejected.",
+        errorType: "pipeline_requires_sqlite_queue",
+        reason: "Durable pipelines require one SQLite transaction for their pipeline row, child manifest, encrypted requests, and queue release.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        suggestedFix: "Set CODEX_OPENCODE_QUEUE_MODE=sqlite and restart the MCP server. Memory mode remains available for standalone queue jobs only.",
+      }) }] };
+    }
     if (sanitizedWorkspace && (usePolicy || String(finalValidationCommand || "").trim() || jobs.some((job) => String(job.validationCommand || job.scopeContract?.validationCommand || job.delegation?.validationCommand || "").trim()))) {
       return { content: [{ type: "text", text: formatRejectedExecution({
         headline: "Sanitized multi-agent pipeline rejected.",
@@ -9112,21 +11584,21 @@ server.tool(
   "Start a previously created multi-agent pipeline by enqueueing its bounded jobs through the MCP queue.",
   {
     pipelineId: z.string(),
-    cwd: z.string().optional(),
+    cwd: z.string().min(1),
   },
   async ({ pipelineId, cwd = "" }) => {
-    if (effectiveQueueMode() === "off") {
+    if (effectiveQueueMode() !== "sqlite") {
       return {
         content: [
           {
             type: "text",
             text: formatRejectedExecution({
               headline: "Multi-agent pipeline rejected.",
-              errorType: "queue_disabled",
-              reason: "run_multi_agent_pipeline requires the MCP queue.",
+              errorType: "pipeline_requires_sqlite_queue",
+              reason: "run_multi_agent_pipeline requires the SQLite queue so batch activation is atomic and restart-recoverable.",
               requestedAgent: "pipeline_coordinator",
               actualAgent: "none",
-              suggestedFix: "Set CODEX_OPENCODE_QUEUE_MODE=memory or sqlite, then restart the MCP server.",
+              suggestedFix: "Set CODEX_OPENCODE_QUEUE_MODE=sqlite and restart the MCP server.",
             }),
           },
         ],
@@ -9134,10 +11606,7 @@ server.tool(
     }
 
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecord = PIPELINE_RUNS.get(pipelineId);
-    const record = memoryRecord && recordMatchesProject(memoryRecord, projectRoot)
-      ? memoryRecord
-      : await readPersistedPipelineRecord(pipelineId, projectRoot || cwd);
+    const record = await authoritativePipelineRecord(pipelineId, projectRoot || cwd);
     if (!record) {
       return { content: [{ type: "text", text: `Multi-agent pipeline not found: ${pipelineId}` }] };
     }
@@ -9147,7 +11616,7 @@ server.tool(
       if (!claim.ok) return { content: [{ type: "text", text: pipelineOwnerRejection(record, "start") }] };
     }
 
-    if (!["planned", "failed"].includes(record.status) || record.queueJobIds?.length) {
+    if (record.status !== "planned" || record.queueJobIds?.length) {
       return {
         content: [
           {
@@ -9164,47 +11633,30 @@ server.tool(
       };
     }
 
-    await updatePipelineRecord(record, {
-      status: "running",
-      startedAt: record.startedAt || new Date().toISOString(),
-      events: (record.events || []).concat({
-        type: "start_claimed",
-        at: new Date().toISOString(),
-        ownerInstanceId: BRIDGE_INSTANCE_ID,
-      }),
-    });
-
-    const queueJobIds = [];
+    const preparedRecords = [];
     const errors = [];
     for (const job of record.jobs || []) {
-      const enqueued = await enqueueQueueJob({ ...job, cwd: job.cwd || record.cwd }, pipelineId, { schedule: false, initialStatus: "held" });
-      if (!enqueued.ok) {
+      const prepared = await enqueueQueueJob(
+        { ...job, cwd: job.cwd || record.cwd },
+        pipelineId,
+        { schedule: false, initialStatus: "held", persist: false }
+      );
+      if (!prepared.ok) {
         errors.push({
           agent: job.agent,
-          errorType: enqueued.errorType,
-          error: enqueued.error,
-          suggestedFix: enqueued.suggestedFix,
+          errorType: prepared.errorType,
+          error: prepared.error,
+          suggestedFix: prepared.suggestedFix,
         });
         continue;
       }
-      queueJobIds.push(enqueued.record.jobId);
+      preparedRecords.push(prepared.record);
     }
 
     if (errors.length) {
-      for (const jobId of queueJobIds) {
-        const queued = QUEUE_JOBS.get(jobId);
-        if (!queued) continue;
-        Object.assign(queued, {
-          status: "cancelled",
-          finishedAt: new Date().toISOString(),
-          errorType: "pipeline_batch_aborted",
-          errorReason: "Pipeline enqueue preflight failed; no held job was released for execution.",
-        });
-        delete queued.request;
-        await persistQueueRecord(queued);
-      }
       await updatePipelineRecord(record, {
         status: "failed",
+        batchState: "aborted",
         errors,
         finishedAt: new Date().toISOString(),
       });
@@ -9222,32 +11674,24 @@ server.tool(
       };
     }
 
-    await updatePipelineRecord(record, {
-      status: "running",
-      queueJobIds,
-      events: (record.events || []).concat({
-        type: "queue_batch_held",
-        at: new Date().toISOString(),
-        queueJobIds,
-      }),
-    });
-
-    for (const jobId of queueJobIds) {
-      const queued = QUEUE_JOBS.get(jobId);
-      if (!queued || queued.status !== "held") continue;
-      queued.status = "pending";
-      await persistQueueRecord(queued);
+    const activation = await activatePipelineBatch(record, preparedRecords);
+    if (!activation.ok) {
+      return {
+        content: [{
+          type: "text",
+          text: formatRejectedExecution({
+            headline: "Multi-agent pipeline activation rejected.",
+            errorType: activation.errorType,
+            reason: activation.error,
+            requestedAgent: "pipeline_coordinator",
+            actualAgent: "none",
+            lockMode: "atomic_sqlite_batch",
+            suggestedFix: "Inspect the durable pipeline revision and retry only if it remains planned with no child manifest.",
+          }),
+        }],
+      };
     }
 
-    await updatePipelineRecord(record, {
-      status: "running",
-      queueJobIds,
-      events: (record.events || []).concat({
-        type: "started",
-        at: new Date().toISOString(),
-        queueJobIds,
-      }),
-    });
     scheduleQueue();
     return {
       content: [
@@ -9269,14 +11713,11 @@ server.tool(
   "Get one multi-agent pipeline, including queue job status and integration queue.",
   {
     pipelineId: z.string(),
-    cwd: z.string().optional(),
+    cwd: z.string().min(1),
   },
   async ({ pipelineId, cwd = "" }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecord = PIPELINE_RUNS.get(pipelineId);
-    const record = memoryRecord && recordMatchesProject(memoryRecord, projectRoot)
-      ? memoryRecord
-      : await readPersistedPipelineRecord(pipelineId, projectRoot || cwd);
+    const record = await authoritativePipelineRecord(pipelineId, projectRoot || cwd);
     if (!record) {
       return { content: [{ type: "text", text: `Multi-agent pipeline not found: ${pipelineId}` }] };
     }
@@ -9313,16 +11754,13 @@ server.tool(
   "Finalize a multi-agent pipeline after all integrations by running final validation and optional read-only reviewer/tester gates.",
   {
     pipelineId: z.string(),
-    cwd: z.string().optional(),
+    cwd: z.string().min(1),
     skipReviewers: z.boolean().optional().describe("Skip configured reviewer/tester gates and run only final validation."),
     dryRun: z.boolean().optional().describe("Do not run final validation or reviewer/tester commands; record skipped dry-run gates."),
   },
   async ({ pipelineId, cwd = "", skipReviewers = false, dryRun = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecord = PIPELINE_RUNS.get(pipelineId);
-    const record = memoryRecord && recordMatchesProject(memoryRecord, projectRoot)
-      ? memoryRecord
-      : await readPersistedPipelineRecord(pipelineId, projectRoot || cwd);
+    const record = await authoritativePipelineRecord(pipelineId, projectRoot || cwd);
     if (!record) {
       return { content: [{ type: "text", text: `Multi-agent pipeline not found: ${pipelineId}` }] };
     }
@@ -9380,21 +11818,18 @@ server.tool(
   "list_multi_agent_pipelines",
   "List multi-agent pipelines from memory and persisted state.",
   {
-    cwd: z.string().optional(),
-    status: z.enum(["planned", "running", "awaiting_integration", "awaiting_finalization", "finalizing", "integrating", "completed", "failed", "cancelled"]).optional(),
+    cwd: z.string().min(1),
+    status: z.enum(["planned", "running", "awaiting_integration", "awaiting_finalization", "finalizing", "integrating", "cleanup_pending", "cleanup_failed", "completed", "failed", "cancelled"]).optional(),
   },
   async ({ cwd = "", status = "" }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-    const memoryRecords = [...PIPELINE_RUNS.values()]
-      .filter((record) => recordMatchesProject(record, projectRoot))
-      .map((record) => pipelineRecordSnapshot(record))
-      .filter((record) => !status || record.status === status);
-    const persistedRecords = await listPersistedPipelineRecords(projectRoot || cwd, status);
-    const byId = new Map();
-    for (const record of persistedRecords.concat(memoryRecords)) {
-      byId.set(record.pipelineId, record);
-    }
-    const records = [...byId.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const records = (effectiveQueueMode() === "sqlite"
+      ? await listPersistedPipelineRecords(projectRoot || cwd, status)
+      : [...PIPELINE_RUNS.values()]
+        .filter((record) => recordMatchesProject(record, projectRoot))
+        .map((record) => pipelineRecordSnapshot(record))
+        .filter((record) => !status || record.status === status)
+    ).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
     return {
       content: [
         {
@@ -9413,7 +11848,7 @@ server.tool(
   "integrate_opencode_worktree",
   "Serially integrate one OpenCode worktree or branch after ownership, patch, conflict, and validation checks.",
   {
-    cwd: z.string().optional().describe("Target repository path where the patch should be checked or applied."),
+    cwd: z.string().min(1).describe("Canonical target repository path where the patch should be checked or applied."),
     pipelineId: z.string().optional().describe("Optional pipeline id to append this integration result to its audit trail."),
     worktreePath: z.string().optional().describe("OpenCode worktree path containing uncommitted changes to integrate."),
     branch: z.string().optional().describe("Branch containing committed changes to integrate. Use worktreePath for uncommitted worktree output."),
@@ -9451,10 +11886,7 @@ server.tool(
     let validationPolicyTrust = null;
     if (pipelineId) {
       const requestedProjectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
-      const memoryPipeline = PIPELINE_RUNS.get(pipelineId);
-      pipeline = memoryPipeline && recordMatchesProject(memoryPipeline, requestedProjectRoot)
-        ? memoryPipeline
-        : await readPersistedPipelineRecord(pipelineId, requestedProjectRoot || cwd);
+      pipeline = await authoritativePipelineRecord(pipelineId, requestedProjectRoot || cwd);
       if (!pipeline) {
         return { content: [{ type: "text", text: `Multi-agent pipeline not found: ${pipelineId}` }] };
       }
@@ -9464,25 +11896,28 @@ server.tool(
       }
       if (!PIPELINE_RUNS.has(pipelineId)) PIPELINE_RUNS.set(pipelineId, pipeline);
       await refreshPipelineRecord(pipeline);
+      await reconcilePipelineIntegrationOperationStates(pipeline);
       const candidates = (pipeline.integrationQueue || []).filter((item) => {
         const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
         const sameBranch = branch && item.branch === branch;
         return sameWorktree || sameBranch;
       });
-      if (candidates.length !== 1 || candidates[0].status !== "pending") {
+      if (candidates.length !== 1 || !["pending", "integrating"].includes(candidates[0].status)) {
         return { content: [{ type: "text", text: formatRejectedExecution({
           headline: "Pipeline integration rejected.",
           errorType: "pipeline_integration_item_invalid",
           reason: candidates.length !== 1
             ? "The source did not identify exactly one planned pipeline integration item."
-            : `The matched integration item is ${candidates[0].status}, not pending.`,
+            : `The matched integration item is ${candidates[0].status}, not pending or durably recovering.`,
           requestedAgent: "merge_manager",
           actualAgent: "none",
           suggestedFix: "Use the exact retained worktree/branch reported by the completed pipeline queue item and do not replay an integration.",
         }) }] };
       }
       pipelineItem = candidates[0];
-      if (!pipelineItem.sourceBaseCommit || !/^[a-f0-9]{64}$/i.test(pipelineItem.patchSha256 || "") || !/^[a-f0-9]{64}$/i.test(pipelineItem.sourceStateSha256 || "")) {
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(pipelineItem.sourceBaseCommit || "")
+        || !/^[a-f0-9]{64}$/i.test(pipelineItem.patchSha256 || "")
+        || !/^[a-f0-9]{64}$/i.test(pipelineItem.sourceStateSha256 || "")) {
         return { content: [{ type: "text", text: formatRejectedExecution({
           headline: "Pipeline integration rejected.",
           errorType: "pipeline_source_identity_unattested",
@@ -9552,6 +11987,27 @@ server.tool(
       allowDirtyTarget,
       cleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
+      pipelineId,
+      pipelineJobId: pipelineItem?.jobId || "",
+      onIntegrationPrepared: pipeline ? async ({ operationId }) => {
+        const integrationQueue = (pipeline.integrationQueue || []).map((item) => {
+          const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
+          const sameBranch = branch && item.branch === branch;
+          return sameWorktree || sameBranch
+            ? { ...item, status: "integrating", operationId }
+            : item;
+        });
+        await updatePipelineRecord(pipeline, {
+          integrationQueue,
+          events: (pipeline.events || []).concat({
+            type: "integration_prepared",
+            at: new Date().toISOString(),
+            operationId,
+            jobId: pipelineItem?.jobId || "",
+          }),
+        });
+        pipelineItem = integrationQueue.find((item) => item.operationId === operationId) || pipelineItem;
+      } : null,
       expectedSourceIdentity: pipelineItem ? {
         sourceBaseCommit: pipelineItem.sourceBaseCommit,
         patchSha256: pipelineItem.patchSha256,
@@ -9570,6 +12026,7 @@ server.tool(
           source: result.source || worktreePath || branch || "",
           changedFiles: result.changedFiles || [],
           appliedFiles: result.appliedFiles || [],
+          operationId: result.operationId || pipelineItem?.operationId || "",
         });
         const nextIntegrationQueue = (pipeline.integrationQueue || []).map((item) => {
           const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
@@ -9577,8 +12034,15 @@ server.tool(
           return sameWorktree || sameBranch
             ? {
                 ...item,
-                status: result.ok && result.status === "applied" ? "integrated" : result.ok ? item.status : "rejected",
+                status: result.ok && result.status === "applied"
+                  ? "integrated"
+                  : result.ok
+                    ? (item.status === "integrating" ? "pending" : item.status)
+                    : result.errorType === "integration_recovery_quarantined"
+                      ? "quarantined"
+                      : "rejected",
                 errorType: result.errorType || "",
+                operationId: result.operationId || item.operationId || "",
                 cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && cleanupAfterSuccess && worktreePath),
                 sourceBaseCommit: result.sourceBaseCommit || "",
                 patchSha256: result.patchSha256 || "",
@@ -9907,20 +12371,25 @@ function orchestratorPolicyError(job, lockPlan, executionMode = "single") {
   };
 }
 
-function normalizePathForCompare(path) {
-  return normalizeFilesystemCase(normalizeLockPath(path));
+function normalizePathForCompare(value, cwd = "") {
+  const normalized = cwd ? normalizeLockPathForCwd(value, cwd) : normalizeLockPath(value);
+  return normalizeFilesystemCase(normalized, cwd);
 }
 
 function hasAmbiguousPathPattern(paths) {
   return normalizeList(paths).some((path) => /[*?[\]{}!]/.test(path));
 }
 
-function overlaps(pathsA, pathsB) {
+function overlaps(pathsA, pathsB, cwd = "") {
   for (const a of pathsA) {
     for (const b of pathsB) {
-      const left = normalizePathForCompare(a);
-      const right = normalizePathForCompare(b);
-      if (left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)) {
+      const left = normalizePathForCompare(a, cwd);
+      const right = normalizePathForCompare(b, cwd);
+      if (left === REPOSITORY_SCOPE_LOCK_PATH
+        || right === REPOSITORY_SCOPE_LOCK_PATH
+        || left === right
+        || left.startsWith(`${right}/`)
+        || right.startsWith(`${left}/`)) {
         return [a, b];
       }
     }
@@ -10021,6 +12490,35 @@ function createLockPlan(job, index) {
     sanitizedWorkspace: job.sanitizedWorkspace || null,
     validationCommand: job.validationCommand || job.delegation?.validationCommand || scopeContract?.validationCommand || "",
     timeoutMs: job.timeoutMs || job.delegation?.timeoutMs || contractTimeoutMs || null,
+  };
+}
+
+function directExecutionLockConflictDetails(lockResult, { queueConflict = false, lockType = "write" } = {}) {
+  if (queueConflict) {
+    return {
+      headline: "Queued job is waiting for a conflicting consistency lock.",
+      errorType: "queue_lock_conflict",
+      suggestedFix: "The queue will retry after the conflicting reader/writer lock is released.",
+    };
+  }
+  if (lockResult?.conflict?.origin === "internal") {
+    if (lockType === "read") {
+      return {
+        headline: "Read job is waiting for an active writer.",
+        errorType: "read_lock_conflict",
+        suggestedFix: "Wait for the overlapping writer to finish, retry later, or provide an explicit disjoint scope.read path.",
+      };
+    }
+    return {
+      headline: "Write job is waiting for an active writer.",
+      errorType: "write_lock_conflict",
+      suggestedFix: "Wait for the active writer to finish, retry later, or choose a non-overlapping lockedPaths scope.",
+    };
+  }
+  return {
+    headline: "Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.",
+    errorType: "manual_lock_misuse",
+    suggestedFix: "Release the existing manual lock or wait for it to expire, then call run_opencode_agent with lockedPaths only.",
   };
 }
 
@@ -10378,6 +12876,24 @@ function validateParallelWritePlan(jobs) {
 
   }
 
+  for (let i = 0; i < lockPlans.length; i += 1) {
+    for (let j = i + 1; j < lockPlans.length; j += 1) {
+      const left = lockPlans[i];
+      const right = lockPlans[j];
+      if ((left.lockType === "read") === (right.lockType === "read")) continue;
+      const overlap = overlaps(hardLockPathsForPlan(left), hardLockPathsForPlan(right), left.cwd || right.cwd);
+      if (overlap) {
+        return {
+          error: `Parallel read/write jobs overlap: "${left.agent}" and "${right.agent}" both require ${overlap[0]} / ${overlap[1]}.`,
+          errorType: "parallel_read_write_conflict",
+          suggestedFix: "Run the reader after the overlapping writer, or give the reader an explicit disjoint scope.read path.",
+          conflictingPaths: overlap,
+          lockPlans,
+        };
+      }
+    }
+  }
+
   if (writePlans.length > 1) {
     for (let i = 0; i < writePlans.length; i += 1) {
       for (let j = i + 1; j < writePlans.length; j += 1) {
@@ -10536,7 +13052,16 @@ function validateSingleLockPlan(job) {
   return { error: null, lockPlan };
 }
 
-async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId = null, fromQueue = false, signal = null, onChildSpawn = null, onWorktreePrepared = null } = {}) {
+async function executeOpenCodeJob(requestedJob, {
+  toolStarted = nowMs(),
+  jobId = null,
+  fromQueue = false,
+  signal = null,
+  onChildSpawn = null,
+  onWorktreePrepared = null,
+  assertDurableOwnership = null,
+  renewDurableOwnership = null,
+} = {}) {
   const {
     agent,
     task,
@@ -10575,6 +13100,23 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
         errorType: lockPlanErrorType || "lock_plan_rejected",
         changedFiles: [],
       },
+      lockPlan,
+    };
+  }
+
+  if (fromQueue && !dryRun && lockPlan.lockType !== "read" && !shouldUseWorktree(requestedJob, lockPlan)) {
+    return {
+      response: { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Durable queued writer rejected without isolation.",
+        errorType: "queue_write_requires_worktree",
+        reason: "A queued writer can outlive its bridge owner after a crash, so it must run in a retained Git worktree rather than the target checkout.",
+        requestedAgent: agent,
+        actualAgent: "none",
+        lockMode: lockPlan.lockMode,
+        durationMs: nowMs() - toolStarted,
+        suggestedFix: "Set CODEX_OPENCODE_WORKTREE_MODE=write or all and re-enqueue the job.",
+      }) }] },
+      result: { errorType: "queue_write_requires_worktree", changedFiles: [] },
       lockPlan,
     };
   }
@@ -10754,49 +13296,54 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
 
   let acquiredLock = null;
   let stopLockHeartbeat = () => {};
+  let executionSignal = signal;
   let worktree = null;
   let worktreeDiff = null;
   let worktreeCleanup = null;
-  const shouldAcquireLock = !dryRun && lockPlan.lockType !== "read";
+  let containmentQuarantined = false;
+  const shouldAcquireLock = !dryRun;
   let executionCwd = cwd || process.cwd();
   let sanitizedBefore = null;
 
   try {
     if (shouldAcquireLock) {
+      const requestedLockPaths = hardLockPathsForPlan(lockPlan);
       const lockResult = await acquireHardLock({
         owner: "codex",
         agent: resolution.requestedAgent,
         task,
         cwd: cwd || process.cwd(),
         lockType: lockPlan.lockType,
-        paths: hardLockPathsForPlan(lockPlan),
+        paths: requestedLockPaths,
+        repositoryScope: requestedLockPaths.length === 1 && requestedLockPaths[0] === REPOSITORY_SCOPE_LOCK_PATH,
         ttlMs: hardLockTtlForPlan(lockPlan),
       });
 
       if (!lockResult.ok) {
         const conflictingPaths = conflictPathsFromConflict(lockResult.conflict);
         const queueConflict = fromQueue && effectiveQueueWriteConflictPolicy() === "wait";
+        const conflictDetails = directExecutionLockConflictDetails(lockResult, { queueConflict, lockType: lockPlan.lockType });
         return {
           response: {
             content: [
               {
                 type: "text",
                 text: formatRejectedExecution({
-                  headline: queueConflict ? "Queued write job is waiting for an active lock." : "Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.",
-                  errorType: queueConflict ? "queue_lock_conflict" : "manual_lock_misuse",
+                  headline: conflictDetails.headline,
+                  errorType: conflictDetails.errorType,
                   reason: lockResult.error,
                   requestedAgent: resolution.requestedAgent,
                   actualAgent: resolution.actualAgent,
                   lockMode: lockPlan.lockMode,
                   durationMs: nowMs() - toolStarted,
                   conflictingPaths,
-                  suggestedFix: queueConflict ? "The queue will retry after the active write lock is released." : "Release the existing manual lock or wait for it to expire, then call run_opencode_agent with lockedPaths only.",
+                  suggestedFix: conflictDetails.suggestedFix,
                 }),
               },
             ],
           },
           result: {
-            errorType: queueConflict ? "queue_lock_conflict" : "manual_lock_misuse",
+            errorType: conflictDetails.errorType,
             changedFiles: [],
           },
           lockPlan,
@@ -10806,6 +13353,7 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
 
       acquiredLock = lockResult.lock;
       stopLockHeartbeat = startHardLockHeartbeat(acquiredLock, hardLockTtlForPlan(lockPlan));
+      executionSignal = combineAbortSignals([signal, stopLockHeartbeat.signal]);
     }
 
     if (shouldUseWorktree(requestedJob, lockPlan)) {
@@ -10922,9 +13470,77 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
     }
     agentMetadata = finalAgentMetadata;
     resolution.agentMetadata = finalAgentMetadata.metadata;
+    if (typeof assertDurableOwnership === "function") {
+      const ownership = await assertDurableOwnership();
+      if (!ownership?.ok) {
+        const ownershipError = ownership?.error || new Error("Durable queue ownership was lost before agent spawn.");
+        ownershipError.errorType ||= "queue_ownership_lost";
+        return {
+          response: { content: [{ type: "text", text: formatRejectedExecution({
+            headline: "Durable queue ownership was lost before execution.",
+            errorType: ownershipError.errorType,
+            reason: ownershipError.message || String(ownershipError),
+            requestedAgent: resolution.requestedAgent,
+            actualAgent: resolution.actualAgent,
+            lockMode: lockPlan.lockMode,
+            durationMs: nowMs() - toolStarted,
+            suggestedFix: "Inspect the retained worktree and durable queue record; do not resume this execution generation.",
+          }) }] },
+          result: { errorType: ownershipError.errorType, changedFiles: [] },
+          lockPlan,
+          resolution,
+          worktree,
+        };
+      }
+    }
     const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
-    let result = await runOpenCodeWithPolicy(resolution.actualAgent, prompt, executionCwd, dryRun, lockPlan, lockPlan.timeoutMs, { signal, agentMetadata, onSpawn: onChildSpawn });
+    const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
+      const childAuthority = typeof onChildSpawn === "function"
+        ? await onChildSpawn(spawnIdentity)
+        : { ok: true, deadlineAt: Number.POSITIVE_INFINITY };
+      return {
+        ok: childAuthority?.ok !== false,
+        deadlineAt: Math.min(
+          Number(acquiredLock?.expiresAt || Number.POSITIVE_INFINITY),
+          Number(childAuthority?.deadlineAt || Number.POSITIVE_INFINITY)
+        ),
+      };
+    };
+    const renewExecutionSupervisorAuthority = async () => {
+      const lockRenewed = acquiredLock ? await stopLockHeartbeat.pulse() : true;
+      if (!lockRenewed) return { ok: false };
+      const external = typeof renewDurableOwnership === "function"
+        ? await renewDurableOwnership()
+        : { ok: true, deadlineAt: Number.POSITIVE_INFINITY };
+      return {
+        ok: external?.ok !== false,
+        deadlineAt: Math.min(
+          Number(acquiredLock?.expiresAt || Number.POSITIVE_INFINITY),
+          Number(external?.deadlineAt || Number.POSITIVE_INFINITY)
+        ),
+      };
+    };
+    let result = await runOpenCodeWithPolicy(
+      resolution.actualAgent,
+      prompt,
+      executionCwd,
+      dryRun,
+      lockPlan,
+      lockPlan.timeoutMs,
+      {
+        signal: executionSignal,
+        agentMetadata,
+        onSpawn: persistExecutionSupervisorAuthority,
+        onSupervisorHeartbeat: renewExecutionSupervisorAuthority,
+      }
+    );
+    containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
+      || result?.terminationErrorType === "process_tree_termination_unconfirmed";
+    if (stopLockHeartbeat.signal?.aborted) {
+      result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
+      result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
+    }
     const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
     const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
     const sanitizedAfter = manifestProtected && !dryRun
@@ -10964,7 +13580,7 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
     const validationGate = manifestProtected
       ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
       : !validation.disallowedFiles.length && !result.errorType
-      ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs })
+      ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal })
       : {
           status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
           command: lockPlan.validationCommand || "",
@@ -11128,7 +13744,7 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
             type: "text",
             text: [
               `Temporary lock acquired: ${hardLockSummary(acquiredLock)}`,
-              `Temporary lock released: ${acquiredLock ? "yes" : "not needed"}`,
+              `Temporary lock released: ${acquiredLock ? (containmentQuarantined ? "no (containment quarantined)" : "yes") : "not needed"}`,
               formatSingleResult({ resolution, result, cwd: executionCwd, lockPlan }),
               worktreeReview,
               nativeFallbackViolation,
@@ -11189,9 +13805,19 @@ async function executeOpenCodeJob(requestedJob, { toolStarted = nowMs(), jobId =
       worktreeCleanup: worktree ? { cleanup: "retained_for_review", reason: "infrastructure failure" } : null,
     };
   } finally {
+    if (worktree?.path && existsSync(worktree.path)) {
+      await updateRetainedWorktreeMeasurement(worktree);
+    }
     stopLockHeartbeat();
     if (acquiredLock) {
-      await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+      if (containmentQuarantined) {
+        const quarantined = await quarantineHardLock(acquiredLock);
+        if (!quarantined.ok) {
+          logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
+        }
+      } else {
+        await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+      }
     }
   }
 }
@@ -11255,12 +13881,125 @@ function queueRecordSnapshot(record, includeResult = true) {
     leaseExpiresAt: record.leaseExpiresAt || "",
     childProcessId: record.childProcessId || 0,
     childProcessStartedAt: record.childProcessStartedAt || "",
+    childProcessRole: record.childProcessRole || "",
+    childContainmentIdentity: record.childContainmentIdentity || "",
+    containmentQuarantined: Boolean(record.containmentQuarantined),
+    orphanChildProcessId: record.orphanChildProcessId || 0,
+    orphanChildProcessStartedAt: record.orphanChildProcessStartedAt || "",
+    orphanChildProcessAlive: Boolean(record.orphanChildProcessAlive),
     revision: record.revision || 0,
     resultText: includeResult ? truncateText(persistedResultText, CONFIG.queueResultMaxChars) : "",
     resultTextChars: includeResult ? persistedResultText.length : 0,
     resultTextSha256: includeResult ? createHash("sha256").update(persistedResultText).digest("hex") : "",
     resultTextTruncated: includeResult ? persistedResultText.length > CONFIG.queueResultMaxChars : false,
   });
+}
+
+function queuePrivateDetails(record) {
+  const resultText = redactSensitiveText(record.resultText || "");
+  const details = sanitizePersistedValue({
+    resultText: truncateText(resultText, CONFIG.queueResultMaxChars),
+    resultTextChars: resultText.length,
+    resultTextSha256: createHash("sha256").update(resultText).digest("hex"),
+    resultTextTruncated: resultText.length > CONFIG.queueResultMaxChars,
+    errorReason: truncateText(String(record.errorReason || ""), 12000),
+    validationResult: record.validationResult || null,
+    sanitizedWorkspaceVerification: record.sanitizedWorkspaceVerification || null,
+    actualModelEvidence: record.actualModelEvidence || "",
+  });
+  const serialized = JSON.stringify(details);
+  if (Buffer.byteLength(serialized, "utf8") <= CONFIG.maxSnapshotFileBytes) return details;
+  return sanitizePersistedValue({
+    resultText: details.resultText || "",
+    resultTextChars: details.resultTextChars || 0,
+    resultTextSha256: details.resultTextSha256 || "",
+    resultTextTruncated: Boolean(details.resultTextTruncated),
+    errorReason: details.errorReason || "",
+    validationResult: {
+      truncated: true,
+      chars: JSON.stringify(details.validationResult || null).length,
+      sha256: createHash("sha256").update(JSON.stringify(details.validationResult || null)).digest("hex"),
+    },
+    sanitizedWorkspaceVerification: null,
+    actualModelEvidence: details.actualModelEvidence || "",
+  });
+}
+
+function commandFingerprintFields(value, prefix = "validationCommand") {
+  const text = String(value || "");
+  return {
+    [`${prefix}Chars`]: text.length,
+    [`${prefix}Sha256`]: createHash("sha256").update(text).digest("hex"),
+  };
+}
+
+function scopeContractDurableSummary(contract) {
+  if (!contract) return null;
+  return sanitizePersistedValue({
+    ...contract,
+    validationCommand: "",
+    ...commandFingerprintFields(contract.validationCommand),
+  });
+}
+
+function queueRecordDurableSummary(record) {
+  const hasRawTask = Object.prototype.hasOwnProperty.call(record || {}, "task");
+  const hasRawPrivateDetails = [
+    "resultText",
+    "errorReason",
+    "validationResult",
+    "sanitizedWorkspaceVerification",
+    "actualModelEvidence",
+  ].some((key) => Object.prototype.hasOwnProperty.call(record || {}, key));
+  const preservePrivateMetadata = !hasRawPrivateDetails && Boolean(record?.privateDetailsSha256);
+  const summary = queueRecordSnapshot(record, false);
+  const privateDetails = queuePrivateDetails(record);
+  const privateJson = JSON.stringify(privateDetails);
+  delete summary.resultText;
+  delete summary.errorReason;
+  delete summary.validationResult;
+  delete summary.sanitizedWorkspaceVerification;
+  delete summary.actualModelEvidence;
+  summary.scopeContract = scopeContractDurableSummary(record.scopeContract);
+  summary.resultTextChars = Number(privateDetails.resultTextChars || 0);
+  summary.resultTextSha256 = privateDetails.resultTextSha256 || "";
+  summary.resultTextTruncated = Boolean(privateDetails.resultTextTruncated);
+  summary.errorReasonChars = String(privateDetails.errorReason || "").length;
+  summary.errorReasonSha256 = createHash("sha256").update(String(privateDetails.errorReason || "")).digest("hex");
+  summary.validationResultSha256 = createHash("sha256")
+    .update(JSON.stringify(privateDetails.validationResult || null))
+    .digest("hex");
+  if (!hasRawTask) {
+    summary.taskSha256 = String(record.taskSha256 || summary.taskSha256 || "");
+    summary.taskChars = Number(record.taskChars || 0);
+  }
+  if (preservePrivateMetadata) {
+    summary.resultTextChars = Number(record.resultTextChars || 0);
+    summary.resultTextSha256 = String(record.resultTextSha256 || "");
+    summary.resultTextTruncated = Boolean(record.resultTextTruncated);
+    summary.errorReasonChars = Number(record.errorReasonChars || 0);
+    summary.errorReasonSha256 = String(record.errorReasonSha256 || "");
+    summary.validationResultSha256 = String(record.validationResultSha256 || "");
+  }
+  return sanitizePersistedValue({
+    ...summary,
+    privateDetailsChars: preservePrivateMetadata ? Number(record.privateDetailsChars || 0) : privateJson.length,
+    privateDetailsSha256: preservePrivateMetadata
+      ? String(record.privateDetailsSha256 || "")
+      : createHash("sha256").update(privateJson).digest("hex"),
+  });
+}
+
+async function encryptQueuePrivateDetails(record) {
+  return encryptIntegrationJournalBytes(
+    Buffer.from(JSON.stringify(queuePrivateDetails(record)), "utf8"),
+    `queue-result\0${record.jobId}`
+  );
+}
+
+async function decryptQueuePrivateDetails(envelope, jobId) {
+  if (!envelope) return {};
+  return JSON.parse((await decryptIntegrationJournalBytes(envelope, `queue-result\0${jobId}`)).toString("utf8"));
 }
 
 function enforceQueueResultEvidence(record) {
@@ -11317,20 +14056,238 @@ function loadPersistedQueueRecord(record, row) {
   return record;
 }
 
-function stampPersistedQueueCancellation(db, { jobId, status, requestedAt, recordJson }) {
-  return db.prepare(`
-    UPDATE opencode_jobs
-    SET cancellation_requested_at = CASE
-          WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
-          ELSE cancellation_requested_at
-        END,
-        updated_at = ?, record_json = ?, revision = revision + 1
-    WHERE job_id = ? AND status = ?
-  `).run(requestedAt, requestedAt, recordJson, jobId, status);
+const DURABLE_CANCELLATION_REASON = "Cancellation won the durable terminal-write race.";
+
+function applyDurableCancellationOutcome(record, requestedAt = "") {
+  return {
+    ...record,
+    status: "cancelled",
+    cancellationRequested: true,
+    cancellationRequestedAt: requestedAt || record.cancellationRequestedAt || "",
+    errorType: "agent_cancelled",
+    errorReason: DURABLE_CANCELLATION_REASON,
+    resultText: "",
+    validationResult: null,
+    sanitizedWorkspaceVerification: null,
+    actualModelEvidence: "",
+  };
+}
+
+async function cancelPersistedQueueJob(db, jobId, maxAttempts = 8) {
+  const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted", "not_resumable"]);
+  const preExecutionStatuses = new Set(["held", "pending", "planned", "blocked"]);
+  const activeStatuses = new Set(["running", "validating", "reviewing", "testing"]);
+  const selectCurrent = db.prepare(`
+    SELECT job_id, status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
+           heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
+           child_process_started_at, revision, idempotency_key, request_encrypted, result_encrypted, record_json
+    FROM opencode_jobs WHERE job_id = ?
+  `);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const row = selectCurrent.get(jobId);
+    if (!row) return { ok: false, outcome: "missing", status: "missing" };
+    if (terminalStatuses.has(row.status)) {
+      return { ok: true, outcome: "already_terminal", status: row.status };
+    }
+    if (!preExecutionStatuses.has(row.status) && !activeStatuses.has(row.status)) {
+      return { ok: false, outcome: "unsupported_status", status: row.status };
+    }
+
+    const requestedAt = row.cancellation_requested_at || new Date().toISOString();
+    const currentRecord = {
+      ...persistedQueueRecordFromRow(row),
+      jobId,
+      revision: Number(row.revision || 0),
+    };
+    const preExecution = preExecutionStatuses.has(row.status);
+    const nextRecord = preExecution
+      ? {
+          ...applyDurableCancellationOutcome(currentRecord, requestedAt),
+          status: "cancelled",
+          finishedAt: requestedAt,
+          heartbeatAt: "",
+          leaseExpiresAt: "",
+          childProcessId: 0,
+          childProcessStartedAt: "",
+          revision: Number(row.revision || 0) + 1,
+        }
+      : {
+          ...currentRecord,
+          cancellationRequested: true,
+          cancellationRequestedAt: requestedAt,
+          revision: Number(row.revision || 0) + 1,
+        };
+    const recordJson = JSON.stringify(queueRecordDurableSummary(nextRecord));
+    const encryptedDetails = preExecution ? await encryptQueuePrivateDetails(nextRecord) : null;
+    if (typeof queueCancellationTestHook === "function") {
+      await queueCancellationTestHook({ attempt, row: { ...row }, nextRecord: { ...nextRecord } });
+    }
+    let transactionOpen = false;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const changed = preExecution
+        ? db.prepare(`
+            UPDATE opencode_jobs
+            SET status = 'cancelled', finished_at = ?, cancellation_requested_at = ?, updated_at = ?,
+                heartbeat_at = '', lease_expires_at = '', child_process_id = 0, child_process_started_at = '',
+                record_json = ?, result_encrypted = ?, revision = revision + 1
+            WHERE job_id = ? AND status = ? AND revision = ?
+              AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
+          `).run(
+            requestedAt,
+            requestedAt,
+            requestedAt,
+            recordJson,
+            encryptedDetails,
+            jobId,
+            row.status,
+            Number(row.revision || 0),
+            row.owner_instance_id || "",
+            row.owner_generation || ""
+          )
+        : db.prepare(`
+            UPDATE opencode_jobs
+            SET cancellation_requested_at = CASE
+                  WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
+                  ELSE cancellation_requested_at
+                END,
+                updated_at = ?, record_json = ?, revision = revision + 1
+            WHERE job_id = ? AND status = ? AND revision = ?
+              AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
+          `).run(
+            requestedAt,
+            requestedAt,
+            recordJson,
+            jobId,
+            row.status,
+            Number(row.revision || 0),
+            row.owner_instance_id || "",
+            row.owner_generation || ""
+          );
+      const pipelinePropagation = Number(changed.changes || 0) === 1 && preExecution
+        ? propagatePipelineTerminalInTransaction(db, jobId, "cancelled", requestedAt)
+        : null;
+      db.exec("COMMIT");
+      transactionOpen = false;
+      if (Number(changed.changes || 0) === 1) {
+        return {
+          ok: true,
+          outcome: preExecution ? "cancelled" : "cancellation_requested",
+          status: preExecution ? "cancelled" : row.status,
+          requestedAt,
+          revision: Number(row.revision || 0) + 1,
+          pipelinePropagation,
+        };
+      }
+    } catch (error) {
+      if (transactionOpen) {
+        try { db.exec("ROLLBACK"); } catch { /* Preserve the cancellation error. */ }
+      }
+      throw error;
+    }
+  }
+  const current = selectCurrent.get(jobId);
+  return {
+    ok: false,
+    outcome: "contention",
+    status: current?.status || "missing",
+  };
+}
+
+function propagatePipelineTerminalInTransaction(db, childJobId, terminalStatus, at = new Date().toISOString()) {
+  const relation = db.prepare(`
+    SELECT relation.pipeline_id
+    FROM opencode_pipeline_children AS relation
+    WHERE relation.job_id = ?
+  `).get(childJobId);
+  if (!relation?.pipeline_id) return null;
+  const parent = db.prepare(`
+    SELECT status FROM opencode_pipelines WHERE pipeline_id = ?
+  `).get(relation.pipeline_id);
+  if (!parent || !["planned", "running"].includes(parent.status)) {
+    return {
+      pipelineId: relation.pipeline_id,
+      terminalStatus,
+      parentStatus: parent?.status || "missing",
+      allChildrenTerminal: false,
+    };
+  }
+
+  const aggregate = db.prepare(`
+    SELECT
+      SUM(CASE WHEN job.status IN ('failed', 'interrupted', 'not_resumable') THEN 1 ELSE 0 END) AS failed_count,
+      SUM(CASE WHEN job.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+      SUM(CASE WHEN job.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'not_resumable') THEN 1 ELSE 0 END) AS active_count
+    FROM opencode_pipeline_children AS relation
+    JOIN opencode_jobs AS job ON job.job_id = relation.job_id
+    WHERE relation.pipeline_id = ?
+  `).get(relation.pipeline_id);
+  const failedCount = Number(aggregate?.failed_count || 0);
+  const cancelledCount = Number(aggregate?.cancelled_count || 0);
+  const activeCount = Number(aggregate?.active_count || 0);
+  const parentStatus = failedCount > 0 ? "failed" : cancelledCount > 0 ? "cancelled" : "";
+
+  if (parentStatus) {
+    db.prepare(`
+      UPDATE opencode_jobs
+      SET status = 'cancelled', finished_at = ?, cancellation_requested_at = ?, updated_at = ?,
+          heartbeat_at = '', lease_expires_at = '', child_process_id = 0, child_process_started_at = '',
+          record_json = json_set(
+            CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END,
+            '$.status', 'cancelled', '$.finishedAt', ?, '$.cancellationRequested', 1,
+            '$.cancellationRequestedAt', ?, '$.errorType', 'agent_cancelled'
+          ),
+          revision = revision + 1
+      WHERE job_id IN (
+        SELECT sibling.job_id FROM opencode_pipeline_children AS sibling
+        WHERE sibling.pipeline_id = ? AND sibling.job_id <> ?
+      )
+        AND status IN ('held', 'pending', 'planned', 'blocked')
+    `).run(at, at, at, at, at, relation.pipeline_id, childJobId);
+    db.prepare(`
+      UPDATE opencode_jobs
+      SET cancellation_requested_at = CASE
+            WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
+            ELSE cancellation_requested_at
+          END,
+          updated_at = ?,
+          record_json = json_set(
+            CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END,
+            '$.cancellationRequested', 1, '$.cancellationRequestedAt', ?
+          ),
+          revision = revision + 1
+      WHERE job_id IN (
+        SELECT sibling.job_id FROM opencode_pipeline_children AS sibling
+        WHERE sibling.pipeline_id = ? AND sibling.job_id <> ?
+      )
+        AND status IN ('running', 'validating', 'reviewing', 'testing')
+    `).run(at, at, at, relation.pipeline_id, childJobId);
+    db.prepare(`
+      UPDATE opencode_pipelines
+      SET status = ?, updated_at = ?,
+          record_json = json_set(
+            CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END,
+            '$.status', ?, '$.finishedAt', ?
+          ),
+          revision = revision + 1
+      WHERE pipeline_id = ? AND status IN ('planned', 'running')
+    `).run(parentStatus, at, parentStatus, at, relation.pipeline_id);
+  }
+
+  return {
+    pipelineId: relation.pipeline_id,
+    terminalStatus,
+    parentStatus,
+    allChildrenTerminal: activeCount === 0,
+  };
 }
 
 function persistTerminalQueueRecord(db, record) {
   const activeStatuses = "'running', 'validating', 'reviewing', 'testing'";
+  const attemptedRevision = Number(record.revision || 0);
+  const attemptedOwnerGeneration = String(record.ownerGeneration || "");
   const selectCurrent = db.prepare(`
     SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
            heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
@@ -11347,7 +14304,7 @@ function persistTerminalQueueRecord(db, record) {
       ownerInstanceId: current?.owner_instance_id || record.ownerInstanceId || "",
       ownerProcessId: current?.owner_process_id || record.ownerProcessId || 0,
       ownerGeneration: current?.owner_generation || record.ownerGeneration || "",
-      revision: Number(current?.revision || record.revision || 0) + 1,
+      revision: attemptedRevision + 1,
     };
     if (current
       && ["held", "pending", "planned", "blocked"].includes(current.status)
@@ -11362,18 +14319,12 @@ function persistTerminalQueueRecord(db, record) {
         childProcessStartedAt: "",
       });
       if (current.cancellation_requested_at) {
-        Object.assign(terminalRecord, {
-          status: "cancelled",
-          cancellationRequested: true,
-          cancellationRequestedAt: current.cancellation_requested_at,
-          errorType: "agent_cancelled",
-          errorReason: record.errorReason || "Cancellation won before queue execution.",
-        });
+        Object.assign(terminalRecord, applyDurableCancellationOutcome(terminalRecord, current.cancellation_requested_at));
       }
       const preExecutionChange = db.prepare(`
         UPDATE opencode_jobs
         SET status = ?, started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
-            child_process_id = 0, child_process_started_at = '', record_json = ?, revision = revision + 1
+            child_process_id = 0, child_process_started_at = '', record_json = ?, result_encrypted = ?, revision = revision + 1
         WHERE job_id = ? AND status = ? AND revision = ?
           AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
       `).run(
@@ -11381,14 +14332,23 @@ function persistTerminalQueueRecord(db, record) {
         terminalRecord.startedAt || "",
         terminalRecord.finishedAt,
         new Date().toISOString(),
-        JSON.stringify(queueRecordSnapshot(terminalRecord)),
+        JSON.stringify(queueRecordDurableSummary(terminalRecord)),
+        terminalRecord.status === "cancelled"
+          ? record.cancellationResultEncrypted || null
+          : record.resultEncrypted || null,
         terminalRecord.jobId,
         current.status,
-        Number(current.revision || 0),
+        attemptedRevision,
         BRIDGE_INSTANCE_ID,
-        record.ownerGeneration || ""
+        attemptedOwnerGeneration
       );
       if (Number(preExecutionChange.changes || 0) === 1) {
+        record.pipelinePropagation = propagatePipelineTerminalInTransaction(
+          db,
+          terminalRecord.jobId,
+          terminalRecord.status,
+          terminalRecord.finishedAt || new Date().toISOString()
+        );
         db.exec("COMMIT");
         transactionOpen = false;
         Object.assign(record, terminalRecord);
@@ -11396,14 +14356,21 @@ function persistTerminalQueueRecord(db, record) {
       }
       current = selectCurrent.get(record.jobId);
     }
+    const terminalCommitAt = new Date().toISOString();
     const terminalChange = db.prepare(`
       UPDATE opencode_jobs
       SET status = ?, started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = ?, lease_expires_at = ?,
-          child_process_id = ?, child_process_started_at = ?, record_json = ?, revision = revision + 1
+          child_process_id = ?, child_process_started_at = ?, record_json = ?, result_encrypted = ?, revision = revision + 1
       WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
         AND owner_generation <> ''
+        AND revision = ?
+        AND lease_expires_at > ?
         AND status IN (${activeStatuses})
         AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+        AND EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
     `).run(
       terminalRecord.status,
       terminalRecord.startedAt || "",
@@ -11413,12 +14380,22 @@ function persistTerminalQueueRecord(db, record) {
       terminalRecord.leaseExpiresAt || "",
       terminalRecord.childProcessId || 0,
       terminalRecord.childProcessStartedAt || "",
-      JSON.stringify(queueRecordSnapshot(terminalRecord)),
+      JSON.stringify(queueRecordDurableSummary(terminalRecord)),
+      record.resultEncrypted || null,
       terminalRecord.jobId,
       BRIDGE_INSTANCE_ID,
-      record.ownerGeneration || ""
+      attemptedOwnerGeneration,
+      attemptedRevision,
+      terminalCommitAt,
+      terminalCommitAt
     );
     if (Number(terminalChange.changes || 0) === 1) {
+      record.pipelinePropagation = propagatePipelineTerminalInTransaction(
+        db,
+        terminalRecord.jobId,
+        terminalRecord.status,
+        terminalRecord.finishedAt || new Date().toISOString()
+      );
       db.exec("COMMIT");
       transactionOpen = false;
       Object.assign(record, terminalRecord);
@@ -11428,20 +14405,15 @@ function persistTerminalQueueRecord(db, record) {
     current = selectCurrent.get(record.jobId);
     const ownsCurrentGeneration = current
       && current.owner_instance_id === BRIDGE_INSTANCE_ID
-      && String(current.owner_generation || "") === String(record.ownerGeneration || "");
+      && String(current.owner_generation || "") === attemptedOwnerGeneration;
     if (ownsCurrentGeneration
       && ["running", "validating", "reviewing", "testing"].includes(current.status)
       && current.cancellation_requested_at) {
       const cancelledRecord = {
-        ...record,
-        status: "cancelled",
+        ...applyDurableCancellationOutcome(record, current.cancellation_requested_at),
         finishedAt: record.finishedAt || new Date().toISOString(),
         heartbeatAt: "",
         leaseExpiresAt: "",
-        cancellationRequested: true,
-        cancellationRequestedAt: current.cancellation_requested_at,
-        errorType: "agent_cancelled",
-        errorReason: "Cancellation won the durable terminal-write race.",
         ownerInstanceId: current.owner_instance_id,
         ownerProcessId: current.owner_process_id || 0,
         ownerGeneration: current.owner_generation || "",
@@ -11452,21 +14424,30 @@ function persistTerminalQueueRecord(db, record) {
       const cancellationChange = db.prepare(`
         UPDATE opencode_jobs
         SET status = 'cancelled', started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
-            child_process_id = 0, child_process_started_at = '', record_json = ?, revision = revision + 1
+            child_process_id = 0, child_process_started_at = '', record_json = ?, result_encrypted = ?, revision = revision + 1
         WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
           AND owner_generation <> ''
+          AND revision = ?
           AND status IN (${activeStatuses})
           AND cancellation_requested_at IS NOT NULL AND cancellation_requested_at <> ''
       `).run(
         cancelledRecord.startedAt || "",
         cancelledRecord.finishedAt,
         new Date().toISOString(),
-        JSON.stringify(queueRecordSnapshot(cancelledRecord)),
+        JSON.stringify(queueRecordDurableSummary(cancelledRecord)),
+        record.cancellationResultEncrypted || null,
         cancelledRecord.jobId,
         BRIDGE_INSTANCE_ID,
-        record.ownerGeneration || ""
+        attemptedOwnerGeneration,
+        Number(current.revision || 0)
       );
       if (Number(cancellationChange.changes || 0) === 1) {
+        record.pipelinePropagation = propagatePipelineTerminalInTransaction(
+          db,
+          cancelledRecord.jobId,
+          cancelledRecord.status,
+          cancelledRecord.finishedAt || new Date().toISOString()
+        );
         db.exec("COMMIT");
         transactionOpen = false;
         Object.assign(record, cancelledRecord);
@@ -11477,8 +14458,21 @@ function persistTerminalQueueRecord(db, record) {
 
     db.exec("COMMIT");
     transactionOpen = false;
+    const currentLeaseExpiresAt = Date.parse(current?.lease_expires_at || "");
+    const ownershipLost = Boolean(current) && (
+      current.owner_instance_id !== BRIDGE_INSTANCE_ID
+      || String(current.owner_generation || "") !== attemptedOwnerGeneration
+      || Number(current.revision || 0) !== attemptedRevision
+      || !Number.isFinite(currentLeaseExpiresAt)
+      || currentLeaseExpiresAt <= Date.parse(terminalCommitAt)
+    );
     loadPersistedQueueRecord(record, current);
-    return { persisted: false, status: current?.status || "missing", cancellationWon: Boolean(current?.cancellation_requested_at) };
+    return {
+      persisted: false,
+      status: current?.status || "missing",
+      cancellationWon: Boolean(current?.cancellation_requested_at),
+      ownershipLost,
+    };
   } catch (error) {
     if (transactionOpen) {
       try { db.exec("ROLLBACK"); } catch { /* Preserve the terminal persistence error. */ }
@@ -11493,6 +14487,9 @@ async function persistQueueRecord(record) {
     record.revision = Number(record.revision || 0) + 1;
     return { persisted: true, status: record.status };
   }
+
+  record.resultEncrypted = await encryptQueuePrivateDetails(record);
+  record.cancellationResultEncrypted = await encryptQueuePrivateDetails(applyDurableCancellationOutcome(record));
 
   const db = await openLockDb(record.cwd);
   let transactionOpen = false;
@@ -11525,13 +14522,19 @@ async function persistQueueRecord(record) {
           return { persisted: true, deduplicated: true, jobId: existing.job_id };
         }
       }
+      const capacity = stateCapacityError(db);
+      if (capacity) {
+        db.exec("ROLLBACK");
+        transactionOpen = false;
+        return { persisted: false, ...capacity };
+      }
       try {
         db.prepare(`
         INSERT INTO opencode_jobs
         (job_id, cwd, status, agent, mode, created_at, started_at, finished_at, record_json,
          owner_instance_id, owner_process_id, owner_generation, updated_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
-         child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, result_encrypted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         record.jobId,
         record.cwd || "",
@@ -11541,7 +14544,7 @@ async function persistQueueRecord(record) {
         record.createdAt,
         record.startedAt || "",
         record.finishedAt || "",
-        JSON.stringify(queueRecordSnapshot(record)),
+        JSON.stringify(queueRecordDurableSummary(record)),
         record.ownerInstanceId || "",
         record.ownerProcessId || 0,
         record.ownerGeneration || "",
@@ -11553,7 +14556,8 @@ async function persistQueueRecord(record) {
         record.childProcessStartedAt || "",
         Number(record.revision || 0),
         record.idempotencyKey || null,
-        record.requestEncrypted || null
+        record.requestEncrypted || null,
+        record.resultEncrypted || null
       );
       } catch (error) {
         if (record.idempotencyKey && /UNIQUE constraint failed: opencode_jobs\.idempotency_key/i.test(error.message || String(error))) {
@@ -11576,12 +14580,27 @@ async function persistQueueRecord(record) {
       return { persisted: true, status: record.status, revision: Number(record.revision || 0) };
     }
 
-    const currentRevision = Number(current.revision || 0);
+    let currentRevision = Number(current.revision || 0);
     const sameOwner = current.owner_instance_id === BRIDGE_INSTANCE_ID
       && String(current.owner_generation || "") === String(record.ownerGeneration || "")
       && Boolean(record.ownerGeneration);
     const currentTerminal = ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(current.status);
-    if (currentTerminal || !sameOwner || currentRevision !== Number(record.revision || 0)) {
+    let currentSummaryRevision = -1;
+    try { currentSummaryRevision = Number(JSON.parse(current.record_json || "{}").revision ?? -1); } catch { /* Fail closed below. */ }
+    const attemptedRevision = Number(record.revision || 0);
+    const heartbeatOnlyAdvance = sameOwner
+      && current.status === record.status
+      && currentRevision > attemptedRevision
+      && currentSummaryRevision >= 0
+      && currentSummaryRevision <= attemptedRevision;
+    if (heartbeatOnlyAdvance) {
+      Object.assign(record, {
+        revision: currentRevision,
+        heartbeatAt: current.heartbeat_at || record.heartbeatAt || "",
+        leaseExpiresAt: current.lease_expires_at || record.leaseExpiresAt || "",
+      });
+    }
+    if (currentTerminal || !sameOwner || (currentRevision !== attemptedRevision && !heartbeatOnlyAdvance)) {
       db.exec("COMMIT");
       transactionOpen = false;
       loadPersistedQueueRecord(record, current);
@@ -11594,6 +14613,7 @@ async function persistQueueRecord(record) {
       cancellationRequestedAt: current.cancellation_requested_at || record.cancellationRequestedAt || "",
       revision: currentRevision + 1,
     };
+    const updateAt = new Date().toISOString();
     const changed = db.prepare(`
       UPDATE opencode_jobs
       SET cwd = ?, status = ?, agent = ?, mode = ?, started_at = ?, finished_at = ?, record_json = ?,
@@ -11602,9 +14622,15 @@ async function persistQueueRecord(record) {
             WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
             ELSE cancellation_requested_at
           END,
-          child_process_id = ?, child_process_started_at = ?, revision = revision + 1
+          child_process_id = ?, child_process_started_at = ?, result_encrypted = ?, revision = revision + 1
       WHERE job_id = ? AND status = ? AND revision = ?
         AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
+        AND lease_expires_at > ?
+        AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+        AND EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
     `).run(
       nextRecord.cwd || "",
       nextRecord.status,
@@ -11612,21 +14638,24 @@ async function persistQueueRecord(record) {
       nextRecord.mode,
       nextRecord.startedAt || "",
       nextRecord.finishedAt || "",
-      JSON.stringify(queueRecordSnapshot(nextRecord)),
+      JSON.stringify(queueRecordDurableSummary(nextRecord)),
       nextRecord.ownerInstanceId || "",
       nextRecord.ownerProcessId || 0,
       nextRecord.ownerGeneration || "",
-      new Date().toISOString(),
+      updateAt,
       nextRecord.heartbeatAt || "",
       nextRecord.leaseExpiresAt || "",
       nextRecord.cancellationRequestedAt || "",
       nextRecord.childProcessId || 0,
       nextRecord.childProcessStartedAt || "",
+      record.resultEncrypted || null,
       nextRecord.jobId,
       current.status,
       currentRevision,
       BRIDGE_INSTANCE_ID,
-      record.ownerGeneration || ""
+      record.ownerGeneration || "",
+      updateAt,
+      updateAt
     );
     if (Number(changed.changes || 0) === 1) {
       db.exec("COMMIT");
@@ -11650,17 +14679,30 @@ async function persistQueueRecord(record) {
 }
 
 async function updateQueueRecordDurable(record, patch = {}) {
-  Object.assign(record, patch);
-  return await persistQueueRecord(record);
-}
-
-function queueMaxRetriesForPlan(lockPlan) {
-  void lockPlan;
-  return 0;
+  const candidate = { ...record, ...patch };
+  const result = await persistQueueRecord(candidate);
+  const runtimeState = {
+    abortController: record.abortController,
+    executionPromise: record.executionPromise,
+    queueLeaseFenceTimer: record.queueLeaseFenceTimer,
+    queueOwnershipLost: record.queueOwnershipLost,
+  };
+  if (Number(record.revision || 0) > Number(candidate.revision || 0)
+    && record.ownerGeneration === candidate.ownerGeneration) {
+    candidate.revision = record.revision;
+    candidate.heartbeatAt = record.heartbeatAt;
+    candidate.leaseExpiresAt = record.leaseExpiresAt;
+  }
+  Object.assign(record, candidate);
+  Object.assign(record, runtimeState);
+  return result;
 }
 
 function queueLockPathsForRecord(record) {
-  return normalizeLockPathList(record.allowedEdits?.length ? record.allowedEdits : record.lockedPaths);
+  const paths = record.mode === "read"
+    ? firstNonEmptyList(record.lockedPaths, record.scopeContract?.scope?.read, [REPOSITORY_SCOPE_LOCK_PATH])
+    : firstNonEmptyList(record.allowedEdits, record.lockedPaths);
+  return normalizeLockPathListForCwd(paths, record.cwd || "");
 }
 
 function runningQueueRecords() {
@@ -11690,10 +14732,6 @@ async function persistedRunningQueueRecords(cwd = "") {
 }
 
 async function findQueueWriteConflict(record) {
-  if (record.mode !== "write") {
-    return null;
-  }
-
   const cwdKey = path.resolve(record.cwd || process.cwd());
   const runningById = new Map(runningQueueRecords().map((running) => [running.jobId, running]));
   if (effectiveQueueMode() === "sqlite") {
@@ -11708,26 +14746,32 @@ async function findQueueWriteConflict(record) {
     if (running.jobId === record.jobId) {
       continue;
     }
-    if (running.mode !== "write") {
+    if (record.mode === "read" && running.mode === "read") {
       continue;
     }
 
-    if (path.resolve(running.cwd || process.cwd()) !== cwdKey) {
+    if (!recordMatchesProject(running, cwdKey)) {
       continue;
     }
 
-    const overlap = overlaps(queueLockPathsForRecord(record), queueLockPathsForRecord(running));
-    if (overlap) {
+    const conflict = conflictsWithActiveLock(
+      { lockType: record.mode === "read" ? "read" : "write", paths: queueLockPathsForRecord(record) },
+      { id: running.jobId, owner: running.ownerInstanceId || "queue", agent: running.agent, lockType: running.mode === "read" ? "read" : "write", paths: queueLockPathsForRecord(running) }
+    );
+    if (conflict) {
       if (!QUEUE_JOBS.has(running.jobId)) {
         const activeLocks = await listLocks(cwdKey);
-        const activeOverlap = activeLocks.some((lock) => overlaps(overlap, lock.paths));
+        const activeOverlap = activeLocks.some((lock) => conflictsWithActiveLock(
+          { lockType: record.mode === "read" ? "read" : "write", paths: queueLockPathsForRecord(record) },
+          lock
+        ));
         if (!activeOverlap) {
           continue;
         }
       }
       return {
         jobId: running.jobId,
-        paths: overlap,
+        paths: conflict.overlap,
       };
     }
   }
@@ -11768,7 +14812,7 @@ async function assessQueuePlan(lockPlans = []) {
   };
 }
 
-async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending" } = {}) {
+async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true } = {}) {
   if (effectiveQueueMode() === "off") {
     return {
       ok: false,
@@ -11787,6 +14831,15 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
       error: error || `Write-capable agent "${normalizedJob.agent}" requires lockedPaths so the bridge can create a temporary write lock.`,
       suggestedFix: suggestedFix || "Fix the Scope Contract, lockMode, lockedPaths, and allowedEdits before enqueueing.",
       serialOnlyMatches,
+      lockPlan,
+    };
+  }
+  if (!normalizedJob.dryRun && lockPlan.lockType !== "read" && !shouldUseWorktree(normalizedJob, lockPlan)) {
+    return {
+      ok: false,
+      errorType: "queue_write_requires_worktree",
+      error: "Durable queued writers require retained Git worktree isolation so an orphaned child cannot modify the target checkout.",
+      suggestedFix: "Set CODEX_OPENCODE_WORKTREE_MODE=write or all and restart the bridge before enqueueing write jobs.",
       lockPlan,
     };
   }
@@ -11832,7 +14885,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     finishedAt: "",
     durationMs: 0,
     retryCount: 0,
-    maxRetries: queueMaxRetriesForPlan(lockPlan),
+    maxRetries: 0,
     errorType: "",
     errorReason: "",
     changedFiles: [],
@@ -11864,8 +14917,13 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     cancellationRequestedAt: "",
     childProcessId: 0,
     childProcessStartedAt: "",
+    childProcessRole: "",
+    childContainmentIdentity: "",
+    containmentQuarantined: false,
     revision: 0,
   };
+
+  if (!persist) return { ok: true, record, prepared: true };
 
   const persistence = await persistQueueRecord(record);
   if (persistence.idempotencyConflict) {
@@ -11881,7 +14939,11 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     return { ok: true, record: existing, deduplicated: true };
   }
   if (!persistence.persisted) {
-    return { ok: false, errorType: "queue_persistence_failed", error: "The queue request was not durably accepted." };
+    return {
+      ok: false,
+      errorType: persistence.errorType || "queue_persistence_failed",
+      error: persistence.error || "The queue request was not durably accepted.",
+    };
   }
   QUEUE_JOBS.set(jobId, record);
   if (schedule) {
@@ -11890,10 +14952,284 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   return { ok: true, record };
 }
 
-function shouldRetryQueueJob(record, execution) {
-  void record;
-  void execution;
-  return false;
+async function activatePipelineBatch(record, preparedRecords) {
+  if (effectiveQueueMode() !== "sqlite") {
+    return { ok: false, errorType: "pipeline_requires_sqlite_queue", error: "Atomic pipeline activation requires the SQLite queue." };
+  }
+  if (!Array.isArray(preparedRecords) || !preparedRecords.length || preparedRecords.some((item) => !item?.requestEncrypted)) {
+    return { ok: false, errorType: "pipeline_batch_invalid", error: "Every pipeline child must be validated and encrypted before batch activation." };
+  }
+  const duplicateJobIds = preparedRecords.length !== new Set(preparedRecords.map((item) => item.jobId)).size;
+  if (duplicateJobIds) {
+    return { ok: false, errorType: "pipeline_batch_invalid", error: "Pipeline child job ids must be unique." };
+  }
+  await Promise.all(preparedRecords.map(async (child) => {
+    child.resultEncrypted = child.resultEncrypted || await encryptQueuePrivateDetails(child);
+  }));
+
+  return await enqueuePipelinePersistence(record, async () => {
+    const expectedRevision = Number(record.revision || 0);
+    const activatedAt = new Date().toISOString();
+    const queueJobIds = preparedRecords.map((item) => item.jobId);
+    const candidate = {
+      ...record,
+      status: "running",
+      startedAt: record.startedAt || activatedAt,
+      finishedAt: "",
+      queueJobIds,
+      expectedChildCount: queueJobIds.length,
+      batchState: "released",
+      queueMode: "sqlite",
+      revision: expectedRevision + 1,
+      updatedAt: activatedAt,
+      ownerHeartbeatAt: activatedAt,
+      ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+      events: (record.events || []).concat({
+        type: "queue_batch_activated",
+        at: activatedAt,
+        queueJobIds,
+        expectedChildCount: queueJobIds.length,
+      }),
+    };
+    if (typeof pipelinePersistenceTestHook === "function") await pipelinePersistenceTestHook(candidate);
+    candidate.detailsEncrypted = await encryptPipelinePrivateDetails(candidate);
+    const estimatedBatchBytes = Buffer.byteLength(candidate.detailsEncrypted || "", "utf8")
+      + preparedRecords.reduce((total, child) => total
+        + Buffer.byteLength(child.requestEncrypted || "", "utf8")
+        + Buffer.byteLength(child.resultEncrypted || "", "utf8")
+        + Buffer.byteLength(JSON.stringify(queueRecordDurableSummary(child)), "utf8"), 0);
+
+    const db = await openLockDb(record.cwd);
+    let transactionOpen = false;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const commitAt = new Date().toISOString();
+      const commitLeaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
+      candidate.updatedAt = commitAt;
+      candidate.ownerHeartbeatAt = commitAt;
+      candidate.ownerLeaseExpiresAt = commitLeaseExpiresAt;
+      for (const child of preparedRecords) {
+        child.updatedAt = commitAt;
+        child.heartbeatAt = commitAt;
+        child.leaseExpiresAt = commitLeaseExpiresAt;
+      }
+      const capacity = stateCapacityError(db, estimatedBatchBytes);
+      if (capacity) {
+        db.exec("ROLLBACK");
+        transactionOpen = false;
+        return { ok: false, ...capacity };
+      }
+      const authoritative = db.prepare(`
+        SELECT status, revision, owner_instance_id, owner_generation, expected_child_count, batch_state
+        FROM opencode_pipelines WHERE pipeline_id = ?
+      `).get(record.pipelineId);
+      const existingChildren = db.prepare(
+        "SELECT COUNT(*) AS count FROM opencode_pipeline_children WHERE pipeline_id = ?"
+      ).get(record.pipelineId);
+      const claimMatches = authoritative
+        && authoritative.status === "planned"
+        && Number(authoritative.revision || 0) === expectedRevision
+        && authoritative.owner_instance_id === BRIDGE_INSTANCE_ID
+        && String(authoritative.owner_generation || "") === String(record.ownerGeneration || "")
+        && Number(existingChildren?.count || 0) === 0
+        && Number(authoritative.expected_child_count || 0) === 0
+        && ["unstarted", "legacy"].includes(authoritative.batch_state || "unstarted");
+      if (!claimMatches) {
+        db.exec("ROLLBACK");
+        transactionOpen = false;
+        return { ok: false, errorType: "pipeline_concurrent_update", error: "Pipeline activation ownership or revision changed before the atomic batch transaction." };
+      }
+
+      const insertJob = db.prepare(`
+        INSERT INTO opencode_jobs
+        (job_id, cwd, status, agent, mode, created_at, started_at, finished_at, record_json,
+         owner_instance_id, owner_process_id, owner_generation, updated_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
+         child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, result_encrypted)
+        VALUES (?, ?, 'held', ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0, ?, ?, ?)
+      `);
+      const insertChild = db.prepare(`
+        INSERT INTO opencode_pipeline_children (pipeline_id, ordinal, job_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const [ordinal, child] of preparedRecords.entries()) {
+        const held = { ...child, status: "held", revision: 0 };
+        insertJob.run(
+          held.jobId,
+          held.cwd || "",
+          held.agent,
+          held.mode,
+          held.createdAt,
+          JSON.stringify(queueRecordDurableSummary(held)),
+          held.ownerInstanceId || "",
+          held.ownerProcessId || 0,
+          held.ownerGeneration || "",
+          commitAt,
+          held.heartbeatAt,
+          held.leaseExpiresAt,
+          held.idempotencyKey || null,
+          held.requestEncrypted,
+          held.resultEncrypted
+        );
+        insertChild.run(record.pipelineId, ordinal, held.jobId, commitAt);
+      }
+
+      const releaseJob = db.prepare(`
+        UPDATE opencode_jobs
+        SET status = 'pending', updated_at = ?, record_json = ?, revision = revision + 1
+        WHERE job_id = ? AND status = 'held' AND revision = 0
+          AND owner_instance_id = ? AND owner_generation = ?
+      `);
+      for (const child of preparedRecords) {
+        const pending = { ...child, status: "pending", revision: 1 };
+        const released = releaseJob.run(
+          commitAt,
+          JSON.stringify(queueRecordDurableSummary(pending)),
+          child.jobId,
+          BRIDGE_INSTANCE_ID,
+          child.ownerGeneration || ""
+        );
+        if (Number(released.changes || 0) !== 1) throw new Error("Pipeline child release CAS failed.");
+      }
+
+      const activated = db.prepare(`
+        UPDATE opencode_pipelines
+        SET status = 'running', updated_at = ?, record_json = ?, details_encrypted = ?, revision = ?,
+            owner_heartbeat_at = ?, owner_lease_expires_at = ?, expected_child_count = ?,
+            batch_state = 'released', cleanup_state = ?, queue_mode = 'sqlite'
+        WHERE pipeline_id = ? AND revision = ? AND status = ?
+          AND owner_instance_id = ? AND owner_generation = ?
+          AND owner_lease_expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM bridge_instances
+            WHERE instance_id = opencode_pipelines.owner_instance_id AND lease_expires_at > ?
+          )
+      `).run(
+        candidate.updatedAt,
+        JSON.stringify(pipelineRecordDurableSummary(candidate)),
+        candidate.detailsEncrypted,
+        candidate.revision,
+        candidate.ownerHeartbeatAt,
+        candidate.ownerLeaseExpiresAt,
+        candidate.expectedChildCount,
+        candidate.cleanupState || "none",
+        candidate.pipelineId,
+        expectedRevision,
+        authoritative.status,
+        BRIDGE_INSTANCE_ID,
+        record.ownerGeneration || "",
+        commitAt,
+        commitAt
+      );
+      if (Number(activated.changes || 0) !== 1) throw new Error("Pipeline activation CAS failed.");
+      db.exec("COMMIT");
+      transactionOpen = false;
+
+      Object.assign(record, candidate);
+      for (const child of preparedRecords) {
+        child.status = "pending";
+        child.revision = 1;
+        QUEUE_JOBS.set(child.jobId, child);
+      }
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      return { ok: true, record, queueJobIds };
+    } catch (error) {
+      if (transactionOpen) {
+        try { db.exec("ROLLBACK"); } catch { /* Preserve the activation error. */ }
+      }
+      return {
+        ok: false,
+        errorType: error?.code === "SQLITE_CONSTRAINT_UNIQUE" ? "pipeline_batch_idempotency_conflict" : "pipeline_batch_persistence_failed",
+        error: error?.message || "Pipeline batch activation failed and was rolled back.",
+      };
+    } finally {
+      closeDb(db);
+    }
+  });
+}
+
+function abandonLocalQueueWorker(record, detail) {
+  clearQueueLeaseFence(record);
+  loseQueueOwnership(record, detail);
+  if (effectiveQueueMode() === "sqlite" && QUEUE_JOBS.get(record.jobId) === record) {
+    QUEUE_JOBS.delete(record.jobId);
+  }
+}
+
+async function updateQueueTerminalRecordDurable(record, patch) {
+  const result = await updateQueueRecordDurable(record, patch);
+  if (!result.persisted && result.ownershipLost) {
+    const detail = `Durable queue ownership was lost while committing terminal status ${patch.status || "unknown"}.`;
+    abandonLocalQueueWorker(record, detail);
+    logEvent("warn", "queue.terminal_commit_rejected", {
+      jobId: record.jobId,
+      ownerGeneration: record.ownerGeneration || "",
+      status: result.status || "missing",
+    });
+  }
+  return result;
+}
+
+async function handleQueueWorkerInfrastructureFailure(record, error) {
+  const errorText = truncateText(redactSensitiveText(error?.message || String(error)), 2000);
+  record.abortController?.abort(error instanceof Error ? error : new Error(errorText));
+  logEvent("error", "queue.worker_unhandled_failure", {
+    jobId: record.jobId,
+    ownerGeneration: record.ownerGeneration || "",
+    error: errorText,
+  });
+  try {
+    const persisted = await updateQueueTerminalRecordDurable(record, {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      heartbeatAt: "",
+      leaseExpiresAt: "",
+      errorType: "queue_worker_infrastructure_failed",
+      errorReason: errorText,
+      childProcessId: 0,
+      childProcessStartedAt: "",
+    });
+    if (!persisted.persisted) {
+      logEvent("error", "queue.worker_terminal_persistence_rejected", {
+        jobId: record.jobId,
+        status: persisted.status || "missing",
+      });
+      if (!["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(persisted.status || "")) {
+        abandonLocalQueueWorker(record, "The queue worker could not durably record its terminal infrastructure failure.");
+      }
+    }
+  } catch (persistenceError) {
+    logEvent("error", "queue.worker_terminal_persistence_failed", {
+      jobId: record.jobId,
+      error: truncateText(redactSensitiveText(persistenceError?.message || String(persistenceError)), 2000),
+    });
+    abandonLocalQueueWorker(record, "Terminal queue persistence failed; local lease renewal was stopped for deterministic recovery.");
+  }
+}
+
+function superviseQueueWorker(record, workerPromise) {
+  const supervised = workerPromise.catch(async (error) => {
+    try {
+      await handleQueueWorkerInfrastructureFailure(record, error);
+    } catch (handlerError) {
+      logEvent("error", "queue.worker_failure_handler_failed", {
+        jobId: record.jobId,
+        error: truncateText(redactSensitiveText(handlerError?.message || String(handlerError)), 2000),
+      });
+    }
+  });
+  const guarded = supervised.catch((error) => {
+    try {
+      logEvent("error", "queue.worker_supervision_failed", {
+        jobId: record.jobId,
+        error: truncateText(redactSensitiveText(error?.message || String(error)), 2000),
+      });
+    } catch {
+      // The final supervision boundary must never reject.
+    }
+  });
+  record.executionPromise = guarded;
+  return guarded;
 }
 
 async function claimQueueRecord(record) {
@@ -11918,13 +15254,69 @@ async function claimQueueRecord(record) {
   try {
     db.exec("BEGIN IMMEDIATE");
     const row = db.prepare(`
-      SELECT status, owner_instance_id, owner_generation, cancellation_requested_at
+      SELECT status, revision, owner_instance_id, owner_generation, lease_expires_at, cancellation_requested_at
       FROM opencode_jobs WHERE job_id = ?
     `).get(record.jobId);
+    const parent = db.prepare(`
+      SELECT pipeline.pipeline_id, pipeline.status, pipeline.batch_state
+      FROM opencode_pipeline_children AS relation
+      JOIN opencode_pipelines AS pipeline ON pipeline.pipeline_id = relation.pipeline_id
+      WHERE relation.job_id = ?
+    `).get(record.jobId);
+    const parentAllowsClaim = !parent
+      || (parent.status === "running" && parent.batch_state === "released");
+    if (row && parent && parent.batch_state === "released" && parent.status !== "running"
+      && ["pending", "planned", "blocked"].includes(row.status)) {
+      const cancelledAt = new Date().toISOString();
+      const cancelled = db.prepare(`
+        UPDATE opencode_jobs
+        SET status = 'cancelled', finished_at = ?, cancellation_requested_at = ?, updated_at = ?,
+            heartbeat_at = '', lease_expires_at = '', child_process_id = 0, child_process_started_at = '',
+            record_json = json_set(
+              CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END,
+              '$.status', 'cancelled', '$.finishedAt', ?, '$.cancellationRequested', 1,
+              '$.cancellationRequestedAt', ?, '$.errorType', 'agent_cancelled'
+            ),
+            revision = revision + 1
+        WHERE job_id = ? AND status = ? AND revision = ?
+          AND owner_instance_id = ? AND owner_generation = ?
+      `).run(
+        cancelledAt,
+        cancelledAt,
+        cancelledAt,
+        cancelledAt,
+        cancelledAt,
+        record.jobId,
+        row.status,
+        Number(row.revision || 0),
+        row.owner_instance_id || "",
+        row.owner_generation || ""
+      );
+      if (Number(cancelled.changes || 0) === 1) {
+        db.exec("COMMIT");
+        Object.assign(record, {
+          status: "cancelled",
+          finishedAt: cancelledAt,
+          cancellationRequested: true,
+          cancellationRequestedAt: cancelledAt,
+          errorType: "agent_cancelled",
+          errorReason: `Parent pipeline ${parent.pipeline_id} is already ${parent.status}.`,
+          heartbeatAt: "",
+          leaseExpiresAt: "",
+          revision: Number(row.revision || 0) + 1,
+        });
+        return { ok: false, status: "cancelled", parentStatus: parent.status };
+      }
+      db.exec("ROLLBACK");
+      return { ok: false, status: "claim_lost" };
+    }
     const claimable = row
       && ["pending", "planned", "blocked"].includes(row.status)
+      && parentAllowsClaim
       && row.owner_instance_id === BRIDGE_INSTANCE_ID
       && String(row.owner_generation || "") === String(record.ownerGeneration || "")
+      && Number(row.revision || 0) === Number(record.revision || 0)
+      && Date.parse(row.lease_expires_at || "") > Date.parse(heartbeatAt)
       && !row.cancellation_requested_at;
     if (!claimable) {
       db.exec("ROLLBACK");
@@ -11940,13 +15332,18 @@ async function claimQueueRecord(record) {
       }
       return { ok: false, status: row?.status || "missing" };
     }
-    const snapshot = JSON.stringify(queueRecordSnapshot({ ...record, ...runningState }));
+    const snapshot = JSON.stringify(queueRecordDurableSummary({ ...record, ...runningState }));
     const changed = db.prepare(`
       UPDATE opencode_jobs
       SET status = 'running', started_at = ?, updated_at = ?, heartbeat_at = ?, lease_expires_at = ?,
           owner_process_id = ?, record_json = ?, revision = revision + 1
-      WHERE job_id = ? AND status = ? AND owner_instance_id = ? AND owner_generation = ?
+      WHERE job_id = ? AND status = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
+        AND lease_expires_at > ?
         AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+        AND EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
     `).run(
       runningState.startedAt,
       heartbeatAt,
@@ -11956,8 +15353,11 @@ async function claimQueueRecord(record) {
       snapshot,
       record.jobId,
       row.status,
+      Number(record.revision || 0),
       BRIDGE_INSTANCE_ID,
-      record.ownerGeneration || ""
+      record.ownerGeneration || "",
+      heartbeatAt,
+      heartbeatAt
     );
     if (Number(changed.changes || 0) !== 1) {
       db.exec("ROLLBACK");
@@ -11979,11 +15379,13 @@ async function startQueueRecord(record) {
   if (!claim.ok) return false;
 
   record.abortController = new AbortController();
-  record.executionPromise = (async () => {
+  record.queueOwnershipLost = false;
+  resetQueueLeaseFence(record);
+  const workerPromise = (async () => {
     const started = nowMs();
     try {
       if (record.cancellationRequested) {
-        await updateQueueRecordDurable(record, {
+        await updateQueueTerminalRecordDurable(record, {
           status: "cancelled",
           finishedAt: new Date().toISOString(),
           durationMs: nowMs() - started,
@@ -11998,18 +15400,35 @@ async function startQueueRecord(record) {
         jobId: record.jobId,
         fromQueue: true,
         signal: record.abortController.signal,
+        assertDurableOwnership: async () => await assertQueueRecordDurableOwnership(record),
+        renewDurableOwnership: async () => await renewQueueRecordDurableOwnership(record),
         onWorktreePrepared: async (worktree) => {
-          await updateQueueRecordDurable(record, {
+          const persisted = await updateQueueRecordDurable(record, {
             worktreePath: worktree.path || "",
             worktreeBranch: worktree.branch || "",
             worktreeBaseCommit: worktree.baseCommit || "",
             worktreeBaseTree: worktree.baseTree || "",
           });
+          if (!persisted.persisted) {
+            loseQueueOwnership(record, "Durable queue ownership changed while recording the isolated worktree.");
+            throw queueOwnershipLossError("Durable queue ownership changed while recording the isolated worktree.");
+          }
         },
-        onChildSpawn: async ({ pid, startedAt }) => {
-          record.childProcessId = pid || 0;
-          record.childProcessStartedAt = startedAt || new Date().toISOString();
-          await persistQueueRecord(record);
+        onChildSpawn: async ({ pid, startedAt, processRole, containmentIdentity }) => {
+          const launchAuthorizedAt = new Date().toISOString();
+          const persisted = await updateQueueRecordDurable(record, {
+            childProcessId: pid || 0,
+            childProcessStartedAt: startedAt || new Date().toISOString(),
+            childProcessRole: processRole || "supervisor",
+            childContainmentIdentity: containmentIdentity || "",
+            heartbeatAt: launchAuthorizedAt,
+            leaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+          });
+          if (!persisted.persisted) {
+            loseQueueOwnership(record, "Durable queue ownership changed while recording the process supervisor identity.");
+            throw queueOwnershipLossError("The payload launch gate could not persist its process supervisor identity.");
+          }
+          return { ok: true, deadlineAt: Date.parse(record.leaseExpiresAt || "") };
         },
       });
       const validationError = execution.validation?.disallowedFiles?.length
@@ -12017,8 +15436,8 @@ async function startQueueRecord(record) {
         : "";
       const errorType = execution.result?.errorType || validationError || "";
 
-      if (record.cancellationRequested || errorType === "agent_cancelled") {
-        await updateQueueRecordDurable(record, {
+      if ((record.cancellationRequested || errorType === "agent_cancelled") && errorType !== "process_tree_termination_unconfirmed") {
+        await updateQueueTerminalRecordDurable(record, {
           status: "cancelled",
           finishedAt: new Date().toISOString(),
           durationMs: nowMs() - started,
@@ -12054,26 +15473,15 @@ async function startQueueRecord(record) {
         await updateQueueRecordDurable(record, {
           status: "blocked",
           errorType,
-          errorReason: "Waiting for the active cross-process write lock to be released.",
+          errorReason: "Waiting for the active cross-process reader/writer consistency lock to be released.",
           childProcessId: 0,
           childProcessStartedAt: "",
         });
         return;
       }
 
-      if (shouldRetryQueueJob(record, execution)) {
-        await updateQueueRecordDurable(record, {
-          status: "pending",
-          retryCount: record.retryCount + 1,
-          errorType,
-          errorReason: "Retrying safe read-only job after timeout.",
-          childProcessId: 0,
-          childProcessStartedAt: "",
-        });
-        return;
-      }
-
-      await updateQueueRecordDurable(record, {
+      const containmentUnconfirmed = errorType === "process_tree_termination_unconfirmed";
+      await updateQueueTerminalRecordDurable(record, {
         status: errorType ? "failed" : "completed",
         finishedAt: new Date().toISOString(),
         durationMs: nowMs() - started,
@@ -12102,11 +15510,12 @@ async function startQueueRecord(record) {
         worktreeBaseTree: execution.worktree?.baseTree || "",
         worktreePatchSha256: execution.result?.worktree?.patchSha256 || "",
         worktreeSourceStateSha256: execution.result?.worktree?.sourceStateSha256 || "",
-        childProcessId: 0,
-        childProcessStartedAt: "",
+        childProcessId: containmentUnconfirmed ? record.childProcessId : 0,
+        childProcessStartedAt: containmentUnconfirmed ? record.childProcessStartedAt : "",
+        containmentQuarantined: containmentUnconfirmed,
       });
     } catch (error) {
-      await updateQueueRecordDurable(record, {
+      await updateQueueTerminalRecordDurable(record, {
         status: "failed",
         finishedAt: new Date().toISOString(),
         durationMs: nowMs() - started,
@@ -12118,6 +15527,18 @@ async function startQueueRecord(record) {
         childProcessStartedAt: "",
       });
     } finally {
+      clearQueueLeaseFence(record);
+      if (record.parentJobId && ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
+        try {
+          await reconcileParentPipelineAfterQueueTerminal(record);
+        } catch (error) {
+          logEvent("warn", "pipeline.child_terminal_reconciliation_failed", {
+            pipelineId: record.parentJobId,
+            jobId: record.jobId,
+            errorType: error?.errorType || "pipeline_child_terminal_reconciliation_failed",
+          });
+        }
+      }
       if (["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
         delete record.request;
       }
@@ -12126,6 +15547,7 @@ async function startQueueRecord(record) {
       scheduleQueue();
     }
   })();
+  superviseQueueWorker(record, workerPromise);
   return true;
 }
 
@@ -12162,6 +15584,10 @@ function scheduleQueue(delayMs = 0) {
         }
 
         if (!["pending", "blocked", "planned"].includes(record.status)) {
+          continue;
+        }
+        const recordRoot = path.resolve(record.cwd || process.cwd());
+        if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(recordRoot)) {
           continue;
         }
 
@@ -12201,7 +15627,9 @@ function scheduleQueue(delayMs = 0) {
       logEvent("warn", "queue.scheduler_failed", { error: error.message || String(error) });
     } finally {
       queueSchedulerActive = false;
-      const records = [...QUEUE_JOBS.values()];
+      const records = [...QUEUE_JOBS.values()].filter((record) =>
+        !INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(record.cwd || process.cwd()))
+      );
       const hasCapacity = runningQueueRecords().length < CONFIG.queueParallelLimit;
       const nextDelay = nextQueueScheduleDelay(records, hasCapacity);
       if (nextDelay !== null) {
@@ -12220,11 +15648,18 @@ async function readPersistedQueueRecord(jobId, cwd = "") {
   try {
     const row = db.prepare(`
       SELECT status, finished_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
-             child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, record_json
+             child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted,
+             result_encrypted, record_json
       FROM opencode_jobs WHERE job_id = ?
     `).get(jobId);
-    return row?.record_json ? {
+    if (!row?.record_json) return null;
+    const privateDetails = row.result_encrypted
+      ? await decryptQueuePrivateDetails(row.result_encrypted, jobId)
+      : {};
+    return {
       ...JSON.parse(row.record_json),
+      ...privateDetails,
+      privateDetailsAvailable: Boolean(row.result_encrypted),
       status: row.status,
       finishedAt: row.finished_at || "",
       heartbeatAt: row.heartbeat_at || "",
@@ -12234,7 +15669,7 @@ async function readPersistedQueueRecord(jobId, cwd = "") {
       childProcessId: row.child_process_id || 0,
       childProcessStartedAt: row.child_process_started_at || "",
       revision: row.revision || 0,
-    } : null;
+    };
   } finally {
     closeDb(db);
   }
@@ -12268,6 +15703,11 @@ async function listPersistedQueueRecords(cwd = "", status = "") {
   }
 }
 
+async function authoritativeQueueRecord(jobId, cwd = "") {
+  if (effectiveQueueMode() !== "sqlite") return QUEUE_JOBS.get(jobId) || null;
+  return await readPersistedQueueRecord(jobId, cwd);
+}
+
 function makePipelineId(name = "pipeline") {
   return `${safeNamePart(name, "pipeline")}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
@@ -12278,9 +15718,10 @@ function pipelineRecordSnapshot(record) {
   return sanitizePersistedValue({
     pipelineId: record.pipelineId,
     revision: Number(record.revision || 0),
-    ownerInstanceId: record.ownerInstanceId || BRIDGE_INSTANCE_ID,
-    ownerHeartbeatAt: record.ownerHeartbeatAt || new Date().toISOString(),
-    ownerLeaseExpiresAt: record.ownerLeaseExpiresAt || new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+    ownerInstanceId: record.ownerInstanceId || "",
+    ownerGeneration: record.ownerGeneration || "",
+    ownerHeartbeatAt: record.ownerHeartbeatAt || "",
+    ownerLeaseExpiresAt: record.ownerLeaseExpiresAt || "",
     name: record.name || "",
     cwd: record.cwd || "",
     status: record.status,
@@ -12294,6 +15735,10 @@ function pipelineRecordSnapshot(record) {
     jobs: record.jobs || [],
     lockPlans: record.lockPlans || [],
     queueJobIds: record.queueJobIds || [],
+    expectedChildCount: Number(record.expectedChildCount || 0),
+    batchState: record.batchState || "unstarted",
+    cleanupState: record.cleanupState || "none",
+    queueMode: record.queueMode || "legacy",
     integrationQueue: record.integrationQueue || [],
     finalValidationCommand: record.finalValidationCommand || "",
     finalValidationSource,
@@ -12310,6 +15755,139 @@ function pipelineRecordSnapshot(record) {
     sanitizedWorkspace: record.sanitizedWorkspace || null,
     sanitizedWorkspaceAttestation: record.sanitizedWorkspaceAttestation || null,
   });
+}
+
+function pipelinePrivateDetails(record) {
+  const details = sanitizePersistedValue({
+    policy: record.policy || null,
+    jobs: record.jobs || [],
+    lockPlans: record.lockPlans || [],
+    integrationQueue: record.integrationQueue || [],
+    finalValidationCommand: record.finalValidationCommand || "",
+    finalValidationSpec: record.finalValidationSpec || null,
+    finalValidationResult: record.finalValidationResult || null,
+    reviewerJob: record.reviewerJob || null,
+    reviewerResult: record.reviewerResult || null,
+    testerJob: record.testerJob || null,
+    testerResult: record.testerResult || null,
+    sourceCleanupResults: record.sourceCleanupResults || [],
+    events: record.events || [],
+    errors: record.errors || [],
+    sanitizedWorkspaceAttestation: record.sanitizedWorkspaceAttestation || null,
+  });
+  const serialized = JSON.stringify(details);
+  if (Buffer.byteLength(serialized, "utf8") <= CONFIG.maxSnapshotFileBytes) return details;
+  const essentialCleanupAuthorization = [...(details.events || [])]
+    .reverse()
+    .find((event) => event?.type === "source_cleanup_authorized");
+  return sanitizePersistedValue({
+    policy: details.policy || null,
+    jobs: [],
+    lockPlans: details.lockPlans || [],
+    integrationQueue: details.integrationQueue || [],
+    finalValidationCommand: details.finalValidationCommand || "",
+    finalValidationSpec: details.finalValidationSpec || null,
+    reviewerJob: null,
+    testerJob: null,
+    sourceCleanupResults: details.sourceCleanupResults || [],
+    events: essentialCleanupAuthorization ? [essentialCleanupAuthorization] : [],
+    errors: [],
+    truncated: true,
+    originalChars: serialized.length,
+    originalSha256: createHash("sha256").update(serialized).digest("hex"),
+  });
+}
+
+function pipelineRecordDurableSummary(record) {
+  const summary = pipelineRecordSnapshot(record);
+  const privateDetails = pipelinePrivateDetails(record);
+  const privateJson = JSON.stringify(privateDetails);
+  summary.policy = record.policy ? sanitizePersistedValue({
+    path: record.policy.path || "",
+    sha256: record.policy.sha256 || "",
+    trustedForAuthority: Boolean(record.policy.trustedForAuthority),
+  }) : null;
+  summary.jobs = (record.jobs || []).map((job) => {
+    const hasRawTask = Object.prototype.hasOwnProperty.call(job || {}, "task");
+    return sanitizePersistedValue({
+      agent: job.agent || "",
+      role: job.role || "",
+      write: Boolean(job.write),
+      taskChars: hasRawTask ? String(job.task || "").length : Number(job.taskChars || 0),
+      taskSha256: hasRawTask
+        ? createHash("sha256").update(String(job.task || "")).digest("hex")
+        : String(job.taskSha256 || ""),
+    });
+  });
+  summary.lockPlans = (record.lockPlans || []).map((plan) => sanitizePersistedValue({
+    index: Number(plan.index || 0),
+    agent: plan.agent || "",
+    cwd: plan.cwd || "",
+    lockMode: plan.lockMode || "",
+    lockType: plan.lockType || "",
+    orchestratorMode: plan.orchestratorMode || "",
+    userAuthorizedOrchestrator: Boolean(plan.userAuthorizedOrchestrator),
+    contractorAuthorizationVerified: Boolean(plan.contractorAuthorizationVerified),
+    lockedPaths: plan.lockedPaths || [],
+    allowedEdits: plan.allowedEdits || [],
+    forbiddenEdits: plan.forbiddenEdits || [],
+    sharedFiles: plan.sharedFiles || [],
+    serialOnly: plan.serialOnly || [],
+    scopeContract: scopeContractDurableSummary(plan.scopeContract),
+    timeoutMs: plan.timeoutMs || null,
+    taskChars: String(plan.task || "").length,
+    taskSha256: createHash("sha256").update(String(plan.task || "")).digest("hex"),
+    ...commandFingerprintFields(plan.validationCommand),
+  }));
+  summary.integrationQueue = (record.integrationQueue || []).map((item) => sanitizePersistedValue({
+    agent: item.agent || "",
+    jobId: item.jobId || "",
+    worktreePath: item.worktreePath || "",
+    branch: item.branch || "",
+    sourceBaseCommit: item.sourceBaseCommit || "",
+    sourceBaseTree: item.sourceBaseTree || "",
+    patchSha256: item.patchSha256 || "",
+    sourceStateSha256: item.sourceStateSha256 || "",
+    allowedEdits: item.allowedEdits || [],
+    lockedPaths: item.lockedPaths || [],
+    forbiddenEdits: item.forbiddenEdits || [],
+    sharedFiles: item.sharedFiles || [],
+    serialOnly: item.serialOnly || [],
+    changedFiles: item.changedFiles || [],
+    status: item.status || "",
+    operationId: item.operationId || "",
+    validationSource: item.validationSource || "",
+    ...commandFingerprintFields(item.validationCommand),
+    validationSpecSha256: createHash("sha256").update(JSON.stringify(item.validationSpec || null)).digest("hex"),
+  }));
+  summary.finalValidationCommand = "";
+  summary.finalValidationSpec = null;
+  summary.finalValidationResult = null;
+  summary.reviewerJob = null;
+  summary.reviewerResult = null;
+  summary.testerJob = null;
+  summary.testerResult = null;
+  summary.sourceCleanupResults = [];
+  summary.events = [];
+  summary.errors = [];
+  summary.sanitizedWorkspaceAttestation = null;
+  summary.privateDetailsChars = privateJson.length;
+  summary.privateDetailsSha256 = createHash("sha256").update(privateJson).digest("hex");
+  summary.eventCount = (record.events || []).length;
+  summary.errorCount = (record.errors || []).length;
+  return sanitizePersistedValue(summary);
+}
+
+async function encryptPipelinePrivateDetails(record) {
+  return encryptIntegrationJournalBytes(
+    Buffer.from(JSON.stringify(pipelinePrivateDetails(record)), "utf8"),
+    `pipeline-details\0${record.pipelineId}`
+  );
+}
+
+async function decryptPipelinePrivateDetails(envelope, pipelineId) {
+  if (!envelope) return {};
+  return JSON.parse((await decryptIntegrationJournalBytes(envelope, `pipeline-details\0${pipelineId}`)).toString("utf8"));
 }
 
 function pipelineReplayRequest(record) {
@@ -12330,41 +15908,132 @@ function pipelineOwnedByThisInstance(record) {
 }
 
 async function claimPersistedPipeline(record) {
-  if (pipelineOwnedByThisInstance(record)) return { ok: true, record };
-  if (["planned", "running"].includes(record?.status) && !record.requestEncrypted && !record.replayRequestAvailable) {
-    return { ok: false, reason: "legacy_pipeline_request_unavailable" };
-  }
   const db = await openLockDb(record.cwd);
+  let transactionOpen = false;
   try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const row = db.prepare(`
+      SELECT status, revision, request_encrypted, details_encrypted, record_json, owner_instance_id, owner_generation,
+             owner_heartbeat_at, owner_lease_expires_at, expected_child_count, batch_state, cleanup_state, queue_mode
+      FROM opencode_pipelines WHERE pipeline_id = ?
+    `).get(record.pipelineId);
+    if (!row) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return { ok: false, reason: "missing" };
+    }
+    let durableSummary = {};
+    try { durableSummary = JSON.parse(row.record_json || "{}"); } catch { durableSummary = {}; }
+    const authoritative = {
+      ...durableSummary,
+      ...record,
+      status: row.status,
+      revision: Number(row.revision || 0),
+      ownerInstanceId: row.owner_instance_id || record.ownerInstanceId || durableSummary.ownerInstanceId || "",
+      ownerGeneration: row.owner_generation || record.ownerGeneration || durableSummary.ownerGeneration || "",
+      ownerHeartbeatAt: row.owner_heartbeat_at || record.ownerHeartbeatAt || durableSummary.ownerHeartbeatAt || "",
+      ownerLeaseExpiresAt: row.owner_lease_expires_at || record.ownerLeaseExpiresAt || durableSummary.ownerLeaseExpiresAt || "",
+      expectedChildCount: Number(row.expected_child_count || record.expectedChildCount || durableSummary.expectedChildCount || 0),
+      batchState: row.batch_state || record.batchState || durableSummary.batchState || "unstarted",
+      cleanupState: row.cleanup_state || record.cleanupState || durableSummary.cleanupState || "none",
+      queueMode: row.queue_mode || record.queueMode || durableSummary.queueMode || "legacy",
+      requestEncrypted: row.request_encrypted || record.requestEncrypted || "",
+      replayRequestAvailable: Boolean(row.request_encrypted),
+    };
+    if (["completed", "failed", "cancelled"].includes(authoritative.status)) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative);
+      return { ok: false, reason: "terminal" };
+    }
+    if (["planned", "running"].includes(authoritative.status) && !row.request_encrypted) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative);
+      return { ok: false, reason: "legacy_pipeline_request_unavailable" };
+    }
     const now = Date.now();
-    const expiresAt = Date.parse(record?.ownerLeaseExpiresAt || "");
-    const owner = record?.ownerInstanceId
-      ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(record.ownerInstanceId)
+    const expiresAt = Date.parse(authoritative.ownerLeaseExpiresAt || "");
+    const owner = authoritative.ownerInstanceId
+      ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(authoritative.ownerInstanceId)
       : null;
     const ownerExpiresAt = Date.parse(owner?.lease_expires_at || "");
-    if ((Number.isFinite(expiresAt) && expiresAt > now)
-      || (Number.isFinite(ownerExpiresAt) && ownerExpiresAt > now)) return { ok: false, reason: "owner_lease_active" };
-    const expectedRevision = Number(record.revision || 0);
+    const sameLiveOwner = authoritative.ownerInstanceId === BRIDGE_INSTANCE_ID
+      && authoritative.ownerGeneration
+      && authoritative.ownerGeneration === record.ownerGeneration
+      && Number.isFinite(expiresAt)
+      && expiresAt > now;
+    if (sameLiveOwner) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative);
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      return { ok: true, record };
+    }
+    if ((Number.isFinite(expiresAt) && expiresAt > now) || (Number.isFinite(ownerExpiresAt) && ownerExpiresAt > now)) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative);
+      return { ok: false, reason: "owner_lease_active" };
+    }
+    const expectedRevision = Number(authoritative.revision || 0);
     const claimedAt = new Date().toISOString();
     const candidate = {
-      ...record,
+      ...authoritative,
       ownerInstanceId: BRIDGE_INSTANCE_ID,
-      ownerHeartbeatAt: now,
-      ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+      ownerGeneration: randomBytes(12).toString("hex"),
       ownerHeartbeatAt: claimedAt,
       ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
       revision: expectedRevision + 1,
       updatedAt: claimedAt,
-      events: (record.events || []).concat({ type: "pipeline_owner_recovered", at: claimedAt, ownerInstanceId: BRIDGE_INSTANCE_ID }),
     };
+    const durableCandidate = sanitizePersistedValue({
+      ...durableSummary,
+      status: candidate.status,
+      revision: candidate.revision,
+      updatedAt: candidate.updatedAt,
+      ownerInstanceId: candidate.ownerInstanceId,
+      ownerGeneration: candidate.ownerGeneration,
+      ownerHeartbeatAt: candidate.ownerHeartbeatAt,
+      ownerLeaseExpiresAt: candidate.ownerLeaseExpiresAt,
+      queueMode: candidate.queueMode || "sqlite",
+    });
     const updated = db.prepare(`
-      UPDATE opencode_pipelines SET updated_at = ?, record_json = ?, revision = ?
+      UPDATE opencode_pipelines
+      SET updated_at = ?, record_json = ?, revision = ?, owner_instance_id = ?, owner_generation = ?,
+          owner_heartbeat_at = ?, owner_lease_expires_at = ?, queue_mode = ?
       WHERE pipeline_id = ? AND revision = ?
-    `).run(candidate.updatedAt, JSON.stringify(pipelineRecordSnapshot(candidate)), candidate.revision, candidate.pipelineId, expectedRevision);
-    if (Number(updated.changes || 0) !== 1) return { ok: false, reason: "concurrent_update" };
+        AND owner_instance_id = ? AND owner_generation = ?
+    `).run(
+      candidate.updatedAt,
+      JSON.stringify(durableCandidate),
+      candidate.revision,
+      candidate.ownerInstanceId,
+      candidate.ownerGeneration,
+      candidate.ownerHeartbeatAt,
+      candidate.ownerLeaseExpiresAt,
+      candidate.queueMode || "sqlite",
+      candidate.pipelineId,
+      expectedRevision,
+      authoritative.ownerInstanceId || "",
+      authoritative.ownerGeneration || ""
+    );
+    if (Number(updated.changes || 0) !== 1) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return { ok: false, reason: "concurrent_update" };
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
     Object.assign(record, candidate);
     PIPELINE_RUNS.set(record.pipelineId, record);
     return { ok: true, record };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the claim error. */ }
+    }
+    throw error;
   } finally {
     closeDb(db);
   }
@@ -12402,46 +16071,93 @@ function pipelineConcurrentUpdateError(snapshot, authoritative = null) {
   return error;
 }
 
+function pipelineRecordJson(snapshot) {
+  const { requestEncrypted, detailsEncrypted, ...summary } = snapshot;
+  return JSON.stringify(sanitizePersistedValue(summary));
+}
+
 async function writePipelineRecordSnapshot(snapshot, { create = false, expectedRevision = null } = {}) {
-  if (typeof pipelinePersistenceTestHook === "function") {
-    await pipelinePersistenceTestHook(snapshot);
-  }
   const db = await openLockDb(snapshot.cwd);
   try {
+    const commitAt = new Date().toISOString();
+    const committedSnapshot = {
+      ...snapshot,
+      updatedAt: commitAt,
+      ownerHeartbeatAt: commitAt,
+      ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+    };
     if (create) {
+      const capacity = stateCapacityError(db);
+      if (capacity) {
+        const error = new Error(capacity.error);
+        error.errorType = capacity.errorType;
+        throw error;
+      }
       const inserted = db.prepare(`
         INSERT INTO opencode_pipelines
-        (pipeline_id, cwd, status, created_at, updated_at, record_json, revision, request_encrypted)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (pipeline_id, cwd, status, created_at, updated_at, record_json, revision, request_encrypted, details_encrypted,
+         owner_instance_id, owner_generation, owner_heartbeat_at, owner_lease_expires_at,
+         expected_child_count, batch_state, cleanup_state, queue_mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pipeline_id) DO NOTHING
       `).run(
-        snapshot.pipelineId,
-        snapshot.cwd || "",
-        snapshot.status,
-        snapshot.createdAt,
-        snapshot.updatedAt,
-        JSON.stringify(pipelineRecordSnapshot(snapshot)),
-        Number(snapshot.revision || 0),
-        snapshot.requestEncrypted || null
+        committedSnapshot.pipelineId,
+        committedSnapshot.cwd || "",
+        committedSnapshot.status,
+        committedSnapshot.createdAt,
+        committedSnapshot.updatedAt,
+        pipelineRecordJson(committedSnapshot),
+        Number(committedSnapshot.revision || 0),
+        committedSnapshot.requestEncrypted || null,
+        committedSnapshot.detailsEncrypted || null,
+        committedSnapshot.ownerInstanceId || "",
+        committedSnapshot.ownerGeneration || "",
+        committedSnapshot.ownerHeartbeatAt || "",
+        committedSnapshot.ownerLeaseExpiresAt || "",
+        Number(committedSnapshot.expectedChildCount || 0),
+        committedSnapshot.batchState || "unstarted",
+        committedSnapshot.cleanupState || "none",
+        committedSnapshot.queueMode || "sqlite"
       );
       if (inserted.changes !== 1) throw pipelineConcurrentUpdateError(snapshot);
-      return snapshot;
+      return committedSnapshot;
     }
     const expected = Number(expectedRevision);
     const updated = db.prepare(`
       UPDATE opencode_pipelines
-      SET cwd = ?, status = ?, created_at = ?, updated_at = ?, record_json = ?, revision = ?, request_encrypted = COALESCE(?, request_encrypted)
-      WHERE pipeline_id = ? AND revision = ?
+      SET cwd = ?, status = ?, created_at = ?, updated_at = ?, record_json = ?, revision = ?, request_encrypted = COALESCE(?, request_encrypted),
+          details_encrypted = COALESCE(?, details_encrypted),
+          owner_instance_id = ?, owner_generation = ?, owner_heartbeat_at = ?, owner_lease_expires_at = ?,
+          expected_child_count = ?, batch_state = ?, cleanup_state = ?, queue_mode = ?
+      WHERE pipeline_id = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
+        AND owner_lease_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_pipelines.owner_instance_id AND lease_expires_at > ?
+        )
     `).run(
-      snapshot.cwd || "",
-      snapshot.status,
-      snapshot.createdAt,
-      snapshot.updatedAt,
-      JSON.stringify(pipelineRecordSnapshot(snapshot)),
-      Number(snapshot.revision || 0),
-      snapshot.requestEncrypted || null,
-      snapshot.pipelineId,
-      expected
+      committedSnapshot.cwd || "",
+      committedSnapshot.status,
+      committedSnapshot.createdAt,
+      committedSnapshot.updatedAt,
+      pipelineRecordJson(committedSnapshot),
+      Number(committedSnapshot.revision || 0),
+      committedSnapshot.requestEncrypted || null,
+      committedSnapshot.detailsEncrypted || null,
+      committedSnapshot.ownerInstanceId || "",
+      committedSnapshot.ownerGeneration || "",
+      committedSnapshot.ownerHeartbeatAt || "",
+      committedSnapshot.ownerLeaseExpiresAt || "",
+      Number(committedSnapshot.expectedChildCount || 0),
+      committedSnapshot.batchState || "unstarted",
+      committedSnapshot.cleanupState || "none",
+      committedSnapshot.queueMode || "sqlite",
+      committedSnapshot.pipelineId,
+      expected,
+      committedSnapshot.ownerInstanceId || "",
+      committedSnapshot.ownerGeneration || "",
+      commitAt,
+      commitAt
     );
     if (updated.changes !== 1) {
       const row = db.prepare("SELECT status, revision, record_json FROM opencode_pipelines WHERE pipeline_id = ?").get(snapshot.pipelineId);
@@ -12452,7 +16168,7 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
       } : null;
       throw pipelineConcurrentUpdateError(snapshot, authoritative);
     }
-    return snapshot;
+    return committedSnapshot;
   } finally {
     closeDb(db);
   }
@@ -12460,15 +16176,24 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
 
 function persistPipelineRecord(record) {
   if (!record.ownerInstanceId) record.ownerInstanceId = BRIDGE_INSTANCE_ID;
+  if (!record.ownerGeneration) record.ownerGeneration = randomBytes(12).toString("hex");
   record.ownerHeartbeatAt = record.ownerHeartbeatAt || new Date().toISOString();
   record.ownerLeaseExpiresAt = record.ownerLeaseExpiresAt || new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
+  record.queueMode = "sqlite";
   return enqueuePipelinePersistence(record, async () => {
-    if (effectiveQueueMode() === "sqlite" && !record.requestEncrypted) {
-      record.requestEncrypted = await encryptQueueRequest(pipelineReplayRequest(record), record.pipelineId);
-    }
-    const snapshot = pipelineRecordSnapshot(record);
-    await writePipelineRecordSnapshot({ ...snapshot, requestEncrypted: record.requestEncrypted || "" }, { create: true });
-    record.revision = Number(snapshot.revision || record.revision || 0);
+    if (typeof pipelinePersistenceTestHook === "function") await pipelinePersistenceTestHook(record);
+    record.requestEncrypted = await encryptQueueRequest(pipelineReplayRequest(record), record.pipelineId);
+    record.detailsEncrypted = await encryptPipelinePrivateDetails(record);
+    const snapshot = pipelineRecordDurableSummary(record);
+    const persisted = await writePipelineRecordSnapshot({
+      ...snapshot,
+      requestEncrypted: record.requestEncrypted || "",
+      detailsEncrypted: record.detailsEncrypted || "",
+    }, { create: true });
+    record.revision = Number(persisted.revision || record.revision || 0);
+    record.updatedAt = persisted.updatedAt;
+    record.ownerHeartbeatAt = persisted.ownerHeartbeatAt;
+    record.ownerLeaseExpiresAt = persisted.ownerLeaseExpiresAt;
     return record;
   });
 }
@@ -12491,7 +16216,15 @@ async function updatePipelineRecord(record, patch = {}) {
         ownerHeartbeatAt: new Date().toISOString(),
         ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
       };
-      await writePipelineRecordSnapshot(pipelineRecordSnapshot(candidate), { expectedRevision });
+      if (typeof pipelinePersistenceTestHook === "function") await pipelinePersistenceTestHook(candidate);
+      candidate.detailsEncrypted = await encryptPipelinePrivateDetails(candidate);
+      const persisted = await writePipelineRecordSnapshot({
+        ...pipelineRecordDurableSummary(candidate),
+        detailsEncrypted: candidate.detailsEncrypted,
+      }, { expectedRevision });
+      candidate.updatedAt = persisted.updatedAt;
+      candidate.ownerHeartbeatAt = persisted.ownerHeartbeatAt;
+      candidate.ownerLeaseExpiresAt = persisted.ownerLeaseExpiresAt;
       Object.assign(record, candidate);
       return record;
     });
@@ -12505,16 +16238,68 @@ async function updatePipelineRecord(record, patch = {}) {
   }
 }
 
+async function reconcilePipelineIntegrationOperationStates(record) {
+  let changed = false;
+  const events = [...(record.events || [])];
+  const integrationQueue = [];
+  for (const item of record.integrationQueue || []) {
+    if (item.status !== "integrating" || !item.operationId) {
+      integrationQueue.push(item);
+      continue;
+    }
+    const operation = await readIntegrationOperationSummary(record.cwd, item.operationId);
+    const operationMatchesItem = Boolean(operation)
+      && operation.pipelineId === record.pipelineId
+      && operation.pipelineJobId === String(item.jobId || "")
+      && (!item.patchSha256 || operation.patchSha256 === item.patchSha256)
+      && (!item.sourceStateSha256 || operation.sourceStateSha256 === item.sourceStateSha256);
+    let status = item.status;
+    if (!operationMatchesItem) status = "quarantined";
+    else if (operation.status === "committed") status = "integrated";
+    else if (["rolled_back", "recovered_noop"].includes(operation.status)) status = "pending";
+    else if (operation.status === "quarantined") status = "quarantined";
+    if (status !== item.status) {
+      changed = true;
+      events.push({
+        type: "integration_journal_reconciled",
+        at: new Date().toISOString(),
+        operationId: item.operationId,
+        jobId: item.jobId || "",
+        status,
+      });
+    }
+    integrationQueue.push({ ...item, status });
+  }
+  if (changed) await updatePipelineRecord(record, { integrationQueue, events });
+  return record;
+}
+
 async function readPersistedPipelineRecord(pipelineId, cwd = "") {
   const db = await openLockDb(cwd);
   try {
-    const row = db.prepare("SELECT status, revision, request_encrypted, record_json FROM opencode_pipelines WHERE pipeline_id = ?").get(pipelineId);
+    const row = db.prepare(`
+      SELECT status, revision, request_encrypted, details_encrypted, record_json, owner_instance_id, owner_generation,
+             owner_heartbeat_at, owner_lease_expires_at, expected_child_count, batch_state, cleanup_state, queue_mode
+      FROM opencode_pipelines WHERE pipeline_id = ?
+    `).get(pipelineId);
     if (!row?.record_json) return null;
     const record = {
       ...JSON.parse(row.record_json),
       status: row.status,
       revision: Number(row.revision || 0),
+      ownerInstanceId: row.owner_instance_id || "",
+      ownerGeneration: row.owner_generation || "",
+      ownerHeartbeatAt: row.owner_heartbeat_at || "",
+      ownerLeaseExpiresAt: row.owner_lease_expires_at || "",
+      expectedChildCount: Number(row.expected_child_count || 0),
+      batchState: row.batch_state || "unstarted",
+      cleanupState: row.cleanup_state || "none",
+      queueMode: row.queue_mode || "legacy",
     };
+    if (row.details_encrypted) {
+      Object.assign(record, await decryptPipelinePrivateDetails(row.details_encrypted, pipelineId));
+      record.privateDetailsAvailable = true;
+    }
     if (row.request_encrypted) {
       const replay = await decryptQueueRequest(row.request_encrypted, pipelineId);
       Object.assign(record, replay);
@@ -12529,15 +16314,90 @@ async function readPersistedPipelineRecord(pipelineId, cwd = "") {
 async function listPersistedPipelineRecords(cwd = "", status = "") {
   const db = await openLockDb(cwd);
   try {
+    const fields = `status, revision, request_encrypted, record_json, owner_instance_id, owner_generation,
+      owner_heartbeat_at, owner_lease_expires_at, expected_child_count, batch_state, cleanup_state, queue_mode`;
     const rows = status
-      ? db.prepare("SELECT status, revision, request_encrypted, record_json FROM opencode_pipelines WHERE status = ? ORDER BY created_at DESC").all(status)
-      : db.prepare("SELECT status, revision, request_encrypted, record_json FROM opencode_pipelines ORDER BY created_at DESC").all();
+      ? db.prepare(`SELECT ${fields} FROM opencode_pipelines WHERE status = ? ORDER BY created_at DESC`).all(status)
+      : db.prepare(`SELECT ${fields} FROM opencode_pipelines ORDER BY created_at DESC`).all();
     return rows.map((row) => ({
       ...JSON.parse(row.record_json),
       status: row.status,
       revision: Number(row.revision || 0),
+      ownerInstanceId: row.owner_instance_id || "",
+      ownerGeneration: row.owner_generation || "",
+      ownerHeartbeatAt: row.owner_heartbeat_at || "",
+      ownerLeaseExpiresAt: row.owner_lease_expires_at || "",
+      expectedChildCount: Number(row.expected_child_count || 0),
+      batchState: row.batch_state || "unstarted",
+      cleanupState: row.cleanup_state || "none",
+      queueMode: row.queue_mode || "legacy",
       replayRequestAvailable: Boolean(row.request_encrypted),
     }));
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function authoritativePipelineRecord(pipelineId, cwd = "") {
+  if (effectiveQueueMode() !== "sqlite") return PIPELINE_RUNS.get(pipelineId) || null;
+  const durable = await readPersistedPipelineRecord(pipelineId, cwd);
+  if (!durable) return null;
+  const local = PIPELINE_RUNS.get(pipelineId);
+  const sameGeneration = local
+    && local.ownerInstanceId === durable.ownerInstanceId
+    && String(local.ownerGeneration || "") === String(durable.ownerGeneration || "")
+    && Number(local.revision || 0) === Number(durable.revision || 0);
+  if (sameGeneration) {
+    Object.assign(local, durable);
+    return local;
+  }
+  return durable;
+}
+
+async function readPersistedPipelineChildren(record) {
+  const db = await openLockDb(record.cwd);
+  try {
+    const rows = db.prepare(`
+      SELECT child.ordinal, child.job_id AS relation_job_id,
+             job.status, job.started_at, job.finished_at, job.owner_instance_id, job.owner_process_id,
+             job.owner_generation, job.heartbeat_at, job.lease_expires_at, job.cancellation_requested_at,
+             job.child_process_id, job.child_process_started_at, job.revision, job.idempotency_key,
+             job.request_encrypted, job.record_json
+      FROM opencode_pipeline_children AS child
+      LEFT JOIN opencode_jobs AS job ON job.job_id = child.job_id
+      WHERE child.pipeline_id = ?
+      ORDER BY child.ordinal
+    `).all(record.pipelineId);
+    const expectedIds = Array.isArray(record.queueJobIds) ? record.queueJobIds : [];
+    const expectedCount = Number(record.expectedChildCount || expectedIds.length || 0);
+    const missingOrdinals = [];
+    const missingJobIds = [];
+    let manifestMismatch = rows.length !== expectedCount || expectedIds.length !== expectedCount;
+    const snapshots = [];
+    for (let ordinal = 0; ordinal < expectedCount; ordinal += 1) {
+      const row = rows[ordinal];
+      if (!row || Number(row.ordinal) !== ordinal) {
+        missingOrdinals.push(ordinal);
+        manifestMismatch = true;
+        continue;
+      }
+      const expectedJobId = expectedIds[ordinal] || "";
+      if (!expectedJobId || row.relation_job_id !== expectedJobId) manifestMismatch = true;
+      if (!row.record_json) {
+        missingJobIds.push(row.relation_job_id || expectedJobId || `ordinal:${ordinal}`);
+        manifestMismatch = true;
+        continue;
+      }
+      snapshots.push(persistedQueueRecordFromRow(row));
+    }
+    return {
+      ok: !manifestMismatch,
+      expectedCount,
+      relationCount: rows.length,
+      snapshots,
+      missingOrdinals,
+      missingJobIds,
+    };
   } finally {
     closeDb(db);
   }
@@ -12580,17 +16440,46 @@ function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) 
       sourceStateSha256: job.worktreeSourceStateSha256 || prior.sourceStateSha256 || "",
       allowedEdits: job.allowedEdits || prior.allowedEdits || [],
       changedFiles: job.changedFiles || prior.changedFiles || [],
-      status: prior.status === "integrated" ? "integrated" : prior.status === "rejected" ? "rejected" : "pending",
+      status: ["integrated", "rejected", "integrating", "quarantined"].includes(prior.status)
+        ? prior.status
+        : "pending",
     };
   });
 }
 
 async function refreshPipelineRecord(record) {
-  const queueSnapshots = [];
-  for (const jobId of record.queueJobIds || []) {
-    const snapshot = pipelineJobStatus(jobId, record.cwd) || await readPersistedQueueRecord(jobId, record.cwd);
-    if (snapshot) {
-      queueSnapshots.push(snapshot);
+  if (["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"].includes(record.status)) {
+    return record;
+  }
+  let queueSnapshots = [];
+  if (effectiveQueueMode() === "sqlite") {
+    const children = await readPersistedPipelineChildren(record);
+    if (!children.ok) {
+      await updatePipelineRecord(record, {
+        status: "failed",
+        finishedAt: record.finishedAt || new Date().toISOString(),
+        batchState: "incomplete",
+        errors: (record.errors || []).concat({
+          errorType: "pipeline_child_record_missing",
+          expectedChildCount: children.expectedCount,
+          relationCount: children.relationCount,
+          missingOrdinals: children.missingOrdinals,
+          missingJobIds: children.missingJobIds,
+        }),
+        events: (record.events || []).concat({
+          type: "pipeline_child_manifest_invalid",
+          at: new Date().toISOString(),
+          expectedChildCount: children.expectedCount,
+          relationCount: children.relationCount,
+        }),
+      });
+      return record;
+    }
+    queueSnapshots = children.snapshots;
+  } else {
+    for (const jobId of record.queueJobIds || []) {
+      const snapshot = pipelineJobStatus(jobId, record.cwd);
+      if (snapshot) queueSnapshots.push(snapshot);
     }
   }
 
@@ -12641,12 +16530,41 @@ async function refreshPipelineRecord(record) {
   return record;
 }
 
+async function reconcileParentPipelineAfterQueueTerminal(childRecord) {
+  const pipelineId = childRecord?.pipelinePropagation?.pipelineId || childRecord?.parentJobId || "";
+  if (!pipelineId || effectiveQueueMode() !== "sqlite") return null;
+  const parent = await readPersistedPipelineRecord(pipelineId, childRecord.cwd || "");
+  if (!parent) return null;
+  PIPELINE_RUNS.set(pipelineId, parent);
+
+  if (["failed", "cancelled"].includes(parent.status)) {
+    for (const siblingJobId of parent.queueJobIds || []) {
+      if (siblingJobId === childRecord.jobId) continue;
+      const durableSibling = await readPersistedQueueRecord(siblingJobId, parent.cwd);
+      const localSibling = QUEUE_JOBS.get(siblingJobId);
+      if (!durableSibling || !localSibling) continue;
+      const abortController = localSibling.abortController;
+      const executionPromise = localSibling.executionPromise;
+      Object.assign(localSibling, durableSibling, { abortController, executionPromise });
+      if (durableSibling.cancellationRequested || durableSibling.status === "cancelled") {
+        abortController?.abort(new Error(`Parent pipeline ${pipelineId} became ${parent.status}.`));
+      }
+    }
+    return parent;
+  }
+
+  if (childRecord?.pipelinePropagation?.allChildrenTerminal) {
+    await refreshPipelineRecord(parent);
+  }
+  return parent;
+}
+
 function pipelineHasPendingIntegrations(record) {
   const queue = record.integrationQueue || [];
   return queue.some((item) => item.status !== "integrated");
 }
 
-async function runPipelineReadOnlyGate(record, gateName, gateJob) {
+async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null) {
   if (!gateJob) {
     return null;
   }
@@ -12678,7 +16596,7 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob) {
       `Pipeline id: ${record.pipelineId}`,
       "Review/test the integrated result only. Do not edit files.",
     ].filter(Boolean).join("\n"),
-  }, { toolStarted: nowMs(), jobId: `${record.pipelineId}-${gateName}` });
+  }, { toolStarted: nowMs(), jobId: `${record.pipelineId}-${gateName}`, signal });
 
   const result = {
     gate: gateName,
@@ -12690,12 +16608,59 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob) {
   return result;
 }
 
-async function finalizePipelineSourceCleanup(record, { dryRun = false, authorizeCleanup = null } = {}) {
+function cleanupAuthorizationMatchesItem(record, authorization, item) {
+  if (!authorization || !item) return false;
+  const cwd = record.cwd || process.cwd();
+  const authorizationPath = normalizeFilesystemCase(path.resolve(String(authorization.worktreePath || "")), cwd);
+  const itemPath = normalizeFilesystemCase(path.resolve(String(item.worktreePath || "")), cwd);
+  return Boolean(authorization.worktreePath && item.worktreePath)
+    && authorizationPath === itemPath
+    && String(authorization.branch || "") === String(item.branch || "")
+    && String(authorization.sourceBaseCommit || "") === String(item.sourceBaseCommit || "")
+    && String(authorization.patchSha256 || "") === String(item.patchSha256 || "")
+    && String(authorization.sourceStateSha256 || "") === String(item.sourceStateSha256 || "");
+}
+
+async function finalizePipelineSourceCleanup(record, {
+  dryRun = false,
+  authorizeCleanup = null,
+  authorizedWorktrees = null,
+} = {}) {
+  const durableAuthorizations = Array.isArray(authorizedWorktrees) ? authorizedWorktrees : null;
   const cleanupPlan = [];
   for (const item of record.integrationQueue || []) {
     if (!item.cleanupRequested || !item.worktreePath) continue;
+    if (durableAuthorizations) {
+      const matchingAuthorizations = durableAuthorizations.filter((authorization) => cleanupAuthorizationMatchesItem(record, authorization, item));
+      if (matchingAuthorizations.length !== 1) {
+        cleanupPlan.push({
+          result: {
+            worktreePath: item.worktreePath,
+            branch: item.branch || "",
+            cleanup: "retained_for_review",
+            reason: "cleanup_identity_not_durably_authorized",
+          },
+        });
+        continue;
+      }
+    }
     if (dryRun) {
       cleanupPlan.push({ result: { worktreePath: item.worktreePath, cleanup: "skipped_dry_run" } });
+      continue;
+    }
+    if (!existsSync(item.worktreePath)) {
+      const branch = String(item.branch || "").trim();
+      const worktrees = await runCommand("git", ["worktree", "list", "--porcelain"], record.cwd, 1000 * 15);
+      const branchRef = branch
+        ? await runCommand("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], record.cwd, 1000 * 15)
+        : { exitCode: 1 };
+      const registered = worktrees.exitCode === 0
+        && worktrees.stdout.split(/\r?\n/).some((line) => line === `worktree ${path.resolve(item.worktreePath)}`);
+      cleanupPlan.push({
+        result: !registered && branchRef.exitCode !== 0
+          ? { worktreePath: item.worktreePath, branch, cleanup: "success", reason: "recovered_already_removed" }
+          : { worktreePath: item.worktreePath, branch, cleanup: "retained_for_review", reason: "cleanup_identity_ambiguous_after_restart" },
+      });
       continue;
     }
     const source = await collectIntegrationPatch({
@@ -12787,7 +16752,84 @@ async function finalizePipelineSourceCleanup(record, { dryRun = false, authorize
   return results;
 }
 
-async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = false, beforeFinalValidationHook = null } = {}) {
+async function resumeAuthorizedPipelineCleanup(record) {
+  const authorizationEvent = [...(record.events || [])].reverse().find((event) => event.type === "source_cleanup_authorized");
+  const expectedTargetStateSha256 = authorizationEvent?.targetStateSha256 || "";
+  const cleanupItems = (record.integrationQueue || []).filter((item) => item.cleanupRequested && item.worktreePath);
+  const eventWorktrees = Array.isArray(authorizationEvent?.worktrees) ? authorizationEvent.worktrees : [];
+  const authorizationCardinalityMatches = eventWorktrees.length === cleanupItems.length
+    && cleanupItems.every((item) => eventWorktrees.filter((authorization) => cleanupAuthorizationMatchesItem(record, authorization, item)).length === 1);
+  const targetState = expectedTargetStateSha256 ? await captureIntegrationTargetState(record.cwd) : null;
+  if (!expectedTargetStateSha256 || !targetState?.ok || targetState.targetStateSha256 !== expectedTargetStateSha256) {
+    await updatePipelineRecord(record, {
+      status: "completed",
+      finishedAt: record.finishedAt || new Date().toISOString(),
+      cleanupPending: false,
+      cleanupState: "completed_with_retained_sources",
+      errors: (record.errors || []).concat({
+        type: "source_cleanup",
+        errorType: "pipeline_cleanup_target_state_changed",
+        error: "The target state no longer matches the durable cleanup authorization; source worktrees were retained.",
+      }),
+    });
+    return { ok: true, retainedSources: true, warningType: "pipeline_cleanup_target_state_changed", record };
+  }
+
+  const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
+    authorizeCleanup: async () => {},
+    authorizedWorktrees: authorizationCardinalityMatches ? eventWorktrees : [],
+  });
+  const failures = sourceCleanupResults.filter((result) => result.cleanup === "failed");
+  const retained = sourceCleanupResults.filter((result) => ["retained_for_review", "partial"].includes(result.cleanup));
+  await updatePipelineRecord(record, {
+    status: failures.length ? "cleanup_failed" : "completed",
+    finishedAt: failures.length ? "" : (record.finishedAt || new Date().toISOString()),
+    sourceCleanupResults,
+    cleanupPending: failures.length > 0,
+    cleanupState: failures.length ? "failed_retryable" : retained.length ? "completed_with_retained_sources" : "completed",
+    events: (record.events || []).concat({
+      type: failures.length ? "source_cleanup_recovery_failed" : "source_cleanup_recovered",
+      at: new Date().toISOString(),
+      retainedSources: retained.length,
+    }),
+  });
+  return failures.length
+    ? { ok: false, errorType: "pipeline_cleanup_failed", record }
+    : { ok: true, record };
+}
+
+async function finalizePipelineRecord(record, options = {}) {
+  const targetCwd = await resolveProjectStateRoot(record.cwd || process.cwd());
+  const lockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
+  const lockResult = await acquireHardLock({
+    owner: "codex",
+    agent: "pipeline_finalizer",
+    task: `Finalize pipeline ${record.pipelineId || "unknown"}`,
+    cwd: targetCwd,
+    lockType: "read",
+    paths: [REPOSITORY_SCOPE_LOCK_PATH],
+    repositoryScope: true,
+    ttlMs: lockTtlMs,
+  });
+  if (!lockResult.ok) {
+    return {
+      ok: false,
+      errorType: "pipeline_finalization_lock_conflict",
+      error: `Pipeline finalization requires a stable repository snapshot: ${lockResult.error}`,
+      conflictingPaths: conflictPathsFromConflict(lockResult.conflict),
+      record,
+    };
+  }
+  const heartbeat = startHardLockHeartbeat(lockResult.lock, lockTtlMs);
+  try {
+    return await finalizePipelineRecordWhileLocked(record, { ...options, signal: combineAbortSignals([options.signal, heartbeat.signal]) });
+  } finally {
+    heartbeat();
+    await releaseHardLock(lockResult.lock.id, lockResult.lock.token, lockResult.lock.paths, lockResult.lock.cwd);
+  }
+}
+
+async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false, dryRun = false, beforeFinalValidationHook = null, signal = null } = {}) {
   await refreshPipelineRecord(record);
   const now = new Date().toISOString();
   const events = (record.events || []).concat({
@@ -12960,6 +17002,7 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
           cwd: record.cwd,
           dryRun,
           trustedSpec: record.finalValidationSpec || null,
+          signal,
         });
   let finalValidationAfterState = finalValidationBeforeState;
   let finalValidationMutationFiles = [];
@@ -13016,7 +17059,7 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
     };
   }
 
-  const reviewerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "reviewer", record.reviewerJob);
+  const reviewerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "reviewer", record.reviewerJob, signal);
   if (reviewerResult?.status === "failed") {
     await updatePipelineRecord(record, {
       status: "failed",
@@ -13037,7 +17080,7 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
     };
   }
 
-  const testerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "tester", record.testerJob);
+  const testerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "tester", record.testerJob, signal);
   if (testerResult?.status === "failed") {
     await updatePipelineRecord(record, {
       status: "failed",
@@ -13103,20 +17146,37 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
     beforeFinalGates: sanitizedBeforeFinalGates,
     afterAllWaves: sanitizedFinal,
   } : null;
+  if (signal?.aborted) {
+    const errorType = abortSignalErrorType(signal, "read_lock_ownership_lost");
+    await updatePipelineRecord(record, {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      finalValidationResult,
+      reviewerResult,
+      testerResult,
+      errors: (record.errors || []).concat({
+        type: "finalization",
+        errorType,
+        error: signal.reason?.message || "Pipeline finalization lost its repository consistency lease.",
+      }),
+    });
+    return { ok: false, errorType, error: "Pipeline finalization lost its repository consistency lease; source worktrees were retained.", record };
+  }
   const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
     dryRun,
     authorizeCleanup: async (authorizationResults, authorizations) => {
       await updatePipelineRecord(record, {
-        status: "completed",
-        finishedAt: record.finishedAt || new Date().toISOString(),
+        status: "cleanup_pending",
+        finishedAt: "",
         finalValidationResult,
         reviewerResult,
         testerResult,
         sanitizedWorkspaceAttestation,
         sourceCleanupResults: authorizationResults,
         cleanupPending: authorizations.length > 0,
+        cleanupState: authorizations.length > 0 ? "authorized" : "none",
         events: (record.events || []).concat({
-          type: "finalization_completed",
+          type: "finalization_gates_passed",
           at: new Date().toISOString(),
           cleanupPending: authorizations.length > 0,
         }, {
@@ -13134,15 +17194,22 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
       });
     },
   });
+  const cleanupFailures = sourceCleanupResults.filter((result) => result.cleanup === "failed");
+  const retainedSources = sourceCleanupResults.filter((result) => ["retained_for_review", "partial"].includes(result.cleanup));
   await updatePipelineRecord(record, {
-    status: "completed",
-    finishedAt: record.finishedAt || new Date().toISOString(),
+    status: cleanupFailures.length ? "cleanup_failed" : "completed",
+    finishedAt: cleanupFailures.length ? "" : (record.finishedAt || new Date().toISOString()),
     finalValidationResult,
     reviewerResult,
     testerResult,
     sanitizedWorkspaceAttestation,
     sourceCleanupResults,
-    cleanupPending: false,
+    cleanupPending: cleanupFailures.length > 0,
+    cleanupState: cleanupFailures.length
+      ? "failed_retryable"
+      : retainedSources.length
+        ? "completed_with_retained_sources"
+        : "completed",
     events: (record.events || []).concat(
       (record.events || []).some((event) => event.type === "finalization_completed") ? [] : [{
         type: "finalization_completed",
@@ -13152,11 +17219,14 @@ async function finalizePipelineRecord(record, { skipReviewers = false, dryRun = 
       [{
         type: "source_cleanup_completed",
         at: new Date().toISOString(),
+        retainedSources: retainedSources.length,
       }]
     ),
   });
 
-  return { ok: true, record };
+  return cleanupFailures.length
+    ? { ok: false, errorType: "pipeline_cleanup_failed", error: "One or more authorized source worktrees could not be removed safely.", record }
+    : { ok: true, record };
 }
 
 function createPipelinePlan({
@@ -13270,6 +17340,9 @@ function createPipelinePlan({
     record: {
       pipelineId: makePipelineId(name),
       ownerInstanceId: BRIDGE_INSTANCE_ID,
+      ownerGeneration: randomBytes(12).toString("hex"),
+      ownerHeartbeatAt: now,
+      ownerLeaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
       revision: 0,
       name,
       cwd: cwd || jobs[0]?.cwd || process.cwd(),
@@ -13283,6 +17356,10 @@ function createPipelinePlan({
       jobs: policyAdjustedJobs.map((job) => ({ ...job })),
       lockPlans,
       queueJobIds: [],
+      expectedChildCount: 0,
+      batchState: "unstarted",
+      cleanupState: "none",
+      queueMode: "sqlite",
       integrationQueue,
       finalValidationCommand: effectiveFinalValidationCommand,
       finalValidationSource: effectiveFinalValidationSource,
@@ -13417,7 +17494,7 @@ server.tool(
       z.object({
         agent: z.string(),
         task: z.string(),
-        cwd: z.string().optional(),
+        cwd: z.string().min(1),
         allowFallbackToBuild: z.boolean().optional(),
         subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
         proxyAgent: z.string().optional(),
@@ -13596,20 +17673,22 @@ server.tool(
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
       const lockPlan = lockPlans[index];
-      const shouldAcquireLock = !job.dryRun && lockPlan.lockType !== "read";
+      const shouldAcquireLock = !job.dryRun;
 
       if (!shouldAcquireLock) {
         acquiredLocks[index] = null;
         continue;
       }
 
+      const requestedLockPaths = hardLockPathsForPlan(lockPlan);
       const lockResult = await acquireHardLock({
         owner: "codex",
         agent: lockPlan.agent,
         task: lockPlan.task,
         cwd: job.cwd || process.cwd(),
         lockType: lockPlan.lockType,
-        paths: lockPlan.lockType === "read" ? lockPlan.lockedPaths : hardLockPathsForPlan(lockPlan),
+        paths: requestedLockPaths,
+        repositoryScope: requestedLockPaths.length === 1 && requestedLockPaths[0] === REPOSITORY_SCOPE_LOCK_PATH,
         ttlMs: hardLockTtlForPlan(lockPlan),
       });
 
@@ -13624,7 +17703,7 @@ server.tool(
               text: [
                 formatRejectedExecution({
                   headline: "Parallel OpenCode execution rejected.",
-                  errorType: "write_lock_conflict",
+                  errorType: lockPlan.lockType === "read" ? "read_lock_conflict" : "write_lock_conflict",
                   reason: lockResult.error,
                   requestedAgent: lockPlan.agent,
                   actualAgent: "none",
@@ -13788,6 +17867,13 @@ server.tool(
     let results;
     const parallelRollbackReports = [];
     const groupController = new AbortController();
+    for (const heartbeat of acquiredLockHeartbeats.filter(Boolean)) {
+      const abortGroupForLostLock = () => {
+        if (!groupController.signal.aborted) groupController.abort(heartbeat.signal.reason);
+      };
+      if (heartbeat.signal?.aborted) abortGroupForLostLock();
+      else heartbeat.signal?.addEventListener("abort", abortGroupForLostLock, { once: true });
+    }
     const groupDeadlineMs = Math.max(...lockPlans.map((plan) => timeoutForAgent(plan.agent, plan, plan.timeoutMs))) + 1000 * 60;
     let groupDeadlineExpired = false;
     const groupDeadlineTimer = setTimeout(() => {
@@ -13953,7 +18039,7 @@ server.tool(
           result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
         }
         const validationGate = !unsafeFiles.length && !result.errorType
-          ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun: job.dryRun || false, timeoutMs: CONFIG.validationCommandTimeoutMs })
+          ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun: job.dryRun || false, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: groupController.signal })
           : {
               status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
               command: lockPlan.validationCommand || "",
@@ -14201,12 +18287,33 @@ async function runSelfTests() {
       targetStateSha256: "e".repeat(64),
     },
     contractSha256: "f".repeat(64),
+    projectKey: process.cwd(),
   });
   assert.equal(
     Date.parse(previewTimingFixture.expiresAt) - Date.parse(previewTimingFixture.createdAt),
     INTEGRATION_PREVIEW_TTL_MS
   );
   INTEGRATION_PREVIEWS.delete(previewTimingFixture.previewId);
+  INTEGRATION_PREVIEWS.set("expired-preview-self-test", {
+    identity: {},
+    expiresAt: Date.now() - 1,
+    projectKey: path.resolve(process.cwd()),
+  });
+  sweepIntegrationPreviews();
+  assert.equal(INTEGRATION_PREVIEWS.has("expired-preview-self-test"), false);
+  assert.doesNotThrow(() => assertSupportedQueueRetryConfig({ queueReadOnlyRetries: 0, queueWriteRetries: 0 }));
+  assert.throws(
+    () => assertSupportedQueueRetryConfig({ queueReadOnlyRetries: 1, queueWriteRetries: 0 }),
+    /unsupported and must remain 0/
+  );
+  const previousCallerModel = process.env.CODEX_OPENCODE_CALLER_MODEL;
+  try {
+    process.env.CODEX_OPENCODE_CALLER_MODEL = "multiplexed";
+    assert.throws(() => assertSupportedCallerModel(), /only supports trusted_stdio/);
+  } finally {
+    if (previousCallerModel === undefined) delete process.env.CODEX_OPENCODE_CALLER_MODEL;
+    else process.env.CODEX_OPENCODE_CALLER_MODEL = previousCallerModel;
+  }
   assert.equal(transientGitIndexReadError({ stderr: "fatal: .git/index: index file open failed: Permission denied" }), true);
   assert.equal(transientGitIndexReadError({ stderr: "fatal: not a git repository" }), false);
   let gitIndexReadAttempts = 0;
@@ -14237,6 +18344,18 @@ async function runSelfTests() {
   assert.equal(independentSettled[0].status, "rejected");
   assert.equal(independentSettled[1].status, "fulfilled");
   assert.equal(independentSiblingCompleted, true);
+  assert.deepEqual(
+    directExecutionLockConflictDetails({ conflict: { origin: "internal" } }),
+    {
+      headline: "Write job is waiting for an active writer.",
+      errorType: "write_lock_conflict",
+      suggestedFix: "Wait for the active writer to finish, retry later, or choose a non-overlapping lockedPaths scope.",
+    }
+  );
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "manual" } }).errorType, "manual_lock_misuse");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "legacy" } }).errorType, "manual_lock_misuse");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "internal" } }, { queueConflict: true }).errorType, "queue_lock_conflict");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "internal" } }, { lockType: "read" }).errorType, "read_lock_conflict");
   const disjointDirtyDetails = dirtyCheckpointDetails({
     dirtyFiles: ["src/disjoint.txt"],
     overlappingFiles: [],
@@ -14830,12 +18949,19 @@ async function runSelfTests() {
   assert.equal(normalizeLockPath("apps\\api\\app\\**\\"), "apps/api/app");
   assert.equal(normalizeLockPath("apps/web///"), "apps/web");
   assert.equal(normalizeLockPath("./apps/web/*"), "apps/web");
+  assert.equal(normalizeLockPath("src/./file.js"), "src/file.js");
+  assert.equal(normalizeLockPath("src/."), "src");
   assert.equal(normalizeLockPath("README.md"), "README.md");
   assert.equal(isWithinAnyPath("src/file.js", ["src"], process.cwd()), true);
   assert.equal(
     isWithinAnyPath("SRC/file.js", ["src"], process.cwd()),
-    process.platform === "win32"
+    filesystemCaseModeForRoot(process.cwd()) !== "sensitive"
   );
+  const canonicalFilePath = normalizeLockPathForCwd("src/file.js", process.cwd());
+  for (const alias of ["src/./file.js", "src//file.js", "./src/file.js"]) {
+    assert.equal(normalizeLockPathForCwd(alias, process.cwd()), canonicalFilePath);
+  }
+  assert.equal(normalizeLockPathForCwd("src/a/../file.js", process.cwd()), "src/a/../file.js");
   assert.equal(isWithinAnyPath("private.key", DEFAULT_FORBIDDEN_EDIT_PATHS, process.cwd()), true);
   assert.equal(isWithinAnyPath("apps/web/.env.local", DEFAULT_FORBIDDEN_EDIT_PATHS, process.cwd()), true);
   assert.equal(isWithinAnyPath("apps/api/secrets/token.txt", DEFAULT_FORBIDDEN_EDIT_PATHS, process.cwd()), true);
@@ -14847,6 +18973,8 @@ async function runSelfTests() {
   assert.equal(isOrchestratorAgent("principal-engineer-orchestrator"), true);
   assert.equal(isManagedReadOnlyAgent("principal-engineer-orchestrator"), true);
   assert.match(unsafePathReason(["../secrets"]), /parent traversal/);
+  assert.match(unsafePathReason(["src/a/../file.js"]), /parent traversal/);
+  assert.match(unsafePathReason(["src/foo/.."]), /parent traversal/);
   assert.match(unsafePathReason(["~/secret"]), /home-directory/);
   assert.match(unsafePathReason(["."]), /filesystem root/);
   assert.equal(defaultBuilderTimeoutMs, 1000 * 60 * 15);
@@ -14898,6 +19026,91 @@ async function runSelfTests() {
   const cancellationProbe = await cancellationProbePromise;
   assert.equal(cancellationProbe.exitCode, 130);
   assert.equal(cancellationProbe.cancelled, true);
+  let transientHeartbeatCalls = 0;
+  const transientHeartbeat = startHardLockHeartbeat({
+    id: "transient-heartbeat",
+    token: "transient-token",
+    lockType: "write",
+    expiresAt: Date.now() + 300,
+  }, 300, {
+    intervalMs: 50,
+    refreshLease: async () => {
+      transientHeartbeatCalls += 1;
+      if (transientHeartbeatCalls === 1) throw new Error("injected transient heartbeat failure");
+      return true;
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(transientHeartbeat.signal.aborted, false, "One transient hard-lock heartbeat failure must not abort a healthy owner.");
+  transientHeartbeat();
+  const sustainedHeartbeat = startHardLockHeartbeat({
+    id: "sustained-heartbeat",
+    token: "sustained-token",
+    lockType: "write",
+    expiresAt: Date.now() + 300,
+  }, 300, {
+    intervalMs: 50,
+    refreshLease: async () => { throw new Error("injected sustained heartbeat failure"); },
+  });
+  const sustainedWriter = runSpawnCommand(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 10000)"],
+    process.cwd(),
+    10000,
+    {},
+    { signal: sustainedHeartbeat.signal }
+  );
+  const sustainedWriterResult = await sustainedWriter;
+  assert.equal(sustainedHeartbeat.signal.aborted, true);
+  assert.equal(sustainedWriterResult.cancellationErrorType, "write_lock_ownership_lost");
+  sustainedHeartbeat();
+  let transientProviderHeartbeatCalls = 0;
+  const transientProviderHeartbeat = startProviderLeaseHeartbeat({
+    id: "transient-provider-heartbeat",
+    expiresAt: Date.now() + 300,
+  }, {
+    intervalMs: 50,
+    refreshLease: async () => {
+      transientProviderHeartbeatCalls += 1;
+      if (transientProviderHeartbeatCalls === 1) throw new Error("injected transient provider heartbeat failure");
+      return true;
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(transientProviderHeartbeat.signal.aborted, false, "One transient provider-lease failure must not abort a healthy execution.");
+  transientProviderHeartbeat();
+  const sustainedProviderHeartbeat = startProviderLeaseHeartbeat({
+    id: "sustained-provider-heartbeat",
+    expiresAt: Date.now() + 300,
+  }, {
+    intervalMs: 50,
+    refreshLease: async () => { throw new Error("injected sustained provider heartbeat failure"); },
+  });
+  const providerBoundExecution = await runSpawnCommand(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 10000)"],
+    process.cwd(),
+    10000,
+    {},
+    { signal: sustainedProviderHeartbeat.signal }
+  );
+  assert.equal(sustainedProviderHeartbeat.signal.aborted, true);
+  assert.equal(providerBoundExecution.cancellationErrorType, "provider_lease_ownership_lost");
+  sustainedProviderHeartbeat();
+  const transientQueueLeaseRecord = {
+    jobId: "transient-queue-lease",
+    status: "running",
+    ownerGeneration: "generation-a",
+    leaseExpiresAt: new Date(Date.now() + CONFIG.queueHeartbeatMs * 3).toISOString(),
+    abortController: new AbortController(),
+  };
+  noteQueueLeaseRenewalFailure(transientQueueLeaseRecord, { detail: "injected transient queue heartbeat failure" });
+  assert.equal(transientQueueLeaseRecord.abortController.signal.aborted, false);
+  transientQueueLeaseRecord.leaseExpiresAt = new Date(Date.now() + Math.max(1, CONFIG.queueHeartbeatMs - 1)).toISOString();
+  noteQueueLeaseRenewalFailure(transientQueueLeaseRecord, { detail: "injected sustained queue heartbeat failure" });
+  assert.equal(transientQueueLeaseRecord.abortController.signal.aborted, true);
+  assert.equal(abortSignalErrorType(transientQueueLeaseRecord.abortController.signal), "queue_ownership_lost");
+  clearQueueLeaseFence(transientQueueLeaseRecord);
   const providerFailureProbe = await runSpawnCommand(
     process.execPath,
     ["-e", "console.error('APIError: 429 RESOURCE_EXHAUSTED daily quota exceeded'); setTimeout(() => {}, 10000)"],
@@ -15327,6 +19540,30 @@ async function runSelfTests() {
   ]);
   assert.equal(mixedAbsoluteRelativeParallel.errorType, "parallel_plan_rejected");
   assert.deepEqual(mixedAbsoluteRelativeParallel.conflictingPaths, ["apps/web", "apps/web"]);
+  const aliasedParallel = validateParallelWritePlan([
+    {
+      agent: "builder",
+      task: "Edit canonical path.",
+      cwd: process.cwd(),
+      write: true,
+      lockType: "write",
+      lockedPaths: ["src/file.js"],
+      allowedEdits: ["src/file.js"],
+      scopeContract: writeScope(["src/file.js"]),
+    },
+    {
+      agent: "debugger",
+      task: "Edit dot-aliased path.",
+      cwd: process.cwd(),
+      write: true,
+      lockType: "write",
+      lockedPaths: ["src/./file.js"],
+      allowedEdits: ["./src//file.js"],
+      scopeContract: writeScope(["src/./file.js"], { allowedEdits: ["./src//file.js"] }),
+    },
+  ]);
+  assert.equal(aliasedParallel.errorType, "parallel_plan_rejected");
+  assert.deepEqual(aliasedParallel.conflictingPaths, [canonicalFilePath, canonicalFilePath]);
 
   const parallelPreflight = validateDelegationPlanInputs([
     {
@@ -15561,7 +19798,24 @@ async function runSelfTests() {
       scopeContract: writeScope(["apps/web/**"]),
     },
   ]);
-  assert.equal(readWithScopeParallel.error, null);
+  assert.equal(readWithScopeParallel.errorType, "parallel_read_write_conflict");
+  const disjointReadWriteParallel = validateParallelWritePlan([
+    {
+      agent: "reviewer",
+      task: "Review api while builder edits web.",
+      scopeContract: { mode: "read", read: ["apps/api"], write: [], allowedEdits: [], forbidden: [], shared: [], serialOnly: [], validationCommand: "" },
+    },
+    {
+      agent: "builder",
+      task: "Edit web.",
+      write: true,
+      lockType: "write",
+      lockedPaths: ["apps/web/**"],
+      allowedEdits: ["apps/web/**"],
+      scopeContract: writeScope(["apps/web/**"]),
+    },
+  ]);
+  assert.equal(disjointReadWriteParallel.error, null);
 
   const readOnlyTimeoutViolations = verifyParallelLockResults([
     {
@@ -15590,12 +19844,14 @@ async function runSelfTests() {
   selfTestProgress("queue/lock/recovery");
   if (effectiveQueueMode() !== "off") {
     QUEUE_JOBS.clear();
+    const durableQueueSelfTestJobIds = [];
     const queuedReadOnly = await enqueueQueueJob({
       agent: "reviewer",
       task: "Review only.",
       dryRun: true,
     }, "", { schedule: false });
     assert.equal(queuedReadOnly.ok, true);
+    durableQueueSelfTestJobIds.push(queuedReadOnly.record.jobId);
     assert.equal(queuedReadOnly.record.mode, "read");
     assert.equal(queuedReadOnly.record.maxRetries, 0);
     if (effectiveQueueMode() === "sqlite") {
@@ -15605,6 +19861,7 @@ async function runSelfTests() {
       const first = await enqueueQueueJob({ agent: "reviewer", task: "Idempotent review.", dryRun: true, idempotencyKey }, "", { schedule: false });
       const second = await enqueueQueueJob({ agent: "reviewer", task: "Idempotent review.", dryRun: true, idempotencyKey }, "", { schedule: false });
       assert.equal(first.ok, true);
+      durableQueueSelfTestJobIds.push(first.record.jobId);
       assert.equal(second.ok, true);
       assert.equal(second.deduplicated, true);
       assert.equal(second.record.jobId, first.record.jobId);
@@ -15623,6 +19880,7 @@ async function runSelfTests() {
       scopeContract: writeScope(["apps/web/**"]),
     }, "", { schedule: false });
     assert.equal(queuedWrite.ok, true);
+    durableQueueSelfTestJobIds.push(queuedWrite.record.jobId);
     assert.equal(queuedWrite.record.mode, "write");
     assert.deepEqual(queuedWrite.record.lockedPaths, ["apps/web"]);
     assert.deepEqual(queuedWrite.record.allowedEdits, ["apps/web"]);
@@ -15638,9 +19896,28 @@ async function runSelfTests() {
       scopeContract: writeScope(["apps/web/src/**"]),
     }, "", { schedule: false });
     assert.equal(queuedBlocked.ok, true);
+    durableQueueSelfTestJobIds.push(queuedBlocked.record.jobId);
     const queueConflict = await findQueueWriteConflict(queuedBlocked.record);
     assert.equal(queueConflict.jobId, queuedWrite.record.jobId);
     assert.deepEqual(queueConflict.paths, ["apps/web/src", "apps/web"]);
+    const queuedReaderConflict = await findQueueWriteConflict({
+      jobId: "queued-reader-conflict",
+      cwd: queuedWrite.record.cwd,
+      mode: "read",
+      scopeContract: { scope: { read: ["apps/web"] } },
+      lockedPaths: [],
+      allowedEdits: [],
+    });
+    assert.equal(queuedReaderConflict.jobId, queuedWrite.record.jobId);
+    const queuedDisjointReaderConflict = await findQueueWriteConflict({
+      jobId: "queued-reader-disjoint",
+      cwd: queuedWrite.record.cwd,
+      mode: "read",
+      scopeContract: { scope: { read: ["apps/api"] } },
+      lockedPaths: [],
+      allowedEdits: [],
+    });
+    assert.equal(queuedDisjointReaderConflict, null);
     const queueAssessment = await assessQueuePlan([{
       lockType: "write",
       cwd: queuedBlocked.record.cwd,
@@ -15648,11 +19925,42 @@ async function runSelfTests() {
       allowedEdits: queuedBlocked.record.allowedEdits,
     }]);
     assert.match(queueAssessment.status, /must_wait|conflict/);
-    assert.equal(shouldRetryQueueJob(queuedReadOnly.record, { result: { errorType: "read_only_agent_unavailable" } }), false);
-    assert.equal(shouldRetryQueueJob(queuedWrite.record, { result: { errorType: "agent_timeout" } }), false);
     assert.equal(queueRecordSnapshot(queuedReadOnly.record).status, "pending");
     assert.equal((await updateQueueRecordDurable(queuedBlocked.record, { status: "cancelled", finishedAt: new Date().toISOString() })).persisted, true);
     assert.equal(queueRecordSnapshot(queuedBlocked.record).status, "cancelled");
+    if (CONFIG.worktreeMode === "off") {
+      const unsafeQueuedWriter = await enqueueQueueJob({
+        agent: "builder",
+        task: "Attempt a durable direct writer.",
+        write: true,
+        lockedPaths: ["apps/api"],
+        allowedEdits: ["apps/api"],
+        scopeContract: writeScope(["apps/api"]),
+      }, "", { schedule: false });
+      assert.equal(unsafeQueuedWriter.ok, false);
+      assert.equal(unsafeQueuedWriter.errorType, "queue_write_requires_worktree");
+    }
+    if (effectiveQueueMode() === "sqlite") {
+      const queueSelfTestDb = await openLockDb(queuedReadOnly.record.cwd);
+      let queueSelfTestTransactionOpen = false;
+      try {
+        queueSelfTestDb.exec("BEGIN IMMEDIATE");
+        queueSelfTestTransactionOpen = true;
+        const deleteQueueSelfTestJob = queueSelfTestDb.prepare("DELETE FROM opencode_jobs WHERE job_id = ?");
+        for (const jobId of new Set(durableQueueSelfTestJobIds)) {
+          deleteQueueSelfTestJob.run(jobId);
+        }
+        queueSelfTestDb.exec("COMMIT");
+        queueSelfTestTransactionOpen = false;
+      } catch (error) {
+        if (queueSelfTestTransactionOpen) {
+          try { queueSelfTestDb.exec("ROLLBACK"); } catch { /* Preserve the self-test error. */ }
+        }
+        throw error;
+      } finally {
+        closeDb(queueSelfTestDb);
+      }
+    }
     QUEUE_JOBS.clear();
   }
 
@@ -15666,6 +19974,32 @@ async function runSelfTests() {
   PIPELINE_RUNS.delete("expired-memory-pipeline");
 
   const tempDir = await mkdtemp(path.join(tmpdir(), "codex-opencode-mcp-"));
+  const clearSelfTestIntegrationQuarantine = async () => {
+    const db = await openLockDb(tempDir);
+    let transactionOpen = false;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const rows = db.prepare(`
+        SELECT operation_id FROM integration_operations
+        WHERE cwd = ? AND status = 'quarantined'
+        ORDER BY operation_id
+      `).all(path.resolve(tempDir));
+      assert.ok(rows.length > 0, "The ambiguity fixture must leave durable quarantine evidence.");
+      db.prepare("DELETE FROM integration_operations WHERE cwd = ? AND status = 'quarantined'")
+        .run(path.resolve(tempDir));
+      db.exec("COMMIT");
+      transactionOpen = false;
+      return rows.map((row) => row.operation_id);
+    } catch (error) {
+      if (transactionOpen) {
+        try { db.exec("ROLLBACK"); } catch { /* Preserve the self-test error. */ }
+      }
+      throw error;
+    } finally {
+      closeDb(db);
+    }
+  };
   const tempStateDir = `${tempDir}-state`;
   const outsideLinkTarget = `${tempDir}-outside`;
   const nonGitFixture = `${tempDir}-non-git`;
@@ -15859,6 +20193,7 @@ async function runSelfTests() {
       "server.js",
       "package.json",
       "package-lock.json",
+      "bin/process-supervisor.js",
       "bin/tui.js",
       "bin/e2e.js",
       "bin/e2e-contractor.js",
@@ -16022,6 +20357,7 @@ async function runSelfTests() {
         .run("src", "builder", "legacy-run", legacyRawToken, "write", Date.now() + 60000, Date.now(), tempDir, secretSentinel);
       ensureLockTableSchema(legacyLockDb);
       assert.equal(lockTableHasCompositePrimaryKey(legacyLockDb), true);
+      assert.equal(legacyLockDb.prepare("SELECT acquisition_origin FROM locks WHERE run_id = ?").get("legacy-run").acquisition_origin, "legacy");
       scrubLegacyLockSecrets(legacyLockDb);
       const scrubbedLegacyLock = legacyLockDb.prepare("SELECT token, task FROM locks WHERE run_id = ?").get("legacy-run");
       assert.match(scrubbedLegacyLock.token, /^sha256:[a-f0-9]{64}$/);
@@ -16058,6 +20394,27 @@ async function runSelfTests() {
     assert.equal(blockedWriterByReaders.ok, false);
     await releaseHardLock(readLockA.lock.id, readLockA.lock.token, readLockA.lock.paths, tempDir);
     await releaseHardLock(readLockB.lock.id, readLockB.lock.token, readLockB.lock.paths, tempDir);
+
+    const repositoryReaderA = await acquireHardLock({
+      owner: "codex", agent: "reviewer", cwd: tempDir, lockType: "read",
+      paths: [REPOSITORY_SCOPE_LOCK_PATH], repositoryScope: true,
+    });
+    const repositoryReaderB = await acquireHardLock({
+      owner: "codex", agent: "tester", cwd: tempDir, lockType: "read",
+      paths: [REPOSITORY_SCOPE_LOCK_PATH], repositoryScope: true,
+    });
+    assert.equal(repositoryReaderA.ok, true);
+    assert.equal(repositoryReaderB.ok, true);
+    const writerBlockedByRepositoryReader = await acquireHardLock({ owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["apps/api"] });
+    assert.equal(writerBlockedByRepositoryReader.ok, false);
+    await releaseHardLock(repositoryReaderA.lock.id, repositoryReaderA.lock.token, repositoryReaderA.lock.paths, tempDir);
+    await releaseHardLock(repositoryReaderB.lock.id, repositoryReaderB.lock.token, repositoryReaderB.lock.paths, tempDir);
+    const scopedReader = await acquireHardLock({ owner: "codex", agent: "reviewer", cwd: tempDir, lockType: "read", paths: ["apps/web"] });
+    const disjointWriterDuringRead = await acquireHardLock({ owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["apps/api"] });
+    assert.equal(scopedReader.ok, true);
+    assert.equal(disjointWriterDuringRead.ok, true);
+    await releaseHardLock(scopedReader.lock.id, scopedReader.lock.token, scopedReader.lock.paths, tempDir);
+    await releaseHardLock(disjointWriterDuringRead.lock.id, disjointWriterDuringRead.lock.token, disjointWriterDuringRead.lock.paths, tempDir);
 
     const lockA = await acquireHardLock({
       owner: "codex",
@@ -16099,6 +20456,59 @@ async function runSelfTests() {
     assert.equal(absoluteConflict.ok, false);
     await releaseHardLock(relativeLock.lock.id, relativeLock.lock.token, relativeLock.lock.paths, tempDir);
 
+    const canonicalAliasLock = await acquireHardLock({
+      owner: "codex",
+      agent: "builder",
+      cwd: tempDir,
+      lockType: "write",
+      paths: ["src/file.js"],
+    });
+    assert.equal(canonicalAliasLock.ok, true);
+    for (const alias of ["src/./file.js", "src//file.js", "./src/file.js"]) {
+      const aliasConflict = await acquireHardLock({
+        owner: "codex",
+        agent: "debugger",
+        cwd: tempDir,
+        lockType: "write",
+        paths: [alias],
+      });
+      assert.equal(aliasConflict.ok, false, `Alias ${alias} must not acquire an independent lock.`);
+    }
+    const traversalAlias = await acquireHardLock({
+      owner: "codex",
+      agent: "debugger",
+      cwd: tempDir,
+      lockType: "write",
+      paths: ["src/a/../file.js"],
+    });
+    assert.equal(traversalAlias.ok, false);
+    assert.match(traversalAlias.error, /parent traversal/);
+    await releaseHardLock(canonicalAliasLock.lock.id, canonicalAliasLock.lock.token, canonicalAliasLock.lock.paths, tempDir);
+
+    const directoryAliasLock = await acquireHardLock({ owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["src"] });
+    assert.equal(directoryAliasLock.ok, true);
+    const directoryDotConflict = await acquireHardLock({ owner: "codex", agent: "debugger", cwd: tempDir, lockType: "write", paths: ["src/."] });
+    assert.equal(directoryDotConflict.ok, false);
+    const directoryTraversalAlias = await acquireHardLock({ owner: "codex", agent: "debugger", cwd: tempDir, lockType: "write", paths: ["src/foo/.."] });
+    assert.equal(directoryTraversalAlias.ok, false);
+    assert.match(directoryTraversalAlias.error, /parent traversal/);
+    await releaseHardLock(directoryAliasLock.lock.id, directoryAliasLock.lock.token, directoryAliasLock.lock.paths, tempDir);
+
+    const caseMode = filesystemCaseModeForRoot(tempDir);
+    const upperCaseLock = await acquireHardLock({ owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["src/User.ts"] });
+    const lowerCaseLock = await acquireHardLock({ owner: "codex", agent: "debugger", cwd: tempDir, lockType: "write", paths: ["src/user.ts"] });
+    assert.equal(upperCaseLock.ok, true);
+    assert.equal(lowerCaseLock.ok, caseMode === "sensitive", `Case mode ${caseMode} must determine lock identity.`);
+    if (lowerCaseLock.ok) await releaseHardLock(lowerCaseLock.lock.id, lowerCaseLock.lock.token, lowerCaseLock.lock.paths, tempDir);
+    await releaseHardLock(upperCaseLock.lock.id, upperCaseLock.lock.token, upperCaseLock.lock.paths, tempDir);
+
+    const disjointAliasControlA = await acquireHardLock({ owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["src/a"] });
+    const disjointAliasControlB = await acquireHardLock({ owner: "codex", agent: "debugger", cwd: tempDir, lockType: "write", paths: ["src/b"] });
+    assert.equal(disjointAliasControlA.ok, true);
+    assert.equal(disjointAliasControlB.ok, true);
+    await releaseHardLock(disjointAliasControlA.lock.id, disjointAliasControlA.lock.token, disjointAliasControlA.lock.paths, tempDir);
+    await releaseHardLock(disjointAliasControlB.lock.id, disjointAliasControlB.lock.token, disjointAliasControlB.lock.paths, tempDir);
+
     const ordinaryWriter = await acquireHardLock({
       owner: "codex",
       agent: "builder",
@@ -16135,6 +20545,23 @@ async function runSelfTests() {
     }
     await cleanupExpiredLocks(tempDir);
     assert.equal((await listLocks(tempDir)).length, 0);
+    const auditRetentionDb = await openLockDb(tempDir);
+    try {
+      const expiredRun = auditRetentionDb.prepare("SELECT status, finished_at FROM runs WHERE run_id = ?").get(lockB.lock.id);
+      assert.equal(expiredRun.status, "expired");
+      assert.equal(Number.isFinite(Number(expiredRun.finished_at)), true);
+      auditRetentionDb.prepare("INSERT INTO changed_files (run_id, path, allowed) VALUES (?, ?, ?)")
+        .run(lockB.lock.id, "expired-audit-fixture.txt", 1);
+      auditRetentionDb.prepare("UPDATE runs SET finished_at = ? WHERE run_id = ?")
+        .run(Date.now() - (CONFIG.auditRetentionDays + 1) * 24 * 60 * 60 * 1000, lockB.lock.id);
+      const auditDbPath = stateDbPath(tempDir);
+      statePruneTimes.delete(auditDbPath);
+      prunePersistedState(auditRetentionDb, auditDbPath);
+      assert.equal(auditRetentionDb.prepare("SELECT 1 FROM runs WHERE run_id = ?").get(lockB.lock.id), undefined);
+      assert.equal(auditRetentionDb.prepare("SELECT 1 FROM changed_files WHERE run_id = ?").get(lockB.lock.id), undefined);
+    } finally {
+      closeDb(auditRetentionDb);
+    }
 
     const staleQueueDb = await openLockDb(tempDir);
     try {
@@ -16260,31 +20687,13 @@ async function runSelfTests() {
       );
       staleQueueDb.prepare("UPDATE opencode_jobs SET cancellation_requested_at = '' WHERE job_id = ?")
         .run(terminalRaceRecord.jobId);
-      const initialCancellation = stampPersistedQueueCancellation(staleQueueDb, {
-        jobId: terminalRaceRecord.jobId,
-        status: terminalRaceRecord.status,
-        requestedAt: recentCreatedAt,
-        recordJson: JSON.stringify(queueRecordSnapshot({
-          ...terminalRaceRecord,
-          cancellationRequested: true,
-          cancellationRequestedAt: recentCreatedAt,
-        })),
-      });
-      assert.equal(Number(initialCancellation.changes || 0), 1);
-      const laterCancellationAt = new Date(Date.parse(recentCreatedAt) + 1000).toISOString();
-      stampPersistedQueueCancellation(staleQueueDb, {
-        jobId: terminalRaceRecord.jobId,
-        status: terminalRaceRecord.status,
-        requestedAt: laterCancellationAt,
-        recordJson: JSON.stringify(queueRecordSnapshot({
-          ...terminalRaceRecord,
-          cancellationRequested: true,
-          cancellationRequestedAt: laterCancellationAt,
-        })),
-      });
+      const initialCancellation = await cancelPersistedQueueJob(staleQueueDb, terminalRaceRecord.jobId);
+      assert.equal(initialCancellation.outcome, "cancellation_requested");
+      const repeatedCancellation = await cancelPersistedQueueJob(staleQueueDb, terminalRaceRecord.jobId);
+      assert.equal(repeatedCancellation.outcome, "cancellation_requested");
       assert.equal(
         staleQueueDb.prepare("SELECT cancellation_requested_at FROM opencode_jobs WHERE job_id = ?").get(terminalRaceRecord.jobId).cancellation_requested_at,
-        recentCreatedAt
+        initialCancellation.requestedAt
       );
       Object.assign(terminalRaceRecord, {
         status: "completed",
@@ -16301,9 +20710,9 @@ async function runSelfTests() {
         "SELECT status, cancellation_requested_at, record_json FROM opencode_jobs WHERE job_id = ?"
       ).get(terminalRaceRecord.jobId);
       assert.equal(terminalRaceRow.status, "cancelled");
-      assert.equal(terminalRaceRow.cancellation_requested_at, recentCreatedAt);
+      assert.equal(terminalRaceRow.cancellation_requested_at, initialCancellation.requestedAt);
       assert.equal(JSON.parse(terminalRaceRow.record_json).status, "cancelled");
-      assert.equal(JSON.parse(terminalRaceRow.record_json).cancellationRequestedAt, recentCreatedAt);
+      assert.equal(JSON.parse(terminalRaceRow.record_json).cancellationRequestedAt, initialCancellation.requestedAt);
       Object.assign(terminalRaceRecord, { status: "failed", errorType: "late_failure" });
       const terminalReplay = persistTerminalQueueRecord(staleQueueDb, terminalRaceRecord);
       assert.equal(terminalReplay.persisted, false);
@@ -16319,6 +20728,9 @@ async function runSelfTests() {
         errorType: "",
         errorReason: "",
         ownerGeneration: "current-owner-generation",
+        heartbeatAt: recentCreatedAt,
+        leaseExpiresAt: futureLease,
+        revision: 0,
       };
       insertLeased.run(
         currentOwnerRecord.jobId, tempDir, currentOwnerRecord.status, currentOwnerRecord.agent, currentOwnerRecord.mode,
@@ -16349,7 +20761,34 @@ async function runSelfTests() {
       assert.equal(currentOwnerTerminal.cancellationWon, false);
       assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(currentOwnerRecord.jobId).status, "completed");
 
-      staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?)").run(
+      const expiredOwnerRecord = {
+        ...currentOwnerRecord,
+        jobId: "terminal-expired-lease-self-test",
+        status: "running",
+        finishedAt: "",
+        ownerGeneration: "expired-owner-generation",
+        heartbeatAt: oldCreatedAt,
+        leaseExpiresAt: expiredLease,
+        revision: 0,
+      };
+      insertLeased.run(
+        expiredOwnerRecord.jobId, tempDir, expiredOwnerRecord.status, expiredOwnerRecord.agent, expiredOwnerRecord.mode,
+        expiredOwnerRecord.createdAt, expiredOwnerRecord.startedAt, "", JSON.stringify(queueRecordSnapshot(expiredOwnerRecord)),
+        expiredOwnerRecord.ownerInstanceId, expiredOwnerRecord.ownerProcessId, expiredOwnerRecord.ownerGeneration,
+        expiredOwnerRecord.heartbeatAt, expiredOwnerRecord.heartbeatAt, expiredOwnerRecord.leaseExpiresAt
+      );
+      Object.assign(expiredOwnerRecord, {
+        status: "completed",
+        finishedAt: new Date().toISOString(),
+        heartbeatAt: "",
+        leaseExpiresAt: "",
+      });
+      const expiredOwnerTerminal = persistTerminalQueueRecord(staleQueueDb, expiredOwnerRecord);
+      assert.equal(expiredOwnerTerminal.persisted, false);
+      assert.equal(expiredOwnerTerminal.ownershipLost, true);
+      assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(expiredOwnerRecord.jobId).status, "running");
+
+      staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
         "stale-self-test",
         "recent-self-test",
         "crashed-self-test",
@@ -16357,7 +20796,8 @@ async function runSelfTests() {
         "cancelled-orphan-self-test",
         "live-lease-self-test",
         terminalRaceRecord.jobId,
-        currentOwnerRecord.jobId
+        currentOwnerRecord.jobId,
+        expiredOwnerRecord.jobId
       );
     } finally {
       closeDb(staleQueueDb);
@@ -16406,6 +20846,58 @@ async function runSelfTests() {
     assert.equal(preExecutionFailure.persisted, true);
     assert.equal(preExecutionFailureRecord.status, "failed");
     assert.equal((await readPersistedQueueRecord(preExecutionFailureRecord.jobId, tempDir)).status, "failed");
+
+    const atomicCancellationRecord = makeQueuePersistenceRecord("atomic-cancellation-self-test");
+    assert.equal((await persistQueueRecord(atomicCancellationRecord)).persisted, true);
+    const cancellationDb = await openLockDb(tempDir);
+    try {
+      const cancelled = await cancelPersistedQueueJob(cancellationDb, atomicCancellationRecord.jobId);
+      assert.equal(cancelled.outcome, "cancelled");
+      const cancelledRow = cancellationDb.prepare(`
+        SELECT status, cancellation_requested_at, result_encrypted FROM opencode_jobs WHERE job_id = ?
+      `).get(atomicCancellationRecord.jobId);
+      assert.equal(cancelledRow.status, "cancelled");
+      assert.ok(cancelledRow.cancellation_requested_at);
+      assert.ok(cancelledRow.result_encrypted);
+
+      const cancellationRaceRecord = makeQueuePersistenceRecord("cancellation-claim-race-self-test");
+      assert.equal((await persistQueueRecord(cancellationRaceRecord)).persisted, true);
+      queueCancellationTestHook = async ({ attempt, row }) => {
+        if (attempt !== 0) return;
+        const currentSummary = JSON.parse(row.record_json || "{}");
+        const newerSummary = queueRecordDurableSummary({
+          ...currentSummary,
+          status: "running",
+          startedAt: new Date().toISOString(),
+          worktreePath: path.join(tempDir, "durable-race-worktree"),
+          revision: Number(row.revision || 0) + 1,
+        });
+        cancellationDb.prepare(`
+          UPDATE opencode_jobs
+          SET status = 'running', started_at = ?, record_json = ?, revision = revision + 1
+          WHERE job_id = ? AND status = ? AND revision = ?
+        `).run(
+          newerSummary.startedAt,
+          JSON.stringify(newerSummary),
+          cancellationRaceRecord.jobId,
+          row.status,
+          Number(row.revision || 0)
+        );
+      };
+      const racedCancellation = await cancelPersistedQueueJob(cancellationDb, cancellationRaceRecord.jobId);
+      assert.equal(racedCancellation.outcome, "cancellation_requested");
+      const racedRow = cancellationDb.prepare(`
+        SELECT status, cancellation_requested_at, record_json FROM opencode_jobs WHERE job_id = ?
+      `).get(cancellationRaceRecord.jobId);
+      assert.equal(racedRow.status, "running");
+      assert.ok(racedRow.cancellation_requested_at);
+      assert.equal(JSON.parse(racedRow.record_json).worktreePath, path.join(tempDir, "durable-race-worktree"));
+    } finally {
+      queueCancellationTestHook = null;
+      cancellationDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?)")
+        .run(atomicCancellationRecord.jobId, "cancellation-claim-race-self-test");
+      closeDb(cancellationDb);
+    }
 
     const scheduledConflictRecord = makeQueuePersistenceRecord("scheduled-conflict-reject-self-test");
     Object.assign(scheduledConflictRecord, {
@@ -16506,6 +20998,21 @@ async function runSelfTests() {
     assert.ok(listedTruncatedQueue);
     assert.equal(listedTruncatedQueue.status, "completed");
     assert.equal(listedTruncatedQueue.completionOutcome, "completed_with_truncated_output");
+    assert.equal(listedTruncatedQueue.resultText, undefined);
+    assert.equal(listedTruncatedQueue.resultTextChars, CONFIG.queueResultMaxChars + 1);
+    const encryptedQueueResultDb = await openLockDb(tempDir);
+    try {
+      const encryptedQueueResult = encryptedQueueResultDb.prepare(`
+        SELECT record_json, result_encrypted FROM opencode_jobs WHERE job_id = ?
+      `).get(truncatedQueueRecord.jobId);
+      const publicQueueSummary = JSON.parse(encryptedQueueResult.record_json);
+      assert.equal(publicQueueSummary.resultText, undefined);
+      assert.equal(publicQueueSummary.errorReason, undefined);
+      assert.ok(encryptedQueueResult.result_encrypted);
+      assert.doesNotMatch(encryptedQueueResult.result_encrypted, /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/);
+    } finally {
+      closeDb(encryptedQueueResultDb);
+    }
 
     const missingFinalQueueRecord = makeQueuePersistenceRecord("queue-missing-final-self-test");
     assert.equal((await persistQueueRecord(missingFinalQueueRecord)).persisted, true);
@@ -16617,7 +21124,7 @@ async function runSelfTests() {
     await chmod(rollbackVictim, 0o755);
     const executableOwnedSnapshot = await exactIntegrationFileSnapshot(tempDir, ["src/allowed.txt"]);
     if (process.platform !== "win32") {
-      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:73:"), true);
+      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:493:"), true);
     }
     const safeModeRollback = await rollbackVerifiedOwnedChanges({
       cwd: tempDir,
@@ -16720,7 +21227,7 @@ async function runSelfTests() {
       let rawPersistedPipeline = null;
       try {
         rawPersistedPipeline = pipelinePersistenceDb.prepare(
-          "SELECT record_json, request_encrypted FROM opencode_pipelines WHERE pipeline_id = ?"
+          "SELECT record_json, request_encrypted, details_encrypted FROM opencode_pipelines WHERE pipeline_id = ?"
         ).get(pipelinePersistenceIsolationRecord.pipelineId);
       } finally {
         closeDb(pipelinePersistenceDb);
@@ -16731,6 +21238,8 @@ async function runSelfTests() {
       assert.equal(rawPipelineRecord.jobs[0].taskSha256, createHash("sha256").update(pipelinePersistenceTask).digest("hex"));
       assert.doesNotMatch(rawPersistedPipeline.record_json, new RegExp(pipelinePersistenceTask));
       assert.ok(rawPersistedPipeline.request_encrypted);
+      assert.ok(rawPersistedPipeline.details_encrypted);
+      assert.doesNotMatch(rawPersistedPipeline.details_encrypted, new RegExp(pipelinePersistenceTask));
       const replayedPipeline = await readPersistedPipelineRecord(pipelinePersistenceIsolationRecord.pipelineId, tempDir);
       assert.equal(replayedPipeline.jobs[0].task, pipelinePersistenceTask);
     } finally {
@@ -16741,6 +21250,156 @@ async function runSelfTests() {
         closeDb(pipelinePersistenceDb);
       }
       queueModeOverride = previousPipelinePersistenceMode;
+    }
+
+    const previousAtomicPipelineMode = queueModeOverride;
+    queueModeOverride = "sqlite";
+    const makeAtomicPipelineFixture = async (pipelineId) => {
+      const createdAt = new Date().toISOString();
+      const fixture = {
+        pipelineId,
+        cwd: tempDir,
+        status: "planned",
+        createdAt,
+        updatedAt: createdAt,
+        jobs: [
+          { agent: "reviewer", task: `${pipelineId} child one`, cwd: tempDir, write: false, lockType: "read", lockMode: "off", dryRun: true },
+          { agent: "tester", task: `${pipelineId} child two`, cwd: tempDir, write: false, lockType: "read", lockMode: "off", dryRun: true },
+        ],
+        queueJobIds: [],
+        expectedChildCount: 0,
+        batchState: "unstarted",
+        cleanupState: "none",
+        queueMode: "sqlite",
+        events: [],
+        errors: [],
+      };
+      await persistPipelineRecord(fixture);
+      const prepared = [];
+      for (const job of fixture.jobs) {
+        const child = await enqueueQueueJob(job, fixture.pipelineId, {
+          schedule: false,
+          initialStatus: "held",
+          persist: false,
+        });
+        assert.equal(child.ok, true);
+        assert.equal(QUEUE_JOBS.has(child.record.jobId), false);
+        prepared.push(child.record);
+      }
+      return { fixture, prepared };
+    };
+    try {
+      const atomic = await makeAtomicPipelineFixture("pipeline-atomic-batch-self-test");
+      const activated = await activatePipelineBatch(atomic.fixture, atomic.prepared);
+      assert.equal(activated.ok, true, JSON.stringify(activated));
+      const atomicDb = await openLockDb(tempDir);
+      try {
+        const durablePipeline = atomicDb.prepare(`
+          SELECT status, expected_child_count, batch_state FROM opencode_pipelines WHERE pipeline_id = ?
+        `).get(atomic.fixture.pipelineId);
+        assert.equal(durablePipeline.status, "running");
+        assert.equal(durablePipeline.expected_child_count, 2);
+        assert.equal(durablePipeline.batch_state, "released");
+        assert.equal(atomicDb.prepare(
+          "SELECT COUNT(*) AS count FROM opencode_pipeline_children WHERE pipeline_id = ?"
+        ).get(atomic.fixture.pipelineId).count, 2);
+        assert.deepEqual(atomicDb.prepare(`
+          SELECT status FROM opencode_jobs WHERE job_id IN (?, ?) ORDER BY job_id
+        `).all(...atomic.prepared.map((record) => record.jobId)).map((row) => row.status), ["pending", "pending"]);
+      } finally {
+        closeDb(atomicDb);
+      }
+      const missingChildDb = await openLockDb(tempDir);
+      try {
+        missingChildDb.prepare("DELETE FROM opencode_jobs WHERE job_id = ?").run(atomic.prepared[1].jobId);
+      } finally {
+        closeDb(missingChildDb);
+      }
+      await refreshPipelineRecord(atomic.fixture);
+      assert.equal(atomic.fixture.status, "failed");
+      assert.equal(atomic.fixture.batchState, "incomplete");
+      assert.equal(atomic.fixture.errors.at(-1).errorType, "pipeline_child_record_missing");
+
+      const propagation = await makeAtomicPipelineFixture("pipeline-terminal-propagation-self-test");
+      assert.equal((await activatePipelineBatch(propagation.fixture, propagation.prepared)).ok, true);
+      const failingChild = propagation.prepared[0];
+      const siblingChild = propagation.prepared[1];
+      assert.equal((await claimQueueRecord(failingChild)).ok, true);
+      const failedChild = await updateQueueTerminalRecordDurable(failingChild, {
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        heartbeatAt: "",
+        leaseExpiresAt: "",
+        errorType: "pipeline_child_self_test_failure",
+        errorReason: "Injected child failure for deterministic sibling cancellation.",
+      });
+      assert.equal(failedChild.persisted, true);
+      await reconcileParentPipelineAfterQueueTerminal(failingChild);
+      const propagationDb = await openLockDb(tempDir);
+      try {
+        assert.equal(propagationDb.prepare(
+          "SELECT status FROM opencode_pipelines WHERE pipeline_id = ?"
+        ).get(propagation.fixture.pipelineId).status, "failed");
+        const siblingRow = propagationDb.prepare(`
+          SELECT status, cancellation_requested_at FROM opencode_jobs WHERE job_id = ?
+        `).get(siblingChild.jobId);
+        assert.equal(siblingRow.status, "cancelled");
+        assert.ok(siblingRow.cancellation_requested_at);
+      } finally {
+        closeDb(propagationDb);
+      }
+      assert.equal((await claimQueueRecord(siblingChild)).ok, false);
+      assert.equal(siblingChild.status, "cancelled");
+
+      const rollback = await makeAtomicPipelineFixture("pipeline-atomic-rollback-self-test");
+      const rollbackDb = await openLockDb(tempDir);
+      try {
+        rollbackDb.exec(`
+          CREATE TRIGGER pipeline_atomic_rollback_injected
+          BEFORE UPDATE OF status ON opencode_jobs
+          WHEN NEW.job_id = '${rollback.prepared[1].jobId.replaceAll("'", "''")}' AND NEW.status = 'pending'
+          BEGIN
+            SELECT RAISE(ABORT, 'injected pipeline child release failure');
+          END;
+        `);
+      } finally {
+        closeDb(rollbackDb);
+      }
+      const rolledBack = await activatePipelineBatch(rollback.fixture, rollback.prepared);
+      assert.equal(rolledBack.ok, false);
+      const rollbackVerificationDb = await openLockDb(tempDir);
+      try {
+        rollbackVerificationDb.exec("DROP TRIGGER pipeline_atomic_rollback_injected");
+        assert.equal(rollbackVerificationDb.prepare(
+          "SELECT COUNT(*) AS count FROM opencode_jobs WHERE job_id IN (?, ?)"
+        ).get(...rollback.prepared.map((record) => record.jobId)).count, 0);
+        assert.equal(rollbackVerificationDb.prepare(
+          "SELECT COUNT(*) AS count FROM opencode_pipeline_children WHERE pipeline_id = ?"
+        ).get(rollback.fixture.pipelineId).count, 0);
+        const rolledBackPipeline = rollbackVerificationDb.prepare(`
+          SELECT status, expected_child_count, batch_state FROM opencode_pipelines WHERE pipeline_id = ?
+        `).get(rollback.fixture.pipelineId);
+        assert.equal(rolledBackPipeline.status, "planned");
+        assert.equal(rolledBackPipeline.expected_child_count, 0);
+        assert.equal(rolledBackPipeline.batch_state, "unstarted");
+        rollbackVerificationDb.prepare("DELETE FROM opencode_pipelines WHERE pipeline_id IN (?, ?)")
+          .run(atomic.fixture.pipelineId, rollback.fixture.pipelineId);
+        rollbackVerificationDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?)")
+          .run(...atomic.prepared.map((record) => record.jobId));
+        rollbackVerificationDb.prepare("DELETE FROM opencode_pipelines WHERE pipeline_id = ?")
+          .run(propagation.fixture.pipelineId);
+        rollbackVerificationDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?)")
+          .run(...propagation.prepared.map((record) => record.jobId));
+      } finally {
+        closeDb(rollbackVerificationDb);
+      }
+      for (const child of atomic.prepared) QUEUE_JOBS.delete(child.jobId);
+      for (const child of propagation.prepared) QUEUE_JOBS.delete(child.jobId);
+      PIPELINE_RUNS.delete(atomic.fixture.pipelineId);
+      PIPELINE_RUNS.delete(propagation.fixture.pipelineId);
+      PIPELINE_RUNS.delete(rollback.fixture.pipelineId);
+    } finally {
+      queueModeOverride = previousAtomicPipelineMode;
     }
 
     const persistenceOrderRecord = {
@@ -16845,6 +21504,14 @@ async function runSelfTests() {
     const restoredPipeline = await readPersistedPipelineRecord(persistedPipelinePlan.record.pipelineId, tempDir);
     assert.equal(restoredPipeline.pipelineId, persistedPipelinePlan.record.pipelineId);
     assert.equal(restoredPipeline.status, "planned");
+    const pipelineFinalizationWriter = await acquireHardLock({
+      owner: "codex", agent: "builder", cwd: tempDir, lockType: "write", paths: ["src/allowed.txt"],
+    });
+    assert.equal(pipelineFinalizationWriter.ok, true);
+    const blockedPipelineFinalization = await finalizePipelineRecord(persistedPipelinePlan.record, { skipReviewers: true, dryRun: true });
+    assert.equal(blockedPipelineFinalization.ok, false);
+    assert.equal(blockedPipelineFinalization.errorType, "pipeline_finalization_lock_conflict");
+    await releaseHardLock(pipelineFinalizationWriter.lock.id, pipelineFinalizationWriter.lock.token, pipelineFinalizationWriter.lock.paths, tempDir);
     const pendingFinalize = await finalizePipelineRecord(persistedPipelinePlan.record, { skipReviewers: true, dryRun: true });
     assert.equal(pendingFinalize.ok, false);
     assert.equal(pendingFinalize.errorType, "pipeline_pending_integrations");
@@ -17016,15 +21683,20 @@ async function runSelfTests() {
     } finally {
       pipelinePersistenceTestHook = null;
     }
-    assert.equal((await lstat(terminalFaultWorktree.path)).isDirectory(), true);
-    assert.equal(terminalFaultPipeline.status, "finalizing");
-    assert.deepEqual(terminalFaultPipeline.sourceCleanupResults, []);
+    await assert.rejects(lstat(terminalFaultWorktree.path), (error) => error?.code === "ENOENT");
+    assert.equal(terminalFaultPipeline.status, "cleanup_pending");
+    assert.equal(terminalFaultPipeline.cleanupPending, true);
+    assert.equal(terminalFaultPipeline.cleanupState, "authorized");
     const terminalFaultPersisted = await readPersistedPipelineRecord(terminalFaultPipeline.pipelineId, tempDir);
-    assert.equal(terminalFaultPersisted.status, "finalizing");
-    assert.deepEqual(terminalFaultPersisted.sourceCleanupResults, []);
-    assert.equal(terminalFaultPersisted.events.some((event) => event.type === "source_cleanup_authorized"), false);
+    assert.equal(terminalFaultPersisted.status, "cleanup_pending");
+    assert.equal(terminalFaultPersisted.cleanupPending, true);
+    assert.equal(terminalFaultPersisted.events.some((event) => event.type === "source_cleanup_authorized"), true);
     assert.equal(terminalFaultPersisted.events.some((event) => event.type === "finalization_completed"), false);
-    assert.equal((await cleanupWorktree(terminalFaultWorktree, "always", true)).cleanup, "success");
+    const recoveredTerminalCleanup = await resumeAuthorizedPipelineCleanup(terminalFaultPipeline);
+    assert.equal(recoveredTerminalCleanup.ok, true);
+    assert.equal(terminalFaultPipeline.status, "completed");
+    assert.equal(terminalFaultPipeline.cleanupPending, false);
+    assert.equal(terminalFaultPipeline.sourceCleanupResults[0].reason, "recovered_already_removed");
 
     await mkdir(path.join(tempDir, ".mcp"), { recursive: true });
     const policyContent = JSON.stringify({
@@ -17160,6 +21832,92 @@ async function runSelfTests() {
     const policyCommit = await runCommand("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "add agent policy"], tempDir, 1000 * 15);
     assert.equal(policyCommit.exitCode, 0);
 
+    assert.equal((await runCommand(
+      "git",
+      ["config", "--local", "filter.bridge-unsafe.smudge", "node malicious-filter.cjs"],
+      tempDir,
+      1000 * 15
+    )).exitCode, 0);
+    const unsafeGitConfigWorktree = await createWorktreeForJob({
+      cwd: tempDir,
+      agent: "builder",
+      jobId: "git-config-isolation-self-test",
+    });
+    assert.equal(unsafeGitConfigWorktree.ok, false);
+    assert.equal(unsafeGitConfigWorktree.errorType, "git_repository_config_unsafe");
+    assert.ok(unsafeGitConfigWorktree.unsafeKeys.includes("filter.bridge-unsafe.smudge"));
+    assert.equal((await runCommand(
+      "git",
+      ["config", "--local", "--unset-all", "filter.bridge-unsafe.smudge"],
+      tempDir,
+      1000 * 15
+    )).exitCode, 0);
+
+    const hookMarker = path.join(tempDir, ".git", "bridge-hook-executed");
+    const hookPath = path.join(tempDir, ".git", "hooks", "post-checkout");
+    const shellHookMarker = hookMarker.replace(/\\/g, "/").replace(/'/g, "'\\''");
+    await writeFile(hookPath, [
+      "#!/bin/sh",
+      `printf '%s' "\${BRIDGE_TEST_SECRET:-missing}" > '${shellHookMarker}'`,
+    ].join("\n"), "utf8");
+    await chmod(hookPath, 0o755);
+    process.env.BRIDGE_TEST_SECRET = "bridge-secret-must-not-reach-git";
+    try {
+      const hookProtectedWorktree = await createWorktreeForJob({
+        cwd: tempDir,
+        agent: "builder",
+        jobId: "git-hook-isolation-self-test",
+      });
+      assert.equal(hookProtectedWorktree.ok, true, JSON.stringify(hookProtectedWorktree, null, 2));
+      assert.equal(existsSync(hookMarker), false, "Bridge-owned Git must not execute repository hooks.");
+      assert.equal((await inspectSourceCheckpointState(hookProtectedWorktree.path)).ok, true);
+      assert.equal((await cleanupWorktree(hookProtectedWorktree, "always", true)).cleanup, "success");
+    } finally {
+      delete process.env.BRIDGE_TEST_SECRET;
+      await rm(hookMarker, { force: true });
+      await rm(hookPath, { force: true });
+    }
+
+    const branchRaceWorktree = await createWorktreeForJob({
+      cwd: tempDir,
+      agent: "builder",
+      jobId: "branch-cleanup-cas-self-test",
+    });
+    assert.equal(branchRaceWorktree.ok, true, JSON.stringify(branchRaceWorktree, null, 2));
+    const replacementBranchOid = (await runCommand(
+      "git",
+      ["rev-parse", "--verify", "--end-of-options", "HEAD^"],
+      tempDir,
+      1000 * 15
+    )).stdout.trim();
+    try {
+      worktreeCleanupTestHook = async ({ branchRef, expectedBranchOid }) => {
+        const replaced = await runCommand(
+          "git",
+          ["update-ref", branchRef, replacementBranchOid, expectedBranchOid],
+          tempDir,
+          1000 * 15
+        );
+        assert.equal(replaced.exitCode, 0, replaced.stderr);
+      };
+      const branchRaceCleanup = await cleanupWorktree(branchRaceWorktree, "always", true);
+      assert.equal(branchRaceCleanup.cleanup, "partial");
+      assert.equal((await runCommand(
+        "git",
+        ["show-ref", "--hash", "--verify", `refs/heads/${branchRaceWorktree.branch}`],
+        tempDir,
+        1000 * 15
+      )).stdout.trim(), replacementBranchOid);
+    } finally {
+      worktreeCleanupTestHook = null;
+      await runCommand(
+        "git",
+        ["update-ref", "-d", `refs/heads/${branchRaceWorktree.branch}`, replacementBranchOid],
+        tempDir,
+        1000 * 15
+      );
+    }
+
     selfTestProgress("integration/receipts");
     const worktree = await createWorktreeForJob({
       cwd: tempDir,
@@ -17167,6 +21925,15 @@ async function runSelfTests() {
       jobId: "self-test",
     });
     assert.equal(worktree.ok, true);
+    const registeredWorktreeDb = await openLockDb(tempDir);
+    try {
+      const registered = registeredWorktreeDb.prepare(`
+        SELECT status FROM worktree_artifacts WHERE worktree_path = ? AND cwd = ?
+      `).get(path.resolve(worktree.path), path.resolve(tempDir));
+      assert.equal(registered?.status, "retained");
+    } finally {
+      closeDb(registeredWorktreeDb);
+    }
     const worktreePreserve = await cleanupWorktree(worktree, "never", false);
     assert.equal(worktreePreserve.cleanup, "skipped");
     await writeFile(path.join(worktree.path, "src", "allowed.txt"), "worktree allowed\n", "utf8");
@@ -17194,6 +21961,15 @@ async function runSelfTests() {
     assert.ok(worktreeDiff.changedFiles.includes("src/allowed.txt"));
     const worktreeCleanup = await cleanupWorktree(worktree, "always", true);
     assert.notEqual(worktreeCleanup.cleanup, "failed");
+    const cleanedWorktreeDb = await openLockDb(tempDir);
+    try {
+      const cleaned = cleanedWorktreeDb.prepare(`
+        SELECT status FROM worktree_artifacts WHERE worktree_path = ? AND cwd = ?
+      `).get(path.resolve(worktree.path), path.resolve(tempDir));
+      assert.ok(["cleaned", "cleaned_branch_retained"].includes(cleaned?.status));
+    } finally {
+      closeDb(cleanedWorktreeDb);
+    }
 
     const ignoredSourceWorktree = await createWorktreeForJob({
       cwd: tempDir,
@@ -17319,11 +22095,80 @@ async function runSelfTests() {
     });
     assert.equal(integrationApplied.ok, true, JSON.stringify(integrationApplied, null, 2));
     assert.equal(integrationApplied.status, "applied");
+    assert.match(integrationApplied.operationId || "", /^integration-[0-9]+-[a-f0-9]{16}$/);
+    assert.equal((await readIntegrationOperationSummary(tempDir, integrationApplied.operationId))?.status, "committed");
+    const committedJournalDb = await openLockDb(tempDir);
+    try {
+      const committedEvidence = committedJournalDb.prepare(`
+        SELECT pre_encrypted, post_encrypted
+        FROM integration_operation_files
+        WHERE operation_id = ? AND path = ?
+      `).get(integrationApplied.operationId, "src/allowed.txt");
+      assert.ok(committedEvidence?.pre_encrypted);
+      assert.ok(committedEvidence?.post_encrypted);
+      assert.doesNotMatch(committedEvidence.pre_encrypted, /integrated allowed/i);
+      assert.doesNotMatch(committedEvidence.post_encrypted, /integrated allowed/i);
+    } finally {
+      closeDb(committedJournalDb);
+    }
     assert.equal((await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8")).replace(/\r\n/g, "\n"), "integrated allowed\n");
     assert.deepEqual(
       (await runCommand("git", ["status", "--short"], tempDir, 1000 * 15)).stdout.split(/\r?\n/).filter((line) => line.trim()),
       [" M src/allowed.txt"]
     );
+    const journalRecoveryPath = path.join(tempDir, "src", "journal-recovery.txt");
+    const journalRecoveryPreimage = "journal encrypted preimage sentinel\n";
+    const journalRecoveryPostimage = "journal simulated crash postimage\n";
+    await writeFile(journalRecoveryPath, journalRecoveryPreimage, "utf8");
+    const journalRecoveryTargetState = await captureIntegrationTargetState(tempDir);
+    assert.equal(journalRecoveryTargetState.ok, true);
+    const journalRecoveryMode = (await lstat(journalRecoveryPath)).mode & 0o111;
+    const journalRecoveryPrepared = await prepareIntegrationOperation({
+      cwd: tempDir,
+      targetState: journalRecoveryTargetState,
+      patch: {
+        changedFiles: ["src/journal-recovery.txt"],
+        patchSha256: createHash("sha256").update(journalRecoveryPostimage).digest("hex"),
+        sourceBaseCommit: journalRecoveryTargetState.targetHead,
+        sourceStateSha256: createHash("sha256").update("journal recovery source").digest("hex"),
+      },
+      contractSha256: createHash("sha256").update("journal recovery contract").digest("hex"),
+      expectedPostSnapshot: new Map([[
+        "src/journal-recovery.txt",
+        `file:${journalRecoveryMode}:${createHash("sha256").update(journalRecoveryPostimage).digest("hex")}`,
+      ]]),
+    });
+    await transitionIntegrationOperation(tempDir, journalRecoveryPrepared.operationId, "prepared", "applying", {
+      outcome: "self_test_simulated_crash",
+    });
+    await writeFile(journalRecoveryPath, journalRecoveryPostimage, "utf8");
+    const blockedByJournal = await acquireHardLock({
+      owner: "codex",
+      agent: "builder",
+      cwd: tempDir,
+      lockType: "write",
+      paths: ["src/journal-recovery.txt"],
+    });
+    assert.equal(blockedByJournal.ok, false);
+    assert.equal(blockedByJournal.errorType, "integration_recovery_pending");
+    assert.equal(blockedByJournal.operationId, journalRecoveryPrepared.operationId);
+    const readDuringRecovery = await acquireHardLock({
+      owner: "codex",
+      agent: "reviewer",
+      cwd: tempDir,
+      lockType: "read",
+      paths: ["src/journal-recovery.txt"],
+    });
+    assert.equal(readDuringRecovery.ok, true);
+    await releaseHardLock(readDuringRecovery.lock.id, readDuringRecovery.lock.token, readDuringRecovery.lock.paths, tempDir);
+    const journalRecovery = await recoverIntegrationOperationsWhileLocked(tempDir, {
+      operationId: journalRecoveryPrepared.operationId,
+    });
+    assert.equal(journalRecovery.ok, true, JSON.stringify(journalRecovery, null, 2));
+    assert.equal(journalRecovery.recovered[0]?.status, "rolled_back");
+    assert.equal(await readFile(journalRecoveryPath, "utf8"), journalRecoveryPreimage);
+    assert.equal((await readIntegrationOperationSummary(tempDir, journalRecoveryPrepared.operationId))?.status, "rolled_back");
+    await rm(journalRecoveryPath, { force: true });
     await writeFile(path.join(tempDir, "src", "api.txt"), "changed between integration and cleanup\n", "utf8");
     assert.match(
       await integrationCleanupTargetStateError(tempDir, integrationApplied.integratedTargetStateSha256),
@@ -17459,6 +22304,7 @@ async function runSelfTests() {
     assert.equal(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
     assert.equal(await readFile(path.join(tempDir, "src", "api.txt"), "utf8"), "validation worktree B\n");
     assert.equal((await runCommand("git", ["restore", "--staged", "--worktree", "--", "src/api.txt"], tempDir, 1000 * 15)).exitCode, 0);
+    await clearSelfTestIntegrationQuarantine();
     assert.equal((await cleanupWorktree(validationIndexWorktree, "always", true)).cleanup, "success");
 
     await writeFile(path.join(tempDir, "src", "delete-me.txt"), "delete rollback sentinel\n", "utf8");
@@ -17514,7 +22360,7 @@ async function runSelfTests() {
       previewReceipt: deleteRollbackPreview.previewReceipt,
     });
     assert.equal(deleteRollbackResult.ok, false);
-    assert.equal(deleteRollbackResult.errorType, "validation_command_failed");
+    assert.equal(deleteRollbackResult.errorType, "validation_command_failed", JSON.stringify(deleteRollbackResult, null, 2));
     assert.equal(deleteRollbackResult.rollback.rollback, "success");
     assert.equal(await readFile(path.join(tempDir, "src", "delete-me.txt"), "utf8"), "delete rollback sentinel\n");
     assert.equal(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
@@ -17752,6 +22598,7 @@ async function runSelfTests() {
     assert.deepEqual(validationMutationResult.rollback.unresolvedFiles, ["src/allowed.txt"]);
     assert.notEqual(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
     assert.equal((await runCommand("git", ["restore", "--worktree", "--", "src/allowed.txt"], tempDir, 1000 * 15)).exitCode, 0);
+    await clearSelfTestIntegrationQuarantine();
     assert.equal((await cleanupWorktree(validationMutationWorktree, "always", true)).cleanup, "success");
 
     const extraPathWorktree = await createWorktreeForJob({
@@ -17823,6 +22670,7 @@ async function runSelfTests() {
     assert.equal((await runCommand("git", ["diff", "--cached", "--binary", "--", "src/allowed.txt"], tempDir, 1000 * 15)).stdout, concurrentCachedDiff);
     assert.equal(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
     assert.equal((await runCommand("git", ["restore", "--staged", "--worktree", "--", "src/allowed.txt"], tempDir, 1000 * 15)).exitCode, 0);
+    await clearSelfTestIntegrationQuarantine();
     assert.equal((await cleanupWorktree(stagedOwnershipWorktree, "always", true)).cleanup, "success");
 
     const headRaceWorktree = await createWorktreeForJob({
@@ -18108,6 +22956,7 @@ async function verifyReleaseManifest(releaseRoot) {
     "server.js",
     "package.json",
     "package-lock.json",
+    "bin/process-supervisor.js",
     "bin/tui.js",
     "bin/e2e.js",
     "bin/e2e-contractor.js",
@@ -18199,10 +23048,283 @@ async function verifyReleaseIntegrity() {
   }
 }
 
-async function reconcileQueueStateAtStartup() {
-  if (effectiveQueueMode() !== "sqlite") return;
+function reconcileLegacyPipelineBatches(db, now = Date.now()) {
+  const candidates = db.prepare(`
+    SELECT pipeline_id, status, revision, owner_instance_id, owner_generation,
+           owner_lease_expires_at, expected_child_count, batch_state, record_json
+    FROM opencode_pipelines
+    WHERE status IN ('planned', 'running') AND batch_state = 'legacy'
+  `).all();
+  const reconciled = [];
+  for (const candidateRow of candidates) {
+    let transactionOpen = false;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const row = db.prepare(`
+        SELECT pipeline_id, status, revision, owner_instance_id, owner_generation,
+               owner_lease_expires_at, expected_child_count, batch_state, record_json
+        FROM opencode_pipelines WHERE pipeline_id = ?
+      `).get(candidateRow.pipeline_id);
+      if (!row || row.batch_state !== "legacy" || !["planned", "running"].includes(row.status)) {
+        db.exec("COMMIT");
+        transactionOpen = false;
+        continue;
+      }
+      const pipelineLease = Date.parse(row.owner_lease_expires_at || "");
+      const owner = row.owner_instance_id
+        ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
+        : null;
+      const instanceLease = Date.parse(owner?.lease_expires_at || "");
+      if ((Number.isFinite(pipelineLease) && pipelineLease > now)
+        || (Number.isFinite(instanceLease) && instanceLease > now)) {
+        db.exec("COMMIT");
+        transactionOpen = false;
+        continue;
+      }
+
+      let snapshot = {};
+      try { snapshot = JSON.parse(row.record_json || "{}"); } catch { snapshot = {}; }
+      const queueJobIds = Array.isArray(snapshot.queueJobIds) ? snapshot.queueJobIds.map(String) : [];
+      const expectedCount = Number(row.expected_child_count || queueJobIds.length || 0);
+      const uniqueIds = new Set(queueJobIds);
+      const manifestRows = queueJobIds.length
+        ? db.prepare(`
+          SELECT job_id, status, revision, request_encrypted, record_json
+          FROM opencode_jobs WHERE job_id IN (${queueJobIds.map(() => "?").join(",")})
+        `).all(...queueJobIds)
+        : [];
+      const parentRows = db.prepare(`
+        SELECT job_id, status, revision, request_encrypted, record_json
+        FROM opencode_jobs
+        WHERE json_valid(record_json) AND json_extract(record_json, '$.parentJobId') = ?
+      `).all(row.pipeline_id);
+      const observedById = new Map([...manifestRows, ...parentRows].map((jobRow) => [jobRow.job_id, jobRow]));
+      const complete = expectedCount > 0
+        && queueJobIds.length === expectedCount
+        && uniqueIds.size === expectedCount
+        && observedById.size === expectedCount
+        && queueJobIds.every((jobId) => observedById.has(jobId))
+        && [...observedById.values()].every((jobRow) => ["held", "pending"].includes(jobRow.status) && jobRow.request_encrypted);
+      const at = new Date(now).toISOString();
+      if (complete) {
+        const insertRelation = db.prepare(`
+          INSERT INTO opencode_pipeline_children (pipeline_id, ordinal, job_id, created_at)
+          VALUES (?, ?, ?, ?)
+        `);
+        for (const [ordinal, jobId] of queueJobIds.entries()) insertRelation.run(row.pipeline_id, ordinal, jobId, at);
+        const releaseHeld = db.prepare(`
+          UPDATE opencode_jobs SET status = 'pending', updated_at = ?, record_json = ?, revision = revision + 1
+          WHERE job_id = ? AND status = 'held' AND revision = ?
+        `);
+        for (const jobRow of observedById.values()) {
+          if (jobRow.status !== "held") continue;
+          let jobSnapshot = {};
+          try { jobSnapshot = JSON.parse(jobRow.record_json || "{}"); } catch { jobSnapshot = {}; }
+          const pending = { ...jobSnapshot, status: "pending", revision: Number(jobRow.revision || 0) + 1 };
+          const released = releaseHeld.run(at, JSON.stringify(queueRecordDurableSummary(pending)), jobRow.job_id, Number(jobRow.revision || 0));
+          if (Number(released.changes || 0) !== 1) throw new Error("Legacy pipeline child release CAS failed.");
+        }
+        const recovered = {
+          ...snapshot,
+          status: "running",
+          expectedChildCount: expectedCount,
+          batchState: "released",
+          queueMode: "sqlite",
+          revision: Number(row.revision || 0) + 1,
+          updatedAt: at,
+        };
+        const updated = db.prepare(`
+          UPDATE opencode_pipelines
+          SET status = 'running', updated_at = ?, record_json = ?, revision = revision + 1,
+              expected_child_count = ?, batch_state = 'released', queue_mode = 'sqlite'
+          WHERE pipeline_id = ? AND revision = ? AND batch_state = 'legacy'
+        `).run(at, JSON.stringify(sanitizePersistedValue(recovered)), expectedCount, row.pipeline_id, Number(row.revision || 0));
+        if (Number(updated.changes || 0) !== 1) throw new Error("Legacy pipeline recovery CAS failed.");
+        reconciled.push({ pipelineId: row.pipeline_id, outcome: "released" });
+      } else {
+        const cancelChild = db.prepare(`
+          UPDATE opencode_jobs
+          SET status = 'cancelled', finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
+              record_json = ?, revision = revision + 1
+          WHERE job_id = ? AND status IN ('held', 'pending', 'planned', 'blocked') AND revision = ?
+        `);
+        for (const jobRow of observedById.values()) {
+          if (!["held", "pending", "planned", "blocked"].includes(jobRow.status)) continue;
+          let jobSnapshot = {};
+          try { jobSnapshot = JSON.parse(jobRow.record_json || "{}"); } catch { jobSnapshot = {}; }
+          const cancelled = {
+            ...jobSnapshot,
+            status: "cancelled",
+            finishedAt: at,
+            heartbeatAt: "",
+            leaseExpiresAt: "",
+            errorType: "pipeline_batch_incomplete",
+            revision: Number(jobRow.revision || 0) + 1,
+          };
+          const cancelledChild = cancelChild.run(
+            at,
+            at,
+            JSON.stringify(queueRecordDurableSummary(cancelled)),
+            jobRow.job_id,
+            Number(jobRow.revision || 0)
+          );
+          if (Number(cancelledChild.changes || 0) !== 1) throw new Error("Legacy pipeline child cancellation CAS failed.");
+        }
+        const failed = {
+          ...snapshot,
+          status: "failed",
+          finishedAt: at,
+          expectedChildCount: expectedCount,
+          batchState: "incomplete",
+          queueMode: "sqlite",
+          revision: Number(row.revision || 0) + 1,
+          updatedAt: at,
+          errorType: "pipeline_batch_incomplete",
+          observedChildCount: observedById.size,
+        };
+        const updated = db.prepare(`
+          UPDATE opencode_pipelines
+          SET status = 'failed', updated_at = ?, record_json = ?, revision = revision + 1,
+              expected_child_count = ?, batch_state = 'incomplete', queue_mode = 'sqlite'
+          WHERE pipeline_id = ? AND revision = ? AND batch_state = 'legacy'
+        `).run(at, JSON.stringify(sanitizePersistedValue(failed)), expectedCount, row.pipeline_id, Number(row.revision || 0));
+        if (Number(updated.changes || 0) !== 1) throw new Error("Legacy pipeline failure CAS failed.");
+        reconciled.push({ pipelineId: row.pipeline_id, outcome: "failed" });
+      }
+      db.exec("COMMIT");
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try { db.exec("ROLLBACK"); } catch { /* Preserve the recovery error. */ }
+      }
+      throw error;
+    }
+  }
+  return reconciled;
+}
+
+function claimPersistedQueueRecordForStartup(db, jobId, expectedRevision, request) {
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const row = db.prepare(`
+      SELECT job_id, status, created_at, started_at, finished_at, owner_instance_id, owner_process_id,
+             owner_generation, heartbeat_at, lease_expires_at, cancellation_requested_at,
+             child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, record_json
+      FROM opencode_jobs WHERE job_id = ?
+    `).get(jobId);
+    if (!row || Number(row.revision || 0) !== Number(expectedRevision || 0)
+      || !["held", "pending", "planned", "blocked"].includes(row.status)) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      return null;
+    }
+
+    const heartbeatAt = new Date().toISOString();
+    const resumed = {
+      ...persistedQueueRecordFromRow(row),
+      jobId: row.job_id,
+      request,
+      task: request?.task || "",
+      status: row.status === "held" ? "held" : "pending",
+      ownerInstanceId: BRIDGE_INSTANCE_ID,
+      ownerProcessId: process.pid,
+      ownerGeneration: randomBytes(12).toString("hex"),
+      heartbeatAt,
+      leaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+      revision: Number(row.revision || 0),
+    };
+    const takeover = db.prepare(`
+      UPDATE opencode_jobs SET status = ?, owner_instance_id = ?, owner_process_id = ?, owner_generation = ?,
+        heartbeat_at = ?, lease_expires_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
+      WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
+        AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
+        AND (lease_expires_at IS NULL OR lease_expires_at = '' OR julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
+    `).run(
+      resumed.status, resumed.ownerInstanceId, resumed.ownerProcessId, resumed.ownerGeneration,
+      resumed.heartbeatAt, resumed.leaseExpiresAt, resumed.heartbeatAt,
+      JSON.stringify(queueRecordDurableSummary({ ...resumed, revision: resumed.revision + 1 })),
+      resumed.jobId, resumed.revision, row.owner_instance_id || "", row.owner_generation || "",
+      heartbeatAt, heartbeatAt
+    );
+    db.exec("COMMIT");
+    transactionOpen = false;
+    if (Number(takeover.changes || 0) !== 1) return null;
+    resumed.revision += 1;
+    return resumed;
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the startup claim error. */ }
+    }
+    throw error;
+  }
+}
+
+function failPersistedQueueStartupRecovery(db, row, failedRecord, encryptedDetails = null) {
+  const failedAt = failedRecord.finishedAt || new Date().toISOString();
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const failed = db.prepare(`
+      UPDATE opencode_jobs SET status = 'failed', finished_at = ?, updated_at = ?, heartbeat_at = '',
+        lease_expires_at = '', child_process_id = 0, child_process_started_at = '', record_json = ?,
+        result_encrypted = ?, revision = revision + 1
+      WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
+        AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
+        AND (lease_expires_at IS NULL OR lease_expires_at = '' OR julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM bridge_instances
+          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
+        )
+    `).run(
+      failedAt, failedAt, JSON.stringify(queueRecordDurableSummary(failedRecord)), encryptedDetails,
+      row.job_id, Number(row.revision || 0), row.owner_instance_id || "", row.owner_generation || "",
+      failedAt, failedAt
+    );
+    if (Number(failed.changes || 0) === 1) {
+      propagatePipelineTerminalInTransaction(db, row.job_id, "failed", failedAt);
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return Number(failed.changes || 0) === 1;
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the startup recovery error. */ }
+    }
+    throw error;
+  }
+}
+
+function ensureDeferredRecoveryTimer() {
+  if (process.argv.includes("--self-test") || deferredRecoveryTimer) return;
+  const intervalMs = Math.max(1000, Math.min(Number(CONFIG.queueHeartbeatMs) || 5000, 5000));
+  deferredRecoveryTimer = setInterval(() => {
+    void reconcileQueueStateAtStartup({ busyTimeoutMs: 250 }).catch((error) => {
+      logEvent("warn", "state.deferred_recovery_failed", {
+        errorType: error?.errorType || "deferred_recovery_failed",
+      });
+    });
+  }, intervalMs);
+  deferredRecoveryTimer.unref?.();
+}
+
+async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
+  if (deferredRecoveryRunning) return;
+  deferredRecoveryRunning = true;
+  try {
+  const queuePersistenceEnabled = effectiveQueueMode() === "sqlite";
   const stateRoot = effectiveBridgeStateDirectory();
   const candidates = [path.join(stateRoot, "bridge-state.sqlite")];
+  const cleanupRecoveryCandidates = [];
+  const pipelineAggregationCandidates = [];
+  const integrationRecoveryCandidates = new Set();
   try {
     const projectsDir = path.join(stateRoot, "projects");
     for (const entry of await readdir(projectsDir, { withFileTypes: true })) {
@@ -18218,7 +23340,9 @@ async function reconcileQueueStateAtStartup() {
     let db = null;
     try {
       db = new DatabaseSync(dbPath);
-      db.exec("PRAGMA busy_timeout = 5000;");
+      db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, Number(busyTimeoutMs) || 250))};`);
+      db.exec("PRAGMA foreign_keys = ON;");
+      db.exec("PRAGMA synchronous = FULL;");
       const hasJobs = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get();
       if (!hasJobs) continue;
       ensureQueueLeaseSchema(db);
@@ -18229,56 +23353,103 @@ async function reconcileQueueStateAtStartup() {
         heartbeat_at TEXT NOT NULL,
         lease_expires_at TEXT NOT NULL
       )`);
+      ensureIntegrationJournalSchema(db);
+      for (const row of db.prepare(`
+        SELECT DISTINCT cwd FROM integration_operations
+        WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      `).all()) {
+        if (row.cwd) integrationRecoveryCandidates.add(path.resolve(row.cwd));
+      }
+      const hasPipelines = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_pipelines'").get();
+      if (hasPipelines) {
+        ensurePipelineRevisionSchema(db);
+        ensureWorktreeArtifactSchema(db);
+        await migrateLegacyEncryptedState(db, dbPath);
+        const legacyBatches = reconcileLegacyPipelineBatches(db);
+        if (legacyBatches.length) {
+          logEvent("warn", "pipeline.legacy_batches_reconciled", {
+            count: legacyBatches.length,
+            outcomes: legacyBatches.map((item) => item.outcome),
+          });
+        }
+        const nowIso = new Date().toISOString();
+        db.prepare(`
+          UPDATE opencode_pipelines
+          SET status = 'cleanup_pending', cleanup_state = 'authorized', updated_at = ?,
+              record_json = json_set(record_json, '$.status', 'cleanup_pending', '$.cleanupState', 'authorized'),
+              revision = revision + 1
+          WHERE status = 'completed' AND json_valid(record_json)
+            AND json_extract(record_json, '$.cleanupPending') = 1
+            AND (owner_lease_expires_at = '' OR owner_lease_expires_at <= ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM bridge_instances
+              WHERE instance_id = opencode_pipelines.owner_instance_id AND lease_expires_at > ?
+            )
+        `).run(nowIso, nowIso, nowIso);
+        const cleanupRows = db.prepare(`
+          SELECT pipeline_id, record_json FROM opencode_pipelines
+          WHERE (status = 'cleanup_pending' AND cleanup_state = 'authorized')
+             OR (status = 'cleanup_failed' AND cleanup_state = 'failed_retryable')
+        `).all();
+        for (const pipelineRow of cleanupRows) {
+          try {
+            const snapshot = JSON.parse(pipelineRow.record_json || "{}");
+            if (snapshot.cwd) cleanupRecoveryCandidates.push({ pipelineId: pipelineRow.pipeline_id, cwd: snapshot.cwd });
+          } catch {
+            // An unreadable pipeline summary cannot authorize destructive cleanup.
+          }
+        }
+        const aggregateRows = db.prepare(`
+          SELECT pipeline.pipeline_id, pipeline.record_json
+          FROM opencode_pipelines AS pipeline
+          WHERE pipeline.status = 'running' AND pipeline.batch_state = 'released'
+            AND pipeline.expected_child_count > 0
+            AND pipeline.expected_child_count = (
+              SELECT COUNT(*) FROM opencode_pipeline_children AS relation
+              WHERE relation.pipeline_id = pipeline.pipeline_id
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM opencode_pipeline_children AS relation
+              JOIN opencode_jobs AS job ON job.job_id = relation.job_id
+              WHERE relation.pipeline_id = pipeline.pipeline_id
+                AND job.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'not_resumable')
+            )
+        `).all();
+        for (const pipelineRow of aggregateRows) {
+          try {
+            const snapshot = JSON.parse(pipelineRow.record_json || "{}");
+            if (snapshot.cwd) pipelineAggregationCandidates.push({ pipelineId: pipelineRow.pipeline_id, cwd: snapshot.cwd });
+          } catch {
+            // An unreadable parent summary is left for operator-visible recovery diagnostics.
+          }
+        }
+      }
       KNOWN_STATE_DB_PATHS.add(dbPath);
+      if (!queuePersistenceEnabled) continue;
       reconcileStaleQueueRecords(db);
       const resumableRows = db.prepare(`
-        SELECT job_id, status, revision, owner_instance_id, lease_expires_at, record_json, idempotency_key, request_encrypted
+        SELECT job_id, status, revision, owner_instance_id, owner_generation, lease_expires_at,
+               record_json, idempotency_key, request_encrypted
         FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked')
           AND request_encrypted IS NOT NULL AND request_encrypted <> ''
       `).all();
       for (const row of resumableRows) {
         if (QUEUE_JOBS.has(row.job_id)) continue;
+        const now = Date.now();
+        const jobLeaseExpiresAt = Date.parse(row.lease_expires_at || "");
+        const owner = row.owner_instance_id
+          ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
+          : null;
+        const ownerLeaseExpiresAt = Date.parse(owner?.lease_expires_at || "");
+        if ((Number.isFinite(jobLeaseExpiresAt) && jobLeaseExpiresAt > now)
+          || (Number.isFinite(ownerLeaseExpiresAt) && ownerLeaseExpiresAt > now)) continue;
+        let request;
         try {
-          const now = Date.now();
-          const jobLeaseExpiresAt = Date.parse(row.lease_expires_at || "");
-          const owner = row.owner_instance_id
-            ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
-            : null;
-          const ownerLeaseExpiresAt = Date.parse(owner?.lease_expires_at || "");
-          if ((Number.isFinite(jobLeaseExpiresAt) && jobLeaseExpiresAt > now)
-            || (Number.isFinite(ownerLeaseExpiresAt) && ownerLeaseExpiresAt > now)) continue;
-          const snapshot = persistedQueueRecordFromRow(row);
-          const request = await decryptQueueRequest(row.request_encrypted, row.job_id);
+          request = await decryptQueueRequest(row.request_encrypted, row.job_id);
           if (request?.internalQueueContractorProof) {
             request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id);
-          }
-          const resumed = {
-            ...snapshot,
-            jobId: row.job_id,
-            request,
-            task: request?.task || "",
-            status: row.status === "held" ? "held" : "pending",
-            ownerInstanceId: BRIDGE_INSTANCE_ID,
-            ownerProcessId: process.pid,
-            ownerGeneration: randomBytes(12).toString("hex"),
-            heartbeatAt: new Date().toISOString(),
-            leaseExpiresAt: new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
-            revision: Number(row.revision || 0),
-          };
-          const takeover = db.prepare(`
-            UPDATE opencode_jobs SET status = ?, owner_instance_id = ?, owner_process_id = ?, owner_generation = ?,
-              heartbeat_at = ?, lease_expires_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
-            WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
-          `).run(
-            resumed.status, resumed.ownerInstanceId, resumed.ownerProcessId, resumed.ownerGeneration,
-            resumed.heartbeatAt, resumed.leaseExpiresAt, resumed.heartbeatAt,
-            JSON.stringify(queueRecordSnapshot({ ...resumed, revision: resumed.revision + 1 })),
-            resumed.jobId, resumed.revision
-          );
-          if (Number(takeover.changes || 0) === 1) {
-            resumed.revision += 1;
-            QUEUE_JOBS.set(resumed.jobId, resumed);
           }
         } catch (error) {
           logEvent("warn", "queue.request_resume_failed", { jobId: row.job_id, dbPath, error: redactSensitiveText(error.message || String(error)) });
@@ -18286,15 +23457,28 @@ async function reconcileQueueStateAtStartup() {
           let snapshot = {};
           try { snapshot = JSON.parse(row.record_json || "{}"); } catch { /* Preserve only bounded failure evidence. */ }
           Object.assign(snapshot, {
+            jobId: row.job_id,
             status: "failed",
             finishedAt: failedAt,
+            heartbeatAt: "",
+            leaseExpiresAt: "",
             errorType: "queue_request_recovery_failed",
             errorReason: "The encrypted queue request could not be recovered. Restore the matching queue-request.key backup before retrying.",
           });
-          db.prepare(`
-            UPDATE opencode_jobs SET status = 'failed', finished_at = ?, updated_at = ?, record_json = ?, revision = revision + 1
-            WHERE job_id = ? AND revision = ? AND status IN ('held', 'pending', 'planned', 'blocked')
-          `).run(failedAt, failedAt, JSON.stringify(sanitizePersistedValue(snapshot)), row.job_id, Number(row.revision || 0));
+          let encryptedDetails = null;
+          try { encryptedDetails = await encryptQueuePrivateDetails(snapshot); } catch { /* The summary remains fail-closed. */ }
+          failPersistedQueueStartupRecovery(db, row, snapshot, encryptedDetails);
+          continue;
+        }
+        try {
+          const resumed = claimPersistedQueueRecordForStartup(db, row.job_id, row.revision, request);
+          if (resumed) QUEUE_JOBS.set(resumed.jobId, resumed);
+        } catch (error) {
+          logEvent("warn", "queue.startup_claim_failed", {
+            jobId: row.job_id,
+            dbPath,
+            error: error.message || String(error),
+          });
         }
       }
     } catch (error) {
@@ -18303,8 +23487,68 @@ async function reconcileQueueStateAtStartup() {
       if (db) closeDb(db);
     }
   }
-  ensureQueueHeartbeatTimer();
-  if (QUEUE_JOBS.size) scheduleQueue();
+  for (const blockedRoot of INTEGRATION_RECOVERY_BLOCKED_ROOTS) {
+    if (!integrationRecoveryCandidates.has(blockedRoot)) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(blockedRoot);
+  }
+  for (const cwd of integrationRecoveryCandidates) {
+    try {
+      const recovery = await recoverIntegrationRepositorySerially(cwd);
+      if (!recovery.ok) {
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+        logEvent("error", "integration.startup_recovery_blocked", {
+          cwdSha256: createHash("sha256").update(cwd).digest("hex"),
+          errorType: recovery.errorType || "integration_recovery_quarantined",
+          operationIds: recovery.operationIds || [],
+        });
+      } else {
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(path.resolve(cwd));
+      }
+    } catch (error) {
+      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+      logEvent("error", "integration.startup_recovery_failed", {
+        cwdSha256: createHash("sha256").update(cwd).digest("hex"),
+        errorType: error?.errorType || "integration_recovery_failed",
+      });
+    }
+  }
+  for (const candidate of pipelineAggregationCandidates) {
+    try {
+      const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
+      if (!record) continue;
+      const claim = await claimPersistedPipeline(record);
+      if (!claim.ok) continue;
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      await refreshPipelineRecord(record);
+    } catch (error) {
+      logEvent("warn", "pipeline.aggregate_recovery_failed", {
+        pipelineId: candidate.pipelineId,
+        errorType: error?.errorType || "pipeline_aggregate_recovery_failed",
+      });
+    }
+  }
+  for (const candidate of cleanupRecoveryCandidates) {
+    try {
+      const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
+      if (!record) continue;
+      const claim = await claimPersistedPipeline(record);
+      if (!claim.ok) continue;
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      await resumeAuthorizedPipelineCleanup(record);
+    } catch (error) {
+      logEvent("warn", "pipeline.cleanup_startup_recovery_failed", {
+        pipelineId: candidate.pipelineId,
+        errorSha256: createHash("sha256").update(error?.message || String(error)).digest("hex"),
+      });
+    }
+  }
+  if (queuePersistenceEnabled) {
+    ensureQueueHeartbeatTimer();
+    if (QUEUE_JOBS.size) scheduleQueue();
+  }
+  ensureDeferredRecoveryTimer();
+  } finally {
+    deferredRecoveryRunning = false;
+  }
 }
 
 async function runProviderLeaseWorker() {
