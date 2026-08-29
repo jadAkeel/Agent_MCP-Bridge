@@ -9,10 +9,12 @@ import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
 const execFileAsync = promisify(execFile);
 const TOOL_TIMEOUT_MS = 60_000;
 const ACTIVE_QUEUE_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
+const serverEntrypoint = resolveServerEntrypoint();
 
 const FAKE_OPENCODE_SOURCE = String.raw`
 #include <stdio.h>
@@ -327,15 +329,39 @@ async function release(client, cwd, lock) {
   assert.match(text, /Temporary lock released\./i);
 }
 
+function directWriteJob(cwd, file, task) {
+  return {
+    agent: "builder",
+    task,
+    cwd,
+    write: true,
+    lockMode: "simple",
+    lockType: "write",
+    lockedPaths: [file],
+    allowedEdits: [file],
+    timeoutMs: 1000,
+    scopeContract: {
+      mode: "write",
+      read: [file],
+      write: [file],
+      allowedEdits: [file],
+      forbidden: [],
+      shared: [],
+      serialOnly: [],
+      validationCommand: "",
+    },
+  };
+}
+
 async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extraEnv = {} }) {
   const client = new Client({ name, version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: "node",
-    args: [path.resolve("server.js")],
+    args: [serverEntrypoint],
     cwd: process.cwd(),
     stderr: "pipe",
     env: {
-      ...process.env,
+      ...serverChildEnvironment(),
       CODEX_OPENCODE_QUEUE_MODE: "sqlite",
       CODEX_OPENCODE_STATE_DIR: stateDir,
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
@@ -598,6 +624,37 @@ async function main() {
     const remaining = await callTool(clientA, "list_agent_locks", { cwd: repo });
     assert.match(remaining, /No active temporary locks\./i);
 
+    const automaticConflictPath = "src/automatic-conflict.txt";
+    const activeAutomaticWriter = callTool(
+      clientA,
+      "run_opencode_agent",
+      directWriteJob(repo, automaticConflictPath, "FAKE_TIMEOUT: hold the automatic writer lock.")
+    );
+    await waitFor(async () => {
+      const locks = await callTool(clientB, "list_agent_locks", { cwd: repo });
+      return locks.includes(automaticConflictPath) ? locks : null;
+    }, "The automatic writer lock did not become visible cross-process.");
+    const automaticConflict = await callTool(
+      clientB,
+      "run_opencode_agent",
+      directWriteJob(repo, automaticConflictPath, "FAKE_INDEPENDENT_SUCCESS")
+    );
+    assert.match(automaticConflict, /(?:Error type|errorType):\s*write_lock_conflict/i, automaticConflict);
+    assert.doesNotMatch(automaticConflict, /manual_lock_misuse|Manual lock already exists/i, automaticConflict);
+    await activeAutomaticWriter;
+
+    const manualConflictPath = "src/manual-conflict.txt";
+    const manualLock = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: [manualConflictPath] });
+    assert.ok(manualLock.credentials, manualLock.text);
+    const manualConflict = await callTool(
+      clientB,
+      "run_opencode_agent",
+      directWriteJob(repo, manualConflictPath, "FAKE_INDEPENDENT_SUCCESS")
+    );
+    assert.match(manualConflict, /(?:Error type|errorType):\s*manual_lock_misuse/i, manualConflict);
+    assert.match(manualConflict, /Manual lock already exists/i, manualConflict);
+    await release(clientA, repo, manualLock);
+
     const dbPath = await projectDbPath(stateDir);
     const instanceRows = withDatabase(dbPath, (db) => db.prepare(
       "SELECT instance_id, process_id, heartbeat_at, lease_expires_at FROM bridge_instances ORDER BY process_id"
@@ -809,13 +866,13 @@ async function main() {
     const providerHoldMs = 700;
     const providerWorkers = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
       process.execPath,
-      [path.resolve("server.js"), "--provider-lease-worker", String(providerHoldMs)],
+      [serverEntrypoint, "--provider-lease-worker", String(providerHoldMs)],
       {
         cwd: process.cwd(),
         windowsHide: true,
         timeout: 30_000,
         env: {
-          ...process.env,
+          ...serverChildEnvironment(),
           CODEX_OPENCODE_STATE_DIR: stateDir,
           CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT: "2",
           CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY: "concurrency-e2e-account",

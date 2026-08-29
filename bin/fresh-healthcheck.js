@@ -16,6 +16,21 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_TIMEOUT_MS = 120_000;
+const HEALTHCHECK_INHERITED_ENV_KEYS = new Set([
+  "COMSPEC",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NO_COLOR",
+  "PATH",
+  "PATHEXT",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "TZ",
+  "WINDIR",
+]);
 const PYTHON_TOML_READER = [
   "import json, sys, tomllib",
   "with open(sys.argv[1], 'rb') as handle:",
@@ -27,6 +42,14 @@ const PYTHON_TOML_READER = [
 function normalizedPath(value) {
   const resolved = path.resolve(value || "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function healthcheckProcessEnvironment(baseEnv = process.env, entryEnv = {}) {
+  const safe = {};
+  for (const [key, value] of Object.entries(baseEnv || {})) {
+    if (HEALTHCHECK_INHERITED_ENV_KEYS.has(key.toUpperCase())) safe[key] = value;
+  }
+  return { ...safe, ...(entryEnv || {}) };
 }
 
 function validateMcpEntry(parsed, serverName) {
@@ -60,7 +83,11 @@ async function loadMcpEntry(configPath, serverName = "opencode", python = proces
   const { stdout } = await execFileAsync(
     python,
     ["-I", "-c", PYTHON_TOML_READER, resolvedConfig, serverName],
-    { windowsHide: true, maxBuffer: 1024 * 1024 }
+    {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      env: healthcheckProcessEnvironment(process.env, { PYTHONIOENCODING: "utf-8" }),
+    }
   );
   return validateMcpEntry(JSON.parse(stdout), serverName);
 }
@@ -156,6 +183,10 @@ async function validateCandidateReleaseEntry(entry) {
   if (releaseManifest?.version !== 1 || !releaseManifest.files || typeof releaseManifest.files !== "object" || Array.isArray(releaseManifest.files)) {
     throw new Error("Candidate release manifest must contain version 1 and a files object.");
   }
+  const profile = releaseManifest.profile || "legacy";
+  if (!["legacy", "v2"].includes(profile)) {
+    throw new Error(`Candidate release manifest has an unsupported profile: ${profile}.`);
+  }
   const releaseFiles = releaseManifest.files;
   const manifestFiles = Object.keys(releaseFiles).sort();
   const actualFiles = (await listCandidateReleaseFiles(releaseRoot))
@@ -187,6 +218,10 @@ async function validateCandidateReleaseEntry(entry) {
     || !Object.keys(releaseFiles).some((relative) => relative.startsWith("opencode/skills/") && relative.endsWith("/SKILL.md"))
   ) {
     throw new Error("Candidate release manifest does not bind the required server, config, agent, skill, and plugin files.");
+  }
+  const hasV2Source = Object.keys(releaseFiles).some((relative) => relative.startsWith("src/v2/") && relative.endsWith(".js"));
+  if (profile === "v2" && (!hasV2Source || Object.hasOwn(releaseFiles, "server.v2.js"))) {
+    throw new Error("V2 candidate release must contain src/v2 modules and must not publish a second server.v2.js entry.");
   }
   const expectedAgentDir = path.join(releaseRoot, "opencode", "agents");
   const expectedSkillDir = path.join(releaseRoot, "opencode", "skills");
@@ -235,7 +270,7 @@ async function validateCandidateReleaseEntry(entry) {
   }
   const pluginModeError = immutableReleasePluginModeError(env);
   if (pluginModeError) throw new Error(pluginModeError);
-  return { releaseRoot, serverPath };
+  return { releaseRoot, serverPath, profile };
 }
 
 function resultText(result) {
@@ -248,13 +283,13 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
     throw new Error("Health-check cwd must be absolute.");
   }
   const entry = await loadMcpEntry(configPath, serverName);
-  await validateCandidateReleaseEntry(entry);
+  const candidate = await validateCandidateReleaseEntry(entry);
   const client = new Client({ name: "codex-opencode-release-healthcheck", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: entry.command,
     args: entry.args,
     cwd: resolvedCwd,
-    env: { ...process.env, ...entry.env },
+    env: healthcheckProcessEnvironment(process.env, entry.env),
     stderr: "pipe",
   });
   try {
@@ -272,13 +307,24 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
     if (!/^OpenCode MCP bridge status: healthy\./im.test(status)) {
       throw new Error(`Fresh MCP process was not healthy:\n${status || "no status text"}`);
     }
-    return { serverName, cwd: resolvedCwd, toolCount: tools.tools.length, healthy: true };
+    return { serverName, cwd: resolvedCwd, profile: candidate.profile, toolCount: tools.tools.length, healthy: true };
   } finally {
     await client.close().catch(() => {});
   }
 }
 
 async function runSelfTest() {
+  const sanitizedEnv = healthcheckProcessEnvironment({
+    PATH: "fixture-path",
+    OPENCODE_AUTH_CONTENT: "must-not-pass",
+    API_TOKEN: "must-not-pass",
+  }, {
+    CODEX_OPENCODE_STATE_DIR: "fixture-state",
+  });
+  assert.deepEqual(sanitizedEnv, {
+    PATH: "fixture-path",
+    CODEX_OPENCODE_STATE_DIR: "fixture-state",
+  });
   const fixture = await mkdtemp(path.join(tmpdir(), "codex-opencode-healthcheck-self-test-"));
   const configPath = path.join(fixture, "config.toml");
   try {
@@ -438,7 +484,7 @@ async function main() {
     throw new Error("Usage: node bin/fresh-healthcheck.js <absolute-config.toml> <absolute-health-cwd> [mcp-server-name]");
   }
   const result = await runFreshHealthcheck({ configPath, cwd, serverName });
-  process.stdout.write(`Fresh MCP health check passed for ${result.serverName}; ${result.toolCount} tools advertised.\n`);
+  process.stdout.write(`Fresh MCP health check passed for ${result.serverName} (${result.profile}); ${result.toolCount} tools advertised.\n`);
 }
 
 if (normalizedPath(process.argv[1] || "") === normalizedPath(SCRIPT_PATH)) {
@@ -448,4 +494,4 @@ if (normalizedPath(process.argv[1] || "") === normalizedPath(SCRIPT_PATH)) {
   });
 }
 
-export { immutableReleasePluginModeError, loadMcpEntry, runFreshHealthcheck, runSelfTestServer, validateCandidateReleaseEntry, validateMcpEntry };
+export { healthcheckProcessEnvironment, immutableReleasePluginModeError, loadMcpEntry, runFreshHealthcheck, runSelfTestServer, validateCandidateReleaseEntry, validateMcpEntry };
