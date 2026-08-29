@@ -15,6 +15,7 @@ assert.equal(Object.isFrozen(SERIAL_ONLY_PATHS), true);
 assert.equal(Object.isFrozen(DEFAULT_FORBIDDEN_EDIT_PATHS), true);
 assert.equal(Object.isFrozen(DEFAULT_SHARED_FILE_PATHS), true);
 assert.equal(DEFAULT_FORBIDDEN_EDIT_PATHS.includes("**/.env.*"), true);
+assert.equal(DEFAULT_FORBIDDEN_EDIT_PATHS.includes(".git/control-state"), true);
 assert.equal(DEFAULT_SHARED_FILE_PATHS.includes("packages/shared/**"), true);
 
 for (const [owner, value, expected] of [
@@ -55,6 +56,7 @@ assert.deepEqual(applied.lockedPaths, ["src/api"]);
 assert.deepEqual(applied.allowedEdits, ["src/api"]);
 assert.equal(applied.forbiddenEdits.includes("src/web"), true);
 assert.equal(applied.forbiddenEdits.includes("private"), true);
+assert.equal(applied.forbiddenEdits.includes(".git/control-state"), true);
 assert.deepEqual(applied.policyOwnedPaths, ["src/api"]);
 assert.equal(applied.policyOwner, "builder");
 assert.equal(applied.scopeContract.mode, "write");

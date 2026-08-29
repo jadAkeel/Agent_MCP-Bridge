@@ -53,7 +53,6 @@ export function resolveBridgePaths({
     BRIDGE_OPENCODE_HOME_DIR,
   };
 }
-
 export function readBridgeConfig(env = process.env) {
   return Object.freeze({
     readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3, env),
@@ -61,6 +60,7 @@ export function readBridgeConfig(env = process.env) {
     builderTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_BUILDER_TIMEOUT_MS", 1000 * 60 * 15, env),
     orchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS", 1000 * 60 * 6, env),
     contractorOrchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS", 1000 * 60 * 20, env),
+    selfTestTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_SELF_TEST_TIMEOUT_MS", 1000 * 60 * 15, env),
     validationCommandTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS", 1000 * 60 * 5, env),
     maxReadOnlyAgentRetries: readNonNegativeIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES", 2, env),
     readOnlyRetryBaseDelayMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS", 1000, env),

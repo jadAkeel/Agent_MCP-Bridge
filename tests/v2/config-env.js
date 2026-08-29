@@ -57,6 +57,7 @@ const expectedConfigKeys = [
   "builderTimeoutMs",
   "orchestratorTimeoutMs",
   "contractorOrchestratorTimeoutMs",
+  "selfTestTimeoutMs",
   "validationCommandTimeoutMs",
   "maxReadOnlyAgentRetries",
   "readOnlyRetryBaseDelayMs",
@@ -109,6 +110,7 @@ const expectedConfigKeys = [
 ];
 const config = readBridgeConfig({
   CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS: "4200",
+  CODEX_OPENCODE_SELF_TEST_TIMEOUT_MS: "7300",
   CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES: "0",
   CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE: " STRICT ",
   CODEX_OPENCODE_LOG_LEVEL: "DEBUG",
@@ -124,6 +126,7 @@ assert.deepEqual(Object.keys(config), expectedConfigKeys);
 assert.equal(Object.isFrozen(config), true);
 assert.equal(Object.isFrozen(config.externalPluginAllowlist), false, "Legacy CONFIG freezing is intentionally shallow.");
 assert.equal(config.readOnlyAgentTimeoutMs, 4200);
+assert.equal(config.selfTestTimeoutMs, 7300);
 assert.equal(config.maxReadOnlyAgentRetries, 0);
 assert.equal(config.defaultWriteLockMode, "strict");
 assert.equal(config.logLevel, "debug");

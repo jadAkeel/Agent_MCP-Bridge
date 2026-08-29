@@ -233,6 +233,23 @@ assert.equal(normalizedWriter.webDenied, true);
 assert.equal(normalizedWriter.skillDenied, true);
 assert.equal(normalizedWriter.promptSha256, createHash("sha256").update("fixture prompt").digest("hex"));
 
+const legacyWriterProfile = structuredClone(parsedWriter);
+legacyWriterProfile.permission = legacyWriterProfile.permission.filter(
+  (rule) => !(rule.permission === "edit" && rule.pattern === ".git/control-state")
+);
+assert.equal(
+  normalizeAgentDebugMetadata(legacyWriterProfile, "planner").protectedEditsDenied,
+  true,
+  "Pre-marker managed writer profiles remain compatible; the bridge enforces the synthetic control marker itself."
+);
+const unsafeControlMarkerProfile = structuredClone(parsedWriter);
+unsafeControlMarkerProfile.permission = unsafeControlMarkerProfile.permission.map((rule) => (
+  rule.permission === "edit" && rule.pattern === ".git/control-state"
+    ? { ...rule, action: "allow" }
+    : rule
+));
+assert.equal(normalizeAgentDebugMetadata(unsafeControlMarkerProfile, "planner").protectedEditsDenied, false);
+
 const expectedRules = effectivePermissionProfileRules(parsedWriter.permission);
 const expectedTools = Object.fromEntries(Object.entries(parsedWriter.tools).sort(([left], [right]) => left.localeCompare(right)));
 assert.equal(normalizedWriter.permissionRulesSha256, createHash("sha256").update(JSON.stringify(expectedRules)).digest("hex"));

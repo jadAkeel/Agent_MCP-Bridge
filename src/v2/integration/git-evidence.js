@@ -104,35 +104,34 @@ export function createGitEvidenceService({
     return value;
   }
 
-  function assertSupportedGitIndexFlags(output) {
+  function parseGitIndexEntries(output) {
     const text = String(output || "");
-    if (!text) return;
-    if (!text.endsWith("\0")) throw gitPathOutputError("tracked index flags");
+    if (!text) return new Map();
+    if (!text.endsWith("\0")) throw gitPathOutputError("tracked index entries");
+    const entries = new Map();
     for (const record of text.slice(0, -1).split("\0")) {
-      if (record.length < 3 || record[1] !== " ") {
-        throw gitPathOutputError("tracked index flags");
-      }
-      const tag = record[0];
-      parseGitPathOutput(`${record.slice(2)}\0`, "tracked index flags");
+      const match = /^([A-Za-z?]) ([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])\t(.+)$/i.exec(record);
+      if (!match) throw gitPathOutputError("tracked index entries");
+      const [, tag, mode, oid, stage, file] = match;
+      parseGitPathOutput(`${file}\0`, "tracked index entries");
       if (tag !== "H") {
         throw gitPathOutputError("unsupported tracked index flags");
       }
+      if (mode === "160000") throw gitPathOutputError("unsupported submodule entry");
+      if (!["100644", "100755", "120000"].includes(mode)) throw gitPathOutputError("unsupported tracked index mode");
+      if (/^0+$/.test(oid)) throw gitPathOutputError("unsupported intent-to-add index entry");
+      if (stage !== "0") throw gitPathOutputError("unsupported unmerged index entry");
+      if (entries.has(file)) throw gitPathOutputError("duplicate tracked index entries");
+      entries.set(file, { tag, mode, oid: oid.toLowerCase(), stage });
     }
+    return entries;
   }
 
-  function assertSupportedGitIndexModes(output) {
-    const text = String(output || "");
-    if (!text) return;
-    if (!text.endsWith("\0")) throw gitPathOutputError("tracked index modes");
-    for (const record of text.slice(0, -1).split("\0")) {
-      const match = /^([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])\t(.+)$/i.exec(record);
-      if (!match) throw gitPathOutputError("tracked index modes");
-      parseGitPathOutput(`${match[4]}\0`, "tracked index modes");
-      if (match[1] === "160000") throw gitPathOutputError("unsupported submodule entry");
-      if (!["100644", "100755", "120000"].includes(match[1])) throw gitPathOutputError("unsupported tracked index mode");
-      if (/^0+$/.test(match[2])) throw gitPathOutputError("unsupported intent-to-add index entry");
-      if (match[3] !== "0") throw gitPathOutputError("unsupported unmerged index entry");
-    }
+  function indexEntriesIdentity(entries) {
+    return [...entries.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([file, entry]) => `${file}\0${entry.tag}\0${entry.mode}\0${entry.oid}\0${entry.stage}`)
+      .join("\0");
   }
 
   function isCanonicalPathInside(root, candidate) {
@@ -199,9 +198,8 @@ export function createGitEvidenceService({
     }
   }
 
-  async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
-    const root = await validateGitRoot(cwd);
-    const [filterConfig, promisorConfig] = await Promise.all([
+  async function inspectGitRepositoryPolicy(root, { includeSymlinkConfig = false } = {}) {
+    const [filterConfig, promisorConfig, symlinkConfig] = await Promise.all([
       runGitReadOnlyCommand(
         ["config", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process)$"],
         root.lexicalRoot,
@@ -212,6 +210,9 @@ export function createGitEvidenceService({
         root.lexicalRoot,
         1000 * 15
       ),
+      includeSymlinkConfig
+        ? runGitReadOnlyCommand(["config", "--bool", "core.symlinks"], root.lexicalRoot, 1000 * 15)
+        : null,
     ]);
     if ((filterConfig.exitCode === 0 && String(filterConfig.stdout || "").trim())
       || ![0, 1].includes(filterConfig.exitCode)) {
@@ -221,30 +222,42 @@ export function createGitEvidenceService({
       || ![0, 1].includes(promisorConfig.exitCode)) {
       throw gitPathOutputError("partial clone or promisor configuration");
     }
-    const [indexFlags, indexModes] = await Promise.all([
-      runGitReadOnlyCommand(["ls-files", "-v", "-z"], root.lexicalRoot, 1000 * 30),
-      runGitReadOnlyCommand(["ls-files", "--stage", "-z"], root.lexicalRoot, 1000 * 30),
-    ]);
-    if (indexFlags.exitCode !== 0 || indexModes.exitCode !== 0) {
+    if (symlinkConfig && ![0, 1].includes(symlinkConfig.exitCode)) {
+      throw gitPathOutputError("core.symlinks configuration");
+    }
+    const symlinkValue = String(symlinkConfig?.stdout || "").trim().toLowerCase();
+    if (symlinkConfig?.exitCode === 0 && !["true", "false"].includes(symlinkValue)) {
+      throw gitPathOutputError("core.symlinks configuration");
+    }
+    return { coreSymlinks: symlinkConfig?.exitCode === 0 ? symlinkValue === "true" : true };
+  }
+
+  async function readGitIndexEntries(root) {
+    const result = await runGitReadOnlyCommand(
+      ["ls-files", "-v", "--stage", "-z"],
+      root.lexicalRoot,
+      1000 * 30
+    );
+    if (result.exitCode !== 0) {
       throw gitPathOutputError("tracked index inspection");
     }
-    assertSupportedGitIndexFlags(indexFlags.stdout);
-    assertSupportedGitIndexModes(indexModes.stdout);
+    return parseGitIndexEntries(result.stdout);
+  }
+
+  async function readGitPathInventory(root, { includeDiffs, includeIgnored }) {
     const commands = [
-      runGitReadOnlyCommand(["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all"], root.lexicalRoot, 1000 * 15),
-      runGitReadOnlyCommand(["diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"], root.lexicalRoot, 1000 * 15),
-      runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard", "-z"], root.lexicalRoot, 1000 * 15),
+      ...(includeDiffs ? [
+        ["working tree", ["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all"], 1000 * 15],
+        ["staged files", ["diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"], 1000 * 15],
+      ] : []),
+      ["untracked files", ["ls-files", "--others", "--exclude-standard", "-z"], 1000 * 15],
+      ...(includeIgnored ? [["ignored files", ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], 1000 * 30]] : []),
     ];
-    if (includeIgnored) {
-      commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], root.lexicalRoot, 1000 * 30));
-    }
-    const [workingTreeDiff, stagedDiff, untracked, ignored] = await Promise.all(commands);
-    const failedChecks = [
-      ["working tree", workingTreeDiff],
-      ["staged files", stagedDiff],
-      ["untracked files", untracked],
-      ...(ignored ? [["ignored files", ignored]] : []),
-    ].filter(([, result]) => result.exitCode !== 0);
+    const results = await Promise.all(commands.map(async ([label, args, timeoutMs]) => [
+      label,
+      await runGitReadOnlyCommand(args, root.lexicalRoot, timeoutMs),
+    ]));
+    const failedChecks = results.filter(([, result]) => result.exitCode !== 0);
     if (failedChecks.length) {
       const details = failedChecks
         .map(([label, result]) => `${label}: ${summarizeStderr(result.stderr || result.stdout) || `exit ${result.exitCode}`}`)
@@ -253,28 +266,73 @@ export function createGitEvidenceService({
       error.errorType = "git_evidence_failed";
       throw error;
     }
+    const paths = new Map();
+    for (const [label, result] of results) {
+      paths.set(label, parseGitPathOutput(result.stdout, label));
+    }
+    return paths;
+  }
+
+  async function validateGitPaths(root, files) {
+    for (const file of files) await validateGitPathType(root, file);
+  }
+
+  async function gitWorkspaceInventory(cwd, { includeIgnored = true } = {}) {
+    const root = await validateGitRoot(cwd);
+    const policy = await inspectGitRepositoryPolicy(root, { includeSymlinkConfig: true });
+    const indexEntries = await readGitIndexEntries(root);
+    const paths = await readGitPathInventory(root, { includeDiffs: false, includeIgnored });
+    const indexIdentity = indexEntriesIdentity(indexEntries);
+    const untrackedFiles = paths.get("untracked files") || [];
+    const ignoredCandidates = paths.get("ignored files") || [];
+    const reportedFiles = [...new Set([...untrackedFiles, ...ignoredCandidates])].sort();
+    if (reportedFiles.length > maxEvidencePaths) throw gitPathOutputError("path count limit");
+    const trackedFiles = [...indexEntries.keys()];
+    const ordinaryFiles = [...new Set([...trackedFiles, ...untrackedFiles])].sort();
+    const ordinarySet = new Set(ordinaryFiles);
+    const ignoredFiles = [...new Set(ignoredCandidates.filter((file) => !ordinarySet.has(file)))].sort();
+    await validateGitPaths(root, [...new Set([...ordinaryFiles, ...ignoredFiles])].sort());
+    return {
+      root: root.canonicalRoot,
+      coreSymlinks: policy.coreSymlinks,
+      indexEntries,
+      indexIdentity,
+      trackedFiles,
+      ordinaryFiles,
+      ignoredFiles,
+    };
+  }
+
+  async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
+    const root = await validateGitRoot(cwd);
+    await inspectGitRepositoryPolicy(root);
+    const beforeIndex = await readGitIndexEntries(root);
+    const paths = await readGitPathInventory(root, { includeDiffs: true, includeIgnored });
+    const afterIndex = await readGitIndexEntries(root);
+    if (indexEntriesIdentity(beforeIndex) !== indexEntriesIdentity(afterIndex)) {
+      throw gitPathOutputError("tracked index changed during inspection");
+    }
 
     const changedFiles = [
       ...new Set(
         [
-          ...parseGitPathOutput(workingTreeDiff.stdout, "working tree"),
-          ...parseGitPathOutput(stagedDiff.stdout, "staged files"),
-          ...parseGitPathOutput(untracked.stdout, "untracked files"),
-          ...parseGitPathOutput(ignored?.stdout || "", "ignored files"),
+          ...(paths.get("working tree") || []),
+          ...(paths.get("staged files") || []),
+          ...(paths.get("untracked files") || []),
+          ...(paths.get("ignored files") || []),
         ]
       ),
     ].sort();
     if (changedFiles.length > maxEvidencePaths) {
       throw gitPathOutputError("path count limit");
     }
-    for (const file of changedFiles) {
-      await validateGitPathType(root, file);
-    }
+    await validateGitPaths(root, changedFiles);
     return changedFiles;
   }
 
   return {
     runGitReadOnlyCommand,
     gitChangedFiles,
+    gitWorkspaceInventory,
   };
 }

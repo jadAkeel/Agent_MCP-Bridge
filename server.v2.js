@@ -3,7 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
@@ -16,7 +16,10 @@ import { fileURLToPath } from "node:url";
 import { createAgentAttestation } from "./src/v2/agents/attestation.js";
 import { createAgentMetadataPolicy } from "./src/v2/agents/metadata-policy.js";
 import { readBridgeConfig, resolveBridgePaths } from "./src/v2/config/bridge-config.js";
+import { createGitControlStateService } from "./src/v2/integration/git-control-state.js";
 import { createGitEvidenceService } from "./src/v2/integration/git-evidence.js";
+import { createGitWorkspaceEvidenceService } from "./src/v2/integration/git-workspace-evidence.js";
+import { createWorkspaceSnapshotService } from "./src/v2/integration/workspace-snapshot.js";
 import { createHardLockService } from "./src/v2/persistence/hard-locks.js";
 import { createProviderLeaseService } from "./src/v2/persistence/provider-leases.js";
 import { createQueueRecordCodec } from "./src/v2/persistence/queue-record-codec.js";
@@ -211,6 +214,10 @@ let stateDirectoryOverride = "";
 let queueModeOverride = "";
 let queueWriteConflictPolicyOverride = "";
 
+function isSelfTestProcess() {
+  return process.argv.includes("--self-test") || process.argv.includes("--self-test-worker");
+}
+
 function effectiveQueueMode() {
   return queueModeOverride || CONFIG.queueMode;
 }
@@ -319,6 +326,7 @@ const { runCommand, runSpawnCommand } = createProcessRunner({
 const {
   runGitReadOnlyCommand,
   gitChangedFiles,
+  gitWorkspaceInventory,
 } = createGitEvidenceService({
   runCommand,
   buildValidationEnv,
@@ -327,6 +335,32 @@ const {
   hasAmbiguousPathPattern,
   isAbsolutePathLike,
   maxEvidencePaths: CONFIG.maxSnapshotFiles,
+});
+
+const { gitControlStateSnapshot } = createGitControlStateService({
+  runGitReadOnlyCommand,
+  maxControlFileBytes: CONFIG.maxSnapshotTotalBytes,
+  maxTotalControlBytes: CONFIG.maxSnapshotTotalBytes,
+});
+
+const {
+  shouldAvoidSnapshotContent,
+  snapshotPaths,
+} = createWorkspaceSnapshotService({
+  config: CONFIG,
+  forbiddenEditPaths: DEFAULT_FORBIDDEN_EDIT_PATHS,
+  isWithinAnyPath,
+});
+
+const {
+  gitChangedFileSnapshot,
+  changedFilesBetween,
+  snapshotIdentitySha256,
+  snapshotSemanticIdentitySha256,
+} = createGitWorkspaceEvidenceService({
+  gitWorkspaceInventory,
+  gitControlStateSnapshot,
+  snapshotPaths,
 });
 
 const {
@@ -1625,20 +1659,6 @@ async function verifyProtectedGitRoot(cwd) {
   return { ok: true, root };
 }
 
-async function fileFingerprint(cwd, file, { metadataOnly = false } = {}) {
-  const base = cwd || process.cwd();
-  try {
-    if (metadataOnly) {
-      const details = await lstat(path.resolve(base, file));
-      return `metadata:${details.size}:${details.mtimeMs}:${details.ctimeMs}:${details.mode}:${details.isSymbolicLink() ? "link" : "file"}`;
-    }
-    const content = await readFile(path.resolve(base, file));
-    return createHash("sha256").update(content).digest("hex");
-  } catch {
-    return "missing";
-  }
-}
-
 async function exactIntegrationFileSnapshot(cwd, files) {
   const snapshot = new Map();
   let totalBytes = 0;
@@ -1762,59 +1782,6 @@ function changedPathSetEvidence(expectedFiles, actualFiles) {
     missingFiles: expected.filter((file) => !actualKeys.has(normalizeFilesystemCase(file))),
     unexpectedFiles: actual.filter((file) => !expectedKeys.has(normalizeFilesystemCase(file))),
   };
-}
-
-async function shouldAvoidSnapshotContent(cwd, file) {
-  if (isWithinAnyPath(file, DEFAULT_FORBIDDEN_EDIT_PATHS, cwd)) {
-    return true;
-  }
-  try {
-    const details = await lstat(path.resolve(cwd || process.cwd(), file));
-    return details.size > CONFIG.maxSnapshotFileBytes || details.isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
-
-async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
-  const ordinaryFiles = await gitChangedFiles(cwd, { includeIgnored: false });
-  const allFiles = includeIgnored ? await gitChangedFiles(cwd, { includeIgnored: true }) : ordinaryFiles;
-  const ordinarySet = new Set(ordinaryFiles);
-  const ignoredFiles = allFiles.filter((file) => !ordinarySet.has(file));
-  if (allFiles.length > CONFIG.maxSnapshotFiles) {
-    const error = new Error(`Changed-file snapshot limit exceeded: ${allFiles.length} files exceeds CODEX_OPENCODE_MAX_SNAPSHOT_FILES=${CONFIG.maxSnapshotFiles}.`);
-    error.errorType = "snapshot_safety_limit_exceeded";
-    throw error;
-  }
-  if (ignoredFiles.length > CONFIG.maxIgnoredSnapshotFiles) {
-    const error = new Error(`Ignored-file snapshot limit exceeded: ${ignoredFiles.length} files exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${CONFIG.maxIgnoredSnapshotFiles}.`);
-    error.errorType = "snapshot_safety_limit_exceeded";
-    throw error;
-  }
-  const snapshot = new Map();
-  for (const file of ordinaryFiles) {
-    snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
-  }
-  for (const file of ignoredFiles) {
-    snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: true }));
-  }
-  return snapshot;
-}
-
-function changedFilesBetween(before, after) {
-  const files = [...new Set([...before.keys(), ...after.keys()])].sort();
-  return files.filter((file) => before.get(file) !== after.get(file));
-}
-
-function snapshotIdentitySha256(snapshot) {
-  const hash = createHash("sha256");
-  for (const [file, fingerprint] of [...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    hash.update(file);
-    hash.update("\0");
-    hash.update(String(fingerprint));
-    hash.update("\0");
-  }
-  return hash.digest("hex");
 }
 
 async function readFileIfExists(filePath) {
@@ -3033,6 +3000,8 @@ async function captureIntegrationTargetState(cwd) {
     };
   }
   const workingStateSha256 = snapshotIdentitySha256(workingState);
+  const workingSemanticStateSha256 = snapshotSemanticIdentitySha256(workingState);
+  const targetStateParts = [targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256];
   return {
     ok: true,
     targetHead,
@@ -3041,7 +3010,8 @@ async function captureIntegrationTargetState(cwd) {
     workingPatchSha256: workingPatch.patchSha256,
     indexSha256: workingPatch.indexSha256,
     workingStateSha256,
-    targetStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, workingStateSha256].join("\0")).digest("hex"),
+    targetStateSha256: createHash("sha256").update([...targetStateParts, workingStateSha256].join("\0")).digest("hex"),
+    cleanupStateSha256: createHash("sha256").update([...targetStateParts, workingSemanticStateSha256].join("\0")).digest("hex"),
   };
 }
 
@@ -3396,6 +3366,18 @@ async function integratePatchWithoutSerialLock({
     }
 
     if (dryRun) {
+      const reviewedTargetState = await captureIntegrationTargetState(targetCwd);
+      if (!reviewedTargetState.ok
+        || reviewedTargetState.cleanupStateSha256 !== targetState.cleanupStateSha256) {
+        return {
+          ok: false,
+          status: "preview_rejected",
+          errorType: "integration_preview_stale",
+          error: "Integration target changed while the patch preview was being verified. No review receipt was issued.",
+          changedFiles: patch.changedFiles,
+          previewReceipt: null,
+        };
+      }
       const safePatchPreview = redactSensitiveText(patch.patch);
       if (safePatchPreview !== patch.patch) {
         return {
@@ -3425,16 +3407,16 @@ async function integratePatchWithoutSerialLock({
           sourceBaseCommit: patch.sourceBaseCommit,
           sourceHead: patch.sourceHead,
           sourceStateSha256: patch.sourceStateSha256,
-          targetHead: targetState.targetHead,
-          targetTree: targetState.targetTree,
-          targetStateSha256: targetState.targetStateSha256,
+          targetHead: reviewedTargetState.targetHead,
+          targetTree: reviewedTargetState.targetTree,
+          targetStateSha256: reviewedTargetState.targetStateSha256,
           contractSha256,
           patchPreview: "",
           patchPreviewTruncated: true,
           previewReceipt: null,
         };
       }
-      const generatedReceipt = makeIntegrationPreviewReceipt({ patch, targetState, contractSha256 });
+      const generatedReceipt = makeIntegrationPreviewReceipt({ patch, targetState: reviewedTargetState, contractSha256 });
       return {
         ok: true,
         status: "dry_run_passed",
@@ -3447,9 +3429,9 @@ async function integratePatchWithoutSerialLock({
         sourceBaseCommit: patch.sourceBaseCommit,
         sourceHead: patch.sourceHead,
         sourceStateSha256: patch.sourceStateSha256,
-        targetHead: targetState.targetHead,
-        targetTree: targetState.targetTree,
-        targetStateSha256: targetState.targetStateSha256,
+        targetHead: reviewedTargetState.targetHead,
+        targetTree: reviewedTargetState.targetTree,
+        targetStateSha256: reviewedTargetState.targetStateSha256,
         contractSha256,
         patchPreview: safePatchPreview,
         patchPreviewTruncated: false,
@@ -3551,6 +3533,10 @@ async function integratePatchWithoutSerialLock({
         unresolvedFiles = normalizeLockPathList(
           unresolvedFiles.concat(committedChanges.exitCode === 0 ? committedChanges.stdout.split("\0") : patch.changedFiles),
         );
+        // A committed HEAD transition is already reported separately.  The
+        // synthetic control-state evidence marker describes that same
+        // transition and is not an additional worktree path to attribute.
+        unresolvedFiles = unresolvedFiles.filter((file) => file !== ".git/control-state");
       }
       return {
         ok: false,
@@ -3860,7 +3846,7 @@ async function integratePatchWithoutSerialLock({
       sourceBaseCommit: patch.sourceBaseCommit,
       sourceStateSha256: patch.sourceStateSha256,
       targetPreviewStateSha256: targetState.targetStateSha256,
-      integratedTargetStateSha256: integratedTargetState.targetStateSha256,
+      integratedTargetStateSha256: integratedTargetState.cleanupStateSha256,
       contractSha256,
       previewId: previewReceipt.previewId,
       preExistingTargetChanges: targetChanges,
@@ -3909,7 +3895,7 @@ async function integrationCleanupTargetStateError(cwd, expectedTargetStateSha256
   }
   const current = await captureIntegrationTargetState(cwd);
   if (!current.ok) return current.error || "The target state could not be reverified immediately before source cleanup.";
-  return current.targetStateSha256 === expectedTargetStateSha256
+  return current.cleanupStateSha256 === expectedTargetStateSha256
     ? ""
     : "The target changed after reviewed integration; the recovery source was retained.";
 }
@@ -4053,7 +4039,7 @@ function heartbeatKnownQueueState() {
 }
 
 function ensureQueueHeartbeatTimer() {
-  if (process.argv.includes("--self-test")) return;
+  if (isSelfTestProcess()) return;
   if (queueHeartbeatTimer) return;
   queueHeartbeatTimer = setInterval(heartbeatKnownQueueState, CONFIG.queueHeartbeatMs);
   queueHeartbeatTimer.unref?.();
@@ -6097,7 +6083,7 @@ function contractorAuthorizationToken(job) {
 }
 
 function effectiveContractorAuthorizationSha256() {
-  return process.argv.includes("--self-test") && selfTestContractorAuthorizationSha256
+  return isSelfTestProcess() && selfTestContractorAuthorizationSha256
     ? selfTestContractorAuthorizationSha256
     : CONFIG.contractorAuthorizationSha256;
 }
@@ -9921,8 +9907,136 @@ server.tool(
   }
 );
 
+async function terminateSelfTestChild(child) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32") {
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        shell: false,
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      const timer = setTimeout(() => {
+        killer.kill();
+        finish();
+      }, 1000 * 10);
+      killer.once("error", finish);
+      killer.once("close", finish);
+    });
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
+async function runSelfTestsSupervised() {
+  const startedAt = Date.now();
+  const scratchRoot = await mkdtemp(path.join(tmpdir(), "ocst-"));
+  const workerPath = fileURLToPath(import.meta.url);
+  let child = null;
+  let timeoutTimer = null;
+  let heartbeatTimer = null;
+  const signalHandlers = new Map();
+  try {
+    console.log(`[${new Date().toISOString()}] self-test supervisor: start (timeout ${CONFIG.selfTestTimeoutMs} ms)`);
+    child = spawn(process.execPath, [workerPath, "--self-test-worker"], {
+      cwd: process.cwd(),
+      detached: process.platform !== "win32",
+      env: {
+        ...buildValidationEnv(),
+        TEMP: scratchRoot,
+        TMP: scratchRoot,
+        TMPDIR: scratchRoot,
+      },
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    const exitPromise = new Promise((resolve) => {
+      child.once("error", (error) => resolve({ kind: "spawn_error", error }));
+      child.once("close", (code, signal) => resolve({ kind: "exit", code, signal }));
+    });
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutTimer = setTimeout(() => resolve({ kind: "timeout" }), CONFIG.selfTestTimeoutMs);
+    });
+    const cancellationPromise = new Promise((resolve) => {
+      for (const signal of ["SIGINT", "SIGTERM"]) {
+        const handler = () => resolve({ kind: "cancelled", signal });
+        signalHandlers.set(signal, handler);
+        process.once(signal, handler);
+      }
+    });
+    heartbeatTimer = setInterval(() => {
+      console.log(`[${new Date().toISOString()}] self-test supervisor: worker active (${Date.now() - startedAt} ms elapsed)`);
+    }, 1000 * 60);
+    heartbeatTimer.unref?.();
+
+    const outcome = await Promise.race([exitPromise, timeoutPromise, cancellationPromise]);
+    if (outcome.kind === "exit" && outcome.code === 0) {
+      console.log(`[${new Date().toISOString()}] self-test supervisor: end (${Date.now() - startedAt} ms elapsed)`);
+      return;
+    }
+    if (outcome.kind === "spawn_error") {
+      throw new Error(`Self-test worker could not start: ${outcome.error.message || String(outcome.error)}`);
+    }
+    if (outcome.kind === "exit") {
+      throw new Error(`Self-test worker failed with exit code ${outcome.code ?? "none"} and signal ${outcome.signal || "none"}.`);
+    }
+
+    const reason = outcome.kind === "timeout"
+      ? `exceeded the ${CONFIG.selfTestTimeoutMs} ms deadline`
+      : `was cancelled by ${outcome.signal}`;
+    console.error(`[${new Date().toISOString()}] self-test supervisor: ${reason}; terminating the worker process tree`);
+    await terminateSelfTestChild(child);
+    const stopped = await Promise.race([
+      exitPromise.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 1000 * 15)),
+    ]);
+    if (!stopped) {
+      throw new Error(`Self-test worker ${reason}, and its process tree did not terminate within 15 seconds.`);
+    }
+    throw new Error(`Self-test worker ${reason}.`);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
+    if (child?.pid && child.exitCode === null && child.signalCode === null) {
+      await terminateSelfTestChild(child);
+    }
+    await rm(scratchRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  }
+}
+
 async function runSelfTests() {
-  const selfTestProgress = (stage) => console.log(`[${new Date().toISOString()}] self-test: ${stage}`);
+  const startedAt = Date.now();
+  let currentPhase = "initialization";
+  let phaseStartedAt = startedAt;
+  const selfTestProgress = (stage) => {
+    currentPhase = stage;
+    phaseStartedAt = Date.now();
+    console.log(`[${new Date().toISOString()}] self-test: ${stage}`);
+  };
+  const selfTestHeartbeat = setInterval(() => {
+    console.log(`[${new Date().toISOString()}] self-test: ${currentPhase} still running (${Date.now() - phaseStartedAt} ms phase, ${Date.now() - startedAt} ms total)`);
+  }, 1000 * 30);
+  selfTestHeartbeat.unref?.();
   selfTestProgress("start");
   selfTestProgress("core validation/security");
   const previewTimingFixture = makeIntegrationPreviewReceipt({
@@ -11429,6 +11543,13 @@ async function runSelfTests() {
     const init = await runCommand("git", ["init"], tempDir, 1000 * 15);
     assert.equal(init.exitCode, 0);
     assert.equal((await runCommand("git", ["config", "core.autocrlf", "false"], tempDir, 1000 * 15)).exitCode, 0);
+    const evidenceBaseCommit = await runCommand(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "evidence baseline"],
+      tempDir,
+      1000 * 15
+    );
+    assert.equal(evidenceBaseCommit.exitCode, 0, evidenceBaseCommit.stderr);
     const pluginFixtureHome = path.join(tempDir, "plugin-home");
     const pluginFixtureSpec = "bridge-plugin-fixture@1.2.3";
     const pluginFixtureRoot = path.join(pluginFixtureHome, ".cache", "opencode", "packages", pluginFixtureSpec);
@@ -12645,6 +12766,7 @@ async function runSelfTests() {
     const mutationPipelineRecord = {
       ...structuredClone(persistedPipelinePlan.record),
       pipelineId: "pipeline-final-validation-mutation",
+      requestEncrypted: "",
       revision: 0,
       ownerInstanceId: BRIDGE_INSTANCE_ID,
       status: "awaiting_finalization",
@@ -12689,6 +12811,7 @@ async function runSelfTests() {
     const cleanupFaultRecord = (pipelineId, worktree, identity) => ({
       ...structuredClone(persistedPipelinePlan.record),
       pipelineId,
+      requestEncrypted: "",
       revision: 0,
       ownerInstanceId: BRIDGE_INSTANCE_ID,
       status: "awaiting_finalization",
@@ -13303,7 +13426,19 @@ async function runSelfTests() {
       dryRun: true,
     });
     assert.equal(createRollbackPreview.ok, true, JSON.stringify(createRollbackPreview, null, 2));
+    const createRollbackStateBeforeIndexProbe = await captureIntegrationTargetState(tempDir);
+    assert.equal(
+      createRollbackStateBeforeIndexProbe.targetStateSha256,
+      createRollbackPreview.previewReceipt.targetStateSha256,
+      JSON.stringify(createRollbackStateBeforeIndexProbe, null, 2)
+    );
     const createRollbackIndexBefore = await captureGitIndexIdentity(tempDir);
+    const createRollbackStateAfterIndexProbe = await captureIntegrationTargetState(tempDir);
+    assert.equal(
+      createRollbackStateAfterIndexProbe.targetStateSha256,
+      createRollbackPreview.previewReceipt.targetStateSha256,
+      JSON.stringify({ before: createRollbackStateBeforeIndexProbe, after: createRollbackStateAfterIndexProbe }, null, 2)
+    );
     const createRollbackResult = await integratePatchSerially({
       cwd: tempDir,
       worktreePath: createRollbackWorktree.path,
@@ -13313,7 +13448,7 @@ async function runSelfTests() {
       previewReceipt: createRollbackPreview.previewReceipt,
     });
     assert.equal(createRollbackResult.ok, false);
-    assert.equal(createRollbackResult.errorType, "validation_command_failed");
+    assert.equal(createRollbackResult.errorType, "validation_command_failed", JSON.stringify(createRollbackResult, null, 2));
     assert.equal(createRollbackResult.rollback.rollback, "success");
     await assert.rejects(lstat(path.join(tempDir, "src", "created-rollback.txt")), (error) => error?.code === "ENOENT");
     assert.equal(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
@@ -13807,6 +13942,7 @@ async function runSelfTests() {
     await rm(tempStateDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     await rm(outsideLinkTarget, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     await rm(nonGitFixture, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+    clearInterval(selfTestHeartbeat);
   }
 
   selfTestProgress("end");
@@ -14115,9 +14251,12 @@ if (process.argv.includes("--provider-lease-worker")) {
 } else if (process.argv.includes("--verify-plugin-policy")) {
   await verifyReleaseIntegrity();
   process.stdout.write(`${JSON.stringify(await verifyExternalPluginPolicy(process.argv[process.argv.indexOf("--verify-plugin-policy") + 1] || process.cwd()))}\n`);
-} else if (process.argv.includes("--self-test")) {
+} else if (process.argv.includes("--self-test-worker")) {
   await verifyReleaseIntegrity();
   await runSelfTests();
+} else if (process.argv.includes("--self-test")) {
+  await verifyReleaseIntegrity();
+  await runSelfTestsSupervised();
 } else {
   await verifyReleaseIntegrity();
   const startupPluginPolicy = await verifyExternalPluginPolicy(process.cwd());

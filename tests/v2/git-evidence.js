@@ -50,7 +50,7 @@ const idle = createGitEvidenceService({
   resolveGitTopLevel: () => { throw new Error("must remain lazy"); },
   sleep: () => { throw new Error("must remain lazy"); },
 });
-assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]);
+assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles", "gitWorkspaceInventory"]);
 
 {
   const calls = [];
@@ -113,11 +113,11 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
   const results = new Map([
     ["config\u0000--name-only\u0000--get-regexp\u0000^filter\\..*\\.(clean|process)$", { exitCode: 1, stdout: "", stderr: "" }],
     ["config\u0000--name-only\u0000--get-regexp\u0000^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$", { exitCode: 1, stdout: "", stderr: "" }],
+    ["config\u0000--bool\u0000core.symlinks", { exitCode: 0, stdout: "false\n", stderr: "" }],
     ["diff\u0000--name-only\u0000-z\u0000--no-renames\u0000--no-ext-diff\u0000--no-textconv\u0000--ignore-submodules=all", { exitCode: 0, stdout: "z.js\0a.js\0", stderr: "" }],
     ["diff\u0000--cached\u0000--name-only\u0000-z\u0000--no-renames\u0000--no-ext-diff\u0000--no-textconv\u0000--ignore-submodules=none", { exitCode: 0, stdout: "b.js\0a.js\0", stderr: "" }],
     ["ls-files\u0000--others\u0000--exclude-standard\u0000-z", { exitCode: 0, stdout: "untracked.txt\0", stderr: "" }],
-    ["ls-files\u0000-v\u0000-z", { exitCode: 0, stdout: "H a.js\0H b.js\0", stderr: "" }],
-    ["ls-files\u0000--stage\u0000-z", { exitCode: 0, stdout: `100644 ${"a".repeat(40)} 0\ta.js\0`, stderr: "" }],
+    ["ls-files\u0000-v\u0000--stage\u0000-z", { exitCode: 0, stdout: `H 100644 ${"a".repeat(40)} 0\ta.js\u0000H 100644 ${"b".repeat(40)} 0\tb.js\u0000H 100644 ${"c".repeat(40)} 0\ttracked-only.js\u0000`, stderr: "" }],
     ["ls-files\u0000--others\u0000--ignored\u0000--exclude-standard\u0000-z", { exitCode: 0, stdout: "ignored.log\0", stderr: "" }],
   ]);
   const service = createGitEvidenceService({
@@ -141,6 +141,83 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
   assert.equal(calls.find((call) => call.args.includes("--ignored")).timeoutMs, 30_000);
   assert.equal(calls.filter((call) => call.timeoutMs === 15_000).length, 5);
   assert.equal(calls.every((call) => call.command === "git" && call.cwd === path.resolve("C:/repo") && call.env.GIT_OPTIONAL_LOCKS === "0"), true);
+  calls.length = 0;
+  const inventory = await service.gitWorkspaceInventory("C:/repo");
+  assert.deepEqual(inventory.ordinaryFiles, ["a.js", "b.js", "tracked-only.js", "untracked.txt"]);
+  assert.deepEqual(inventory.ignoredFiles, ["ignored.log"]);
+  assert.equal(inventory.coreSymlinks, false);
+  assert.equal(inventory.indexEntries.get("tracked-only.js").oid, "c".repeat(40));
+  assert.equal(calls.length, 6);
+  assert.equal(calls.some((call) => call.args[0] === "diff"), false, "Physical inventory must not invoke Git diff or filters.");
+}
+
+{
+  let indexReads = 0;
+  const service = createGitEvidenceService({
+    runCommand: async (_command, args) => {
+      if (args[0] === "config" && args.includes("core.symlinks")) return { exitCode: 0, stdout: "false\n", stderr: "" };
+      if (args[0] === "config") return { exitCode: 1, stdout: "", stderr: "" };
+      if (args[0] === "ls-files" && args.includes("--stage")) {
+        indexReads += 1;
+        return {
+          exitCode: 0,
+          stdout: `H 100644 ${(indexReads === 1 ? "a" : "b").repeat(40)} 0\ttracked.txt\0`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    buildValidationEnv: (extra) => extra,
+    summarizeStderr: (value) => value,
+    normalizeLockPath,
+    hasAmbiguousPathPattern,
+    isAbsolutePathLike,
+    ...trustedRootOptions,
+    sleep: async () => {},
+  });
+  await assert.rejects(
+    service.gitChangedFiles("C:/repo"),
+    (error) => error.errorType === "git_evidence_failed"
+      && /tracked index changed during inspection/.test(error.message),
+    "A same-path OID mutation between the two index manifests must fail closed."
+  );
+}
+
+{
+  const tracked = ["one.txt", "three.txt", "two.txt"];
+  let untrackedOutput = "";
+  const service = createGitEvidenceService({
+    runCommand: async (_command, args) => {
+      if (args[0] === "config" && args.includes("core.symlinks")) return { exitCode: 0, stdout: "false\n", stderr: "" };
+      if (args[0] === "config") return { exitCode: 1, stdout: "", stderr: "" };
+      if (args[0] === "ls-files" && args.includes("--stage")) {
+        return {
+          exitCode: 0,
+          stdout: tracked.map((file, index) => `H 100644 ${String(index + 1).repeat(40)} 0\t${file}\0`).join(""),
+          stderr: "",
+        };
+      }
+      if (args[0] === "ls-files" && args.includes("--others") && !args.includes("--ignored")) {
+        return { exitCode: 0, stdout: untrackedOutput, stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    buildValidationEnv: (extra) => extra,
+    summarizeStderr: (value) => value,
+    normalizeLockPath,
+    hasAmbiguousPathPattern,
+    isAbsolutePathLike,
+    maxEvidencePaths: 2,
+    ...trustedRootOptions,
+    sleep: async () => {},
+  });
+  assert.deepEqual((await service.gitWorkspaceInventory("C:/repo")).trackedFiles, tracked);
+  untrackedOutput = "new-a.txt\0new-b.txt\0new-c.txt\0";
+  await assert.rejects(
+    service.gitWorkspaceInventory("C:/repo"),
+    (error) => error.errorType === "git_evidence_failed" && /path count limit/.test(error.message),
+    "The dirty/untracked cap must not become a cap on clean tracked entries."
+  );
 }
 
 {
@@ -150,8 +227,7 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
     ["diff\u0000--name-only\u0000-z\u0000--no-renames\u0000--no-ext-diff\u0000--no-textconv\u0000--ignore-submodules=all", { exitCode: 2, stdout: "", stderr: "working failed" }],
     ["diff\u0000--cached\u0000--name-only\u0000-z\u0000--no-renames\u0000--no-ext-diff\u0000--no-textconv\u0000--ignore-submodules=none", { exitCode: 3, stdout: "staged failed", stderr: "" }],
     ["ls-files\u0000--others\u0000--exclude-standard\u0000-z", { exitCode: 0, stdout: "", stderr: "" }],
-    ["ls-files\u0000-v\u0000-z", { exitCode: 0, stdout: "", stderr: "" }],
-    ["ls-files\u0000--stage\u0000-z", { exitCode: 0, stdout: "", stderr: "" }],
+    ["ls-files\u0000-v\u0000--stage\u0000-z", { exitCode: 0, stdout: "", stderr: "" }],
   ]);
   const service = createGitEvidenceService({
     runCommand: async (_command, args) => failures.get(args.join("\u0000")),
@@ -241,11 +317,12 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
 }
 
 {
-  let indexOutput = "H safe.txt\0";
+  const oid = "a".repeat(40);
+  let indexOutput = `H 100644 ${oid} 0\tsafe.txt\0`;
   const service = createGitEvidenceService({
     runCommand: async (_command, args) => ({
       exitCode: 0,
-      stdout: args[0] === "ls-files" && args.includes("-v") ? indexOutput : "",
+      stdout: args[0] === "ls-files" && args.includes("--stage") ? indexOutput : "",
       stderr: "",
     }),
     buildValidationEnv: (extra) => extra,
@@ -257,7 +334,22 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
     sleep: async () => {},
   });
   assert.deepEqual(await service.gitChangedFiles("C:/repo"), []);
-  for (const unsupported of ["h assume.txt\0", "S sparse.txt\0", "s both.txt\0", "M conflicted.txt\0", "Z future.txt\0"]) {
+  indexOutput = `H 100755 ${"b".repeat(64)} 0\tsha256.txt\0`;
+  assert.deepEqual(await service.gitChangedFiles("C:/repo"), [], "SHA-256 index OIDs and executable modes remain supported.");
+  indexOutput = `H 100644 ${"c".repeat(39)} 0\tshort-oid.txt\0`;
+  await assert.rejects(
+    service.gitChangedFiles("C:/repo"),
+    (error) => error.errorType === "git_evidence_failed"
+      && /tracked index entries: unsupported or lossy path output/.test(error.message)
+  );
+  indexOutput = `H 100644 ${oid} 0\tduplicate.txt\0H 100644 ${oid} 0\tduplicate.txt\0`;
+  await assert.rejects(
+    service.gitChangedFiles("C:/repo"),
+    (error) => error.errorType === "git_evidence_failed"
+      && /duplicate tracked index entries/.test(error.message)
+  );
+  for (const tag of ["h", "S", "s", "M", "Z"]) {
+    const unsupported = `${tag} 100644 ${oid} 0\tunsupported.txt\0`;
     indexOutput = unsupported;
     await assert.rejects(
       service.gitChangedFiles("C:/repo"),
@@ -265,21 +357,20 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
         && /unsupported tracked index flags: unsupported or lossy path output/.test(error.message)
     );
   }
-  indexOutput = "H unterminated.txt";
+  indexOutput = `H 100644 ${oid} 0\tunterminated.txt`;
   await assert.rejects(
     service.gitChangedFiles("C:/repo"),
     (error) => error.errorType === "git_evidence_failed"
-      && /tracked index flags: unsupported or lossy path output/.test(error.message)
+      && /tracked index entries: unsupported or lossy path output/.test(error.message)
   );
 }
 
 {
   let diffCalls = 0;
-  let stage = `160000 ${"b".repeat(40)} 0\tsubmodule\0`;
+  let stage = `H 160000 ${"b".repeat(40)} 0\tsubmodule\0`;
   const service = createGitEvidenceService({
     runCommand: async (_command, args) => {
       if (args[0] === "diff") diffCalls += 1;
-      if (args[0] === "ls-files" && args.includes("-v")) return { exitCode: 0, stdout: "H submodule\0", stderr: "" };
       if (args[0] === "ls-files" && args.includes("--stage")) return { exitCode: 0, stdout: stage, stderr: "" };
       return { exitCode: 0, stdout: "", stderr: "" };
     },
@@ -297,21 +388,21 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles"]
       && /unsupported submodule entry/.test(error.message)
   );
   assert.equal(diffCalls, 0, "Submodules must be rejected before worktree diff can invoke nested configuration.");
-  stage = `100644 ${"c".repeat(40)} 2\tconflicted.txt\0`;
+  stage = `H 100644 ${"c".repeat(40)} 2\tconflicted.txt\0`;
   await assert.rejects(
     service.gitChangedFiles("C:/repo"),
     (error) => error.errorType === "git_evidence_failed"
       && /unsupported unmerged index entry/.test(error.message)
   );
   assert.equal(diffCalls, 0);
-  stage = `040000 ${"d".repeat(40)} 0\tunsupported-tree\0`;
+  stage = `H 040000 ${"d".repeat(40)} 0\tunsupported-tree\0`;
   await assert.rejects(
     service.gitChangedFiles("C:/repo"),
     (error) => error.errorType === "git_evidence_failed"
       && /unsupported tracked index mode/.test(error.message)
   );
   assert.equal(diffCalls, 0);
-  stage = `100644 ${"0".repeat(40)} 0\tintent-to-add.txt\0`;
+  stage = `H 100644 ${"0".repeat(40)} 0\tintent-to-add.txt\0`;
   await assert.rejects(
     service.gitChangedFiles("C:/repo"),
     (error) => error.errorType === "git_evidence_failed"

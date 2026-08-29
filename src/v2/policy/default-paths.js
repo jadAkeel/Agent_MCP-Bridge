@@ -26,8 +26,8 @@ export const SERIAL_ONLY_PATHS = Object.freeze([
   "db/migrations/**",
   "prisma/schema.prisma",
 ]);
-
 export const DEFAULT_FORBIDDEN_EDIT_PATHS = Object.freeze([
+  ".git/control-state",
   ".env",
   ".env.*",
   "**/.env",

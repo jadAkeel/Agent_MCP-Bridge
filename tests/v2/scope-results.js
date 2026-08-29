@@ -44,6 +44,18 @@ assert.deepEqual(writeResult.forbiddenFiles, [".env"]);
 assert.deepEqual(writeResult.sharedFiles, ["package.json"]);
 assert.equal(writeResult.serialOnlyMatches.some((match) => match.startsWith("package.json (package.json)")), true);
 
+const gitControlResult = validateChangedFilesForPlan({
+  changedFiles: [".git/control-state"],
+  lockPlan: {
+    ...writePlan,
+    allowedEdits: ["**"],
+    forbiddenEdits: [".git/control-state"],
+    scopeContract: null,
+  },
+});
+assert.deepEqual(gitControlResult.forbiddenFiles, [".git/control-state"]);
+assert.deepEqual(gitControlResult.disallowedFiles, [".git/control-state"]);
+
 const readPlan = {
   ...writePlan,
   lockType: "read",

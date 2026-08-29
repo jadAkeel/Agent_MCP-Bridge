@@ -110,6 +110,13 @@ export function createAgentMetadataPolicy({
     const editProtectedDenyPatterns = edit.overrides
       .filter((rule) => rule.action === "deny")
       .map((rule) => rule.pattern);
+    // `.git/control-state` is a bridge-generated evidence marker rather than
+    // a real OpenCode filesystem path. Older managed profiles legitimately do
+    // not contain a rule for it; the bridge still rejects the marker itself
+    // through its changed-file policy. If a profile does mention it, only a
+    // deny rule is safe.
+    const syntheticControlStateRules = edit.overrides.filter((rule) => rule.pattern === ".git/control-state");
+    const agentProtectedEditPatterns = DEFAULT_FORBIDDEN_EDIT_PATHS.filter((pattern) => pattern !== ".git/control-state");
     const bash = permissionDefaultAndOverrides(permissions, "bash");
     const bashAutomaticAllowUnsafe = bash.overrides.filter((rule) => rule.action === "allow" && !SAFE_AGENT_BASH_ALLOW_PATTERNS.has(rule.pattern));
     const task = permissionDefaultAndOverrides(permissions, "task");
@@ -121,9 +128,11 @@ export function createAgentMetadataPolicy({
     const canEdit = editToolKeys.length === 0 || editToolKeys.some((key) => tools[key] !== false);
     const protectedEditsDenied = !canEdit || (
       edit.defaultAction === "allow"
-      && edit.overrides.length === DEFAULT_FORBIDDEN_EDIT_PATHS.length
-      && edit.overrides.every((rule) => rule.action === "deny" && DEFAULT_FORBIDDEN_EDIT_PATHS.includes(rule.pattern))
-      && DEFAULT_FORBIDDEN_EDIT_PATHS.every((pattern) => editProtectedDenyPatterns.includes(pattern))
+      && syntheticControlStateRules.every((rule) => rule.action === "deny")
+      && edit.overrides.filter((rule) => rule.pattern !== ".git/control-state").length === agentProtectedEditPatterns.length
+      && edit.overrides.filter((rule) => rule.pattern !== ".git/control-state")
+        .every((rule) => rule.action === "deny" && agentProtectedEditPatterns.includes(rule.pattern))
+      && agentProtectedEditPatterns.every((pattern) => editProtectedDenyPatterns.includes(pattern))
     );
     const normalized = {
       name: String(parsed.name || expectedName || ""),
