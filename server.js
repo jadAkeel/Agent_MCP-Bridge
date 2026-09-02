@@ -14397,7 +14397,10 @@ async function runSelfTests() {
   assert.equal(REQUIRED_MANAGED_AGENTS.includes(MCP_SANITIZED_READER_AGENT), true);
   assert.equal(GLOBALLY_REQUIRED_MANAGED_AGENTS.includes(MCP_SANITIZED_READER_AGENT), false);
   const sanitizedAgentSource = await readFile(path.join(BRIDGE_RUNTIME_DIR, "opencode", "agents", `${MCP_SANITIZED_READER_AGENT}.md`), "utf8");
-  assert.equal(sanitizedAgentSource.split(/^---\s*$/m).slice(2).join("---").trim(), MCP_SANITIZED_READER_PROMPT);
+  assert.equal(
+    sanitizedAgentSource.split(/^---\s*$/m).slice(2).join("---").trim().replace(/\r\n/g, "\n"),
+    MCP_SANITIZED_READER_PROMPT
+  );
   const sanitizedRouteFixture = {
     requestedAgent: "reviewer",
     actualAgent: MCP_SANITIZED_READER_AGENT,
