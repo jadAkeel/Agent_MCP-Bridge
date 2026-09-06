@@ -30,6 +30,8 @@ Every write job must have an explicit Scope Contract. Locks are not the primary 
 
 Use the simplest level that fits the task. Pipelines are advanced-only and are rejected when too small.
 
+Daily mode is intentionally shorter: keep tiny work in Codex, use one direct read-only agent for a second opinion, and use one direct `builder` or `debugger` for a bounded write. Add queue, pipeline, reviewer, or tester stages only when concurrency or task risk justifies them. OpenCode contractor mode remains explicit opt-in.
+
 ## Scope Contract
 
 Write jobs require:
@@ -58,7 +60,7 @@ Rules:
 
 ## Main Tools
 
-- `get_opencode_bridge_status`: verify OpenCode, Git, agent discovery, and effective worktree/queue/lock settings.
+- `get_opencode_bridge_status`: run the quick daily OpenCode/Git/agent/config check. Pass `deep: true` for full managed-role attestation during activation or audits; every actual agent execution still re-attests its selected role immediately before spawn.
 - `validate_delegation_plan`: preflight one or more jobs without running OpenCode or acquiring locks.
 - `run_opencode_agent`: run one bounded OpenCode agent.
 - `run_opencode_parallel`: run independent jobs only when their write scopes are safe.
@@ -125,6 +127,14 @@ integrate_opencode_worktree(dryRun: true)
 Non-dry-run integration without both `reviewed: true` and the exact unexpired preview receipt is rejected. Any source or target mutation after preview returns `integration_preview_stale`. Source cleanup is opt-in, requires `validationGate.status === "passed"`, and rechecks the source patch immediately before removal. Branch cleanup uses an exact expected-object `update-ref` deletion; a branch moved or recreated during cleanup is retained and reported as partial. Pipeline cleanup is deferred until final validation, reviewer, and tester gates all succeed. Failed, partial, unreviewed, and not-yet-integrated worktrees are retained.
 
 Before creating any writer worktree, the bridge rejects staged, unstaged, untracked, conflicted, or dirty-submodule state with `dirty_worktree_requires_checkpoint`—including dirt unrelated to the requested scope. A worktree starts from a pinned commit/tree and cannot safely reproduce uncheckpointed prerequisites. The bridge never stashes, resets, commits, or overlays the source checkout; create or select an external checkpoint and retry.
+
+Writer worktrees intentionally do not share a mutable `node_modules` or equivalent dependency directory with the source checkout. Use a dependency-free check such as `git diff --check` before integration when the worktree has no installed packages, then run the full project tests from the source checkout after reviewed integration. If a task needs a new package, the writer must stop before adding an undeclared import and return a single-line structured request:
+
+```text
+DEPENDENCY_REQUIRED {"packages":[{"name":"package-name","version":"optional-range","reason":"why it is needed"}],"reason":"why the task cannot continue safely"}
+```
+
+The bridge reports this as `dependency_required`. Codex reviews and applies approved package/lockfile changes serially, creates a new clean checkpoint, and retries the bounded writer. This avoids both unreviewed dependency changes and unsafe shared dependency junctions.
 
 ## Project Policy
 
@@ -235,6 +245,8 @@ The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.js
 ### Managed Gemini OAuth profile
 
 The managed non-sanitized agents default to `google/antigravity-gemini-3.8-flash` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
+
+`bin/fresh-healthcheck.js` supports both profiles. With a release-manifest pin it performs the complete immutable tree verification. Without that pin it verifies the exact server hash, starts a fresh MCP process, and relies on bridge health to attest the managed Gemini runtime and external-plugin policy; the result identifies this as `server-pinned` mode.
 
 This is a deliberate reduction from full immutable-release assurance: OAuth refresh requires a writable runtime, and the managed agent and skill files in that runtime are attested against their effective OpenCode metadata but are not pinned by the release manifest. The bridge passes `--model google/antigravity-gemini-3.8-flash --variant high` explicitly and disables silent fallback. OpenCode `1.17.13` does not emit authoritative runtime model identity in every JSON stream, so successful live smoke tests prove the configured command and provider response, not cryptographic runtime-model attestation.
 
@@ -390,6 +402,16 @@ Run the cross-process concurrency stress without invoking models:
 ```powershell
 npm run test:concurrency
 ```
+
+Measure the active daily profile without invoking a model:
+
+```powershell
+$env:MCP_BENCH_CONFIG = 'C:\absolute\path\to\.codex\config.toml'
+$env:MCP_BENCH_ITERATIONS = '3'
+node bin/mcp-health-benchmark.js 'C:\absolute\healthy\git-checkout'
+```
+
+This benchmarks quick health by default and prints every sample plus p50/p95. Set `MCP_BENCH_DEEP=true` only when measuring the slower full activation/audit path.
 
 This starts independent MCP server processes against temporary repositories and shared SQLite state. It verifies normal-job shared readers, reader/writer exclusion, disjoint read/write concurrency, absolute/relative/dot/separator/case path identity, rejected traversal aliases, repository-wide serial integration, overlapping/disjoint writer races, crash-orphan worktree isolation, release cleanup, SQLite busy retry behavior, and the cross-process provider/account concurrency ceiling.
 

@@ -80,6 +80,7 @@ Before starting:
 - Keep changes minimal and aligned with existing project patterns.
 - Do not rewrite unrelated code.
 - Do not introduce dependencies unless necessary and explained.
+- If a new or unavailable package is required, do not add an undeclared import and do not edit package manifests or lockfiles. Return exactly one single-line `DEPENDENCY_REQUIRED` JSON marker using the format supplied in the task packet.
 - Inspect existing patterns before editing.
 - Run relevant tests, typecheck, lint, or build commands when possible.
 - If verification fails, diagnose and fix only related issues.

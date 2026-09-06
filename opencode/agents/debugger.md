@@ -98,6 +98,7 @@ Before starting:
 - Modify forbidden paths
 - Delete files
 - Run destructive commands
+- Add undeclared imports or edit package manifests/lockfiles; return the task packet's single-line `DEPENDENCY_REQUIRED` JSON marker instead
 
 ## Debugging Process
 

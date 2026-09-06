@@ -262,9 +262,10 @@ const DEFAULT_RETURN_FORMAT = [
   "5. Files wanted but not edited",
   "6. Changes made or proposed",
   "7. NEEDS_INTEGRATION, if required",
-  "8. Risks",
-  "9. Validation performed",
-  "10. Validation still recommended",
+  "8. DEPENDENCY_REQUIRED, if a package manifest change is required",
+  "9. Risks",
+  "10. Validation performed",
+  "11. Validation still recommended",
 ].join("\n");
 const QUEUE_JOBS = new Map();
 const PIPELINE_RUNS = new Map();
@@ -4431,9 +4432,35 @@ function buildCompactPrompt(agent, task, delegation = {}) {
     "If you need files outside the lock:",
     "Do not edit them. Return NEEDS_INTEGRATION with the file/path needed, reason, and recommended change.",
     "",
+    "If a new or unavailable package is required:",
+    "Do not add an undeclared import and do not edit package manifests or lockfiles. Return exactly one single-line marker in this form: DEPENDENCY_REQUIRED {\"packages\":[{\"name\":\"package-name\",\"version\":\"optional-range\",\"reason\":\"why it is needed\"}],\"reason\":\"why the task cannot continue safely\"}",
+    "",
     "Return format:",
     delegation.returnFormat || DEFAULT_RETURN_FORMAT,
   ].join("\n");
+}
+
+const dependencyRequestPayloadSchema = z.object({
+  packages: z.array(z.object({
+    name: z.string().min(1).max(214).regex(/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i),
+    version: z.string().max(100).optional(),
+    reason: z.string().max(1000).optional(),
+  }).strict()).min(1).max(20),
+  reason: z.string().min(1).max(2000),
+}).strict();
+
+function parseDependencyRequest(text) {
+  const match = String(text || "").match(/^DEPENDENCY_REQUIRED\s+([^\r\n]+)\s*$/m);
+  if (!match) return { request: null, error: "" };
+  try {
+    const parsed = dependencyRequestPayloadSchema.safeParse(JSON.parse(match[1]));
+    if (!parsed.success) {
+      return { request: null, error: "DEPENDENCY_REQUIRED payload does not match the required schema." };
+    }
+    return { request: parsed.data, error: "" };
+  } catch {
+    return { request: null, error: "DEPENDENCY_REQUIRED payload is not valid single-line JSON." };
+  }
 }
 
 function openCodeRunArgs(agent, prompt, metadata = null, { forcePure = false } = {}) {
@@ -4529,6 +4556,14 @@ function classifyResultError(result) {
 
   if (!result.dryRun && !result.assistantFinalResponseDetected) {
     return result.permissionDeniedCount > 0 ? "agent_permission_denied_without_final_response" : "agent_empty_final_response";
+  }
+
+  if (result.dependencyRequestError) {
+    return "dependency_request_invalid";
+  }
+
+  if (result.dependencyRequest) {
+    return "dependency_required";
   }
 
   if (!result.dryRun && result.modelEvidenceAmbiguous) {
@@ -4891,6 +4926,9 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   runResult.exactCliModelPin = configuredMetadata?.provider && configuredMetadata?.model
     ? `${configuredMetadata.provider}/${configuredMetadata.model}`
     : "";
+  const dependencyRequest = parseDependencyRequest(runResult.stdout);
+  runResult.dependencyRequest = dependencyRequest.request;
+  runResult.dependencyRequestError = dependencyRequest.error;
   runResult.errorType = classifyResultError(runResult);
   if (!runResult.errorType && runtimeModelEvidencePresent && !runResult.modelAttested) {
     runResult.errorType = "opencode_model_mismatch";
@@ -5076,6 +5114,8 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     lockPlan?.scopeContract ? `Scope write paths: ${lockPlan.scopeContract.scope.write.length ? lockPlan.scopeContract.scope.write.join(", ") : "none"}` : null,
     lockPlan?.scopeContract ? `Scope forbidden paths: ${lockPlan.scopeContract.scope.forbidden.length ? lockPlan.scopeContract.scope.forbidden.join(", ") : "none"}` : null,
     `Shared files frozen: ${lockPlan?.sharedFiles?.length ? lockPlan.sharedFiles.join(", ") : "none specified"}`,
+    `Dependency request: ${result?.dependencyRequest ? JSON.stringify(result.dependencyRequest) : "none"}`,
+    result?.dependencyRequestError ? `Dependency request error: ${result.dependencyRequestError}` : null,
     `Files changed: ${result?.changedFiles?.length ? result.changedFiles.join(", ") : "none detected"}`,
     `Exit code: ${result?.exitCode ?? "not run"}`,
     `Duration ms: ${result?.durationMs ?? 0}`,
@@ -10763,20 +10803,21 @@ server.tool(
 
 server.tool(
   "get_opencode_bridge_status",
-  "Check OpenCode, Git, agent discovery, and the bridge's effective safety configuration.",
+  "Check OpenCode, Git, agent discovery, and the bridge's effective safety configuration. Quick mode is the daily default; deep mode re-attests every managed role for activation and audits.",
   {
     cwd: z.string().min(1).describe("Canonical repository path used for command and agent discovery checks."),
+    deep: z.boolean().optional().describe("Run slow full managed-role attestation. Defaults to false; actual agent execution always re-attests its role before spawn."),
   },
-  async ({ cwd }) => {
+  async ({ cwd, deep = false }) => {
     const [pluginPolicy, openCodeVersion, gitVersion, agentDiscovery, safeOrchestratorMetadata, contractorOrchestratorMetadata, contractorNestedAttestation, sanitizedReaderMetadata, managedSkillEvidence, providerCapacity] = await Promise.all([
       verifyExternalPluginPolicy(cwd),
       safeOpenCodeCommand(["--version"], cwd, 1000 * 30),
       runCommand("git", ["--version"], cwd, 1000 * 30),
       listAvailableAgents(cwd),
-      readAgentDebugMetadata(MCP_ORCHESTRATOR_AGENT, cwd || process.cwd()),
-      readAgentDebugMetadata(MCP_CONTRACTOR_ORCHESTRATOR_AGENT, cwd || process.cwd()),
-      attestContractorNestedAgents(cwd || process.cwd()),
-      readAgentDebugMetadata(MCP_SANITIZED_READER_AGENT, cwd || process.cwd(), { forcePure: true }),
+      deep ? readAgentDebugMetadata(MCP_ORCHESTRATOR_AGENT, cwd || process.cwd()) : Promise.resolve(null),
+      deep ? readAgentDebugMetadata(MCP_CONTRACTOR_ORCHESTRATOR_AGENT, cwd || process.cwd()) : Promise.resolve(null),
+      deep ? attestContractorNestedAgents(cwd || process.cwd()) : Promise.resolve({ ok: true, skipped: true }),
+      deep ? readAgentDebugMetadata(MCP_SANITIZED_READER_AGENT, cwd || process.cwd(), { forcePure: true }) : Promise.resolve(null),
       managedSkillSourceEvidence(),
       providerCapacitySnapshot(),
     ]);
@@ -10799,16 +10840,17 @@ server.tool(
       && contractorOrchestratorPolicy?.bashDenied === true
       && contractorOrchestratorPolicy?.skillDenied === true;
     const contractorSubagentAllowlistEnforced = contractorOrchestratorPolicy?.taskDelegationAllowlistSafe === true;
-    const healthy = openCodeVersion.exitCode === 0
+    const baseHealthy = openCodeVersion.exitCode === 0
       && gitVersion.exitCode === 0
       && agentDiscovery.result.exitCode === 0
       && missingRequiredAgents.length === 0
-      && safeOrchestratorEnforced
+      && managedSkillEvidence.ok;
+    const deepHealthy = safeOrchestratorEnforced
       && contractorOrchestratorEnforced
       && contractorSubagentAllowlistEnforced
       && contractorNestedAttestation.ok
-      && managedSkillEvidence.ok
       && !sanitizedReaderPolicyError;
+    const healthy = baseHealthy && (!deep || deepHealthy);
 
     return {
       content: [
@@ -10822,6 +10864,8 @@ server.tool(
             `Bridge source SHA-256 at startup: ${BRIDGE_SOURCE_SHA256}`,
             `Bridge release root: ${BRIDGE_RUNTIME_DIR}`,
             `Bridge release manifest pin: ${String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "not pinned")}`,
+            `Health depth: ${deep ? "deep managed-role attestation" : "quick daily check"}`,
+            `Execution-time role attestation: always enabled`,
             `Node runtime: ${process.version}`,
             "Provider readiness: not tested by health (no model request sent)",
             "Project OpenCode config: disabled; use a reviewed managed profile, not the personal/project default",
@@ -10836,18 +10880,18 @@ server.tool(
             `Managed skill source aggregate SHA-256: ${managedSkillEvidence.sha256 || "unavailable"}`,
             `Managed skill source error: ${managedSkillEvidence.error || "none"}`,
             `MCP orchestrator execution agent: ${MCP_ORCHESTRATOR_AGENT}`,
-            `MCP orchestrator edit permission denied: ${safeOrchestratorPolicy?.canEdit === false ? "yes" : "no"}`,
-            `MCP orchestrator nested task permission denied: ${safeOrchestratorPolicy?.canDelegate === false ? "yes" : "no"}`,
+            `MCP orchestrator edit permission denied: ${deep ? (safeOrchestratorPolicy?.canEdit === false ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP orchestrator nested task permission denied: ${deep ? (safeOrchestratorPolicy?.canDelegate === false ? "yes" : "no") : "not checked in quick mode"}`,
             `MCP contractor orchestrator execution agent: ${MCP_CONTRACTOR_ORCHESTRATOR_AGENT}`,
-            `MCP contractor direct edit permission denied: ${contractorOrchestratorPolicy?.canEdit === false ? "yes" : "no"}`,
-            `MCP contractor nested task permission enabled: ${contractorOrchestratorPolicy?.canDelegate === true ? "yes" : "no"}`,
-            `MCP contractor shell permission denied: ${contractorOrchestratorPolicy?.bashDenied === true ? "yes" : "no"}`,
-            `MCP contractor skill permission denied: ${contractorOrchestratorPolicy?.skillDenied === true ? "yes" : "no"}`,
-            `MCP contractor subagent allowlist enforced: ${contractorSubagentAllowlistEnforced ? "yes" : "no"}`,
-            `MCP contractor nested agent profiles attested: ${contractorNestedAttestation.ok ? "yes" : "no"}`,
-            `MCP contractor nested agent policy error: ${contractorNestedAttestation.ok ? "none" : contractorNestedAttestation.error}`,
-            `MCP sanitized reader isolated policy attested: ${sanitizedReaderPolicyError ? "no" : "yes"}`,
-            `MCP sanitized reader policy error: ${sanitizedReaderPolicyError?.error || "none"}`,
+            `MCP contractor direct edit permission denied: ${deep ? (contractorOrchestratorPolicy?.canEdit === false ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor nested task permission enabled: ${deep ? (contractorOrchestratorPolicy?.canDelegate === true ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor shell permission denied: ${deep ? (contractorOrchestratorPolicy?.bashDenied === true ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor skill permission denied: ${deep ? (contractorOrchestratorPolicy?.skillDenied === true ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor subagent allowlist enforced: ${deep ? (contractorSubagentAllowlistEnforced ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor nested agent profiles attested: ${deep ? (contractorNestedAttestation.ok ? "yes" : "no") : "not checked in quick mode"}`,
+            `MCP contractor nested agent policy error: ${deep && !contractorNestedAttestation.ok ? contractorNestedAttestation.error : "none"}`,
+            `MCP sanitized reader isolated policy attested: ${deep ? (sanitizedReaderPolicyError ? "no" : "yes") : "not checked in quick mode"}`,
+            `MCP sanitized reader policy error: ${deep ? (sanitizedReaderPolicyError?.error || "none") : "none"}`,
             `Agent discovery exit code: ${agentDiscovery.result.exitCode}`,
             `Available agents: ${availableAgents.length ? availableAgents.join(", ") : "none discovered"}`,
             `Missing required managed agents: ${missingRequiredAgents.length ? missingRequiredAgents.join(", ") : "none"}`,
@@ -13743,13 +13787,17 @@ async function executeOpenCodeJob(requestedJob, {
         };
       }
     }
-    const finalAgentMetadata = await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+    const finalAgentMetadata = dryRun
+      ? agentMetadata
+      : await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
     const finalMetadataPolicyError = effectiveReadOnlyMetadataError(
       finalAgentMetadata,
       lockPlan,
       agentMetadataPolicyOptions(resolution, lockPlan, agentMetadata.metadata)
     );
-    const finalContractorNestedAttestation = lockPlan.orchestratorMode === "contractor"
+    const finalContractorNestedAttestation = dryRun
+      ? contractorNestedAttestation
+      : lockPlan.orchestratorMode === "contractor"
       ? await attestContractorNestedAgents(executionCwd, { forcePure })
       : { ok: true };
     const finalContractorNestedError = finalContractorNestedAttestation.ok ? null : finalContractorNestedAttestation;
@@ -14166,6 +14214,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     maxRetries: record.maxRetries || 0,
     errorType: record.errorType || "",
     errorReason: record.errorReason || "",
+    dependencyRequest: record.dependencyRequest || null,
     completionOutcome: record.completionOutcome || (essentialResultTruncated ? "completed_with_truncated_output" : ""),
     changedFiles: record.changedFiles || [],
     noChanges: Boolean(record.noChanges),
@@ -14215,6 +14264,7 @@ function queuePrivateDetails(record) {
     validationResult: record.validationResult || null,
     sanitizedWorkspaceVerification: record.sanitizedWorkspaceVerification || null,
     actualModelEvidence: record.actualModelEvidence || "",
+    dependencyRequest: record.dependencyRequest || null,
   });
   const serialized = JSON.stringify(details);
   if (Buffer.byteLength(serialized, "utf8") <= CONFIG.maxSnapshotFileBytes) return details;
@@ -14231,6 +14281,7 @@ function queuePrivateDetails(record) {
     },
     sanitizedWorkspaceVerification: null,
     actualModelEvidence: details.actualModelEvidence || "",
+    dependencyRequest: details.dependencyRequest || null,
   });
 }
 
@@ -15215,6 +15266,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     actualProvider: "",
     actualModel: "",
     actualModelEvidence: "",
+    dependencyRequest: null,
     resultText: "",
     worktreePath: "",
     worktreeBranch: "",
@@ -15770,6 +15822,7 @@ async function startQueueRecord(record) {
           actualProvider: execution.result?.actualProvider || "",
           actualModel: execution.result?.actualModel || "",
           actualModelEvidence: execution.result?.actualModelEvidence || "",
+          dependencyRequest: execution.result?.dependencyRequest || null,
           resultText: execution.response?.content?.[0]?.text || "",
           worktreePath: execution.worktree?.path || "",
           worktreeBranch: execution.worktree?.branch || "",
@@ -15817,6 +15870,7 @@ async function startQueueRecord(record) {
         actualProvider: execution.result?.actualProvider || "",
         actualModel: execution.result?.actualModel || "",
         actualModelEvidence: execution.result?.actualModelEvidence || "",
+        dependencyRequest: execution.result?.dependencyRequest || null,
         resultText: execution.response?.content?.[0]?.text || "",
         worktreePath: execution.worktree?.path || "",
         worktreeBranch: execution.worktree?.branch || "",
@@ -19410,6 +19464,14 @@ async function runSelfTests() {
   assert.doesNotMatch(redactSensitiveText(`{"access_token":"${jsonSecret}","api_key":"AIza123456789012345678901234"}`), /opaque-access-token|AIza123/);
   assert.doesNotMatch(JSON.stringify(sanitizePersistedValue({ contractorAuthorizationToken: secretSentinel, resultText: `Authorization: Bearer ${secretSentinel}` })), new RegExp(secretSentinel));
   assert.equal(classifyResultError({ exitCode: 0, assistantFinalResponseDetected: true, rawOutputTruncated: true }), "essential_output_truncated");
+  const dependencyRequestFixture = parseDependencyRequest('before\nDEPENDENCY_REQUIRED {"packages":[{"name":"@scope/example","version":"^1.2.3","reason":"required by the requested feature"}],"reason":"package manifest is frozen"}\nafter');
+  assert.equal(dependencyRequestFixture.error, "");
+  assert.equal(dependencyRequestFixture.request.packages[0].name, "@scope/example");
+  assert.equal(classifyResultError({ exitCode: 0, assistantFinalResponseDetected: true, dependencyRequest: dependencyRequestFixture.request }), "dependency_required");
+  const invalidDependencyRequestFixture = parseDependencyRequest('DEPENDENCY_REQUIRED {"packages":[],"reason":"missing package"}');
+  assert.equal(invalidDependencyRequestFixture.request, null);
+  assert.match(invalidDependencyRequestFixture.error, /required schema/);
+  assert.equal(classifyResultError({ exitCode: 0, assistantFinalResponseDetected: true, dependencyRequestError: invalidDependencyRequestFixture.error }), "dependency_request_invalid");
   assert.equal(detectsOpenCodeApiError('{"type":"error","message":"No payment method"}\n'), true);
   assert.equal(detectsOpenCodeApiError('{"type":"text","message":"ok"}\n'), false);
   assert.equal(detectsOpenCodeApiError("APIError: request failed\n"), true);

@@ -61,15 +61,17 @@ CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git"
 CODEX_OPENCODE_SANITIZED_MAX_FILES = "25000"
 CODEX_OPENCODE_SANITIZED_MAX_BYTES = "1073741824"
 
-# Immutable production releases require false and use OpenCode's built-in Codex
-# OAuth transport. External plugins remain available only to a separately
-# reviewed, unpinned development deployment.
+# Strict immutable releases require false and use OpenCode's built-in Codex OAuth
+# transport. Daily Gemini hybrid mode uses true with an exact plugin allowlist,
+# pinned plugin manifest, dedicated writable XDG_CONFIG_HOME, and a server hash.
+# Hybrid mode must leave CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 unset.
 CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "false"
 # CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST = "@scope/plugin@1.2.3"
 # CODEX_OPENCODE_PLUGIN_MANIFEST_PATH = "C:\\trusted\\plugin-integrity-manifest.json"
 # CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = "<sha256-of-plugin-integrity-manifest.json>"
 
-# Mandatory production release pins. The manifest covers the exact release file
+# The server hash is used by both strict and server-pinned hybrid profiles. The
+# release manifest is strict-profile only and covers the exact release file
 # list, including server.js, package files, bin/, node_modules, reviewed nonsecret
 # OpenCode config/settings, managed agents, and managed skills. Follow the ordered
 # release procedure.

@@ -111,6 +111,14 @@ function requiredSha256(env, name) {
   return value;
 }
 
+function optionalSha256(env, name) {
+  const value = String(env[name] || "").trim().toLowerCase();
+  if (value && !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`${name} must be empty or a SHA-256 hex digest in the candidate MCP entry.`);
+  }
+  return value;
+}
+
 function requiredAbsoluteEnvPath(env, name) {
   const value = String(env[name] || "").trim();
   if (!path.isAbsolute(value)) {
@@ -147,8 +155,12 @@ async function validateCandidateReleaseEntry(entry) {
     throw new Error("Candidate bridge server does not match CODEX_OPENCODE_EXPECTED_SERVER_SHA256.");
   }
 
+  const expectedReleaseManifestSha256 = optionalSha256(env, "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256");
+  if (!expectedReleaseManifestSha256) {
+    return { releaseRoot, serverPath, integrityMode: "server-pinned" };
+  }
+
   const releaseManifestPath = await assertRealPath(path.join(releaseRoot, "release-manifest.json"), "file", "Candidate release manifest");
-  const expectedReleaseManifestSha256 = requiredSha256(env, "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256");
   if (await sha256File(releaseManifestPath) !== expectedReleaseManifestSha256) {
     throw new Error("Candidate release manifest does not match CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256.");
   }
@@ -235,7 +247,7 @@ async function validateCandidateReleaseEntry(entry) {
   }
   const pluginModeError = immutableReleasePluginModeError(env);
   if (pluginModeError) throw new Error(pluginModeError);
-  return { releaseRoot, serverPath };
+  return { releaseRoot, serverPath, integrityMode: "immutable-release" };
 }
 
 function resultText(result) {
@@ -248,7 +260,7 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
     throw new Error("Health-check cwd must be absolute.");
   }
   const entry = await loadMcpEntry(configPath, serverName);
-  await validateCandidateReleaseEntry(entry);
+  const candidate = await validateCandidateReleaseEntry(entry);
   const client = new Client({ name: "codex-opencode-release-healthcheck", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: entry.command,
@@ -264,7 +276,7 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
       throw new Error("Fresh MCP process did not advertise get_opencode_bridge_status.");
     }
     const result = await client.callTool(
-      { name: "get_opencode_bridge_status", arguments: { cwd: resolvedCwd } },
+      { name: "get_opencode_bridge_status", arguments: { cwd: resolvedCwd, deep: true } },
       undefined,
       { timeout: timeoutMs, maxTotalTimeout: timeoutMs }
     );
@@ -272,7 +284,7 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
     if (!/^OpenCode MCP bridge status: healthy\./im.test(status)) {
       throw new Error(`Fresh MCP process was not healthy:\n${status || "no status text"}`);
     }
-    return { serverName, cwd: resolvedCwd, toolCount: tools.tools.length, healthy: true };
+    return { serverName, cwd: resolvedCwd, toolCount: tools.tools.length, healthy: true, integrityMode: candidate.integrityMode };
   } finally {
     await client.close().catch(() => {});
   }
@@ -367,6 +379,7 @@ async function runSelfTest() {
     const healthy = await runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 });
     assert.equal(healthy.healthy, true);
     assert.equal(healthy.toolCount, 1);
+    assert.equal(healthy.integrityMode, "immutable-release");
     const unexpectedReleaseFile = path.join(releaseRoot, "unexpected.txt");
     await writeFile(unexpectedReleaseFile, "unexpected\n", "utf8");
     await assert.rejects(
@@ -393,6 +406,17 @@ async function runSelfTest() {
       runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 }),
       /Immutable releases must use pure mode/
     );
+    const serverPinnedEnv = {
+      ...candidateEnv,
+      CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "true",
+      CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST: "fixture-plugin@1.0.0",
+    };
+    delete serverPinnedEnv.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
+    await writeCandidateConfig(serverPinnedEnv);
+    const serverPinned = await runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 });
+    assert.equal(serverPinned.healthy, true);
+    assert.equal(serverPinned.integrityMode, "server-pinned");
+    await writeCandidateConfig(candidateEnv);
     await writeCandidateConfig({ ...candidateEnv, CODEX_OPENCODE_AGENT_DIR: path.join(fixture, "mutable-agents") });
     await assert.rejects(
       runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 }),
@@ -438,7 +462,7 @@ async function main() {
     throw new Error("Usage: node bin/fresh-healthcheck.js <absolute-config.toml> <absolute-health-cwd> [mcp-server-name]");
   }
   const result = await runFreshHealthcheck({ configPath, cwd, serverName });
-  process.stdout.write(`Fresh MCP health check passed for ${result.serverName}; ${result.toolCount} tools advertised.\n`);
+  process.stdout.write(`Fresh MCP health check passed for ${result.serverName}; ${result.toolCount} tools advertised; integrity mode ${result.integrityMode}.\n`);
 }
 
 if (normalizedPath(process.argv[1] || "") === normalizedPath(SCRIPT_PATH)) {

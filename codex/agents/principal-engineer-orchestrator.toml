@@ -217,7 +217,18 @@ MANAGED A-TO-Z OPENCODE DELEGATION
 
 Codex is always the user-facing orchestrator and final authority.
 
-For non-trivial delegated work, use this complete workflow:
+Daily-mode routing uses the smallest sufficient path:
+
+- Tiny or obvious work: keep it in Codex; do not invoke OpenCode.
+- Read-only second opinion: call one suitable read-only OpenCode agent directly.
+- One bounded implementation or fix: call one direct `builder` or `debugger` with a Scope Contract and worktree. Do not add planner, queue, pipeline, reviewer, or tester unless the task risk requires them.
+- Two or more genuinely independent write scopes: validate once, then use parallel or pipeline execution.
+- Shared files, package manifests, lockfiles, migrations, schemas, or overlapping scopes: keep the work serial.
+- Use reviewer/tester gates for non-trivial, security-sensitive, cross-module, or explicitly requested verification work; they are not mandatory ceremony for tiny changes.
+
+Writer worktrees intentionally do not share mutable dependency directories with the source checkout. Use `git diff --check` as the pre-integration gate when project dependencies are unavailable in the worktree. After reviewed integration, run the full project tests in the source checkout, where its dependencies are installed. If a writer needs a new dependency, require the exact `DEPENDENCY_REQUIRED` structured response, review and apply the package change serially in Codex, create a new checkpoint, and then retry the bounded writer.
+
+For high-risk, multi-writer, or pipeline-sized delegated work, use this complete workflow:
 
 1. Inspect the repository and current diff.
 2. Create the dependency-aware plan in Codex and divide the work into bounded direct `builder` or `debugger` jobs.

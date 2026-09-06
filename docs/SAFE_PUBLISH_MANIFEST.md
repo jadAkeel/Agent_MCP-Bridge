@@ -148,10 +148,14 @@ python -I -c "import sys,tomllib; tomllib.load(open(sys.argv[1],'rb'))" $candida
 node (Join-Path $releaseDirectory 'bin\fresh-healthcheck.js') $candidateConfig 'C:\absolute\healthy\git-checkout'
 ```
 
-Fresh health validates the exact Node/server command, every release file/hash,
-release-local XDG/config/agent/skill/plugin-manifest bindings, pure mode, MCP
-initialization, tool discovery, and a healthy bridge status before spawning the
-candidate MCP.
+With `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` set, fresh health validates
+the exact Node/server command, every release file/hash, release-local
+XDG/config/agent/skill/plugin-manifest bindings, pure mode, MCP initialization,
+tool discovery, and a healthy bridge status before spawning the candidate MCP.
+For the Gemini hybrid profile, leave the release-manifest pin unset: fresh health
+still verifies the exact server hash and fresh MCP health, while the bridge itself
+attests the dedicated managed runtime and external-plugin manifest. The command
+reports `immutable-release` or `server-pinned` so the assurance level is explicit.
 
 ### 5. Apply and prove read/execute-only release protection
 
