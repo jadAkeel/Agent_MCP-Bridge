@@ -13,9 +13,11 @@ import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createDirectRunAudit, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
+const BRIDGE_SOURCE_SHA256 = createHash("sha256").update(await readFile(fileURLToPath(import.meta.url))).digest("hex");
 const PROCESS_SUPERVISOR_PATH = path.join(BRIDGE_RUNTIME_DIR, "bin", "process-supervisor.js");
 const USER_HOME_DIR = homedir();
 const DEFAULT_OPENCODE_CONFIG_DIR = process.env.XDG_CONFIG_HOME
@@ -138,6 +140,7 @@ const CONFIG = Object.freeze({
   readOnlyRetryMaxElapsedMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS", 1000 * 60 * 8),
   maxProcessOutputChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS", 1024 * 1024 * 2),
   maxAssistantResponseChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS", 1024 * 128),
+  requireRuntimeModelEvidence: readChoiceEnv("CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE", ["false", "true"], "false") === "true",
   maxIgnoredSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES", 20000),
   maxSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILES", 25000),
   maxSnapshotFileBytes: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES", 1024 * 1024),
@@ -268,7 +271,6 @@ const PIPELINE_RUNS = new Map();
 const PIPELINE_PERSISTENCE_CHAINS = new Map();
 const BRIDGE_INSTANCE_ID = `${process.pid}-${Date.now()}-${randomBytes(8).toString("hex")}`;
 const QUEUE_CAPABILITY_KEY = randomBytes(32);
-const INTEGRATION_PREVIEW_KEY = randomBytes(32);
 const INTEGRATION_PREVIEWS = new Map();
 const KNOWN_STATE_DB_PATHS = new Set();
 const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new Set();
@@ -330,6 +332,13 @@ const scopeTimeoutPolicySchema = z
   })
   .strict();
 
+const modelRequirementSchema = z.object({
+  provider: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
+  model: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
+  variant: z.string().trim().min(1).max(128).regex(/^[^\s\x00-\x1f\x7f]+$/).optional(),
+  requireRuntimeEvidence: z.boolean().optional(),
+}).strict();
+
 const scopeContractSchema = z
   .object({
     agent: z.string().optional(),
@@ -347,6 +356,7 @@ const scopeContractSchema = z
     validation: scopeValidationSchema.optional(),
     timeoutMs: z.number().int().positive().optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
+    modelRequirement: modelRequirementSchema.optional().describe("Require the attested managed profile to match this provider/model and optional variant. This does not override the profile or configure an endpoint."),
   })
   .strict();
 
@@ -365,6 +375,7 @@ const integrationPreviewReceiptSchema = z
     previewId: z.string().regex(/^[a-fA-F0-9]{64}$/),
     createdAt: z.string(),
     expiresAt: z.string(),
+    nonce: z.string().regex(/^[a-fA-F0-9]{32}$/).optional(),
     patchSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
     sourceBaseCommit: z.string().min(1),
     sourceStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
@@ -431,6 +442,18 @@ function readCsvEnv(name, fallback = []) {
 function readChoiceEnv(name, allowedValues, fallback) {
   const value = String(process.env[name] || "").trim().toLowerCase();
   return allowedValues.includes(value) ? value : fallback;
+}
+
+async function runSingleFlight(flights, key, operation) {
+  const existing = flights.get(key);
+  if (existing) return existing;
+  const flight = Promise.resolve().then(operation);
+  flights.set(key, flight);
+  try {
+    return await flight;
+  } finally {
+    if (flights.get(key) === flight) flights.delete(key);
+  }
 }
 
 const OPENCODE_BASE_ENV_KEYS = new Set([
@@ -741,6 +764,7 @@ function trustedGitArgs(args = []) {
     "-c", `core.hooksPath=${DISABLED_GIT_HOOKS_PATH}`,
     "-c", "core.fsmonitor=false",
     "-c", "core.untrackedCache=false",
+    "-c", "core.quotePath=false",
     "-c", "credential.helper=",
     "-c", "diff.external=",
   ];
@@ -787,7 +811,8 @@ function redactSensitiveText(value) {
     [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
     [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
     [/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[jwt redacted]"],
-    [/\b(?:sk|rk|pk|ghp|gho|github_pat|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
+    [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
+    [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
     [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
     [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
     [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
@@ -900,6 +925,13 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
       exitCode: 0,
     };
   } catch (error) {
+    if (/maxBuffer|ENOBUFS/i.test(String(error?.message || error))) {
+      return {
+        stdout: String(error?.stdout || ""),
+        stderr: "Process output exceeded the bridge capture budget; the command was terminated by the bridge instead of returning truncated evidence.",
+        exitCode: "process_output_limit_exceeded",
+      };
+    }
     return {
       stdout: error.stdout || "",
       stderr: error.stderr || String(error),
@@ -2358,8 +2390,23 @@ async function managedSkillSourceEvidence(sourceRoot = OPENCODE_SKILL_DIR) {
   }
 }
 
-async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null } = {}) {
-  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, 1000 * 30, { forcePure, runtimeContext });
+const managedSkillDebugFlights = new Map();
+
+async function readManagedSkillDebugMetadata(cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
+  const read = () => safeOpenCodeCommand(["debug", "skill"], cwd, 1000 * 30, { forcePure, runtimeContext, verifiedPluginPolicy });
+  if (forcePure || runtimeContext) return read();
+  const key = normalizePathForCompare(path.resolve(cwd || process.cwd()));
+  return runSingleFlight(managedSkillDebugFlights, key, read);
+}
+
+async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
+  const pluginPolicy = forcePure
+    ? { ok: true, mode: "pure", plugins: [] }
+    : verifiedPluginPolicy || await verifyExternalPluginPolicy(cwd);
+  if (!pluginPolicy.ok) {
+    return { ok: false, errorType: pluginPolicy.errorType, error: pluginPolicy.error, metadata: null, pluginPolicy };
+  }
+  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, 1000 * 30, { forcePure, runtimeContext, verifiedPluginPolicy: pluginPolicy });
   if (result.exitCode !== 0) {
     return { ok: false, errorType: "agent_metadata_unavailable", error: summarizeStderr(result.stderr), metadata: null };
   }
@@ -2374,7 +2421,7 @@ async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeCo
       && metadata.skillDenied !== true
       && RELEASE_REQUIRED_MANAGED_AGENTS.some((item) => item.toLowerCase() === String(agent || "").toLowerCase());
     if (managedSkillAttestationRequired) {
-      const skillResult = await safeOpenCodeCommand(["debug", "skill"], cwd, 1000 * 30, { forcePure, runtimeContext });
+      const skillResult = await readManagedSkillDebugMetadata(cwd, { forcePure, runtimeContext, verifiedPluginPolicy: pluginPolicy });
       if (skillResult.exitCode !== 0) {
         return {
           ok: false,
@@ -2401,7 +2448,7 @@ async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeCo
       return { ok: false, ...skillPolicyError, metadata: null, isolatedRuntimeRoot: result.isolatedRuntimeRoot || "" };
     }
     return metadata
-      ? { ok: true, metadata, isolatedRuntimeRoot: result.isolatedRuntimeRoot || "" }
+      ? { ok: true, metadata, isolatedRuntimeRoot: result.isolatedRuntimeRoot || "", pluginPolicy }
       : { ok: false, errorType: "agent_metadata_invalid", error: "OpenCode debug metadata did not match the requested agent.", metadata: null };
   } catch (error) {
     return { ok: false, errorType: "agent_metadata_invalid", error: error.message || String(error), metadata: null };
@@ -2415,6 +2462,7 @@ function effectiveReadOnlyMetadataError(metadataResult, lockPlan, {
   allowDelegation = false,
   requireBashDenied = false,
   requireSkillDenied = false,
+  modelRequirement = lockPlan?.scopeContract?.modelRequirement || null,
 } = {}) {
   if (!metadataResult?.ok || !metadataResult.metadata) {
     return {
@@ -2427,6 +2475,17 @@ function effectiveReadOnlyMetadataError(metadataResult, lockPlan, {
     return {
       errorType: "agent_model_unattested",
       error: "Effective OpenCode agent metadata did not provide an exact provider and model, so the bridge cannot pin or attest execution.",
+    };
+  }
+  if (modelRequirement && (
+    metadata.provider !== modelRequirement.provider
+    || metadata.model !== modelRequirement.model
+    || (modelRequirement.variant !== undefined && metadata.variant !== modelRequirement.variant)
+  )) {
+    return {
+      errorType: "configured_model_requirement_mismatch",
+      error: `The attested managed profile uses ${metadata.provider}/${metadata.model} (variant ${metadata.variant || "unspecified"}), but the scope requires ${modelRequirement.provider}/${modelRequirement.model}${modelRequirement.variant !== undefined ? ` (variant ${modelRequirement.variant})` : ""}. No agent was spawned with a substitute model.`,
+      suggestedFix: "Select an attested managed profile matching the requested model requirement, or explicitly revise the requirement. The bridge will not override the managed profile.",
     };
   }
   if (expectedAgent && metadata.name !== expectedAgent) {
@@ -2583,6 +2642,7 @@ function agentMetadataPolicyOptions(resolution, lockPlan, expectedMetadata = nul
     expectedAgent: resolution?.actualAgent || "",
     expectedMode: resolution?.actualAgentMode || resolution?.requestedAgentMode || "",
     expectedMetadata,
+    modelRequirement: lockPlan?.scopeContract?.modelRequirement || null,
     allowDelegation: contractorDelegation,
     requireBashDenied: contractorDelegation,
     requireSkillDenied: contractorDelegation,
@@ -2827,7 +2887,7 @@ function expectedOpenCodePluginResolution(specifier) {
   };
 }
 
-async function verifyExternalPluginPolicy(cwd = "") {
+async function verifyExternalPluginPolicyUnshared(cwd = "") {
   if (!CONFIG.allowExternalPlugins) {
     return { ok: true, mode: "pure", plugins: [] };
   }
@@ -3031,10 +3091,20 @@ async function verifyExternalPluginPolicy(cwd = "") {
   }
 }
 
-async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure = false, runtimeContext = null } = {}) {
+const externalPluginPolicyFlights = new Map();
+
+async function verifyExternalPluginPolicy(cwd = "") {
+  if (!CONFIG.allowExternalPlugins) {
+    return { ok: true, mode: "pure", plugins: [] };
+  }
+  const key = normalizePathForCompare(path.resolve(cwd || process.cwd()));
+  return runSingleFlight(externalPluginPolicyFlights, key, () => verifyExternalPluginPolicyUnshared(cwd));
+}
+
+async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
   const pure = forcePure || !CONFIG.allowExternalPlugins;
   if (!pure) {
-    const pluginPolicy = await verifyExternalPluginPolicy(cwd);
+    const pluginPolicy = verifiedPluginPolicy || await verifyExternalPluginPolicy(cwd);
     if (!pluginPolicy.ok) {
       return { stdout: "", stderr: pluginPolicy.error, exitCode: "plugin_policy_rejected", pluginPolicy };
     }
@@ -3176,17 +3246,21 @@ async function verifySanitizedWorkspace(contract, phase = "manual") {
     const actualDirectories = tree.directories.sort();
     const expectedFileList = [...expectedFiles].sort();
     const expectedDirectoryList = [...expectedDirectories].sort();
+    const actualFileSet = new Set(actualFiles);
+    const expectedFileSet = new Set(expectedFileList);
+    const actualDirectorySet = new Set(actualDirectories);
+    const expectedDirectorySet = new Set(expectedDirectoryList);
     const discrepancies = [];
-    for (const file of expectedFileList) if (!actualFiles.includes(file)) discrepancies.push({ type: "missing", path: file });
-    for (const file of actualFiles) if (!expectedFileList.includes(file)) discrepancies.push({ type: "unexpected", path: file });
-    for (const directory of expectedDirectoryList) if (!actualDirectories.includes(directory)) discrepancies.push({ type: "directory_missing", path: directory });
-    for (const directory of actualDirectories) if (!expectedDirectoryList.includes(directory)) discrepancies.push({ type: "directory_unexpected", path: directory });
+    for (const file of expectedFileList) if (!actualFileSet.has(file)) discrepancies.push({ type: "missing", path: file });
+    for (const file of actualFiles) if (!expectedFileSet.has(file)) discrepancies.push({ type: "unexpected", path: file });
+    for (const directory of expectedDirectoryList) if (!actualDirectorySet.has(directory)) discrepancies.push({ type: "directory_missing", path: directory });
+    for (const directory of actualDirectories) if (!expectedDirectorySet.has(directory)) discrepancies.push({ type: "directory_unexpected", path: directory });
     const requiredFiles = (parsedContract.requiredFiles || []).map(normalizedManifestRelativePath);
     const forbiddenFiles = (parsedContract.forbiddenFiles || []).map(normalizedManifestRelativePath);
     if (requiredFiles.some((item) => !item) || forbiddenFiles.some((item) => !item)) {
       throw new Error("Sanitized workspace contract contains an unsafe required/forbidden path.");
     }
-    for (const required of requiredFiles) if (!actualFiles.includes(required)) discrepancies.push({ type: "required_missing", path: required });
+    for (const required of requiredFiles) if (!actualFileSet.has(required)) discrepancies.push({ type: "required_missing", path: required });
     for (const file of actualFiles) if (isWithinAnyPath(file, forbiddenFiles, root)) discrepancies.push({ type: "forbidden_present", path: file });
     for (const file of tree.files) {
       const expected = canonicalManifestFiles[file.relative];
@@ -3341,12 +3415,18 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
   const stderrProviderErrorType = providerErrorTypeFromText(providerDiagnosticTextFromStderr(stderr));
   let providerErrorType = stderrProviderErrorType;
   let stdoutErrorDetected = false;
-  let finalText = "";
-  let lastSubstantiveEvent = "";
   const toolOutcomes = [];
   let parsedEvents = 0;
   let invalidLines = 0;
-  let runtimeModelEvidence = null;
+  let malformedEventLines = 0;
+  let rootSessionId = "";
+  let permissionDeniedCount = 0;
+  const runtimeModels = [];
+  const sessions = new Map();
+  const sessionState = (id) => {
+    if (!sessions.has(id)) sessions.set(id, { lastEvent: "", messageId: "", parts: new Map() });
+    return sessions.get(id);
+  };
 
   for (const line of (stdout || "").split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -3355,23 +3435,47 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     try {
       const event = JSON.parse(trimmed);
       parsedEvents += 1;
-      runtimeModelEvidence ||= modelEvidenceFromEvent(event);
+      if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string") {
+        malformedEventLines += 1;
+        continue;
+      }
+      const info = event.type === "message.updated"
+        ? (event.properties?.info || event.info || event.data?.info)
+        : event.type === "assistant_message" ? (event.message || event.data) : null;
+      const sessionId = String(info?.sessionID || event.sessionID || event.part?.sessionID || "");
+      if (!rootSessionId && ["step_start", "text", "tool_use"].includes(event.type) && event.sessionID) {
+        rootSessionId = String(event.sessionID);
+      }
+      const state = sessionState(sessionId);
+      const modelEvidence = modelEvidenceFromEvent(event);
+      if (modelEvidence) runtimeModels.push({ ...modelEvidence, sessionId });
       if (event?.type === "error" || event?.type === "session.error" || event?.error || event?.data?.error || event?.properties?.error) {
         stdoutErrorDetected = true;
         providerErrorType = providerErrorTypeFromStructuredEvent(event) || providerErrorType;
-        lastSubstantiveEvent = "error";
+        state.lastEvent = "error";
         continue;
       }
-      if (event?.type === "text" && event?.part?.type === "text" && event?.part?.time?.end) {
+      if (event?.type === "text" && event?.part?.type === "text") {
+        state.lastEvent = "incomplete_text";
+        if (!event.part.time?.end) continue;
         const text = String(event.part.text || "").trim();
         if (text) {
-          finalText = text;
-          lastSubstantiveEvent = "text";
+          // Identified parts are full snapshots, not deltas. Replace repeats;
+          // retain distinct parts only within the final assistant message.
+          const messageId = String(event.part.messageID || event.messageID || `legacy-${parsedEvents}`);
+          if (messageId !== state.messageId) state.parts.clear();
+          state.messageId = messageId;
+          state.parts.set(String(event.part.id || `part-${parsedEvents}`), text);
+          state.lastEvent = "text";
         }
         continue;
       }
       if (event?.type === "tool_use") {
-        lastSubstantiveEvent = "tool_use";
+        state.lastEvent = "tool_use";
+        const toolError = String(event.part?.state?.error || "");
+        if (/permission.{0,40}(denied|reject)|(?:denied|reject).{0,40}permission|auto-rejecting/i.test(toolError)) {
+          permissionDeniedCount += 1;
+        }
         if (toolOutcomes.length < 50) {
           toolOutcomes.push({
             tool: String(event?.part?.tool || "unknown"),
@@ -3381,6 +3485,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
       }
     } catch {
       invalidLines += 1;
+      malformedEventLines += 1;
       const detected = providerErrorTypeFromDiagnosticLine(trimmed);
       if (detected) {
         stdoutErrorDetected = true;
@@ -3389,7 +3494,19 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     }
   }
 
-  const finalResponseDetected = lastSubstantiveEvent === "text" && Boolean(finalText);
+  const observedSessionIds = [...new Set(runtimeModels.map((item) => item.sessionId).filter(Boolean))];
+  if (!rootSessionId && observedSessionIds.length === 1) rootSessionId = observedSessionIds[0];
+  const modelEvidenceAmbiguous = !rootSessionId && observedSessionIds.length > 1;
+  const rootModels = runtimeModels.filter((item) => !rootSessionId || item.sessionId === rootSessionId || !item.sessionId);
+  const identities = [...new Map(rootModels.map(({ provider, model }) => [`${provider}\0${model}`, { provider, model }])).values()];
+  const runtimeModelEvidence = identities.at(-1);
+  const finalState = sessions.get(rootSessionId)?.lastEvent ? sessions.get(rootSessionId) : sessions.get("");
+  const finalText = finalState ? [...finalState.parts.values()].join("\n\n") : "";
+  const finalResponseDetected = finalState?.lastEvent === "text" && Boolean(finalText);
+  const deniedDiagnostics = String(stderr).split(/\r?\n/)
+    .filter((line) => /permission requested:.*auto-rejecting|permission.{0,30}denied/i.test(line))
+    .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line));
+  permissionDeniedCount = Math.max(permissionDeniedCount, deniedDiagnostics.length);
   const recoveredTransientProviderError = !stdoutErrorDetected
     && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error"].includes(stderrProviderErrorType)
     && finalResponseDetected;
@@ -3406,6 +3523,13 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     retryAfterMs: retryAfterMsFromText(`${stderr}\n${stdout}`),
     runtimeObservedProvider: runtimeModelEvidence?.provider || "",
     runtimeObservedModel: runtimeModelEvidence?.model || "",
+    runtimeModelIdentities: identities,
+    runtimeModelConflict: identities.length > 1,
+    modelEvidenceAmbiguous,
+    rootSessionId,
+    permissionDeniedCount,
+    streamIntegrity: malformedEventLines ? "malformed" : "valid",
+    malformedEventLines,
     finalResponseDetected,
     finalText: redactSensitiveText(finalTextTruncated ? `${finalText.slice(0, CONFIG.maxAssistantResponseChars)}\n... [assistant response truncated by bridge]` : finalText),
     finalTextTruncated,
@@ -3890,6 +4014,7 @@ function normalizeScopeContract(job) {
   }
 
   const normalized = {
+    ...(raw.modelRequirement !== undefined ? { modelRequirement: modelRequirementSchema.parse(raw.modelRequirement) } : {}),
     agent: String(raw.agent || job.agent || "").trim(),
     role: String(raw.role || "").trim(),
     mode: normalizeScopeMode(raw.mode),
@@ -4157,6 +4282,11 @@ function formatScopeContractForPrompt(scopeContract) {
     `Agent: ${scopeContract.agent || "not specified"}`,
     `Role: ${scopeContract.role || "not specified"}`,
     `Mode: ${scopeContract.mode}`,
+    ...(scopeContract.modelRequirement ? [
+      `Required managed provider/model: ${scopeContract.modelRequirement.provider}/${scopeContract.modelRequirement.model}`,
+      `Required variant: ${scopeContract.modelRequirement.variant || "not specified"}`,
+      `Runtime model evidence required: ${scopeContract.modelRequirement.requireRuntimeEvidence ? "yes" : "no"}`,
+    ] : []),
     `Read paths: ${scopeContract.scope.read.length ? scopeContract.scope.read.join(", ") : "not specified"}`,
     `Write paths: ${scopeContract.scope.write.length ? scopeContract.scope.write.join(", ") : "none"}`,
     `Allowed edits: ${scopeContract.allowedEdits.length ? scopeContract.allowedEdits.join(", ") : "not specified"}`,
@@ -4393,8 +4523,22 @@ function classifyResultError(result) {
     return "agent_exit_nonzero";
   }
 
+  if (result.streamIntegrity === "malformed" || result.malformedEventLines > 0 || result.invalidEventLineCount > 0) {
+    return "opencode_stream_malformed";
+  }
+
   if (!result.dryRun && !result.assistantFinalResponseDetected) {
-    return "agent_empty_final_response";
+    return result.permissionDeniedCount > 0 ? "agent_permission_denied_without_final_response" : "agent_empty_final_response";
+  }
+
+  if (!result.dryRun && result.modelEvidenceAmbiguous) {
+    return "opencode_model_evidence_ambiguous";
+  }
+  if (!result.dryRun && result.runtimeModelConflict) {
+    return "opencode_model_mismatch";
+  }
+  if (!result.dryRun && result.requireRuntimeModelEvidence && !result.modelAttested) {
+    return "opencode_model_evidence_required";
   }
 
   return null;
@@ -4440,7 +4584,9 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
 
-  const pluginPolicy = forcePure ? { ok: true, mode: "pure", plugins: [] } : await verifyExternalPluginPolicy(workDir);
+  const pluginPolicy = forcePure
+    ? { ok: true, mode: "pure", plugins: [] }
+    : metadataResult?.pluginPolicy?.ok ? metadataResult.pluginPolicy : await verifyExternalPluginPolicy(workDir);
   if (!pluginPolicy.ok) {
     return {
       stdout: "",
@@ -4582,7 +4728,11 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       };
     }
   }
-  const finalPreSpawnMetadata = await readAgentDebugMetadata(agent, workDir, { forcePure, runtimeContext: isolatedRuntime });
+  const finalPreSpawnMetadata = await readAgentDebugMetadata(agent, workDir, {
+    forcePure,
+    runtimeContext: isolatedRuntime,
+    verifiedPluginPolicy: preSpawnPluginPolicy,
+  });
   const finalPreSpawnMetadataError = effectiveReadOnlyMetadataError(finalPreSpawnMetadata, null, {
     expectedAgent: agent,
     expectedMode: configuredMetadata?.mode || "",
@@ -4704,6 +4854,13 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     toolOutcomes: inspection.toolOutcomes,
     parsedEventCount: inspection.parsedEvents,
     invalidEventLineCount: inspection.invalidLines,
+    malformedEventLines: inspection.malformedEventLines,
+    streamIntegrity: inspection.streamIntegrity,
+    permissionDeniedCount: inspection.permissionDeniedCount,
+    runtimeModelConflict: inspection.runtimeModelConflict,
+    modelEvidenceAmbiguous: inspection.modelEvidenceAmbiguous,
+    runtimeModelIdentities: inspection.runtimeModelIdentities,
+    requireRuntimeModelEvidence: CONFIG.requireRuntimeModelEvidence || metadataPolicyOptions.modelRequirement?.requireRuntimeEvidence === true,
     rawOutputTruncated: Boolean(result.stdoutTruncated || result.stderrTruncated),
     rawStdoutChars: result.stdoutChars || 0,
     rawStderrChars: result.stderrChars || 0,
@@ -4728,6 +4885,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   runResult.actualModel = runtimeModelEvidencePresent ? runResult.runtimeObservedModel : "not_runtime_emitted";
   runResult.actualModelEvidence = runtimeModelEvidencePresent ? "authoritative_runtime_event" : "unavailable_in_opencode_json_stream";
   runResult.modelAttested = runtimeModelEvidencePresent
+    && !inspection.runtimeModelConflict && !inspection.modelEvidenceAmbiguous
     && runResult.runtimeObservedProvider === runResult.configuredProvider
     && runResult.runtimeObservedModel === runResult.configuredModel;
   runResult.exactCliModelPin = configuredMetadata?.provider && configuredMetadata?.model
@@ -4773,6 +4931,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     expectedAgent: agent,
     expectedMode: agentMetadata?.metadata?.mode || "",
     expectedMetadata: agentMetadata?.metadata || null,
+    modelRequirement: lockPlan?.scopeContract?.modelRequirement || null,
     allowDelegation: lockPlan?.orchestratorMode === "contractor"
       && lockPlan?.contractorAuthorizationVerified
       && String(agent || "").toLowerCase() === MCP_CONTRACTOR_ORCHESTRATOR_AGENT.toLowerCase(),
@@ -4879,6 +5038,11 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Actual provider used: ${result?.actualProvider || "unknown"}`,
     `Actual model used: ${result?.actualModel || "unknown"}`,
     `Actual model evidence: ${result?.actualModelEvidence || "unavailable"}`,
+    `Runtime model verification: ${result?.modelAttested ? "verified for observed root-session messages" : "unverified"}`,
+    `Runtime model evidence required: ${result?.requireRuntimeModelEvidence ? "yes" : "no"}`,
+    `Runtime model identities conflict: ${result?.runtimeModelConflict ? "yes" : "no"}`,
+    `Event stream integrity: ${result?.streamIntegrity || "not inspected"}`,
+    `Permission denials observed: ${result?.permissionDeniedCount || 0}`,
     "Silent model fallback: disabled",
     `Provider/account concurrency key: ${result?.providerConcurrencyKey || "not acquired"}`,
     `Provider capacity wait ms: ${result?.providerConcurrencyWaitMs || 0}`,
@@ -5058,6 +5222,45 @@ async function verifyProtectedGitRoot(cwd) {
   }
   const root = path.resolve(result.stdout.trim());
   return { ok: true, root };
+}
+
+async function verifyJobWorkspaceReadiness(job, lockPlan, worktreeMode = CONFIG.worktreeMode) {
+  if (job.dryRun) return { ok: true, skipped: "routing_only" };
+  // Sanitized callers verify the manifest separately, before agent discovery.
+  if (job.sanitizedWorkspace) return { ok: true, skipped: "manifest_protected" };
+  const gitState = await verifyProtectedGitRoot(job.cwd);
+  if (!gitState.ok) {
+    return {
+      ...gitState,
+      suggestedFix: "Run the job inside a Git repository, or use dryRun for routing-only validation.",
+    };
+  }
+  const head = await runCommand("git", ["rev-parse", "--verify", "HEAD^{commit}"], gitState.root, 1000 * 15, buildValidationEnv());
+  if (head.exitCode !== 0 || !head.stdout.trim()) {
+    return {
+      ok: false,
+      root: gitState.root,
+      errorType: "git_head_required",
+      error: "Protected OpenCode execution requires HEAD to resolve to a commit. An unborn or invalid HEAD cannot provide a reproducible execution baseline.",
+      suggestedFix: "Select a checkout with a valid commit, or create an appropriate checkpoint outside the bridge before retrying. Use dryRun for routing-only validation.",
+    };
+  }
+  if (shouldUseWorktree(job, lockPlan, worktreeMode)) {
+    const checkpoint = await inspectSourceCheckpointState(gitState.root, {
+      lockedPaths: lockPlan.lockedPaths,
+      allowedEdits: lockPlan.allowedEdits,
+      scopeContract: lockPlan.scopeContract,
+    });
+    if (!checkpoint.ok) {
+      return {
+        ...checkpoint,
+        root: gitState.root,
+        ...dirtyCheckpointDetails(checkpoint),
+        suggestedFix: "Create or select an external checkpoint for the complete source checkout; the bridge will not stash, reset, or commit it.",
+      };
+    }
+  }
+  return { ok: true, root: gitState.root, head: head.stdout.trim() };
 }
 
 async function fileFingerprint(cwd, file, { metadataOnly = false } = {}) {
@@ -7578,8 +7781,39 @@ function ensureIntegrationPreviewSweepTimer() {
   integrationPreviewSweepTimer.unref?.();
 }
 
-function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, projectKey = "" }) {
+let integrationPreviewKeyPromise = null;
+function integrationPreviewKey() {
+  if (!integrationPreviewKeyPromise) {
+    integrationPreviewKeyPromise = (async () => {
+      const queueKey = await queueRequestKey();
+      return createHmac("sha256", queueKey).update("integration-preview-receipt-v1").digest();
+    })().catch((error) => {
+      integrationPreviewKeyPromise = null;
+      throw error;
+    });
+  }
+  return integrationPreviewKeyPromise;
+}
+
+async function claimIntegrationPreviewReceipt(projectKey, previewId, expiresAt, consume) {
+  const db = await openLockDb(projectKey);
+  try {
+    if (!consume) {
+      return !db.prepare("SELECT 1 FROM consumed_integration_previews WHERE preview_id = ?").get(previewId);
+    }
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO consumed_integration_previews (preview_id, expires_at, consumed_at)
+      VALUES (?, ?, ?)
+    `).run(previewId, expiresAt, Date.now());
+    return Number(result.changes || 0) === 1;
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, projectKey = "" }) {
   const normalizedProjectKey = path.resolve(projectKey || process.cwd());
+  const previewKey = await integrationPreviewKey();
   const createdAtMs = Date.now();
   sweepIntegrationPreviews(createdAtMs);
   const projectPreviewCount = [...INTEGRATION_PREVIEWS.values()]
@@ -7600,6 +7834,7 @@ function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, pro
   const identity = {
     createdAt,
     expiresAt,
+    nonce: randomBytes(16).toString("hex"),
     patchSha256: patch.patchSha256,
     sourceBaseCommit: patch.sourceBaseCommit,
     sourceStateSha256: patch.sourceStateSha256,
@@ -7607,7 +7842,7 @@ function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, pro
     targetStateSha256: targetState.targetStateSha256,
     contractSha256,
   };
-  const previewId = createHmac("sha256", INTEGRATION_PREVIEW_KEY).update(JSON.stringify(identity)).digest("hex");
+  const previewId = createHmac("sha256", previewKey).update(JSON.stringify(identity)).digest("hex");
   const receipt = {
     previewId,
     ...identity,
@@ -7617,7 +7852,7 @@ function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, pro
   return receipt;
 }
 
-function integrationPreviewReceiptError(receipt, expected, consume = false) {
+async function integrationPreviewReceiptError(receipt, expected, consume = false, projectKey = "") {
   if (!receipt) return "A reviewed apply requires the exact previewReceipt returned by a prior dry run.";
   sweepIntegrationPreviews();
   let parsed;
@@ -7635,9 +7870,11 @@ function integrationPreviewReceiptError(receipt, expected, consume = false) {
   for (const field of fields) {
     if (parsed[field] !== expected[field]) return `Integration preview is stale: ${field} changed after review.`;
   }
+  const previewKey = await integrationPreviewKey();
   const identity = {
     createdAt: parsed.createdAt,
     expiresAt: parsed.expiresAt,
+    ...(parsed.nonce ? { nonce: parsed.nonce } : {}),
     patchSha256: parsed.patchSha256,
     sourceBaseCommit: parsed.sourceBaseCommit,
     sourceStateSha256: parsed.sourceStateSha256,
@@ -7645,17 +7882,28 @@ function integrationPreviewReceiptError(receipt, expected, consume = false) {
     targetStateSha256: parsed.targetStateSha256,
     contractSha256: parsed.contractSha256,
   };
-  const expectedId = createHmac("sha256", INTEGRATION_PREVIEW_KEY).update(JSON.stringify(identity)).digest("hex");
+  const expectedId = createHmac("sha256", previewKey).update(JSON.stringify(identity)).digest("hex");
   const receivedBytes = Buffer.from(parsed.previewId, "hex");
   const expectedBytes = Buffer.from(expectedId, "hex");
   if (receivedBytes.length !== expectedBytes.length || !timingSafeEqual(receivedBytes, expectedBytes)) {
     return "Integration preview receipt identity is invalid.";
   }
+  const normalizedProjectKey = path.resolve(projectKey || process.cwd());
   const issued = INTEGRATION_PREVIEWS.get(parsed.previewId);
-  if (!issued || issued.expiresAt !== expiresAt || JSON.stringify(issued.identity) !== JSON.stringify(identity)) {
+  if (issued && (issued.expiresAt !== expiresAt
+    || issued.projectKey !== normalizedProjectKey
+    || JSON.stringify(issued.identity) !== JSON.stringify(identity))) {
     return "Integration preview receipt was not issued by this bridge process or was already consumed.";
   }
+  try {
+    if (!await claimIntegrationPreviewReceipt(normalizedProjectKey, parsed.previewId, expiresAt, consume)) {
+      return "Integration preview receipt was already consumed.";
+    }
+  } catch {
+    return "Integration preview receipt state could not be verified durably; apply was blocked.";
+  }
   if (consume) INTEGRATION_PREVIEWS.delete(parsed.previewId);
+  else if (!issued) INTEGRATION_PREVIEWS.set(parsed.previewId, { identity, expiresAt, projectKey: normalizedProjectKey });
   return "";
 }
 
@@ -7890,7 +8138,7 @@ async function integratePatchWithoutSerialLock({
     contractSha256,
   };
   if (!dryRun && reviewed) {
-    const earlyReceiptError = integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity);
+    const earlyReceiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, false, targetCwd);
     if (earlyReceiptError) {
       return {
         ok: false,
@@ -8044,7 +8292,7 @@ async function integratePatchWithoutSerialLock({
       }
       let generatedReceipt;
       try {
-        generatedReceipt = makeIntegrationPreviewReceipt({
+        generatedReceipt = await makeIntegrationPreviewReceipt({
           patch,
           targetState,
           contractSha256,
@@ -8097,7 +8345,7 @@ async function integratePatchWithoutSerialLock({
     }
 
 
-    const receiptError = integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, true);
+    const receiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, true, targetCwd);
     if (receiptError) {
       return {
         ok: false,
@@ -9203,6 +9451,7 @@ function prunePersistedState(db, dbPath) {
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
     expireLocksFromDb(db, now);
+    db.prepare("DELETE FROM consumed_integration_previews WHERE expires_at <= ?").run(now);
     db.prepare(`
       DELETE FROM changed_files
       WHERE run_id IN (
@@ -9559,6 +9808,18 @@ function ensureIntegrationJournalSchema(db) {
   `);
 }
 
+function ensureIntegrationPreviewReceiptSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS consumed_integration_previews (
+      preview_id TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL,
+      consumed_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS consumed_integration_previews_expiry_idx
+      ON consumed_integration_previews (expires_at);
+  `);
+}
+
 function ensureWorktreeArtifactSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS worktree_artifacts (
@@ -9752,11 +10013,13 @@ async function openLockDb(cwd = "") {
           lease_expires_at TEXT NOT NULL
         );
       `);
+      ensureDirectRunAuditSchema(db);
       ensureLockTableSchema(db);
       ensureTableColumn(db, "locks", "acquisition_origin", "TEXT NOT NULL DEFAULT 'legacy'");
       ensureQueueLeaseSchema(db);
       ensurePipelineRevisionSchema(db);
       ensureIntegrationJournalSchema(db);
+      ensureIntegrationPreviewReceiptSchema(db);
       ensureWorktreeArtifactSchema(db);
       await migrateLegacyEncryptedState(db, dbPath);
       scrubLegacyLockSecrets(db);
@@ -9795,6 +10058,16 @@ async function openLockDb(cwd = "") {
   }
 
   throw new Error("SQLite lock database could not be opened.");
+}
+
+function directRunAuditStore() {
+  return createDirectRunAudit({
+    openDb: openLockDb,
+    closeDb,
+    resolveProjectRoot: resolveProjectStateRoot,
+    redact: redactSensitiveText,
+    retentionDays: CONFIG.auditRetentionDays,
+  });
 }
 
 function closeDb(db) {
@@ -10299,6 +10572,12 @@ function formatDelegationPlanJob({ index, job, lockPlan, resolution }) {
     `JOB ${index + 1}`,
     `Requested agent: ${resolution?.requestedAgent || lockPlan.agent}`,
     `Requested agent mode: ${resolution?.requestedAgentMode || "unknown"}`,
+    ...(lockPlan.scopeContract?.modelRequirement ? [
+      `Required provider: ${lockPlan.scopeContract.modelRequirement.provider}`,
+      `Required model: ${lockPlan.scopeContract.modelRequirement.model}`,
+      `Required variant: ${lockPlan.scopeContract.modelRequirement.variant || "not specified"}`,
+      `Runtime model evidence required: ${lockPlan.scopeContract.modelRequirement.requireRuntimeEvidence ? "yes" : "no"}`,
+    ] : []),
     `Actual agent: ${resolution?.actualAgent || "none"}`,
     `Actual agent mode: ${resolution?.actualAgentMode || resolution?.requestedAgentMode || "unknown"}`,
     `Fallback used: ${resolution?.fallbackUsed ? "yes" : "no"}`,
@@ -10489,34 +10768,29 @@ server.tool(
     cwd: z.string().min(1).describe("Canonical repository path used for command and agent discovery checks."),
   },
   async ({ cwd }) => {
-    const pluginPolicy = await verifyExternalPluginPolicy(cwd);
-    if (!pluginPolicy.ok) {
-      return { content: [{ type: "text", text: `OpenCode MCP bridge status: attention required.\n\nPlugin policy: rejected\nReason: ${pluginPolicy.error}` }] };
-    }
-    const [openCodeVersion, gitVersion, agentDiscovery, safeOrchestratorDebug, contractorOrchestratorMetadata, contractorNestedAttestation, sanitizedReaderMetadata, managedSkillEvidence, providerCapacity] = await Promise.all([
+    const [pluginPolicy, openCodeVersion, gitVersion, agentDiscovery, safeOrchestratorMetadata, contractorOrchestratorMetadata, contractorNestedAttestation, sanitizedReaderMetadata, managedSkillEvidence, providerCapacity] = await Promise.all([
+      verifyExternalPluginPolicy(cwd),
       safeOpenCodeCommand(["--version"], cwd, 1000 * 30),
       runCommand("git", ["--version"], cwd, 1000 * 30),
       listAvailableAgents(cwd),
-      safeOpenCodeCommand(["debug", "agent", MCP_ORCHESTRATOR_AGENT], cwd, 1000 * 30),
+      readAgentDebugMetadata(MCP_ORCHESTRATOR_AGENT, cwd || process.cwd()),
       readAgentDebugMetadata(MCP_CONTRACTOR_ORCHESTRATOR_AGENT, cwd || process.cwd()),
       attestContractorNestedAgents(cwd || process.cwd()),
       readAgentDebugMetadata(MCP_SANITIZED_READER_AGENT, cwd || process.cwd(), { forcePure: true }),
       managedSkillSourceEvidence(),
       providerCapacitySnapshot(),
     ]);
+    if (!pluginPolicy.ok) {
+      return { content: [{ type: "text", text: `OpenCode MCP bridge status: attention required.\n\nPlugin policy: rejected\nReason: ${pluginPolicy.error}` }] };
+    }
     const availableAgents = availableAgentLabels(agentDiscovery.agents);
     const missingRequiredAgents = GLOBALLY_REQUIRED_MANAGED_AGENTS.filter((agent) => !agentDiscovery.agents.has(agent));
     const sanitizedReaderPolicyError = sanitizedAgentMetadataError(sanitizedReaderMetadata, path.resolve(cwd || process.cwd()));
-    let safeOrchestratorPolicy = null;
-    try {
-      safeOrchestratorPolicy = JSON.parse(safeOrchestratorDebug.stdout);
-    } catch {
-      safeOrchestratorPolicy = null;
-    }
-    const safeOrchestratorEnforced = safeOrchestratorDebug.exitCode === 0
+    const safeOrchestratorPolicy = safeOrchestratorMetadata?.metadata || null;
+    const safeOrchestratorEnforced = safeOrchestratorMetadata?.ok
       && safeOrchestratorPolicy?.name === MCP_ORCHESTRATOR_AGENT
-      && safeOrchestratorPolicy?.tools?.apply_patch === false
-      && safeOrchestratorPolicy?.tools?.task === false;
+      && safeOrchestratorPolicy?.canEdit === false
+      && safeOrchestratorPolicy?.canDelegate === false;
     const contractorOrchestratorPolicy = contractorOrchestratorMetadata?.metadata || null;
     const contractorOrchestratorEnforced = contractorOrchestratorMetadata?.ok
       && contractorOrchestratorPolicy?.name === MCP_CONTRACTOR_ORCHESTRATOR_AGENT
@@ -10545,6 +10819,13 @@ server.tool(
             "",
             `OpenCode executable: ${OPENCODE_EXE}`,
             `OpenCode version: ${(openCodeVersion.stdout || openCodeVersion.stderr || "unavailable").trim()}`,
+            `Bridge source SHA-256 at startup: ${BRIDGE_SOURCE_SHA256}`,
+            `Bridge release root: ${BRIDGE_RUNTIME_DIR}`,
+            `Bridge release manifest pin: ${String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "not pinned")}`,
+            `Node runtime: ${process.version}`,
+            "Provider readiness: not tested by health (no model request sent)",
+            "Project OpenCode config: disabled; use a reviewed managed profile, not the personal/project default",
+            `Runtime model evidence required by operator: ${CONFIG.requireRuntimeModelEvidence ? "yes" : "no"}`,
             `OpenCode check exit code: ${openCodeVersion.exitCode}`,
             `Git version: ${(gitVersion.stdout || gitVersion.stderr || "unavailable").trim()}`,
             `Git check exit code: ${gitVersion.exitCode}`,
@@ -10555,8 +10836,8 @@ server.tool(
             `Managed skill source aggregate SHA-256: ${managedSkillEvidence.sha256 || "unavailable"}`,
             `Managed skill source error: ${managedSkillEvidence.error || "none"}`,
             `MCP orchestrator execution agent: ${MCP_ORCHESTRATOR_AGENT}`,
-            `MCP orchestrator edit permission denied: ${safeOrchestratorPolicy?.tools?.apply_patch === false ? "yes" : "no"}`,
-            `MCP orchestrator nested task permission denied: ${safeOrchestratorPolicy?.tools?.task === false ? "yes" : "no"}`,
+            `MCP orchestrator edit permission denied: ${safeOrchestratorPolicy?.canEdit === false ? "yes" : "no"}`,
+            `MCP orchestrator nested task permission denied: ${safeOrchestratorPolicy?.canDelegate === false ? "yes" : "no"}`,
             `MCP contractor orchestrator execution agent: ${MCP_CONTRACTOR_ORCHESTRATOR_AGENT}`,
             `MCP contractor direct edit permission denied: ${contractorOrchestratorPolicy?.canEdit === false ? "yes" : "no"}`,
             `MCP contractor nested task permission enabled: ${contractorOrchestratorPolicy?.canDelegate === true ? "yes" : "no"}`,
@@ -10606,11 +10887,12 @@ server.tool(
   },
   async ({ cwd }) => {
     const projectRoot = await resolveProjectStateRoot(cwd);
-    const [jobs, pipelines, locks, provider] = await Promise.all([
+    const [jobs, pipelines, locks, provider, directRunAudit] = await Promise.all([
       listPersistedQueueRecords(projectRoot),
       listPersistedPipelineRecords(projectRoot),
       listLocks(projectRoot),
       providerCapacitySnapshot(),
+      directRunAuditStore().snapshot(projectRoot),
     ]);
     const nonterminal = jobs.filter((job) => !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
     const failed = jobs.filter((job) => ["failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
@@ -10621,11 +10903,19 @@ server.tool(
         jobs: jobs.length,
         nonterminalJobs: nonterminal.length,
         failedJobs: failed.length,
+        directRuns: directRunAudit.records.length,
+        failedDirectRuns: directRunAudit.records.filter((run) => ["failed", "rejected"].includes(run.status)).length,
+        unfinishedDirectRuns: directRunAudit.records.filter((run) => run.status === "started").length,
         pipelines: pipelines.length,
         nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,
         locks: locks.length,
         providerCapacity: provider.capacity,
         providerActiveLeases: provider.leases.length,
+      },
+      directRuns: directRunAudit.records,
+      diagnosticCoverage: {
+        jobs: "queued_jobs_only",
+        directRuns: directRunAudit.coverage,
       },
       jobs: jobs.map((job) => ({
         jobId: job.jobId,
@@ -10775,6 +11065,23 @@ server.tool(
           }),
         }],
       };
+    }
+
+    for (let index = 0; index < jobs.length; index += 1) {
+      const readiness = await verifyJobWorkspaceReadiness(jobs[index], lockPlans[index]);
+      if (!readiness.ok) {
+        return { content: [{ type: "text", text: formatRejectedExecution({
+          headline: "Delegation plan workspace preflight rejected before OpenCode discovery.",
+          errorType: readiness.errorType,
+          reason: readiness.error,
+          requestedAgent: lockPlans[index].agent,
+          actualAgent: "none",
+          lockMode: lockPlans[index].lockMode,
+          durationMs: nowMs() - toolStarted,
+          ...dirtyCheckpointDetails(readiness),
+          suggestedFix: readiness.suggestedFix,
+        }) }] };
+      }
     }
 
     const activeConflict = await findActiveLockConflict(lockPlans);
@@ -11034,8 +11341,9 @@ server.tool(
       validationCommand,
       delegation,
     };
-    const execution = await executeOpenCodeJob(await normalizeJobCwd(requestedJob), { toolStarted });
-    return execution.response;
+    return directRunAuditStore().run(requestedJob, async ({ onChildSpawn }) =>
+      executeOpenCodeJob(await normalizeJobCwd(requestedJob), { toolStarted, onChildSpawn })
+    );
   }
 );
 
@@ -13143,8 +13451,8 @@ async function executeOpenCodeJob(requestedJob, {
     };
   }
 
-  if (!dryRun && !requestedJob.sanitizedWorkspace) {
-    const gitState = await verifyProtectedGitRoot(cwd);
+  {
+    const gitState = await verifyJobWorkspaceReadiness(requestedJob, lockPlan);
     if (!gitState.ok) {
       return {
         response: {
@@ -13158,7 +13466,8 @@ async function executeOpenCodeJob(requestedJob, {
               actualAgent: "none",
               lockMode: lockPlan.lockMode,
               durationMs: nowMs() - toolStarted,
-              suggestedFix: "Run the job inside a Git repository, or use dryRun for routing-only validation.",
+              ...dirtyCheckpointDetails(gitState),
+              suggestedFix: gitState.suggestedFix,
             }),
           }],
         },
@@ -14586,13 +14895,18 @@ async function persistQueueRecord(record) {
       && Boolean(record.ownerGeneration);
     const currentTerminal = ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(current.status);
     let currentSummaryRevision = -1;
-    try { currentSummaryRevision = Number(JSON.parse(current.record_json || "{}").revision ?? -1); } catch { /* Fail closed below. */ }
+    let currentSummaryStatus = "";
+    try {
+      const currentSummary = JSON.parse(current.record_json || "{}");
+      currentSummaryRevision = Number(currentSummary.revision ?? -1);
+      currentSummaryStatus = String(currentSummary.status || "");
+    } catch { /* Fail closed below. */ }
     const attemptedRevision = Number(record.revision || 0);
     const heartbeatOnlyAdvance = sameOwner
-      && current.status === record.status
       && currentRevision > attemptedRevision
       && currentSummaryRevision >= 0
-      && currentSummaryRevision <= attemptedRevision;
+      && currentSummaryRevision <= attemptedRevision
+      && currentSummaryStatus === current.status;
     if (heartbeatOnlyAdvance) {
       Object.assign(record, {
         revision: currentRevision,
@@ -17578,9 +17892,7 @@ server.tool(
     }
 
     for (let index = 0; index < jobs.length; index += 1) {
-      if (jobs[index].dryRun) continue;
-      if (jobs[index].sanitizedWorkspace) continue;
-      const gitState = await verifyProtectedGitRoot(jobs[index].cwd);
+      const gitState = await verifyJobWorkspaceReadiness(jobs[index], lockPlans[index]);
       if (!gitState.ok) {
         return {
           content: [{
@@ -17593,7 +17905,8 @@ server.tool(
               actualAgent: "none",
               lockMode: lockPlans[index].lockMode,
               durationMs: nowMs() - toolStarted,
-              suggestedFix: "Run every non-dry-run job inside a Git repository.",
+              ...dirtyCheckpointDetails(gitState),
+              suggestedFix: gitState.suggestedFix,
             }),
           }],
         };
@@ -18272,11 +18585,133 @@ server.tool(
   }
 );
 
+function runEventEvidenceSelfTests() {
+  const requiredModel = { provider: "fixture", model: "model-a", variant: "high", requireRuntimeEvidence: true };
+  assert.deepEqual(modelRequirementSchema.parse(requiredModel), requiredModel);
+  assert.equal(modelRequirementSchema.safeParse({ ...requiredModel, endpoint: "https://example.invalid" }).success, false);
+  assert.equal(modelRequirementSchema.safeParse({ ...requiredModel, variant: "high\n" }).success, true);
+  assert.equal(modelRequirementSchema.safeParse({ ...requiredModel, model: "model\ninvalid" }).success, false);
+  const requiredScope = { mode: "read", read: ["src"], modelRequirement: requiredModel };
+  assert.deepEqual(normalizeScopeContract({ agent: "planner", scopeContract: requiredScope }).modelRequirement, requiredModel);
+  assert.deepEqual(normalizeScopeContract({ agent: "planner", delegation: { scopeContract: requiredScope } }).modelRequirement, requiredModel);
+  const normalizedRequiredScope = normalizeScopeContract({ agent: "planner", scopeContract: requiredScope });
+  assert.deepEqual(normalizeScopeContract({ agent: "planner", scopeContract: normalizedRequiredScope }).modelRequirement, requiredModel);
+  const modelMetadata = { ok: true, metadata: {
+    name: "planner", mode: "all", provider: "fixture", model: "model-a", variant: "high",
+    canDelegate: false, externalDirectoryDenied: true, webDenied: true, bashAutomaticAllowSafe: true, canEdit: false,
+  } };
+  const requiredLock = { lockType: "read", scopeContract: normalizedRequiredScope };
+  assert.equal(effectiveReadOnlyMetadataError(modelMetadata, requiredLock), null);
+  for (const changed of [{ model: "other" }, { provider: "other" }, { variant: "low" }]) {
+    assert.equal(effectiveReadOnlyMetadataError({ ok: true, metadata: { ...modelMetadata.metadata, ...changed } }, requiredLock).errorType,
+      "configured_model_requirement_mismatch");
+  }
+  const text = (value, messageID = "final", id = "part-1", sessionID = "root") => ({
+    type: "text", sessionID, part: { type: "text", text: value, id, messageID, time: { end: 1 } },
+  });
+  const model = (modelID, sessionID = "root") => ({
+    type: "message.updated", properties: { info: { role: "assistant", providerID: "fixture", modelID, sessionID } },
+  });
+  const inspect = (events, stderr = "") => inspectOpenCodeEventStream(
+    events.map((event) => typeof event === "string" ? event : JSON.stringify(event)).join("\n"), stderr
+  );
+  const classify = (inspection, extra = {}) => classifyResultError({
+    exitCode: 0, assistantFinalResponseDetected: inspection.finalResponseDetected,
+    streamIntegrity: inspection.streamIntegrity, malformedEventLines: inspection.malformedEventLines,
+    runtimeModelConflict: inspection.runtimeModelConflict, modelEvidenceAmbiguous: inspection.modelEvidenceAmbiguous,
+    permissionDeniedCount: inspection.permissionDeniedCount, ...extra,
+  });
+  for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]) {
+    const canary = prefix + "A".repeat(36);
+    for (const value of [canary, `api_key=${canary}`, `https://example.invalid/?value=${canary}`, JSON.stringify({ output: canary })]) {
+      assert.equal(redactSensitiveText(value).includes(canary), false, `GitHub ${prefix} canary must be redacted.`);
+      assert.equal(JSON.stringify(sanitizePersistedValue({ resultText: value })).includes(canary), false);
+      assert.equal(JSON.stringify(sanitizeLogValue({ evidence: value })).includes(canary), false);
+    }
+  }
+  assert.equal(redactSensitiveText("github_pat_example ghp_short normal report"), "github_pat_example ghp_short normal report");
+  const multipart = inspect([text("draft", "commentary"), text("A"), text("A revised"), text("B", "final", "part-2")]);
+  assert.equal(multipart.finalText, "A revised\n\nB");
+  assert.equal(multipart.finalResponseDetected, true);
+  assert.equal(inspect([text("old", "before"), text("new", "after")]).finalText, "new");
+  assert.equal(inspect([text("old"), { type: "tool_use", sessionID: "root", part: { tool: "read", state: { status: "completed" } } }]).finalResponseDetected, false);
+  assert.equal(inspect([text("old"), { type: "text", sessionID: "root", part: { type: "text", text: "unfinished", time: {} } }]).finalResponseDetected, false);
+  const switched = inspect([model("model-a"), model("model-b"), text("done")]);
+  assert.equal(switched.runtimeModelConflict, true);
+  assert.equal(switched.runtimeObservedModel, "model-b");
+  assert.equal(classify(switched), "opencode_model_mismatch");
+  const child = inspect([
+    { type: "step_start", sessionID: "root" }, model("parent"),
+    model("child", "child-session"), text("child answer", "child-final", "child-part", "child-session"),
+    text("parent answer"),
+  ]);
+  assert.equal(child.runtimeObservedModel, "parent");
+  assert.equal(child.runtimeModelConflict, false);
+  assert.equal(child.finalText, "parent answer");
+  const ambiguous = inspect([model("a", "left"), model("b", "right")]);
+  assert.equal(ambiguous.modelEvidenceAmbiguous, true);
+  const missing = inspect([text("done")]);
+  assert.equal(missing.runtimeObservedModel, "");
+  assert.equal(classify(missing), null);
+  assert.equal(classify(missing, { requireRuntimeModelEvidence: true }), "opencode_model_evidence_required");
+  assert.equal(classify(missing, { requireRuntimeModelEvidence: true, modelAttested: true }), null);
+  assert.equal(inspect([text("my model is fixture/model-a")]).runtimeObservedModel, "");
+  for (const malformed of ["{cut-off", "null", "[]", "42", JSON.stringify({ unexpected: "object" })]) {
+    const result = inspect([malformed, text("done")]);
+    assert.equal(result.streamIntegrity, "malformed");
+    assert.equal(classify(result), "opencode_stream_malformed");
+  }
+  const denial = "permission requested: bash (git log --oneline --decorate -10); auto-rejecting";
+  const denied = inspect([{ type: "tool_use", sessionID: "root", part: { tool: "bash", state: { status: "error" } } }], denial);
+  assert.equal(classify(denied), "agent_permission_denied_without_final_response");
+  assert.equal(classify(inspect([text("Partial report: shell was denied.")], denial)), null);
+  assert.equal(classify(inspect([])), "agent_empty_final_response");
+  console.log("Event evidence and redaction regression tests passed.");
+}
+
 async function runSelfTests() {
+  runEventEvidenceSelfTests();
   const selfTestProgress = (stage) => console.log(`[${new Date().toISOString()}] self-test: ${stage}`);
   selfTestProgress("start");
+  const initialSelfTestStateDirectoryOverride = stateDirectoryOverride;
+  const earlySelfTestStateDir = await mkdtemp(path.join(tmpdir(), "codex-opencode-self-test-state-"));
+  stateDirectoryOverride = earlySelfTestStateDir;
   selfTestProgress("core validation/security");
-  const previewTimingFixture = makeIntegrationPreviewReceipt({
+  {
+    const flights = new Map();
+    let calls = 0;
+    let releaseFlight;
+    const gate = new Promise((resolve) => { releaseFlight = resolve; });
+    const operation = async () => {
+      calls += 1;
+      await gate;
+      return { ok: true, call: calls };
+    };
+    const first = runSingleFlight(flights, "same", operation);
+    const second = runSingleFlight(flights, "same", operation);
+    releaseFlight();
+    assert.deepEqual(await Promise.all([first, second]), [{ ok: true, call: 1 }, { ok: true, call: 1 }]);
+    assert.equal(calls, 1, "Concurrent single-flight callers must share one operation.");
+    assert.equal(flights.size, 0, "A completed single-flight operation must not remain cached.");
+    await runSingleFlight(flights, "same", async () => ({ ok: ++calls, call: calls }));
+    assert.equal(calls, 2, "A later caller must re-run the operation instead of using a settled cache entry.");
+
+    let failureCalls = 0;
+    const fail = () => runSingleFlight(flights, "failure", async () => {
+      failureCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      throw new Error("single-flight-test-failure");
+    });
+    await assert.rejects(Promise.all([fail(), fail()]), /single-flight-test-failure/);
+    assert.equal(failureCalls, 1, "Concurrent failures must share one fail-closed operation.");
+    assert.equal(flights.size, 0, "A failed single-flight operation must be removed immediately.");
+    assert.deepEqual(
+      await runSingleFlight(flights, "failure", async () => ({ ok: true })),
+      { ok: true },
+      "A failure must never be cached for a later caller."
+    );
+  }
+  const previewReceiptIdentityArguments = {
     patch: {
       patchSha256: "a".repeat(64),
       sourceBaseCommit: "b".repeat(40),
@@ -18288,7 +18723,8 @@ async function runSelfTests() {
     },
     contractSha256: "f".repeat(64),
     projectKey: process.cwd(),
-  });
+  };
+  const previewTimingFixture = await makeIntegrationPreviewReceipt(previewReceiptIdentityArguments);
   assert.equal(
     Date.parse(previewTimingFixture.expiresAt) - Date.parse(previewTimingFixture.createdAt),
     INTEGRATION_PREVIEW_TTL_MS
@@ -18301,6 +18737,94 @@ async function runSelfTests() {
   });
   sweepIntegrationPreviews();
   assert.equal(INTEGRATION_PREVIEWS.has("expired-preview-self-test"), false);
+  {
+    const previewExpectedIdentity = {
+      patchSha256: previewReceiptIdentityArguments.patch.patchSha256,
+      sourceBaseCommit: previewReceiptIdentityArguments.patch.sourceBaseCommit,
+      sourceStateSha256: previewReceiptIdentityArguments.patch.sourceStateSha256,
+      targetHead: previewReceiptIdentityArguments.targetState.targetHead,
+      targetStateSha256: previewReceiptIdentityArguments.targetState.targetStateSha256,
+      contractSha256: previewReceiptIdentityArguments.contractSha256,
+    };
+    assert.equal(
+      await integrationPreviewReceiptError(previewTimingFixture, previewExpectedIdentity, true, previewReceiptIdentityArguments.projectKey),
+      "",
+      "A valid unconsumed receipt must be accepted."
+    );
+    INTEGRATION_PREVIEWS.delete(previewTimingFixture.previewId);
+    assert.equal(
+      await integrationPreviewReceiptError(previewTimingFixture, previewExpectedIdentity, true, previewReceiptIdentityArguments.projectKey),
+      "Integration preview receipt was already consumed.",
+      "A consumed receipt must stay single-use after process memory is lost."
+    );
+    const restartPreviewFixture = await makeIntegrationPreviewReceipt(previewReceiptIdentityArguments);
+    assert.notEqual(restartPreviewFixture.previewId, previewTimingFixture.previewId);
+    INTEGRATION_PREVIEWS.delete(restartPreviewFixture.previewId);
+    assert.equal(
+      await integrationPreviewReceiptError(restartPreviewFixture, previewExpectedIdentity, true, previewReceiptIdentityArguments.projectKey),
+      "",
+      "An unconsumed receipt lost to a bridge restart must still be accepted once."
+    );
+    assert.equal(
+      await integrationPreviewReceiptError(restartPreviewFixture, previewExpectedIdentity, true, previewReceiptIdentityArguments.projectKey),
+      "Integration preview receipt was already consumed.",
+      "The restart receipt consumption must be durable."
+    );
+    const previewStateRoot = await resolveProjectStateRoot(previewReceiptIdentityArguments.projectKey);
+    const previewDbPath = stateDbPath(previewStateRoot);
+    const previewDb = await openLockDb(previewReceiptIdentityArguments.projectKey);
+    try {
+      const expiredPreviewId = "0".repeat(64);
+      previewDb.prepare(`
+        INSERT INTO consumed_integration_previews (preview_id, expires_at, consumed_at)
+        VALUES (?, ?, ?)
+      `).run(expiredPreviewId, Date.now() - 1, Date.now() - 2);
+      statePruneTimes.delete(previewDbPath);
+      prunePersistedState(previewDb, previewDbPath);
+      assert.equal(
+        previewDb.prepare("SELECT 1 FROM consumed_integration_previews WHERE preview_id = ?").get(expiredPreviewId),
+        undefined,
+        "Expired integration preview consumption records must be pruned."
+      );
+      assert.ok(
+        previewDb.prepare("SELECT 1 FROM consumed_integration_previews WHERE preview_id = ?").get(restartPreviewFixture.previewId),
+        "Unexpired integration preview consumption records must be retained."
+      );
+    } finally {
+      closeDb(previewDb);
+    }
+  }
+  const exampleConfigPath = path.join(BRIDGE_RUNTIME_DIR, "codex", "config.example.toml");
+  if (existsSync(exampleConfigPath)) {
+    const exampleConfig = await readFile(exampleConfigPath, "utf8");
+    const retentionMatch = exampleConfig.match(/^CODEX_OPENCODE_QUEUE_RETENTION_DAYS\s*=\s*"(\d+)"/m);
+    assert.ok(retentionMatch, "config.example.toml pins CODEX_OPENCODE_QUEUE_RETENTION_DAYS.");
+    assert.ok(
+      Number(retentionMatch[1]) > 0,
+      "config.example.toml QUEUE_RETENTION_DAYS must be strictly positive; zero crashes startup."
+    );
+  }
+  {
+    const quoteFixtureRoot = await mkdtemp(path.join(tmpdir(), "codex-opencode-quotepath-self-test-"));
+    try {
+      const unicodeFileName = "\u0645\u0644\u0641.txt";
+      await runCommand("git", ["init", "-q"], quoteFixtureRoot, 1000 * 30);
+      await runCommand("git", ["config", "user.email", "bridge-self-test@example.invalid"], quoteFixtureRoot, 1000 * 30);
+      await runCommand("git", ["config", "user.name", "bridge-self-test"], quoteFixtureRoot, 1000 * 30);
+      await writeFile(path.join(quoteFixtureRoot, unicodeFileName), "one\n", "utf8");
+      await runCommand("git", ["add", "-A"], quoteFixtureRoot, 1000 * 30);
+      await runCommand("git", ["commit", "-qm", "seed"], quoteFixtureRoot, 1000 * 30);
+      await writeFile(path.join(quoteFixtureRoot, unicodeFileName), "two\n", "utf8");
+      const changedUnicodeFiles = await gitChangedFiles(quoteFixtureRoot);
+      assert.deepEqual(
+        changedUnicodeFiles,
+        [unicodeFileName],
+        "Changed-file validation must observe non-ASCII paths verbatim (core.quotePath=false)."
+      );
+    } finally {
+      await rm(quoteFixtureRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+    }
+  }
   assert.doesNotThrow(() => assertSupportedQueueRetryConfig({ queueReadOnlyRetries: 0, queueWriteRetries: 0 }));
   assert.throws(
     () => assertSupportedQueueRetryConfig({ queueReadOnlyRetries: 1, queueWriteRetries: 0 }),
@@ -20003,14 +20527,20 @@ async function runSelfTests() {
   const tempStateDir = `${tempDir}-state`;
   const outsideLinkTarget = `${tempDir}-outside`;
   const nonGitFixture = `${tempDir}-non-git`;
-  const previousStateDirectoryOverride = stateDirectoryOverride;
   stateDirectoryOverride = tempStateDir;
   try {
     await mkdir(nonGitFixture, { recursive: true });
     assert.equal((await verifyProtectedGitRoot(nonGitFixture)).errorType, "git_state_required");
+    const readinessReaderPlan = { lockType: "read", lockedPaths: [], allowedEdits: [] };
+    const readinessReaderJob = { agent: "reviewer", task: "Workspace readiness regression", cwd: nonGitFixture, write: false, lockMode: "off" };
+    assert.equal((await verifyJobWorkspaceReadiness(readinessReaderJob, readinessReaderPlan)).errorType, "git_state_required");
+    assert.deepEqual(await verifyJobWorkspaceReadiness({ ...readinessReaderJob, dryRun: true }, readinessReaderPlan), { ok: true, skipped: "routing_only" });
+    assert.equal((await executeOpenCodeJob(readinessReaderJob)).result.errorType, "git_state_required");
     await assert.rejects(gitChangedFiles(nonGitFixture), /Git changed-file inspection failed closed/);
     const init = await runCommand("git", ["init"], tempDir, 1000 * 15);
     assert.equal(init.exitCode, 0);
+    assert.equal((await verifyJobWorkspaceReadiness({ ...readinessReaderJob, cwd: tempDir }, readinessReaderPlan)).errorType, "git_head_required");
+    assert.equal((await executeOpenCodeJob({ ...readinessReaderJob, cwd: tempDir })).result.errorType, "git_head_required");
     assert.equal((await runCommand("git", ["config", "core.autocrlf", "false"], tempDir, 1000 * 15)).exitCode, 0);
     const pluginFixtureHome = path.join(tempDir, "plugin-home");
     const pluginFixtureSpec = "bridge-plugin-fixture@1.2.3";
@@ -20293,6 +20823,11 @@ async function runSelfTests() {
       "delegation_plan_preflight_before_discovery"
     );
     assert.equal(sanitizedPlanPassed.ok, true, JSON.stringify(sanitizedPlanPassed, null, 2));
+    assert.deepEqual(await verifyJobWorkspaceReadiness({
+      ...readinessReaderJob,
+      cwd: sanitizedRoot,
+      sanitizedWorkspace: sanitizedContract,
+    }, readinessReaderPlan, "all"), { ok: true, skipped: "manifest_protected" });
     await writeFile(path.join(sanitizedRoot, "unexpected.txt"), "unexpected\n", "utf8");
     const sanitizedAdded = await verifySanitizedWorkspace(sanitizedContract, "after_wave");
     assert.equal(sanitizedAdded.ok, false);
@@ -20970,6 +21505,27 @@ async function runSelfTests() {
     assert.equal(heartbeatRevisionRecord.revision, persistedHeartbeatRevision.revision);
     assert.equal((await updateQueueRecordDurable(heartbeatRevisionRecord, { status: "cancelled", finishedAt: new Date().toISOString() })).persisted, true);
 
+    const staleHeartbeatTransitionRecord = makeQueuePersistenceRecord("stale-heartbeat-transition-self-test");
+    assert.equal((await persistQueueRecord(staleHeartbeatTransitionRecord)).persisted, true);
+    const staleHeartbeatDb = await openLockDb(tempDir);
+    try {
+      const heartbeatAt = new Date().toISOString();
+      staleHeartbeatDb.prepare(`
+        UPDATE opencode_jobs
+        SET heartbeat_at = ?, lease_expires_at = ?, revision = revision + 1
+        WHERE job_id = ?
+      `).run(
+        heartbeatAt,
+        new Date(Date.now() + CONFIG.queueLeaseMs).toISOString(),
+        staleHeartbeatTransitionRecord.jobId
+      );
+    } finally {
+      closeDb(staleHeartbeatDb);
+    }
+    const staleHeartbeatTransition = await updateQueueRecordDurable(staleHeartbeatTransitionRecord, { status: "planned" });
+    assert.equal(staleHeartbeatTransition.persisted, true);
+    assert.equal(staleHeartbeatTransitionRecord.status, "planned");
+
     const truncatedQueueRecord = makeQueuePersistenceRecord("queue-result-truncation-self-test");
     assert.equal((await persistQueueRecord(truncatedQueueRecord)).persisted, true);
     assert.equal((await claimQueueRecord(truncatedQueueRecord)).ok, true);
@@ -21031,11 +21587,12 @@ async function runSelfTests() {
 
     const queuePersistenceCleanupDb = await openLockDb(tempDir);
     try {
-      queuePersistenceCleanupDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?)").run(
+      queuePersistenceCleanupDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?)").run(
         preExecutionFailureRecord.jobId,
         scheduledConflictRecord.jobId,
         staleRevisionRecord.jobId,
         heartbeatRevisionRecord.jobId,
+        staleHeartbeatTransitionRecord.jobId,
         truncatedQueueRecord.jobId,
         missingFinalQueueRecord.jobId,
         missingWriteEvidenceRecord.jobId
@@ -21055,6 +21612,11 @@ async function runSelfTests() {
     assert.equal(commit.exitCode, 0);
     assert.equal(await resolveProjectStateRoot(path.join(tempDir, "src")), path.resolve(tempDir));
     const initialHead = (await runCommand("git", ["rev-parse", "HEAD"], tempDir, 1000 * 15)).stdout.trim();
+    const readinessWriterPlan = { lockType: "write", lockedPaths: ["src/allowed.txt"], allowedEdits: ["src/allowed.txt"] };
+    const readinessWriterJob = { cwd: tempDir, write: true };
+    const cleanReadiness = await verifyJobWorkspaceReadiness(readinessWriterJob, readinessWriterPlan, "write");
+    assert.equal(cleanReadiness.ok, true);
+    assert.equal(cleanReadiness.head, initialHead);
     await writeFile(path.join(tempDir, "src", "blocked.txt"), "unstaged checkpoint test\n", "utf8");
     await writeFile(path.join(tempDir, "src", "api.txt"), "staged checkpoint test\n", "utf8");
     assert.equal((await runCommand("git", ["add", "--", "src/api.txt"], tempDir, 1000 * 15)).exitCode, 0);
@@ -21075,6 +21637,14 @@ async function runSelfTests() {
     assert.deepEqual(dirtyPreflight.overlappingFiles, ["src/allowed.txt"]);
     assert.ok(dirtyPreflight.disjointFiles.includes("untracked-checkpoint.txt"));
     assert.deepEqual(dirtyPreflight.conflictingPaths, ["src/allowed.txt"]);
+    const dirtyReadiness = await verifyJobWorkspaceReadiness(readinessWriterJob, readinessWriterPlan, "write");
+    assert.equal(dirtyReadiness.errorType, "dirty_worktree_requires_checkpoint");
+    assert.deepEqual(dirtyReadiness.dirtyFiles, dirtyPreflight.dirtyFiles);
+    assert.deepEqual(dirtyReadiness.conflictingPaths, ["src/allowed.txt"]);
+    assert.equal((await verifyJobWorkspaceReadiness({ ...readinessReaderJob, cwd: tempDir }, readinessReaderPlan, "write")).ok, true);
+    assert.equal((await verifyJobWorkspaceReadiness({ ...readinessReaderJob, cwd: tempDir }, readinessReaderPlan, "all")).errorType, "dirty_worktree_requires_checkpoint");
+    assert.equal((await verifyJobWorkspaceReadiness(readinessWriterJob, readinessWriterPlan, "off")).ok, true);
+    assert.deepEqual(await verifyJobWorkspaceReadiness({ ...readinessWriterJob, dryRun: true }, readinessWriterPlan, "write"), { ok: true, skipped: "routing_only" });
     const dirtyWorktreeRejected = await createWorktreeForJob({
       cwd: tempDir,
       agent: "builder",
@@ -22880,9 +23450,10 @@ async function runSelfTests() {
     assert.equal(rollback.rollback, "success");
   } finally {
     selfTestProgress("cleanup");
-    stateDirectoryOverride = previousStateDirectoryOverride;
+    stateDirectoryOverride = initialSelfTestStateDirectoryOverride;
     await rm(tempDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     await rm(tempStateDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+    await rm(earlySelfTestStateDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     await rm(outsideLinkTarget, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     await rm(nonGitFixture, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
   }
@@ -23577,6 +24148,9 @@ if (process.argv.includes("--provider-lease-worker")) {
 } else if (process.argv.includes("--self-test")) {
   await verifyReleaseIntegrity();
   await runSelfTests();
+} else if (process.argv.includes("--self-test-events")) {
+  await verifyReleaseIntegrity();
+  runEventEvidenceSelfTests();
 } else {
   await verifyReleaseIntegrity();
   const startupPluginPolicy = await verifyExternalPluginPolicy(process.cwd());

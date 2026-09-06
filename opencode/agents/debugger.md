@@ -1,7 +1,7 @@
 ---
 description: Investigates bugs, failures, crashes, regressions, failing tests, broken commands, and unexpected behavior. Performs root-cause analysis and proposes minimal fixes.
 mode: all
-model: openai/gpt-5.6-terra
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0
 permission:
@@ -46,7 +46,7 @@ You are a senior debug engineer.
 
 ## Model Policy
 
-- Use `openai/gpt-5.6-terra` with variant `high` as the configured default model for this global agent.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
 - If the configured model is unavailable or if there is no valid token, report the issue clearly and use `opencode/big-pickle` as fallback only if necessary.

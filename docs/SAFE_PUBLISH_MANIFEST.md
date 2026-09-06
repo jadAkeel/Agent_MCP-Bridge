@@ -53,12 +53,21 @@ includes exact `node_modules`, `bin/`, package files, `server.js`, reviewed
 `opencode.jsonc`/`antigravity.json`, managed agents/skills, and the rewritten
 plugin-integrity manifest. It never includes provider credentials.
 
-Immutable production uses OpenCode pure mode and the built-in Codex OAuth
+Full immutable production uses OpenCode pure mode and the built-in Codex OAuth
 transport. `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS` must be `false`. The bridge
 and fresh health reject external plugins when a release-manifest pin is active:
 the reviewed Antigravity plugin stores its account under `XDG_CONFIG_HOME`, while
 immutable production requires that config home to be the read-only release root.
-The installed optional plugin is still audited separately, but is not activated.
+
+The explicitly authorized Gemini hybrid profile keeps `server.js` in a published
+read/execute-only release and pins its SHA-256, but points `XDG_CONFIG_HOME`, the
+managed agent/skill directories, and plugin manifest at a dedicated writable OAuth
+runtime. It enables only the exact allowlisted plugin and omits
+`CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256`. This is weaker than the full
+immutable profile: plugin/config/settings integrity remains pinned and effective
+agent policy is attested, but same-user mutation of the writable runtime is outside
+the release manifest boundary. Keep the previous immutable profile and config
+backup for rollback.
 
 The active config and active release remain unchanged through candidate build,
 tests, health, and ACL verification.
@@ -74,7 +83,7 @@ npm audit --omit=dev
 Push-Location opencode
 npm audit --omit=dev
 Pop-Location
-npm audit --prefix 'C:\Users\10User\.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.0.0' --omit=dev
+npm audit --prefix 'C:\Users\10User\.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.2.1' --omit=dev
 git diff --check
 ```
 

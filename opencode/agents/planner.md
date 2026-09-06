@@ -1,8 +1,8 @@
 ---
 description: Plans implementation work by inspecting relevant files, identifying risks, affected areas, and verification steps before any code changes.
 mode: all
-model: openai/gpt-5.6-luna
-variant: medium
+model: google/antigravity-gemini-3.8-flash
+variant: high
 temperature: 0.1
 permission:
   edit: deny

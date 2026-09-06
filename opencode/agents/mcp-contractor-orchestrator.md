@@ -1,7 +1,7 @@
 ---
 description: Executes explicitly authorized Codex MCP contracts by coordinating bounded OpenCode subagents.
 mode: all
-model: openai/gpt-5.6-terra
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0
 permission:

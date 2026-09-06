@@ -1,8 +1,8 @@
 ---
 description: Explores repositories read-only to locate relevant files, patterns, dependencies, commands, and risks.
 mode: all
-model: openai/gpt-5.6-luna
-variant: medium
+model: google/antigravity-gemini-3.8-flash
+variant: high
 temperature: 0
 permission:
   edit: deny

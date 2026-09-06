@@ -23,7 +23,8 @@ CODEX_OPENCODE_WORKTREE_ROOT = "global"
 # Executed writer worktrees are always retained. This legacy setting applies only
 # to empty/pre-execution cleanup paths; reviewed integration owns deletion.
 CODEX_OPENCODE_WORKTREE_CLEANUP = "never"
-CODEX_OPENCODE_QUEUE_RETENTION_DAYS = "0"
+# Must be strictly positive; the bridge rejects 0 at startup because no durable archive mode exists.
+CODEX_OPENCODE_QUEUE_RETENTION_DAYS = "30"
 CODEX_OPENCODE_PROVIDER_LEASE_MS = "240000"
 CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS = "20000"
 CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS = "8000"

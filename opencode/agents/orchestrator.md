@@ -1,7 +1,7 @@
 ---
 description: Produces read-only MCP plans for Codex and coordinates OpenCode subagents only in backup or standalone mode.
 mode: all
-model: openai/gpt-5.6-terra
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0
 permission:
@@ -32,7 +32,7 @@ permission:
 
 ## Model Policy
 
-- Use `openai/gpt-5.6-terra` with variant `high` as the configured default model for this global agent.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
 - If the configured model is unavailable, report the issue clearly and use `opencode/big-pickle` as fallback only if necessary.

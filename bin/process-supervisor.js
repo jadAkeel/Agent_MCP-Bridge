@@ -310,11 +310,20 @@ function createSupervisor({ supervisorIdentity = "", identityValid = true } = {}
   };
 
   const terminateWindows = async (reason) => {
-    const taskkill = await runTaskkill();
+    let taskkill = await runTaskkill();
     if (!directChildClosed && processExists(payloadPid)) {
       try { payload?.kill(); } catch { /* Direct-child polling below remains authoritative. */ }
     }
-    const directChildGone = await pollUntil(() => !processExists(payloadPid), terminationConfirmMs);
+    let directChildGone = await pollUntil(() => !processExists(payloadPid), terminationConfirmMs);
+    if (!directChildGone && (taskkill.timedOut || !taskkill.started || taskkill.exitCode !== 0)) {
+      await delay(250);
+      const retriedTaskkill = await runTaskkill();
+      if (retriedTaskkill.started && retriedTaskkill.exitCode === 0) taskkill = retriedTaskkill;
+      if (!directChildClosed && processExists(payloadPid)) {
+        try { payload?.kill(); } catch { /* Direct-child polling below remains authoritative. */ }
+      }
+      directChildGone = await pollUntil(() => !processExists(payloadPid), terminationConfirmMs);
+    }
     if (directChildGone) await waitForDirectClose();
     const bestEffortSucceeded = taskkill.started && taskkill.exitCode === 0 && directChildGone;
     if (!bestEffortSucceeded) {

@@ -1,7 +1,7 @@
 {
   "private": true,
   "dependencies": {
-    "@cortexkit/opencode-antigravity-auth": "2.0.0",
+    "@cortexkit/opencode-antigravity-auth": "2.2.1",
     "@opencode-ai/plugin": "1.17.13"
   }
 }

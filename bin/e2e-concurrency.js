@@ -793,7 +793,14 @@ async function main() {
     }, () => `Foreign queue job ${activeJobId} did not become an active child-owned job.\nLast snapshot: ${JSON.stringify(lastActiveSnapshot)}\nBridge A stderr:\n${clientA.bridgeStderr()}\nBridge B stderr:\n${clientB.bridgeStderr()}`);
     assert.equal(activeSnapshot.ownerProcessId, clientA.bridgePid, "Bridge A must durably own its running queue job.");
     assert.ok(activeSnapshot.worktreePath, "A durable queued writer must publish its retained worktree before child execution.");
-    assert.equal(await readFile(path.join(activeSnapshot.worktreePath, "src", "orphan-worktree.txt"), "utf8"), "orphaned child output stays isolated\n");
+    const isolatedOutput = await waitFor(async () => {
+      try {
+        return await readFile(path.join(activeSnapshot.worktreePath, "src", "orphan-worktree.txt"), "utf8");
+      } catch {
+        return null;
+      }
+    }, "The supervised payload did not publish its isolated worktree output.");
+    assert.equal(isolatedOutput, "orphaned child output stays isolated\n");
     await assert.rejects(access(path.join(repo, "src", "orphan-worktree.txt")), undefined, "The queued writer must not modify the target checkout.");
     const firstHeartbeat = activeSnapshot.heartbeatAt;
     await new Promise((resolve) => setTimeout(resolve, 400));

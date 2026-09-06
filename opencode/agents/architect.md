@@ -1,7 +1,7 @@
 ---
 description: Analyzes architecture, design tradeoffs, module boundaries, refactor risks, and integration impact.
 mode: all
-model: openai/gpt-5.5
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0
 permission:

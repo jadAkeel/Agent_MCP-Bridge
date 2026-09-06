@@ -214,13 +214,13 @@ CODEX_OPENCODE_EXPECTED_SERVER_SHA256=<sha256-of-the-published-server.js>
 CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256=<sha256-of-release-manifest.json>
 ```
 
-The bridge runs every OpenCode command with `--pure` by default. In the pinned OpenCode runtime, `--pure` suppresses configured external plugins while retaining binary-bundled authentication hooks such as the Codex OAuth transport; the bridge must not set `OPENCODE_DISABLE_DEFAULT_PLUGINS`, because that also disables required built-in OAuth routing. Those internal hooks share the exact OpenCode-version trust boundary. A release-manifest-pinned process must keep `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=false`: startup and fresh health reject immutable release pinning with external plugins because the reviewed Antigravity plugin stores credentials under the same `XDG_CONFIG_HOME` that must be read-only release configuration.
+The bridge adds `--pure` whenever `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=false`. In the pinned OpenCode runtime, `--pure` suppresses configured external plugins while retaining binary-bundled authentication hooks such as the Codex OAuth transport; the bridge must not set `OPENCODE_DISABLE_DEFAULT_PLUGINS`, because that also disables required built-in OAuth routing. Those internal hooks share the exact OpenCode-version trust boundary. A release-manifest-pinned process must keep external plugins disabled: startup and fresh health reject immutable release pinning with external plugins because the reviewed Antigravity plugin stores credentials under the same `XDG_CONFIG_HOME` that must remain writable for OAuth refresh.
 
 Outside immutable production mode, the external-plugin verifier remains fail-closed: enabling plugins requires an exact `name@version` allowlist, a pinned integrity manifest, exact effective config origins, canonical cache resolution, the complete package/dependency tree and lock, host version, and non-secret settings. Unexpected sources, siblings, plugins, links, junctions, ranges, tags, URLs, local files, or hash/version/config drift are rejected. This is integrity enforcement against accidental/configuration drift, not protection from an attacker who can rewrite verified files between checks; use OS isolation for that threat.
 
-### Production Builder authentication
+### Immutable pure-profile authentication
 
-The immutable production Builder uses:
+The immutable fallback profile uses:
 
 ```text
 OpenCode: 1.17.13
@@ -230,21 +230,25 @@ Variant: high
 Authentication: OpenCode built-in Codex OAuth transport
 ```
 
-The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.json` files plus managed agents and skills. `XDG_CONFIG_HOME` points at the immutable release root, while built-in OAuth data remains in provider-owned OpenCode data storage. The builder and manifest never publish or hash `auth.json`, `antigravity-accounts.json`, or credential values. At runtime, isolated-role discovery may read a bounded, valid built-in `auth.json` object and pass it only as `OPENCODE_AUTH_CONTENT` to the one-shot child; it is never logged, returned, added to prompts, or persisted by the bridge. The Antigravity account file is never read by bridge code.
+The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.json` files plus managed agents and skills. `XDG_CONFIG_HOME` points at the immutable release root, while built-in OAuth data remains in provider-owned OpenCode data storage. The builder and manifest never publish or hash `auth.json`, `antigravity-accounts.json`, or credential values. At runtime, isolated-role discovery may read a bounded, valid built-in `auth.json` object and pass it only as `OPENCODE_AUTH_CONTENT` to the one-shot child; it exists only in that child's environment for the lifetime of the single command and is never written to the isolated runtime disk, logged, returned, added to prompts, or persisted by the bridge. The Antigravity account file is never read by bridge code.
 
-### Optional Antigravity plugin evidence
+### Managed Gemini OAuth profile
 
-This reviewed manifest requires OpenCode to report exactly `1.17.13`; upgrades require regenerating and re-pinning the plugin manifest. Version `2.0.0` of the CortexKit package currently has an upstream OpenTUI peer-dependency conflict with `opencode plugin` on this Windows host. The MCP bridge does not use the optional plugin TUI, so this machine installs only the server plugin and its exact OpenCode host dependency. If the OpenCode plugin cache is cleared, rebuild that pinned server-only install from the repository root:
+The managed non-sanitized agents default to `google/antigravity-gemini-3.8-flash` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
+
+This is a deliberate reduction from full immutable-release assurance: OAuth refresh requires a writable runtime, and the managed agent and skill files in that runtime are attested against their effective OpenCode metadata but are not pinned by the release manifest. The bridge passes `--model google/antigravity-gemini-3.8-flash --variant high` explicitly and disables silent fallback. OpenCode `1.17.13` does not emit authoritative runtime model identity in every JSON stream, so successful live smoke tests prove the configured command and provider response, not cryptographic runtime-model attestation.
+
+The reviewed plugin manifest requires OpenCode to report exactly `1.17.13`; upgrades require regenerating and re-pinning it. The MCP bridge does not use the optional plugin TUI, so this machine installs only the server plugin and its exact OpenCode host dependency. If the OpenCode plugin cache is cleared, rebuild that pinned server-only install from the repository root:
 
 ```powershell
-$pluginCache = Join-Path $env:USERPROFILE '.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.0.0'
+$pluginCache = Join-Path $env:USERPROFILE '.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.2.1'
 New-Item -ItemType Directory -Path $pluginCache -Force | Out-Null
 Copy-Item -LiteralPath '.\opencode\cortexkit-server-package.json' -Destination (Join-Path $pluginCache 'package.json') -Force
 npm install --prefix $pluginCache --ignore-scripts --legacy-peer-deps
 npm audit --prefix $pluginCache --omit=dev
 ```
 
-This is an unofficial OAuth plugin. It stores a Google refresh token in the provider-owned local Antigravity account file and its maintainers warn that using it may violate Google's terms or lead to account restrictions. The package remains independently audited and its integrity verifier remains tested, but it is not activated by the immutable production profile. The bridge never reads, hashes, copies, logs, returns, or writes its account file or credentials. Only the reviewed nonsecret `opencode.jsonc` and `antigravity.json` inputs are hash-pinned. Keep debug, automatic updates, and quota/account fallback disabled; never commit or copy the credential file, and prefer a dedicated low-privilege account for any separate development use.
+This is an unofficial OAuth plugin. It stores a Google refresh token in the provider-owned local Antigravity account file and its maintainers warn that using it may violate Google's terms or lead to account restrictions. The package remains independently audited and its integrity verifier remains tested, but it is incompatible with the full immutable production profile. The bridge never reads, hashes, copies, logs, returns, or writes its account file or credentials. Only the reviewed nonsecret `opencode.jsonc` and `antigravity.json` inputs are hash-pinned. Keep debug, automatic updates, and quota/account fallback disabled; never commit the credential file, and prefer a dedicated low-privilege account.
 
 On the Codex MCP server entry, set `startup_timeout_sec = 120` and `tool_timeout_sec = 1500`. Codex otherwise defaults MCP tool calls to 60 seconds, which is shorter than the bridge's builder and orchestrator limits. The bundled TUI uses the same 25-minute client timeout; override it with `CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS` only when needed.
 
@@ -286,7 +290,7 @@ Useful defaults:
 | `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS` | `360000` | Per-attempt orchestrator planning timeout; three attempts remain within the 25-minute MCP client limit. |
 | `CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS` | `1200000` | Explicit contractor orchestration timeout; write jobs are not retried automatically. |
 | `CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256` | unset | SHA-256 of the operator-held Contractor capability. Contractor mode is disabled when unset and requires the matching `contractorAuthorizationToken` plus explicit user authorization. |
-| `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS` | `false` | Immutable releases require `false` and use `--pure`; external plugins are available only to separately reviewed, unpinned development deployments. |
+| `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS` | `false` | `false` uses `--pure` and permits full release-manifest pinning. The Gemini hybrid profile sets `true` with an exact plugin allowlist/manifest and server hash, but cannot claim full immutable-release assurance. |
 | `CODEX_OPENCODE_AGENT_DIR` | global OpenCode `agents` | Managed source-profile directory. With release pins enabled this must be the verified release's `opencode/agents`. |
 | `CODEX_OPENCODE_SKILL_DIR` | global OpenCode `skills` | Managed source-skill directory. With release pins enabled this must be the verified release's `opencode/skills`; affected roles reject effective name/origin/tree drift before spawn. |
 | `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | `300000` | Validation command timeout. |

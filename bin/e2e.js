@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +12,21 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const execFileAsync = promisify(execFile);
 const keepFixture = process.argv.includes("--keep");
 const MCP_TOOL_TIMEOUT_MS = 25 * 60 * 1000;
+
+async function configurePureOpenCodeAgents(agentDirectory) {
+  for (const name of await readdir(agentDirectory)) {
+    if (!name.endsWith(".md") || name === "mcp-sanitized-reader.md") continue;
+    const agentPath = path.join(agentDirectory, name);
+    const source = await readFile(agentPath, "utf8");
+    const configured = source
+      .replaceAll("google/antigravity-gemini-3.8-flash", "openai/gpt-5.6-terra")
+      .replace(
+        "This model authenticates through the reviewed Antigravity OAuth plugin in the dedicated Gemini runtime.",
+        "This model authenticates through OpenCode's built-in Codex OAuth transport; the immutable production profile runs in pure mode with external plugins disabled."
+      );
+    await writeFile(agentPath, configured, "utf8");
+  }
+}
 
 function resultText(result) {
   return (result?.content || [])
@@ -111,9 +126,13 @@ async function main() {
     await cp(path.resolve("opencode", "skills"), path.join(isolatedOpenCodeConfig, "skills"), { recursive: true });
     const isolatedBuilderPath = path.join(isolatedOpenCodeConfig, "agents", "builder.md");
     const isolatedBuilderSource = await readFile(isolatedBuilderPath, "utf8");
-    assert.match(isolatedBuilderSource, /^model: openai\/gpt-5\.6-terra$/m, "Ordinary E2E requires the production OpenAI Builder model.");
-    assert.match(isolatedBuilderSource, /built-in Codex OAuth transport/, "Ordinary E2E requires the production built-in OAuth policy.");
-    assert.doesNotMatch(isolatedBuilderSource, /google\/antigravity|opencode\/big-pickle/, "Ordinary E2E rejects a stale Builder plugin or fallback model.");
+    assert.match(isolatedBuilderSource, /^model: google\/antigravity-gemini-3\.8-flash$/m, "Ordinary E2E requires the managed Gemini Builder default.");
+    assert.match(isolatedBuilderSource, /^variant: high$/m, "Ordinary E2E requires high reasoning for the managed Gemini Builder default.");
+    await configurePureOpenCodeAgents(path.join(isolatedOpenCodeConfig, "agents"));
+    const pureBuilderSource = await readFile(isolatedBuilderPath, "utf8");
+    assert.match(pureBuilderSource, /^model: openai\/gpt-5\.6-terra$/m, "Ordinary E2E requires an explicit OpenAI model in its external-plugin-free fixture.");
+    assert.match(pureBuilderSource, /built-in Codex OAuth transport/, "Ordinary E2E requires the production built-in OAuth policy.");
+    assert.doesNotMatch(pureBuilderSource, /google\/antigravity|opencode\/big-pickle/, "Ordinary E2E rejects plugin-dependent or fallback models inside the pure fixture.");
     await writeFile(path.join(isolatedOpenCodeConfig, "opencode.json"), '{"model":"openai/gpt-5.6-terra"}\n', "utf8");
 
     client = new Client({ name: "codex-opencode-e2e", version: "1.0.0" });

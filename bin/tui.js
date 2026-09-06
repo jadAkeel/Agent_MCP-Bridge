@@ -2,6 +2,8 @@
 
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
@@ -268,12 +270,27 @@ async function monitorPipeline(state) {
   const countInput = (await state.rl.question("refresh count, 0 = until terminal [0]: ")).trim();
   const intervalMs = Math.max(1000, Number(intervalInput || 3) * 1000);
   const maxCount = Math.max(0, Number(countInput || 0));
+  const maxConsecutiveFailures = 3;
   let count = 0;
+  let consecutiveFailures = 0;
   let lastDashboard = "";
 
   while (true) {
-    const pipeline = await fetchPipeline(state.client, pipelineId, cwd);
-    const jobs = pipeline ? await fetchPipelineJobs(state.client, pipeline) : [];
+    let pipeline = null;
+    let jobs = [];
+    try {
+      pipeline = await fetchPipeline(state.client, pipelineId, cwd);
+      jobs = pipeline ? await fetchPipelineJobs(state.client, pipeline) : [];
+      if (pipeline) consecutiveFailures = 0;
+    } catch (error) {
+      consecutiveFailures += 1;
+      lastDashboard = `Monitoring error (${consecutiveFailures}/${maxConsecutiveFailures}): ${truncate(error?.message || String(error), 300)}`;
+      output.write("\x1Bc");
+      output.write(`${lastDashboard}\n`);
+      if (consecutiveFailures >= maxConsecutiveFailures) break;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      continue;
+    }
     lastDashboard = await renderPipelineDashboard(pipeline, jobs);
     output.write("\x1Bc");
     output.write(`${lastDashboard}\n`);
@@ -282,6 +299,13 @@ async function monitorPipeline(state) {
     count += 1;
     if (pipeline && ["completed", "failed", "cancelled"].includes(pipeline.status)) {
       break;
+    }
+    if (!pipeline) {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= maxConsecutiveFailures) {
+        lastDashboard = `${lastDashboard}\nPipeline "${pipelineId}" was not found after ${consecutiveFailures} consecutive refreshes; stopped monitoring.`;
+        break;
+      }
     }
     if (maxCount && count >= maxCount) {
       break;

@@ -1,7 +1,7 @@
 ---
 description: Implements approved plans with minimal, production-safe code changes and runs relevant verification.
 mode: all
-model: openai/gpt-5.6-terra
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0.1
 permission:
@@ -46,8 +46,8 @@ You are a senior implementation engineer.
 
 ## Model Policy
 
-- Use `openai/gpt-5.6-terra` with variant `high` as the configured default model.
-- This model authenticates through OpenCode's built-in Codex OAuth transport; the immutable production profile runs in pure mode with external plugins disabled.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model.
+- This model authenticates through the reviewed Antigravity OAuth plugin in the dedicated Gemini runtime.
 - Keep temperature low for deterministic coding behavior.
 - Do not silently switch models.
 - If the configured model is unavailable, report the issue and do not switch providers automatically.

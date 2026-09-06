@@ -1,7 +1,7 @@
 ---
 description: Designs verification plans, identifies edge cases, and reviews or creates tests when explicitly requested.
 mode: all
-model: openai/gpt-5.6-luna
+model: google/antigravity-gemini-3.8-flash
 variant: high
 temperature: 0
 permission:
