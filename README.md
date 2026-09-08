@@ -4,6 +4,8 @@ This bridge lets Codex call OpenCode agents through MCP while keeping Codex as t
 
 One-sentence architecture: Codex decides what to delegate and merge, MCP Bridge enforces scope/routing/scheduling/validation, and OpenCode agents execute bounded tasks.
 
+For the concise operator decision tree, agent roles, daily workflow, and release checklist, read [docs/OPERATOR_QUICKSTART.md](docs/OPERATOR_QUICKSTART.md). Production uses `server.js`; `server.v2.js` remains an explicitly gated experimental modularization target.
+
 ## Official Safety Model
 
 ```text
@@ -308,6 +310,7 @@ Useful defaults:
 | `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | `300000` | Validation command timeout. |
 | `CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS` | `2097152` | Per-stream subprocess capture cap. MCP results contain the bounded final response and tool outcome summary, not raw JSON events. |
 | `CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS` | `131072` | Maximum assistant final response returned to MCP. |
+| `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE` | `false` | When `true`, reject non-dry runs unless OpenCode emits matching root-session provider/model evidence. Configured profile metadata alone is never relabelled as runtime proof. |
 | `CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS` | `12000` | Maximum exact patch preview eligible for a single-use review receipt; oversized or redacted evidence fails closed. |
 | `CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES` | `20000` | Fail-closed cap for metadata-only ignored-file snapshots; ignored contents are not read. |
 | `CODEX_OPENCODE_MAX_SNAPSHOT_FILES` | `25000` | Fail-closed cap for the complete changed-file snapshot set. |

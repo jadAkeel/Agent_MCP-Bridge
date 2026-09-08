@@ -7,8 +7,10 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
 const MCP_TOOL_TIMEOUT_MS = Number(process.env.CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS) || 25 * 60 * 1000;
+const serverEntrypoint = resolveServerEntrypoint();
 
 const MENU = `
 Codex OpenCode MCP Pipeline TUI
@@ -72,9 +74,10 @@ async function createMcpClient() {
   const client = new Client({ name: "codex-opencode-tui", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: "node",
-    args: [path.resolve("server.js")],
+    args: [serverEntrypoint],
     cwd: process.cwd(),
     stderr: "pipe",
+    env: serverChildEnvironment(),
   });
   await client.connect(transport);
   return { client, transport };

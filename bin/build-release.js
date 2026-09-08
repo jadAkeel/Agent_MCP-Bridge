@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
-const PUBLISH_ENTRIES = Object.freeze([
+const LEGACY_PUBLISH_ENTRIES = Object.freeze([
   "server.js",
   "package.json",
   "package-lock.json",
@@ -20,6 +20,24 @@ const PUBLISH_ENTRIES = Object.freeze([
   "opencode/plugin-integrity-manifest.json",
   "node_modules",
 ]);
+
+const V2_PUBLISH_ENTRIES = Object.freeze([
+  { source: "server.v2.js", target: "server.js" },
+  { source: "package.json", target: "package.json" },
+  { source: "package-lock.json", target: "package-lock.json" },
+  { source: "bin", target: "bin" },
+  { source: "opencode/agents", target: "opencode/agents" },
+  { source: "opencode/skills", target: "opencode/skills" },
+  { source: "opencode/.gitignore", target: "opencode/.gitignore" },
+  { source: "opencode/plugin-integrity-manifest.json", target: "opencode/plugin-integrity-manifest.json" },
+  { source: "node_modules", target: "node_modules" },
+  { source: "src/v2", target: "src/v2" },
+]);
+
+const RELEASE_PROFILES = Object.freeze({
+  legacy: LEGACY_PUBLISH_ENTRIES,
+  v2: V2_PUBLISH_ENTRIES,
+});
 
 function normalizeFilesystemCase(value) {
   const resolved = path.resolve(value);
@@ -150,10 +168,33 @@ async function stageReleaseOpenCodeConfig({ sourceRoot, staging, destination }) 
   await writeFile(path.join(staging, "opencode", "plugin-integrity-manifest.json"), manifestContent, "utf8");
 }
 
+function normalizePublishEntries(entries) {
+  if (!Array.isArray(entries) || !entries.length) {
+    throw new Error("Release publish entries must be a non-empty array.");
+  }
+  const normalized = entries.map((entry) => {
+    const source = typeof entry === "string" ? entry : entry?.source;
+    const target = typeof entry === "string" ? entry : entry?.target;
+    for (const [label, value] of [["source", source], ["target", target]]) {
+      if (typeof value !== "string" || !value.trim() || path.isAbsolute(value) || value.includes("\\") || value.split("/").includes("..")) {
+        throw new Error(`Release ${label} mapping is unsafe: ${JSON.stringify(value)}.`);
+      }
+    }
+    return { source: source.trim(), target: target.trim() };
+  });
+  const targets = new Set();
+  for (const { target } of normalized) {
+    if (targets.has(target)) throw new Error(`Release publish target is duplicated: ${target}`);
+    targets.add(target);
+  }
+  return normalized;
+}
+
 async function buildRelease({
   sourceRoot = SOURCE_ROOT,
   destination,
-  publishEntries = PUBLISH_ENTRIES,
+  profile = "legacy",
+  publishEntries = null,
   afterStagingHook = null,
 } = {}) {
   const resolvedSourceRoot = path.resolve(sourceRoot);
@@ -161,6 +202,10 @@ async function buildRelease({
   if (!path.isAbsolute(String(destination || ""))) {
     throw new Error("Release destination must be an absolute path.");
   }
+  if (!Object.hasOwn(RELEASE_PROFILES, profile)) {
+    throw new Error(`Unknown release profile: ${profile}.`);
+  }
+  const mappings = normalizePublishEntries(publishEntries || RELEASE_PROFILES[profile]);
   if (
     resolvedDestination === path.parse(resolvedDestination).root
     || isPathInside(resolvedSourceRoot, resolvedDestination)
@@ -178,11 +223,11 @@ async function buildRelease({
     if (error?.code !== "ENOENT") throw error;
   }
 
-  for (const entry of publishEntries) {
-    const sourceEntry = path.join(resolvedSourceRoot, entry);
+  for (const { source } of mappings) {
+    const sourceEntry = path.join(resolvedSourceRoot, source);
     const details = await lstat(sourceEntry);
     if (details.isSymbolicLink() || (!details.isFile() && !details.isDirectory())) {
-      throw new Error(`Release source entry must be a real file or directory: ${entry}`);
+      throw new Error(`Release source entry must be a real file or directory: ${source}`);
     }
     if (details.isDirectory()) await listExactFiles(sourceEntry);
   }
@@ -191,10 +236,10 @@ async function buildRelease({
   if (!isPathInside(destinationParent, staging)) throw new Error("Release staging path escaped its bounded parent.");
   try {
     await mkdir(staging, { recursive: false });
-    for (const entry of publishEntries) {
-      const target = path.join(staging, entry);
+    for (const { source, target: targetRelative } of mappings) {
+      const target = path.join(staging, targetRelative);
       await mkdir(path.dirname(target), { recursive: true });
-      await cp(path.join(resolvedSourceRoot, entry), target, {
+      await cp(path.join(resolvedSourceRoot, source), target, {
         recursive: true,
         dereference: false,
         errorOnExist: true,
@@ -214,7 +259,10 @@ async function buildRelease({
       }));
     }
     const sortedFiles = Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right)));
-    const manifestContent = `${JSON.stringify({ version: 1, files: sortedFiles }, null, 2)}\n`;
+    const manifestDocument = profile === "legacy"
+      ? { version: 1, files: sortedFiles }
+      : { version: 1, profile, files: sortedFiles };
+    const manifestContent = `${JSON.stringify(manifestDocument, null, 2)}\n`;
     const manifestPath = path.join(staging, "release-manifest.json");
     await writeFile(manifestPath, manifestContent, { encoding: "utf8", flag: "wx" });
     const result = {
@@ -380,11 +428,13 @@ async function main() {
     await runSelfTest();
     return;
   }
-  const rawDestination = String(process.argv[2] || "").trim();
+  const profileIndex = process.argv.indexOf("--profile");
+  const profile = profileIndex >= 0 ? String(process.argv[profileIndex + 1] || "").trim() : "legacy";
+  const rawDestination = String(process.argv.filter((arg, index) => index !== profileIndex && index !== profileIndex + 1 && index > 1)[0] || "").trim();
   if (!rawDestination) {
-    throw new Error("Usage: node bin/build-release.js <new-absolute-release-directory>");
+    throw new Error("Usage: node bin/build-release.js [--profile legacy|v2] <new-absolute-release-directory>");
   }
-  const result = await buildRelease({ destination: rawDestination });
+  const result = await buildRelease({ destination: rawDestination, profile });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
@@ -395,4 +445,4 @@ if (normalizeFilesystemCase(process.argv[1] || "") === normalizeFilesystemCase(S
   });
 }
 
-export { buildRelease, listExactFiles, prepareUnlinkedDestinationParent };
+export { buildRelease, listExactFiles, normalizePublishEntries, prepareUnlinkedDestinationParent };
