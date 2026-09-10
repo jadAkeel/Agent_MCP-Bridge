@@ -35,7 +35,7 @@ permission:
 - Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
-- If the configured model is unavailable, report the issue clearly and use `opencode/big-pickle` as fallback only if necessary.
+- If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
 - Keep temperature at 0 for deterministic orchestration.
 - Include the model and temperature used in the final report.
 

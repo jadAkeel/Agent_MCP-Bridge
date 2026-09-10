@@ -71,6 +71,7 @@ Rules:
 - `create_multi_agent_pipeline`: create an audited multi-agent plan with ownership, worktree, integration, and final-validation checks.
 - `run_multi_agent_pipeline`: enqueue planned pipeline jobs.
 - `get_multi_agent_pipeline` / `list_multi_agent_pipelines`: inspect pipeline status, queue jobs, integrations, and audit events.
+- `abandon_multi_agent_pipeline`: explicitly terminalize an inactive obsolete pipeline after exact-id confirmation. It never deletes unintegrated worktrees.
 - `integrate_opencode_worktree`: dry-run or serially integrate one reviewed worktree/branch.
 - `finalize_multi_agent_pipeline`: run final validation and optional reviewer/tester gates.
 - `acquire_agent_lock` / `release_agent_lock`: exceptional manual cleanup/debugging only.
@@ -361,6 +362,15 @@ Useful defaults:
 
 ## Test
 
+Fast daily checks (no model request):
+
+```powershell
+npm run test:quick
+npm run doctor -- --cwd C:\absolute\repository
+```
+
+`doctor` verifies the configured server hash/release identity, Git availability, and every bridge state database without starting OpenCode. It fails when an expired active job or pipeline needs operator attention. Use the regular bridge status for agent discovery and the live profile smoke only when provider readiness must be proven.
+
 ```powershell
 npm test
 ```
@@ -423,6 +433,16 @@ For the complete deterministic local assurance suite, including dependency audit
 ```powershell
 npm run test:assurance
 ```
+
+`test:assurance` is the full release gate and includes v1, v2, concurrency, and the current dependency advisory audit. It is intentionally not the daily inner loop.
+
+To retire an inactive obsolete pipeline without editing SQLite or deleting its recovery sources:
+
+```powershell
+npm run pipeline:abandon -- --cwd C:\absolute\repository --pipeline <pipeline-id> --confirm <pipeline-id>
+```
+
+The exact repeated id is a destructive-intent guard. Active child jobs and in-progress integration journals are rejected; cancel active jobs first. Terminal audit retention removes the resulting cancelled record later according to `CODEX_OPENCODE_QUEUE_RETENTION_DAYS`.
 
 `npm test` now includes a protocol-robustness fixture. It sends malformed MCP frames and invalid tool arguments, confirms the bridge remains alive, proves rejected input creates no locks, crashes a process holding a short lock lease, restarts a second bridge, and verifies SQLite integrity plus foreign-key consistency. `npm run test:concurrency` also runs those SQLite checks after its multi-process stress workload.
 

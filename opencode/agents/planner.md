@@ -35,10 +35,10 @@ You are a senior implementation planner.
 
 ## Model Policy
 
-- Use `openai/gpt-5.6-luna` with variant `medium` as the configured default model for this global agent.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
-- If the configured model is unavailable, report the issue clearly.
+- If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
 - Keep temperature low for deterministic planning behavior.
 - Include the model and temperature used in the final report.
 

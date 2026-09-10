@@ -16,6 +16,7 @@ const requestTimeoutMs = 30_000;
 const requestOptions = { timeout: requestTimeoutMs, maxTotalTimeout: requestTimeoutMs };
 
 const expectedToolNames = Object.freeze([
+  "abandon_multi_agent_pipeline",
   "acquire_agent_lock",
   "cancel_opencode_job",
   "create_multi_agent_pipeline",
@@ -282,17 +283,17 @@ async function main() {
       legacy.client.listTools(undefined, requestOptions),
       v2.client.listTools(undefined, requestOptions),
     ]);
-    assert.equal(legacyTools.tools.length, 21, "Legacy MCP tool count changed.");
-    assert.equal(v2Tools.tools.length, 21, "V2 MCP tool count changed.");
+    assert.equal(legacyTools.tools.length, 22, "Legacy MCP tool count changed.");
+    assert.equal(v2Tools.tools.length, 22, "V2 MCP tool count changed.");
     assert.deepEqual(
       sortedToolNames(legacyTools),
       expectedToolNames,
-      "Legacy MCP tool names changed from the characterized 21-tool contract."
+      "Legacy MCP tool names changed from the characterized 22-tool contract."
     );
     assert.deepEqual(
       sortedToolNames(v2Tools),
       expectedToolNames,
-      "V2 MCP tool names changed from the characterized 21-tool contract."
+      "V2 MCP tool names changed from the characterized 22-tool contract."
     );
     assert.deepEqual(v2Tools, legacyTools, "V2 full MCP tool-list contract differs from Legacy.");
 
@@ -376,7 +377,7 @@ async function main() {
     );
 
     process.stdout.write(
-      "V1/V2 MCP characterization parity passed (handshake, 21 full tool contracts, 6 deterministic responses, schema error, and semantic rejection).\n"
+      "V1/V2 MCP characterization parity passed (handshake, 22 full tool contracts, 6 deterministic responses, schema error, and semantic rejection).\n"
     );
   } catch (error) {
     const diagnostics = [

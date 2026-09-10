@@ -5,6 +5,9 @@ import { lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
 
 const ACTIVE_QUEUE_STATUSES = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
 
@@ -211,7 +214,11 @@ async function main() {
   if (auditHasFailures(report, options.strict)) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error?.stack || error}\n`);
-  process.exitCode = 1;
-});
+if (path.resolve(process.argv[1] || "") === path.resolve(SCRIPT_PATH)) {
+  main().catch((error) => {
+    process.stderr.write(`${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
+}
+
+export { auditHasFailures, auditStateDirectory, defaultStateDirectory, reportAudit };

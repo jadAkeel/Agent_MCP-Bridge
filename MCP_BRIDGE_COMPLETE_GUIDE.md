@@ -523,6 +523,14 @@ npm run audit:state
 
 The state audit opens only the top-level bridge databases and direct `projects/*.sqlite` records in read-only mode. It reports corruption, foreign-key violations, and owner-expired active jobs or pipelines; `npm run audit:state -- --strict` treats the latter operational warnings as a failing result.
 
+Use the supported maintenance transition for an inactive obsolete pipeline:
+
+```powershell
+npm run pipeline:abandon -- --cwd C:\absolute\repository --pipeline <pipeline-id> --confirm <pipeline-id>
+```
+
+The bridge claims only an expired/unowned durable record, proves every child is terminal, rejects in-progress integration, records an audited cancellation event, and retains every unintegrated worktree. This replaces manual SQLite mutation and lets normal terminal retention handle the record later.
+
 The standard test command must also pass from a published release with both hashes, `XDG_CONFIG_HOME` at the release root, pure mode, and immutable release-local agent/skill/plugin-manifest paths. Build a new non-overwriting snapshot with `npm run release:build -- <absolute-new-directory>`. Then follow [docs/SAFE_PUBLISH_MANIFEST.md](docs/SAFE_PUBLISH_MANIFEST.md): complete the mandatory live/concurrency/audit matrix; validate the exact candidate TOML; run pinned tests and fresh health; apply and verify read/execute-only release ACLs; atomically replace only Codex config; run active fresh health; and atomically restore the old config on failure. No global OpenCode tree is staged or replaced. Effective managed skill names and canonical origins come from OpenCode `debug skill`, while complete effective tree hashes must match release-pinned sources immediately before affected roles spawn. OpenCode JSON mode is parsed into a bounded final response plus tool outcomes; tool-only exit 0, hard quota, authentication, and billing failures are terminal errors rather than successful or generic timeout results.
 
 Run the LangGraph TUI:

@@ -62,6 +62,8 @@ From `C:\Users\10User\codex-opencode-mcp`:
 
 ```powershell
 npm ci
+npm run doctor -- --cwd C:\absolute\target-repository
+npm run test:quick
 npm test
 npm run test:v2
 npm run test:concurrency
@@ -69,7 +71,26 @@ npm audit --omit=dev
 npm run tui
 ```
 
-`npm test` is the production v1 gate. `npm run test:v2` validates the experimental modularization and its public contract parity; it is deliberately slower and belongs in release assurance, not every small edit. TestSprite is skipped when this non-web repository has no linked TestSprite project.
+`doctor` is the fast, model-free daily integrity/state check. `test:quick` is the short development loop. `npm test` is the production v1 gate. `npm run test:v2` validates the experimental modularization and its public contract parity; it is deliberately slower and belongs in release assurance, not every small edit. `npm run test:release` runs every release gate, including dependency advisories. TestSprite is skipped when this non-web repository has no linked TestSprite project.
+
+Retire a stale inactive pipeline through the bridge, never by editing SQLite:
+
+```powershell
+npm run pipeline:abandon -- --cwd C:\absolute\target-repository --pipeline <pipeline-id> --confirm <pipeline-id>
+```
+
+This marks the pipeline cancelled but retains unintegrated worktrees. It rejects active child jobs and integration recovery. Inspect retained work, then clean it explicitly through the reviewed Git/worktree lifecycle.
+
+## Recurrence-prevention guardrails
+
+- Run `doctor` before the first delegated write of the day and after any crash or forced shutdown.
+- Use `test:quick` while editing; use `test:release` only before publishing or activating a release.
+- Require `modelRequirement.requireRuntimeEvidence: true` for jobs where exact provider/model identity matters. Missing evidence fails closed.
+- Keep provider fallback disabled. Agent prompt model policy must match its frontmatter and managed runtime profile.
+- Treat every `awaiting_integration` pipeline as an explicit decision: integrate it, abandon it, or leave a documented recovery reason before ending the session.
+- Keep source checkout clean before writer worktrees and never manually remove a registered worktree before its pipeline record is terminal.
+- Run `npm audit --omit=dev` in the release gate and update transitive fixes without `--force` unless a reviewed breaking upgrade is intentional.
+- Keep only the active release and one verified rollback release after a successful activation; archive audit reports, not entire obsolete runtime trees.
 
 ## Root-cause remediation status
 

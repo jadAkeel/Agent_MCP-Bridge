@@ -12102,6 +12102,127 @@ server.tool(
 );
 
 server.tool(
+  "abandon_multi_agent_pipeline",
+  "Explicitly abandon an inactive durable pipeline while retaining every unintegrated worktree for separate review or cleanup.",
+  {
+    pipelineId: z.string().min(1),
+    cwd: z.string().min(1),
+    confirmation: z.string().min(1).describe("Must exactly equal pipelineId. Prevents accidental abandonment."),
+    reason: z.string().max(500).optional(),
+  },
+  async ({ pipelineId, cwd = "", confirmation, reason = "Operator abandoned an obsolete pipeline." }) => {
+    if (confirmation !== pipelineId) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_abandon_confirmation_mismatch",
+        reason: "The confirmation value must exactly equal the pipeline id.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Inspect the pipeline first, then repeat with confirmation set to the exact pipelineId. Abandonment retains all worktrees.",
+      }) }] };
+    }
+    if (effectiveQueueMode() !== "sqlite") {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_requires_sqlite_queue",
+        reason: "Only durable SQLite pipelines can be abandoned through this recovery operation.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Set CODEX_OPENCODE_QUEUE_MODE=sqlite and restart the MCP server.",
+      }) }] };
+    }
+
+    const projectRoot = await resolveProjectStateRoot(cwd);
+    const record = await authoritativePipelineRecord(pipelineId, projectRoot);
+    if (!record) {
+      return { content: [{ type: "text", text: `Multi-agent pipeline not found: ${pipelineId}` }] };
+    }
+    if (record.status === "cancelled" && (record.events || []).some((event) => event.type === "pipeline_abandoned")) {
+      return { content: [{ type: "text", text: [
+        "Multi-agent pipeline already abandoned; retained sources were not modified.",
+        "",
+        JSON.stringify(pipelineRecordSnapshot(record), null, 2),
+      ].join("\n") }] };
+    }
+    if (["completed", "failed", "cancelled"].includes(record.status)) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_already_terminal",
+        reason: `Pipeline status is already ${record.status}.`,
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Keep the terminal audit record; normal retention will remove it after the configured retention period.",
+      }) }] };
+    }
+    if (!pipelineOwnedByThisInstance(record)) {
+      const claim = await claimPersistedPipeline(record);
+      if (!claim.ok) return { content: [{ type: "text", text: pipelineOwnerRejection(record, "abandonment") }] };
+    }
+
+    const children = record.status === "planned" && record.batchState === "unstarted"
+      ? { ok: true, snapshots: [] }
+      : await readPersistedPipelineChildren(record);
+    if (!children.ok) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_child_record_missing",
+        reason: "The durable child manifest is incomplete, so inactivity cannot be proven safely.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Run diagnose_opencode_bridge and preserve the state database for recovery analysis.",
+      }) }] };
+    }
+    const activeStatuses = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
+    const activeChildren = children.snapshots.filter((child) => activeStatuses.has(child.status));
+    if (activeChildren.length) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_abandon_active_jobs",
+        reason: `The pipeline still has active jobs: ${activeChildren.map((child) => child.jobId).join(", ")}.`,
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Cancel the active queue jobs first, wait for terminal status, then abandon the pipeline.",
+      }) }] };
+    }
+    if ((record.integrationQueue || []).some((item) => item.status === "integrating")) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: "pipeline_integration_in_progress",
+        reason: "An integration journal operation is still in progress or awaiting recovery.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Run diagnose_opencode_bridge and finish integration recovery before abandoning the pipeline.",
+      }) }] };
+    }
+
+    const abandonedAt = new Date().toISOString();
+    await updatePipelineRecord(record, {
+      status: "cancelled",
+      finishedAt: abandonedAt,
+      cleanupPending: false,
+      cleanupState: "abandoned_sources_retained",
+      events: (record.events || []).concat({
+        type: "pipeline_abandoned",
+        at: abandonedAt,
+        reason,
+        retainedWorktrees: (record.integrationQueue || []).filter((item) => item.worktreePath).map((item) => item.worktreePath),
+      }),
+    });
+    return { content: [{ type: "text", text: [
+      "Multi-agent pipeline abandoned. Unintegrated worktrees were retained and no project files were deleted.",
+      "",
+      JSON.stringify(pipelineRecordSnapshot(record), null, 2),
+    ].join("\n") }] };
+  }
+);
+
+server.tool(
   "finalize_multi_agent_pipeline",
   "Finalize a multi-agent pipeline after all integrations by running final validation and optional read-only reviewer/tester gates.",
   {

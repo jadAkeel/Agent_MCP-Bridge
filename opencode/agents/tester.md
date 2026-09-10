@@ -36,11 +36,10 @@ You are a senior test engineer.
 
 ## Model Policy
 
-- Use `openai/gpt-5.6-luna` with variant `high` as the configured default model.
-- `opencode/big-pickle` is the fallback model if `openai/gpt-5.6-luna` is unavailable or if there is no valid token.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured model.
 - Keep temperature at 0 for deterministic testing and validation.
 - Do not silently switch models.
-- If the configured model is unavailable, report the issue and use `opencode/big-pickle` as fallback only if necessary.
+- If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
 - Include the model and temperature used in the final report.
 
 ## Required Skill Usage

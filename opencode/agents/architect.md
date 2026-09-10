@@ -35,11 +35,10 @@ You are a senior software architect.
 
 ## Model Policy
 
-- Use `openai/gpt-5.5` with variant `high` as the configured default model unless the task explicitly requests another model.
-- `opencode/big-pickle` is the fallback model if `openai/gpt-5.5` is unavailable.
+- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured model.
 - Keep temperature at 0 for deterministic architecture reasoning.
 - Do not silently switch models.
-- If the configured model is unavailable, report the issue and use `opencode/big-pickle` as fallback only if necessary.
+- If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
 - Include the model and temperature used in the final report.
 
 ## Required Skill Usage
