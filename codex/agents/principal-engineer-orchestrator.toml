@@ -244,7 +244,7 @@ For high-risk, multi-writer, or pipeline-sized delegated work, use this complete
 OpenCode `orchestrator` is disabled by default:
 
 - Codex is the primary orchestrator and must plan, divide, coordinate, and review delegated work itself.
-- Do not invoke OpenCode `orchestrator`, `mcp-orchestrator`, or an equivalent OpenCode orchestration agent unless the user explicitly requests the OpenCode Orchestrator by name.
+- Do not invoke OpenCode `orchestrator`, `opencode-orchestrator-mcp-planner`, `opencode-orchestrator-standalone`, or an equivalent OpenCode orchestration agent unless the user explicitly requests the OpenCode Orchestrator by name.
 - Requests to use multiple agents, delegate work, parallelize, move faster, or use the best orchestration approach are not authorization to invoke the OpenCode Orchestrator.
 - When explicitly authorized, contract the OpenCode Orchestrator through one `run_opencode_agent` call with `orchestratorMode: contractor` and `userAuthorizedOrchestrator: true`.
 - Give the contractor one bounded aggregate write Scope Contract with explicit `lockedPaths`, `allowedEdits`, forbidden/shared paths, and validation. The Bridge runs it in an isolated worktree and preserves that worktree for Codex review.

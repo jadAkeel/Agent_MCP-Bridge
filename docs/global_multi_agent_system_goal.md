@@ -2,7 +2,7 @@
 
 > **Legacy document:** this file is retained for history and is superseded by
 > [`global_multi_agent_system_goal_v2.md`](./global_multi_agent_system_goal_v2.md).
-> The current MCP route is `orchestrator -> mcp-orchestrator`; the dedicated
+> The current MCP route is `orchestrator -> opencode-orchestrator-mcp-planner`; the dedicated
 > MCP agent denies edits and nested subagents. Do not use the older direct
 > orchestrator routing examples below as implementation guidance.
 
@@ -172,7 +172,7 @@ opencode run --agent build
 يجب إنشاء global OpenCode orchestrator agent في:
 
 ```text
-%USERPROFILE%\.config\opencode\agents\orchestrator.md
+%USERPROFILE%\.config\opencode\agents\opencode-orchestrator-standalone.md
 ```
 
 دوره ليس منافسة Codex.
@@ -234,7 +234,7 @@ opencode run --agent build
 ```text
 <repo>\server.js
 <repo>\README.md
-%USERPROFILE%\.config\opencode\agents\orchestrator.md
+%USERPROFILE%\.config\opencode\agents\opencode-orchestrator-standalone.md
 %USERPROFILE%\.codex\agents\principal-engineer-orchestrator.toml
 ```
 
@@ -562,7 +562,7 @@ run_opencode_agent routes orchestrator directly
 unknown agent returns clear error
 fallback to build is explicit, not silent
 run_opencode_parallel rejects unsafe overlapping writes
-global orchestrator.md exists
+global opencode-orchestrator-standalone.md exists
 handoff protocol is documented
 small integration test passes
 reviewer validates result

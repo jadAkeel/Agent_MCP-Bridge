@@ -97,6 +97,7 @@ assert.deepEqual(Object.keys(idle), ["runGitReadOnlyCommand", "gitChangedFiles",
     assert.equal(config["core.checkStat"], "default");
     assert.equal(config["core.ignoreStat"], "false");
     if (process.platform !== "win32") assert.equal(config["core.fileMode"], "true");
+    if (process.platform === "win32") assert.equal(config["core.longpaths"], "true");
   }
 
   let nonTransientAttempts = 0;

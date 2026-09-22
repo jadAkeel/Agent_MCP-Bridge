@@ -210,5 +210,8 @@ const windowsBuilders = createChildEnvBuilders({
 });
 assert.equal(windowsBuilders.buildOpenCodeEnv().PATHEXT, ".COM;.EXE;.BAT;.CMD");
 assert.equal(windowsBuilders.buildValidationEnv().PATHEXT, ".COM;.EXE;.BAT;.CMD");
+assert.equal(windowsBuilders.buildValidationEnv().GIT_CONFIG_KEY_2, "core.longpaths");
+assert.equal(windowsBuilders.buildValidationEnv().GIT_CONFIG_VALUE_2, "true");
+assert.equal(windowsBuilders.buildValidationEnv().GIT_CONFIG_COUNT, "3");
 
 console.log("V2 configuration and child environment tests passed.");

@@ -274,12 +274,12 @@ async function main() {
     };
     const preflight = await callTool(client, "validate_delegation_plan", { jobs: [contractorJob] });
     assert.match(preflight, /Delegation plan accepted/i);
-    assert.match(preflight, /Actual agent:\s*mcp-contractor-orchestrator/i);
+    assert.match(preflight, /Actual agent:\s*opencode-orchestrator-mcp-contractor/i);
     printStep("preflight", preflight);
 
     const execution = await callTool(client, "run_opencode_agent", contractorJob);
     requireAccepted(execution, "contractor execution");
-    assert.match(execution, /Actual agent used:\s*mcp-contractor-orchestrator/i);
+    assert.match(execution, /Actual agent used:\s*opencode-orchestrator-mcp-contractor/i);
     assert.match(execution, /Orchestrator mode:\s*contractor/i);
     assert.match(execution, /User-authorized contractor:\s*yes/i);
     assert.match(execution, /Worktree changed files:\s*src\/contractor\.txt/i);

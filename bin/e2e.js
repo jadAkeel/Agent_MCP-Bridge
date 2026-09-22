@@ -201,7 +201,7 @@ async function main() {
       },
     });
     requireAccepted(plan, "planning");
-    assert.match(plan, /Actual agent used:\s*mcp-orchestrator/i);
+    assert.match(plan, /Actual agent used:\s*opencode-orchestrator-mcp-planner/i);
     assert.match(plan, /src[\\/]message\.txt/i);
     printStep("planning", plan);
 

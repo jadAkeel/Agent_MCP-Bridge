@@ -50,7 +50,7 @@ const scopeContractSchema = z
     validation: scopeValidationSchema.optional(),
     timeoutMs: z.number().int().positive().optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
-    modelRequirement: modelRequirementSchema.optional().describe("Require the attested managed profile to match this provider/model and optional variant. This does not override the profile or configure an endpoint."),
+    modelRequirement: modelRequirementSchema.optional().describe("Require this provider/model and optional variant. When the operator lists the model in CODEX_OPENCODE_MODEL_ALLOWLIST the bridge pins it explicitly for this job (--model/--variant) and attests runtime evidence against it; otherwise the attested managed profile must already match. It never configures an endpoint."),
   })
   .strict();
 

@@ -32,6 +32,10 @@ CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS = "2097152"
 CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS = "131072"
 # Set true only when missing per-job runtime provider/model events must reject a run.
 CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE = "false"
+# Models Codex may select per job through scopeContract.modelRequirement (provider/model or provider/model@variant).
+# CODEX_OPENCODE_MODEL_ALLOWLIST = "google/antigravity-gemini-3.8-flash@high,opencode/gpt-5.3-codex"
+# strict rejects any uncommitted source change before a writer worktree; unrelated_ok tolerates changes outside the job scope.
+CODEX_OPENCODE_SOURCE_DIRT_POLICY = "strict"
 CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS = "12000"
 CODEX_OPENCODE_MAX_SNAPSHOT_FILES = "25000"
 CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES = "20000"

@@ -114,6 +114,11 @@ export function createChildEnvBuilders({
     env.GIT_CONFIG_VALUE_0 = "false";
     env.GIT_CONFIG_KEY_1 = "core.untrackedCache";
     env.GIT_CONFIG_VALUE_1 = "false";
+    if (platform === "win32") {
+      env.GIT_CONFIG_KEY_2 = "core.longpaths";
+      env.GIT_CONFIG_VALUE_2 = "true";
+      env.GIT_CONFIG_COUNT = "3";
+    }
     return env;
   }
 

@@ -226,7 +226,7 @@ It does not create a new Codex orchestrator.
 
 It uses a dedicated MCP-safe OpenCode planning agent while preserving the regular standalone orchestrator.
 
-It accepts the requested role `orchestrator`, routes that MCP call to `mcp-orchestrator`, then routes implementation to direct MCP-managed writer agents.
+It accepts the requested role `orchestrator`, routes that MCP call to `opencode-orchestrator-mcp-planner`, then routes implementation to direct MCP-managed writer agents.
 
 ### Purpose
 
@@ -292,9 +292,9 @@ Managed Fast Delegation Mode must not be triggered silently for ordinary tasks. 
 
 ### Rules
 
-- Use the dedicated OpenCode `mcp-orchestrator` only for read-only planning through MCP.
+- Use the dedicated OpenCode `opencode-orchestrator-mcp-planner` only for read-only planning through MCP.
 - Codex remains the primary authority.
-- `mcp-orchestrator` must not write or invoke any subagent through MCP; `edit` and `task` are both denied.
+- `opencode-orchestrator-mcp-planner` must not write or invoke any subagent through MCP; `edit` and `task` are both denied.
 - Codex invokes direct `builder` or `debugger` jobs with explicit Scope Contracts.
 - Codex performs final review.
 - Codex previews and reviews worktree integration before applying it.
@@ -304,7 +304,7 @@ Managed Fast Delegation Mode must not be triggered silently for ordinary tasks. 
 - Do not send full conversation history.
 - Use MCP routing so bridge policy and agent discovery remain enforceable.
 - Do not silently fallback to `build`.
-- If `mcp-orchestrator` is missing, return a clear error and never fall back to a write-capable agent.
+- If `opencode-orchestrator-mcp-planner` is missing, return a clear error and never fall back to a write-capable agent.
 - Every direct writer uses explicit locks, allowed-edit boundaries, changed-file validation, and worktree review.
 
 ### Delegation Task Packet
@@ -403,13 +403,13 @@ Codex must not blindly trust the delegated result.
 The MCP-safe planner exists at:
 
 ```text
-~/.config/opencode/agents/mcp-orchestrator.md
+~/.config/opencode/agents/opencode-orchestrator-mcp-planner.md
 ```
 
 The regular backup/standalone orchestrator remains at:
 
 ```text
-~/.config/opencode/agents/orchestrator.md
+~/.config/opencode/agents/opencode-orchestrator-standalone.md
 ```
 
 ### Mode 1: MCP Delegated Planner
@@ -425,7 +425,7 @@ Responsibilities:
 - Return proposed non-overlapping scopes for direct MCP-managed writer calls.
 - Return a concise structured result.
 
-The MCP bridge enforces this mode by routing to `mcp-orchestrator`, whose `edit` and `task` permissions are denied.
+The MCP bridge enforces this mode by routing to `opencode-orchestrator-mcp-planner`, whose `edit` and `task` permissions are denied.
 
 ### Mode 2: Backup Orchestrator
 
@@ -475,7 +475,7 @@ builder      -> builder
 tester       -> tester
 architect    -> architect
 debugger     -> debugger
-orchestrator -> mcp-orchestrator
+orchestrator -> opencode-orchestrator-mcp-planner
 ```
 
 Equivalent command shape:
@@ -493,7 +493,7 @@ builder      -> opencode run --agent builder
 tester       -> opencode run --agent tester
 architect    -> opencode run --agent architect
 debugger     -> opencode run --agent debugger
-orchestrator -> opencode run --agent mcp-orchestrator
+orchestrator -> opencode run --agent opencode-orchestrator-mcp-planner
 ```
 
 Prohibited silent routing:
@@ -898,7 +898,7 @@ builder      -> builder
 tester       -> tester
 architect    -> architect
 debugger     -> debugger
-orchestrator -> mcp-orchestrator
+orchestrator -> opencode-orchestrator-mcp-planner
 ```
 
 Verify:
@@ -934,9 +934,9 @@ Verify:
 
 Verify:
 
-- The dedicated `mcp-orchestrator` safety agent is installed.
+- The dedicated `opencode-orchestrator-mcp-planner` safety agent is installed.
 - The two existing Codex orchestrators still parse and load.
-- The global OpenCode `mcp-orchestrator` and `orchestrator` agents exist.
+- The global OpenCode `opencode-orchestrator-mcp-planner` and `opencode-orchestrator-standalone` agents exist.
 - No repo-local `.opencode/`, `.specify/`, or `specs/` are created unless explicitly requested.
 
 ---
@@ -953,22 +953,22 @@ run_opencode_agent routes builder directly
 run_opencode_agent routes tester directly
 run_opencode_agent routes architect directly when available
 run_opencode_agent routes debugger directly when available
-run_opencode_agent routes requested orchestrator to mcp-orchestrator
+run_opencode_agent routes requested orchestrator to opencode-orchestrator-mcp-planner
 unknown agent returns clear error
 fallback to build is explicit, not silent
 run_opencode_parallel allows safe read-only parallel work
 run_opencode_parallel rejects unsafe overlapping writes
 write delegation requires concrete locks
 shared/global file edits require serial integration
-global mcp-orchestrator.md and orchestrator.md exist
-mcp-orchestrator enforces read-only delegated planning with task denied
+global opencode-orchestrator-mcp-planner.md and opencode-orchestrator-standalone.md exist
+opencode-orchestrator-mcp-planner enforces read-only delegated planning with task denied
 OpenCode orchestrator supports Backup Orchestrator mode
 OpenCode orchestrator supports Standalone Orchestrator mode
 handoff protocol is documented and usable
 Managed Fast Delegation Mode works
 Codex review after delegation works
 OpenCode orchestrator delegation works
-Dedicated mcp-orchestrator safety routing is verified
+Dedicated opencode-orchestrator-mcp-planner safety routing is verified
 Direct routing is verified
 Handoff is verified
 Validation is verified

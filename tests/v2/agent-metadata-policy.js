@@ -18,7 +18,7 @@ const MCP_SANITIZED_READER_PROFILE = Object.freeze({
   variant: "high",
 });
 const MCP_SANITIZED_READER_PROMPT_SHA256 = createHash("sha256").update("sanitized reader prompt").digest("hex");
-const MCP_CONTRACTOR_ORCHESTRATOR_AGENT = "mcp-contractor-orchestrator";
+const MCP_CONTRACTOR_ORCHESTRATOR_AGENT = "opencode-orchestrator-mcp-contractor";
 let runtimeEnv = {};
 
 const policy = createAgentMetadataPolicy({

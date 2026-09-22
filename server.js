@@ -39,11 +39,12 @@ const OPENCODE_SKILL_DIR = path.resolve(
   String(process.env.CODEX_OPENCODE_SKILL_DIR || path.join(DEFAULT_OPENCODE_CONFIG_DIR, "skills")).trim()
 );
 const MCP_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "mcp-orchestrator"
-).trim() || "mcp-orchestrator";
+  process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-planner"
+).trim() || "opencode-orchestrator-mcp-planner";
 const MCP_CONTRACTOR_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT || "mcp-contractor-orchestrator"
-).trim() || "mcp-contractor-orchestrator";
+  process.env.CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-contractor"
+).trim() || "opencode-orchestrator-mcp-contractor";
+const STANDALONE_ORCHESTRATOR_AGENT = "opencode-orchestrator-standalone";
 const MCP_SANITIZED_READER_AGENT = "mcp-sanitized-reader";
 const MCP_SANITIZED_READER_PROFILE = Object.freeze({
   mode: "all",
@@ -59,7 +60,7 @@ const MCP_SANITIZED_READER_PROMPT = [
   "Report the files inspected, conclusions, assumptions, and any evidence that could not be obtained within the sanitized boundary.",
 ].join("\n");
 const MCP_SANITIZED_READER_PROMPT_SHA256 = createHash("sha256").update(MCP_SANITIZED_READER_PROMPT).digest("hex");
-const ORCHESTRATOR_AGENT_ALIASES = new Set(["orchestrator", "principal-engineer-orchestrator"]);
+const ORCHESTRATOR_AGENT_ALIASES = new Set(["orchestrator", "principal-engineer-orchestrator", STANDALONE_ORCHESTRATOR_AGENT]);
 const DEFAULT_SUBAGENT_PROXY_AGENT = "planner";
 const CONTRACTOR_ALLOWED_SUBAGENTS = new Set(["planner", "architect", "builder", "debugger", "reviewer", "tester", "explore"]);
 const WRITE_CAPABLE_AGENTS = new Set(["build", "builder", "debugger", "general"]);
@@ -86,7 +87,7 @@ const SAFE_AGENT_BASH_ALLOW_PATTERNS = new Set([
   "git ls-files --others --exclude-standard",
 ]);
 const REQUIRED_MANAGED_AGENTS = Object.freeze([
-  "orchestrator",
+  STANDALONE_ORCHESTRATOR_AGENT,
   MCP_ORCHESTRATOR_AGENT,
   MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
   "planner",
@@ -153,6 +154,8 @@ const CONFIG = Object.freeze({
   worktreeMode: readChoiceEnv("CODEX_OPENCODE_WORKTREE_MODE", ["off", "write", "all"], "off"),
   worktreeRoot: String(process.env.CODEX_OPENCODE_WORKTREE_ROOT || "global").trim() || "global",
   worktreeCleanup: readChoiceEnv("CODEX_OPENCODE_WORKTREE_CLEANUP", ["always", "on_success", "never"], "never"),
+  sourceDirtPolicy: readChoiceEnv("CODEX_OPENCODE_SOURCE_DIRT_POLICY", ["strict", "unrelated_ok"], "strict"),
+  modelOverrideAllowlist: readCsvEnv("CODEX_OPENCODE_MODEL_ALLOWLIST", []),
   worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
   queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
@@ -300,6 +303,7 @@ function effectiveQueueWriteConflictPolicy() {
   return queueWriteConflictPolicyOverride || CONFIG.queueWriteConflictPolicy;
 }
 let selfTestContractorAuthorizationSha256 = "";
+let selfTestModelOverrideAllowlist = null;
 let pipelinePersistenceTestHook = null;
 let queueCancellationTestHook = null;
 let worktreeCleanupTestHook = null;
@@ -357,7 +361,7 @@ const scopeContractSchema = z
     validation: scopeValidationSchema.optional(),
     timeoutMs: z.number().int().positive().optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
-    modelRequirement: modelRequirementSchema.optional().describe("Require the attested managed profile to match this provider/model and optional variant. This does not override the profile or configure an endpoint."),
+    modelRequirement: modelRequirementSchema.optional().describe("Require this provider/model and optional variant. When the operator lists the model in CODEX_OPENCODE_MODEL_ALLOWLIST the bridge pins it explicitly for this job (--model/--variant) and attests runtime evidence against it; otherwise the attested managed profile must already match. It never configures an endpoint."),
   })
   .strict();
 
@@ -702,6 +706,11 @@ function buildValidationEnv(extra = {}) {
   env.GIT_CONFIG_VALUE_0 = "false";
   env.GIT_CONFIG_KEY_1 = "core.untrackedCache";
   env.GIT_CONFIG_VALUE_1 = "false";
+  if (process.platform === "win32") {
+    env.GIT_CONFIG_KEY_2 = "core.longpaths";
+    env.GIT_CONFIG_VALUE_2 = "true";
+    env.GIT_CONFIG_COUNT = "3";
+  }
   return env;
 }
 
@@ -741,6 +750,13 @@ function buildTrustedGitEnv(extra = null) {
   env.GIT_CONFIG_VALUE_3 = "";
   env.GIT_CONFIG_KEY_4 = "diff.external";
   env.GIT_CONFIG_VALUE_4 = "";
+  if (process.platform === "win32") {
+    // Bridge-owned Git ignores global config, so opt into long paths explicitly:
+    // generated worktree roots plus repository-relative paths routinely exceed MAX_PATH.
+    env.GIT_CONFIG_KEY_5 = "core.longpaths";
+    env.GIT_CONFIG_VALUE_5 = "true";
+    env.GIT_CONFIG_COUNT = "6";
+  }
   return env;
 }
 
@@ -768,6 +784,7 @@ function trustedGitArgs(args = []) {
     "-c", "core.quotePath=false",
     "-c", "credential.helper=",
     "-c", "diff.external=",
+    ...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []),
   ];
   trusted.splice(subcommandIndex, 0, ...enforcedConfig);
   const actualSubcommandIndex = subcommandIndex + enforcedConfig.length;
@@ -2456,6 +2473,60 @@ async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeCo
   }
 }
 
+function parseModelAllowlistEntry(entry) {
+  const raw = String(entry || "").trim();
+  if (!raw) return null;
+  const at = raw.lastIndexOf("@");
+  const modelPart = at > 0 ? raw.slice(0, at).trim() : raw;
+  const variant = at > 0 ? raw.slice(at + 1).trim() : "";
+  const slash = modelPart.indexOf("/");
+  if (slash <= 0 || slash === modelPart.length - 1) return null;
+  if (at > 0 && !variant) return null;
+  return { provider: modelPart.slice(0, slash).trim(), model: modelPart.slice(slash + 1).trim(), variant };
+}
+
+function activeModelOverrideAllowlist() {
+  return process.argv.some((argument) => String(argument).startsWith("--self-test")) && Array.isArray(selfTestModelOverrideAllowlist)
+    ? selfTestModelOverrideAllowlist
+    : CONFIG.modelOverrideAllowlist;
+}
+
+// A job may select a model through scopeContract.modelRequirement only when the
+// operator listed that provider/model (optionally pinned to one variant) in
+// CODEX_OPENCODE_MODEL_ALLOWLIST. The selection becomes an explicit --model/--variant
+// pin that is attested against runtime evidence exactly like the managed profile.
+// The sanitized reader keeps its exact profile and is never overridable.
+function allowlistedModelOverride(modelRequirement, agent = "", allowlist = activeModelOverrideAllowlist()) {
+  if (!modelRequirement?.provider || !modelRequirement?.model) return null;
+  if (String(agent || "").trim().toLowerCase() === MCP_SANITIZED_READER_AGENT.toLowerCase()) return null;
+  for (const entry of Array.isArray(allowlist) ? allowlist : []) {
+    const parsed = parseModelAllowlistEntry(entry);
+    if (!parsed || parsed.provider !== modelRequirement.provider || parsed.model !== modelRequirement.model) continue;
+    if (parsed.variant && modelRequirement.variant !== undefined && parsed.variant !== modelRequirement.variant) continue;
+    return {
+      provider: parsed.provider,
+      model: parsed.model,
+      variant: modelRequirement.variant !== undefined ? String(modelRequirement.variant) : parsed.variant,
+      source: "operator_allowlist",
+    };
+  }
+  return null;
+}
+
+function applyModelOverrideToMetadata(metadata, override) {
+  if (!metadata || !override) return metadata;
+  return {
+    ...metadata,
+    provider: override.provider,
+    model: override.model,
+    variant: override.variant || metadata.variant || "",
+    modelSelection: "operator_allowlist_override",
+    profileProvider: metadata.provider,
+    profileModel: metadata.model,
+    profileVariant: metadata.variant,
+  };
+}
+
 function effectiveReadOnlyMetadataError(metadataResult, lockPlan, {
   expectedAgent = "",
   expectedMode = "",
@@ -2478,7 +2549,7 @@ function effectiveReadOnlyMetadataError(metadataResult, lockPlan, {
       error: "Effective OpenCode agent metadata did not provide an exact provider and model, so the bridge cannot pin or attest execution.",
     };
   }
-  if (modelRequirement && (
+  if (modelRequirement && !allowlistedModelOverride(modelRequirement, metadata.name) && (
     metadata.provider !== modelRequirement.provider
     || metadata.model !== modelRequirement.model
     || (modelRequirement.variant !== undefined && metadata.variant !== modelRequirement.variant)
@@ -4591,8 +4662,10 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const started = nowMs();
   const metadataResult = agentMetadata || await readAgentDebugMetadata(agent, workDir, { forcePure });
   let configuredMetadata = metadataResult?.metadata || null;
+  const modelOverride = allowlistedModelOverride(metadataPolicyOptions.modelRequirement, agent);
 
   if (dryRun) {
+    configuredMetadata = applyModelOverrideToMetadata(configuredMetadata, modelOverride);
     return {
       stdout: "",
       stderr: "",
@@ -4796,7 +4869,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       modelFallbackAllowed: false,
     };
   }
-  configuredMetadata = finalPreSpawnMetadata.metadata;
+  configuredMetadata = applyModelOverrideToMetadata(finalPreSpawnMetadata.metadata, modelOverride);
   remainingRunMs = timeoutMs - (nowMs() - started);
   if (remainingRunMs <= 0) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
@@ -4904,6 +4977,10 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     configuredProvider: configuredMetadata?.provider || "",
     configuredModel: configuredMetadata?.model || "",
     configuredVariant: configuredMetadata?.variant || "",
+    modelSelection: configuredMetadata?.modelSelection || "managed_profile",
+    profileProvider: configuredMetadata?.profileProvider || configuredMetadata?.provider || "",
+    profileModel: configuredMetadata?.profileModel || configuredMetadata?.model || "",
+    profileVariant: configuredMetadata?.profileVariant ?? (configuredMetadata?.variant || ""),
     runtimeObservedProvider: inspection.runtimeObservedProvider || "",
     runtimeObservedModel: inspection.runtimeObservedModel || "",
     modelFallbackAllowed: false,
@@ -5071,6 +5148,10 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Configured provider: ${result?.configuredProvider || "unknown"}`,
     `Configured model: ${result?.configuredModel || "unknown"}`,
     `Configured variant: ${result?.configuredVariant || "unknown"}`,
+    `Model selection: ${result?.modelSelection || "managed_profile"}`,
+    result?.modelSelection === "operator_allowlist_override"
+      ? `Managed profile model: ${result.profileProvider}/${result.profileModel} (variant ${result.profileVariant || "unspecified"})`
+      : null,
     `Runtime-observed provider: ${result?.runtimeObservedProvider || "not emitted"}`,
     `Runtime-observed model: ${result?.runtimeObservedModel || "not emitted"}`,
     `Actual provider used: ${result?.actualProvider || "unknown"}`,
@@ -6678,7 +6759,7 @@ function makeWorktreeBranchName(agent, jobId) {
   ].join("/");
 }
 
-async function inspectSourceCheckpointState(cwd, { lockedPaths = [], allowedEdits = [], scopeContract = null } = {}) {
+async function inspectSourceCheckpointState(cwd, { lockedPaths = [], allowedEdits = [], scopeContract = null, policy = CONFIG.sourceDirtPolicy } = {}) {
   const result = await runCommand("git", ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], cwd, 1000 * 30, buildValidationEnv());
   if (result.exitCode !== 0) {
     return {
@@ -6711,12 +6792,18 @@ async function inspectSourceCheckpointState(cwd, { lockedPaths = [], allowedEdit
   const overlappingFiles = dirtyFiles.filter((file) => Boolean(overlaps([file], scopePaths)));
   const disjointFiles = dirtyFiles.filter((file) => !overlappingFiles.includes(file));
   const conflictingPaths = overlappingFiles.length ? overlappingFiles : dirtyFiles;
+  const toleratesUnrelated = policy === "unrelated_ok" && scopePaths.length > 0;
+  const blockingFiles = toleratesUnrelated ? overlappingFiles : dirtyFiles;
   return {
-    ok: dirtyFiles.length === 0,
-    errorType: dirtyFiles.length ? "dirty_worktree_requires_checkpoint" : null,
-    error: dirtyFiles.length
-      ? "The source checkout contains staged, unstaged, untracked, conflicted, or submodule changes. A HEAD-based worktree would omit that state. The bridge will not stash, reset, commit, or overlay it; create or select an external checkpoint and retry. Unrelated dirt is also rejected because the base must be fully reproducible."
+    ok: blockingFiles.length === 0,
+    errorType: blockingFiles.length ? "dirty_worktree_requires_checkpoint" : null,
+    error: blockingFiles.length
+      ? (toleratesUnrelated
+        ? `The source checkout has uncommitted changes inside this job's locked/allowed scope (${overlappingFiles.join(", ")}). A HEAD-based worktree would omit that state. The bridge will not stash, reset, commit, or overlay it; checkpoint or revert those files and retry. Unrelated changes are tolerated under CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok.`
+        : "The source checkout contains staged, unstaged, untracked, conflicted, or submodule changes. A HEAD-based worktree would omit that state. The bridge will not stash, reset, commit, or overlay it; create or select an external checkpoint and retry. Unrelated dirt is also rejected because the base must be fully reproducible (set CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok to tolerate changes outside the job scope).")
       : "",
+    sourceDirtPolicy: toleratesUnrelated ? "unrelated_ok" : "strict",
+    toleratedDisjointFiles: toleratesUnrelated ? disjointFiles : [],
     dirtyEntries,
     dirtyFiles,
     overlappingFiles,
@@ -7052,7 +7139,7 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
   const [postCheckpointState, postHead, createdWorktreeState] = await Promise.all([
     inspectSourceCheckpointState(repoRoot, { lockedPaths, allowedEdits, scopeContract }),
     runCommand("git", ["rev-parse", "HEAD"], repoRoot, 1000 * 15, buildValidationEnv()),
-    inspectSourceCheckpointState(worktreePath),
+    inspectSourceCheckpointState(worktreePath, { policy: "strict" }),
   ]);
   if (!postCheckpointState.ok || postHead.exitCode !== 0 || postHead.stdout.trim() !== baseCommit || !createdWorktreeState.ok) {
     let preExecutionCleanup = { cleanup: "retained", reason: "new worktree was not proven clean" };
@@ -7097,6 +7184,8 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
     baseCommit,
     baseTree: baseTreeResult.stdout.trim(),
     cleanup: "not_attempted",
+    sourceDirtPolicy: checkpointState.sourceDirtPolicy || "strict",
+    toleratedDisjointFiles: checkpointState.toleratedDisjointFiles || [],
   };
 }
 
@@ -7205,6 +7294,9 @@ function formatWorktreeSummary(worktree, cleanupResult = null) {
     "Worktree: used",
     `Worktree path: ${worktree.path}`,
     `Worktree branch: ${worktree.branch}`,
+    worktree.toleratedDisjointFiles?.length
+      ? `Worktree tolerated unrelated source changes (${worktree.sourceDirtPolicy}): ${worktree.toleratedDisjointFiles.join(", ")}`
+      : null,
     `Worktree cleanup: ${cleanupResult?.cleanup || "not attempted"}`,
     cleanupResult?.reason ? `Worktree cleanup reason: ${cleanupResult.reason}` : null,
     cleanupResult?.error ? `Worktree cleanup error: ${cleanupResult.error}` : null,
@@ -10608,6 +10700,8 @@ async function findActiveLockConflict(lockPlans) {
 
 function formatDelegationPlanJob({ index, job, lockPlan, resolution }) {
   const timeoutMs = timeoutForAgent(resolution?.actualAgent || lockPlan.agent, lockPlan, lockPlan.timeoutMs);
+  const modelOverride = allowlistedModelOverride(lockPlan.scopeContract?.modelRequirement, resolution?.actualAgent || lockPlan.agent);
+  const effectiveMetadata = applyModelOverrideToMetadata(resolution?.agentMetadata || null, modelOverride);
   return [
     `JOB ${index + 1}`,
     `Requested agent: ${resolution?.requestedAgent || lockPlan.agent}`,
@@ -10628,11 +10722,12 @@ function formatDelegationPlanJob({ index, job, lockPlan, resolution }) {
     `Configured provider: ${resolution?.agentMetadata?.provider || "unknown"}`,
     `Configured model: ${resolution?.agentMetadata?.model || "unknown"}`,
     `Configured variant: ${resolution?.agentMetadata?.variant || "unknown"}`,
+    `Model selection: ${modelOverride ? `operator_allowlist_override (${modelOverride.provider}/${modelOverride.model}${modelOverride.variant ? `, variant ${modelOverride.variant}` : ""})` : "managed_profile"}`,
     "Silent model fallback: disabled",
     `Effective edit permission: ${resolution?.agentMetadata ? (resolution.agentMetadata.canEdit ? "enabled" : "denied") : "unattested"}`,
     `Effective task permission: ${resolution?.agentMetadata ? (resolution.agentMetadata.canDelegate ? "enabled" : "denied") : "unattested"}`,
     `Effective external-directory permission denied: ${resolution?.agentMetadata?.externalDirectoryDenied ? "yes" : "no/unattested"}`,
-    `Would run: ${resolution?.actualAgent ? commandShape(resolution.actualAgent, resolution.agentMetadata) : "no"}`,
+    `Would run: ${resolution?.actualAgent ? commandShape(resolution.actualAgent, effectiveMetadata) : "no"}`,
     "Would acquire consistency lock: yes (shared for reads, exclusive for writes/integration)",
     `Lock mode: ${lockPlan.lockMode}`,
     `Lock type: ${lockPlan.lockType}`,
@@ -10870,6 +10965,11 @@ server.tool(
             "Provider readiness: not tested by health (no model request sent)",
             "Project OpenCode config: disabled; use a reviewed managed profile, not the personal/project default",
             `Runtime model evidence required by operator: ${CONFIG.requireRuntimeModelEvidence ? "yes" : "no"}`,
+            ...(CONFIG.requireRuntimeModelEvidence ? [
+              "Warning: OpenCode 1.17.13 emits no runtime provider/model identity in `run --format json`, so every non-dry agent run will end with opencode_model_evidence_required while CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=true. Set it to false and use per-job modelRequirement.requireRuntimeEvidence when exact identity matters more than completing the run.",
+            ] : []),
+            `Source dirt policy: ${CONFIG.sourceDirtPolicy}`,
+            `Model allowlist: ${CONFIG.modelOverrideAllowlist.length ? CONFIG.modelOverrideAllowlist.join(", ") : "none (managed profiles only)"}`,
             `OpenCode check exit code: ${openCodeVersion.exitCode}`,
             `Git version: ${(gitVersion.stdout || gitVersion.stderr || "unavailable").trim()}`,
             `Git check exit code: ${gitVersion.exitCode}`,
@@ -18781,6 +18881,49 @@ function runEventEvidenceSelfTests() {
     assert.equal(effectiveReadOnlyMetadataError({ ok: true, metadata: { ...modelMetadata.metadata, ...changed } }, requiredLock).errorType,
       "configured_model_requirement_mismatch");
   }
+  assert.deepEqual(parseModelAllowlistEntry("opencode/gpt-5.3-codex@high"), { provider: "opencode", model: "gpt-5.3-codex", variant: "high" });
+  assert.deepEqual(parseModelAllowlistEntry(" openai/gpt-5.6-terra "), { provider: "openai", model: "gpt-5.6-terra", variant: "" });
+  assert.equal(parseModelAllowlistEntry("nomodel"), null);
+  assert.equal(parseModelAllowlistEntry("provider/"), null);
+  assert.equal(parseModelAllowlistEntry("provider/model@"), null);
+  assert.equal(parseModelAllowlistEntry(""), null);
+  const overrideRequirement = { provider: "opencode", model: "gpt-5.3-codex", variant: "high" };
+  assert.equal(allowlistedModelOverride(overrideRequirement, "planner", []), null);
+  assert.deepEqual(
+    allowlistedModelOverride(overrideRequirement, "planner", ["opencode/gpt-5.3-codex@high"]),
+    { provider: "opencode", model: "gpt-5.3-codex", variant: "high", source: "operator_allowlist" }
+  );
+  assert.equal(allowlistedModelOverride(overrideRequirement, "planner", ["opencode/gpt-5.3-codex@low"]), null);
+  assert.equal(allowlistedModelOverride({ provider: "opencode", model: "gpt-5.3-codex" }, "planner", ["opencode/gpt-5.3-codex@high"]).variant, "high");
+  assert.equal(allowlistedModelOverride({ provider: "opencode", model: "gpt-5.3-codex" }, "planner", ["opencode/gpt-5.3-codex"]).variant, "");
+  assert.equal(allowlistedModelOverride(overrideRequirement, MCP_SANITIZED_READER_AGENT, ["opencode/gpt-5.3-codex@high"]), null);
+  assert.equal(allowlistedModelOverride(overrideRequirement, "planner", ["opencode/other@high", "bad-entry", ""]), null);
+  assert.equal(allowlistedModelOverride(null, "planner", ["opencode/gpt-5.3-codex"]), null);
+  const overriddenMetadata = applyModelOverrideToMetadata(
+    modelMetadata.metadata,
+    allowlistedModelOverride(overrideRequirement, "planner", ["opencode/gpt-5.3-codex"])
+  );
+  assert.equal(overriddenMetadata.provider, "opencode");
+  assert.equal(overriddenMetadata.model, "gpt-5.3-codex");
+  assert.equal(overriddenMetadata.variant, "high");
+  assert.equal(overriddenMetadata.modelSelection, "operator_allowlist_override");
+  assert.equal(overriddenMetadata.profileProvider, "fixture");
+  assert.equal(overriddenMetadata.profileModel, "model-a");
+  assert.equal(overriddenMetadata.canEdit, false);
+  assert.equal(applyModelOverrideToMetadata(modelMetadata.metadata, null), modelMetadata.metadata);
+  assert.equal(applyModelOverrideToMetadata(null, { provider: "x", model: "y", variant: "" }), null);
+  assert.ok(openCodeRunArgs("planner", "probe", overriddenMetadata).join(" ").includes("--model opencode/gpt-5.3-codex --variant high"));
+  selfTestModelOverrideAllowlist = ["opencode/gpt-5.3-codex@high"];
+  try {
+    const overrideScope = normalizeScopeContract({ agent: "planner", scopeContract: { mode: "read", read: ["src"], modelRequirement: overrideRequirement } });
+    assert.equal(effectiveReadOnlyMetadataError(modelMetadata, { lockType: "read", scopeContract: overrideScope }), null);
+    const unlistedScope = normalizeScopeContract({ agent: "planner", scopeContract: { mode: "read", read: ["src"], modelRequirement: { ...overrideRequirement, model: "not-allowlisted" } } });
+    assert.equal(effectiveReadOnlyMetadataError(modelMetadata, { lockType: "read", scopeContract: unlistedScope }).errorType, "configured_model_requirement_mismatch");
+    const sanitizedMetadata = { ok: true, metadata: { ...modelMetadata.metadata, name: MCP_SANITIZED_READER_AGENT } };
+    assert.equal(effectiveReadOnlyMetadataError(sanitizedMetadata, { lockType: "read", scopeContract: overrideScope }).errorType, "configured_model_requirement_mismatch");
+  } finally {
+    selfTestModelOverrideAllowlist = null;
+  }
   const text = (value, messageID = "final", id = "part-1", sessionID = "root") => ({
     type: "text", sessionID, part: { type: "text", text: value, id, messageID, time: { end: 1 } },
   });
@@ -19547,8 +19690,17 @@ async function runSelfTests() {
   assert.equal(path.resolve(buildOpenCodeEnv().XDG_CONFIG_HOME), path.dirname(DEFAULT_OPENCODE_CONFIG_DIR));
   assert.equal(path.resolve(buildOpenCodeEnv().XDG_DATA_HOME), path.dirname(DEFAULT_OPENCODE_DATA_DIR));
   assert.equal(path.resolve(buildOpenCodeEnv({ HOME: "isolated-home", USERPROFILE: "isolated-profile" }).HOME), path.resolve("isolated-home"));
-  assert.equal(openCodeRunArgs("mcp-orchestrator", "probe").includes("--pure"), !CONFIG.allowExternalPlugins);
+  assert.equal(openCodeRunArgs(MCP_ORCHESTRATOR_AGENT, "probe").includes("--pure"), !CONFIG.allowExternalPlugins);
   assert.equal(buildValidationEnv().GIT_CONFIG_NOSYSTEM, undefined);
+  if (process.platform === "win32") {
+    const trustedGitEnvFixture = buildTrustedGitEnv();
+    assert.equal(trustedGitEnvFixture.GIT_CONFIG_KEY_5, "core.longpaths");
+    assert.equal(trustedGitEnvFixture.GIT_CONFIG_VALUE_5, "true");
+    assert.equal(trustedGitEnvFixture.GIT_CONFIG_COUNT, "6");
+    assert.equal(trustedGitArgs(["worktree", "add"]).includes("core.longpaths=true"), true);
+    assert.equal(buildValidationEnv().GIT_CONFIG_KEY_2, "core.longpaths");
+    assert.equal(buildValidationEnv().GIT_CONFIG_COUNT, "3");
+  }
   assert.equal(buildValidationEnv().GIT_ATTR_NOSYSTEM, undefined);
   const safeDiffValidationFixture = await prepareValidationCommand("git diff --check");
   assert.equal(safeDiffValidationFixture.ok, true);
@@ -19682,6 +19834,13 @@ async function runSelfTests() {
   assert.equal(nextQueueScheduleDelay([{ status: "blocked" }], false), null);
   assert.equal(isOrchestratorAgent("principal-engineer-orchestrator"), true);
   assert.equal(isManagedReadOnlyAgent("principal-engineer-orchestrator"), true);
+  assert.equal(isOrchestratorAgent(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(isManagedReadOnlyAgent(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(isOrchestratorAgent(MCP_ORCHESTRATOR_AGENT), true);
+  assert.equal(isOrchestratorAgent(MCP_CONTRACTOR_ORCHESTRATOR_AGENT), true);
+  assert.equal(isManagedReadOnlyAgent(MCP_CONTRACTOR_ORCHESTRATOR_AGENT), false);
+  assert.equal(REQUIRED_MANAGED_AGENTS.includes(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(REQUIRED_MANAGED_AGENTS.includes("orchestrator"), false);
   assert.match(unsafePathReason(["../secrets"]), /parent traversal/);
   assert.match(unsafePathReason(["src/a/../file.js"]), /parent traversal/);
   assert.match(unsafePathReason(["src/foo/.."]), /parent traversal/);
@@ -21823,6 +21982,28 @@ async function runSelfTests() {
     assert.deepEqual(dirtyPreflight.overlappingFiles, ["src/allowed.txt"]);
     assert.ok(dirtyPreflight.disjointFiles.includes("untracked-checkpoint.txt"));
     assert.deepEqual(dirtyPreflight.conflictingPaths, ["src/allowed.txt"]);
+    const toleratedPreflight = await inspectSourceCheckpointState(tempDir, {
+      lockedPaths: ["docs"],
+      allowedEdits: ["docs"],
+      policy: "unrelated_ok",
+    });
+    assert.equal(toleratedPreflight.ok, true);
+    assert.equal(toleratedPreflight.errorType, null);
+    assert.equal(toleratedPreflight.sourceDirtPolicy, "unrelated_ok");
+    assert.deepEqual(toleratedPreflight.overlappingFiles, []);
+    assert.deepEqual(toleratedPreflight.toleratedDisjointFiles, toleratedPreflight.dirtyFiles);
+    assert.ok(toleratedPreflight.toleratedDisjointFiles.includes("untracked-checkpoint.txt"));
+    const toleratedButOverlapping = await inspectSourceCheckpointState(tempDir, {
+      lockedPaths: ["src/allowed.txt"],
+      allowedEdits: ["src/allowed.txt"],
+      policy: "unrelated_ok",
+    });
+    assert.equal(toleratedButOverlapping.ok, false);
+    assert.equal(toleratedButOverlapping.errorType, "dirty_worktree_requires_checkpoint");
+    assert.match(toleratedButOverlapping.error, /inside this job's locked\/allowed scope \(src\/allowed\.txt\)/);
+    assert.deepEqual(toleratedButOverlapping.conflictingPaths, ["src/allowed.txt"]);
+    assert.equal((await inspectSourceCheckpointState(tempDir, { policy: "unrelated_ok" })).ok, false, "unscoped checks stay strict");
+    assert.equal((await inspectSourceCheckpointState(tempDir, { lockedPaths: ["docs"], allowedEdits: ["docs"], policy: "strict" })).ok, false);
     const dirtyReadiness = await verifyJobWorkspaceReadiness(readinessWriterJob, readinessWriterPlan, "write");
     assert.equal(dirtyReadiness.errorType, "dirty_worktree_requires_checkpoint");
     assert.deepEqual(dirtyReadiness.dirtyFiles, dirtyPreflight.dirtyFiles);

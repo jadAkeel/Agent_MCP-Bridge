@@ -80,7 +80,9 @@ Rules:
 
 ## Orchestrator Modes
 
-By default, a requested OpenCode `orchestrator` is routed to the dedicated `mcp-orchestrator`. That agent is read-only and has OpenCode's `task` permission denied, so it cannot launch nested writers. Codex remains the coordinator and calls bounded workers directly.
+By default, a requested OpenCode `orchestrator` is routed to the dedicated `opencode-orchestrator-mcp-planner`. That agent is read-only and has OpenCode's `task` permission denied, so it cannot launch nested writers. Codex remains the coordinator and calls bounded workers directly.
+
+The managed orchestrator profiles live in `opencode/agents/` under three file names: `opencode-orchestrator-mcp-planner.md` is the read-only MCP planning target, `opencode-orchestrator-mcp-contractor.md` is the explicit contractor target, and `opencode-orchestrator-standalone.md` is the backup/standalone profile for direct OpenCode sessions. OpenCode derives each agent name from its file name. Through the bridge, the requested names `orchestrator`, `principal-engineer-orchestrator`, and `opencode-orchestrator-standalone` are aliases that resolve to the MCP planner, or to the contractor in explicit contractor mode; the standalone profile is never executed by the bridge. Operators may override the two MCP target names with `CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT` and `CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT` only when a release intentionally ships different file names.
 
 The managed `planner`, `architect`, `reviewer`, and `tester` agents also deny both edits and nested subagent launches.
 Known write-capable agents such as `builder` and `debugger` are rejected under read-only locks; use them only as bounded worktree writers.
@@ -93,7 +95,7 @@ userAuthorizedOrchestrator: true
 contractorAuthorizationToken: <operator-held secret matching the configured hash>
 ```
 
-The Bridge then routes the one outer job to `mcp-contractor-orchestrator`. That parent cannot edit, invoke a shell, or load skills; it may coordinate only an allowlisted set of OpenCode worker, planning, review, and test agents, and delegates repository commands or validation to those bounded subagents. Recursive orchestrator calls are denied by OpenCode task permissions. Because nested task execution has no interactive permission-response channel, every managed nested role defaults shell access to deny and exposes only the bridge-reviewed exact Git diagnostic allowlist. The Bridge isolates OpenCode's legacy home and every XDG control/state root, attests the exact parent and every allowlisted nested profile initially and immediately before execution, and uses an in-memory OpenCode session database. The whole contract must be a single bounded write job with explicit `lockedPaths`, `allowedEdits`, a write Scope Contract, and validation. It always runs in an isolated worktree, which is retained for Codex review and explicit integration. The Bridge independently runs the final validation gate even when a subagent reports its own check.
+The Bridge then routes the one outer job to `opencode-orchestrator-mcp-contractor`. That parent cannot edit, invoke a shell, or load skills; it may coordinate only an allowlisted set of OpenCode worker, planning, review, and test agents, and delegates repository commands or validation to those bounded subagents. Recursive orchestrator calls are denied by OpenCode task permissions. Because nested task execution has no interactive permission-response channel, every managed nested role defaults shell access to deny and exposes only the bridge-reviewed exact Git diagnostic allowlist. The Bridge isolates OpenCode's legacy home and every XDG control/state root, attests the exact parent and every allowlisted nested profile initially and immediately before execution, and uses an in-memory OpenCode session database. The whole contract must be a single bounded write job with explicit `lockedPaths`, `allowedEdits`, a write Scope Contract, and validation. It always runs in an isolated worktree, which is retained for Codex review and explicit integration. The Bridge independently runs the final validation gate even when a subagent reports its own check.
 
 ```text
 User explicitly authorizes OpenCode Orchestrator
@@ -105,6 +107,16 @@ User explicitly authorizes OpenCode Orchestrator
 ```
 
 Contractor mode is rejected when the capability is unconfigured/invalid or the explicit authorization flag is absent, and it cannot be placed in `run_opencode_parallel` or a multi-job pipeline. The plaintext token is neither returned nor persisted. MCP validates the aggregate contract and final changed files; it does not expose per-subagent locks inside OpenCode, so use this mode only when the user deliberately chooses the broker workflow.
+
+## Model Selection
+
+Every managed agent profile pins one `provider/model` and variant in its frontmatter, and the bridge passes that pin explicitly on the OpenCode command line. Codex can ask for a different model per job without editing profiles: set `CODEX_OPENCODE_MODEL_ALLOWLIST` to the models the operator trusts, then send `scopeContract.modelRequirement` with the wanted `provider`, `model`, and optional `variant`. When the requirement matches an allowlist entry the bridge pins it for that job, reports `Model selection: operator_allowlist_override` together with the profile model it replaced, and still compares runtime-observed identity against the pinned model. A requirement outside the allowlist is rejected before any process starts, exactly as before. Silent fallback stays disabled and the sanitized reader always keeps its exact profile.
+
+```text
+CODEX_OPENCODE_MODEL_ALLOWLIST=google/antigravity-gemini-3.8-flash@high,opencode/gpt-5.3-codex,opencode/claude-sonnet-5@high
+```
+
+An entry without `@variant` accepts any requested variant and keeps the profile variant when the job does not name one; an entry with `@variant` accepts only that variant.
 
 ## Worktrees And Integration
 
@@ -312,6 +324,8 @@ Useful defaults:
 | `CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS` | `2097152` | Per-stream subprocess capture cap. MCP results contain the bounded final response and tool outcome summary, not raw JSON events. |
 | `CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS` | `131072` | Maximum assistant final response returned to MCP. |
 | `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE` | `false` | When `true`, reject non-dry runs unless OpenCode emits matching root-session provider/model evidence. Configured profile metadata alone is never relabelled as runtime proof. |
+| `CODEX_OPENCODE_MODEL_ALLOWLIST` | unset | Comma-separated `provider/model` or `provider/model@variant` entries a job may select through `scopeContract.modelRequirement`. A matching requirement becomes an explicit `--model`/`--variant` pin for that job and is attested against runtime evidence like any other run; a requirement that is not listed still fails with `configured_model_requirement_mismatch`. The sanitized reader is never overridable. |
+| `CODEX_OPENCODE_SOURCE_DIRT_POLICY` | `strict` | `strict` rejects any uncommitted change in the source checkout before a writer worktree. `unrelated_ok` tolerates changes outside the job's locked/allowed paths (overlapping changes are still rejected) so daily work does not need a checkpoint for every unrelated edit; the tolerated files are reported on the worktree summary, and integration into that dirty target then requires `allowDirtyTarget: true` after review. A freshly created worktree must always be clean. |
 | `CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS` | `12000` | Maximum exact patch preview eligible for a single-use review receipt; oversized or redacted evidence fails closed. |
 | `CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES` | `20000` | Fail-closed cap for metadata-only ignored-file snapshots; ignored contents are not read. |
 | `CODEX_OPENCODE_MAX_SNAPSHOT_FILES` | `25000` | Fail-closed cap for the complete changed-file snapshot set. |
@@ -343,7 +357,7 @@ Useful defaults:
 
 ## Operational Boundaries
 
-- Bridge-owned Git commands run with a reduced environment, system/global configuration disabled, credential prompting disabled, and a process-unique nonexistent `core.hooksPath`. Repository-local filter/diff/merge drivers, credential/header rewrites, executable core controls, and config includes are rejected as `git_repository_config_unsafe` before worktree creation or patch capture. Worktrees start from a pinned committed `HEAD` and tree. Any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; a newly created worktree that is not immediately clean is rejected as `worktree_created_dirty` and retained as evidence.
+- Bridge-owned Git commands run with a reduced environment, system/global configuration disabled, credential prompting disabled, and a process-unique nonexistent `core.hooksPath`. On Windows the bridge also forces `core.longpaths=true` for its own Git commands and its OpenCode children, because generated worktree roots plus repository-relative paths routinely exceed the legacy 260-character limit and global Git configuration is intentionally ignored. Repository-local filter/diff/merge drivers, credential/header rewrites, executable core controls, and config includes are rejected as `git_repository_config_unsafe` before worktree creation or patch capture. Worktrees start from a pinned committed `HEAD` and tree. Under the default `CODEX_OPENCODE_SOURCE_DIRT_POLICY=strict`, any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; `unrelated_ok` tolerates dirt outside the job scope and reports it. A newly created worktree that is not immediately clean is rejected as `worktree_created_dirty` and retained as evidence.
 - Executed writer worktrees are never removed by the job/queue/parallel cleanup setting. They remain the review and recovery source until receipt-bound integration and explicit validated cleanup. Every durable queued writer is worktree-isolated so a child that survives an owner crash cannot modify the target checkout.
 - SQLite queue acceptance persists an AES-256-GCM encrypted replay request before publishing the job to the in-process scheduler. Job results, pipeline details, and integration rollback preimages are encrypted with the same state-root key while list records keep hashes/lengths only. The separate 32-byte `queue-request.key` is required for restart recovery and backup; contractor capability tokens are removed before encryption. Rotating legacy backups/WAL copies remains an operator responsibility. Supply a stable `idempotencyKey` so an identical resubmission returns the original job and a changed request fails with `queue_idempotency_conflict`. Startup and periodic recovery take over only after both durable owner leases expire, and integration journal recovery runs before project jobs are scheduled. Legacy rows without encrypted payloads remain explicitly `not_resumable`.
 - Terminal retention defaults to 30 days and audit retention to 90 days; both must be positive. Row/live-byte/preview/worktree caps apply backpressure without deleting active, quarantined, cleanup-pending, referenced, or retained recovery evidence. Provider leases heartbeat every 20 seconds and expire after four minutes without renewal, keeping crash recovery within the five-minute objective while tolerating short local stalls.
@@ -453,6 +467,12 @@ npm run audit:state
 ```
 
 It opens only regular top-level bridge databases plus `projects/*.sqlite` under `CODEX_OPENCODE_STATE_DIR` (or the default bridge state directory) in read-only mode and reports `integrity_check`, `foreign_key_check`, and active jobs/pipelines whose owner leases have expired. Add `-- --strict` to make expired active rows fail the command; use `-- --json` for automation. An expired row is an operational warning, not database corruption: allow normal deferred recovery to run before manual investigation.
+
+## Housekeeping
+
+Writer worktrees are retained until Codex integrates them, so the bridge state directory grows unless it is collected. `npm run gc` prints a dry-run inventory of every retained worktree and per-project database: orphans whose source repository is gone, directories that outlived their registry record, worktrees still awaiting review, and databases for repositories that no longer exist. `npm run gc:apply` removes the orphans, repairs the registry, and prunes dead databases; add `--include-retained --older-than <days>` to remove reviewed-and-abandoned worktrees, whose `agent/*` branches are kept unless `--delete-branches` is passed. Projects with live jobs, pipelines, locks, or bridge leases are never touched.
+
+`npm run smoke:live` starts the bridge with the exact entry and environment from `~/.codex/config.toml`, checks health, and runs one tiny read-only agent job, reporting configured versus runtime-observed model and the error type. It is the fastest way to prove the daily profile works end to end after any config or release change; `npm run smoke:live:health` skips the model request.
 
 ## Full Guide
 

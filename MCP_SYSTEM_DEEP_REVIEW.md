@@ -143,7 +143,7 @@ Key implementation points:
 - Contractor authorization is at lines 4395-4555.
 - Startup server hash verification is at lines 8129-8145.
 
-The bridge does not automatically invoke OpenCode Orchestrator for normal named-agent jobs. Only an orchestrator alias or explicit MCP orchestrator name is routed to mcp-orchestrator or mcp-contractor-orchestrator.
+The bridge does not automatically invoke OpenCode Orchestrator for normal named-agent jobs. Only an orchestrator alias or explicit MCP orchestrator name is routed to opencode-orchestrator-mcp-planner or opencode-orchestrator-mcp-contractor.
 
 ## 7. Mermaid architecture diagram
 
@@ -182,7 +182,7 @@ flowchart LR
     C -->|"one outer job + boolean authorization + aggregate Scope Contract"| B["MCP Bridge"]
     B --> P["Authorization, single-job, write-scope and path gates"]
     P --> W["Retained isolated Git worktree + write lock"]
-    W --> CO["mcp-contractor-orchestrator"]
+    W --> CO["opencode-orchestrator-mcp-contractor"]
     CO -->|"task allowlist only"| SA{"Allowed OpenCode subagents"}
     SA --> BU["Builder"]
     SA --> DE["Debugger"]
@@ -253,9 +253,9 @@ These changes were preserved. This report is the only audit-created repository f
 - Active runtime server: installed release server.js.
 - Runtime package dependencies: installed release node_modules.
 - Source bin scripts: used only when explicitly run from source; absent from active release.
-- mcp-orchestrator: runtime target for MCP planning-only orchestrator aliases.
-- mcp-contractor-orchestrator: runtime target only for explicit Contractor mode.
-- legacy orchestrator: active in OpenCode for standalone/backup use, but MCP orchestrator aliases are routed away from it.
+- opencode-orchestrator-mcp-planner: runtime target for MCP planning-only orchestrator aliases.
+- opencode-orchestrator-mcp-contractor: runtime target only for explicit Contractor mode.
+- opencode-orchestrator-standalone (legacy standalone profile): active in OpenCode for standalone/backup use, but MCP orchestrator aliases are routed away from it.
 
 ## 10. Default communication flow
 
@@ -285,7 +285,7 @@ The Contractor flow is a distinct bridge policy:
 2. The job must set userAuthorizedOrchestrator true.
 3. The job must be a bounded write job with a write Scope Contract, concrete locks/edits, and simple or strict lock mode.
 4. Contractor mode is rejected in parallel or multi-job execution.
-5. The request routes to mcp-contractor-orchestrator.
+5. The request routes to opencode-orchestrator-mcp-contractor.
 6. A retained worktree is mandatory.
 7. The Contractor has edit denied and can invoke only planner, architect, builder, debugger, reviewer, tester, explore, or explorer.
 8. Other orchestrators are not in the task allowlist, preventing recursive orchestrator calls at the OpenCode permission layer.
@@ -364,9 +364,9 @@ The four explicitly intended Codex mappings in the request match: Principal Sol/
 | planner | all | openai/gpt-5.6-luna / medium | Deny | Deny | Ask; exact Git reads allow | Deny | Deny |
 | explore | subagent | openai/gpt-5.6-luna / medium | Deny | Deny | Ask; limited Git reads allow | Deny | Deny |
 | architect | all | openai/gpt-5.5 / high | Deny | Deny | Ask; exact Git reads allow | Deny | Deny |
-| mcp-orchestrator | all | openai/gpt-5.6-terra / high | Deny | Deny | Ask; exact Git reads allow | Deny | Deny |
-| mcp-contractor-orchestrator | all | openai/gpt-5.6-terra / high | Deny | Allowlisted roles only | Ask; exact Git reads allow | Deny | Deny |
-| orchestrator (legacy) | all | openai/gpt-5.6-terra / high | Deny | Available for backup/standalone policy | Ask; exact Git reads allow | Deny | Deny |
+| opencode-orchestrator-mcp-planner | all | openai/gpt-5.6-terra / high | Deny | Deny | Ask; exact Git reads allow | Deny | Deny |
+| opencode-orchestrator-mcp-contractor | all | openai/gpt-5.6-terra / high | Deny | Allowlisted roles only | Ask; exact Git reads allow | Deny | Deny |
+| opencode-orchestrator-standalone (legacy standalone) | all | openai/gpt-5.6-terra / high | Deny | Available for backup/standalone policy | Ask; exact Git reads allow | Deny | Deny |
 
 All requested OpenCode mappings resolve as intended, except the operational Explore mode problem. Architect is an additional gpt-5.5/high agent not included in the requested target map.
 
@@ -713,7 +713,7 @@ The post-remediation pass did not rerun the expensive Gemini Builder or Contract
 - Unauthorized Contractor mode is rejected.
 - Contractor mode cannot run as a parallel outer job.
 - Planning-only orchestrator requests to invoke writers are rejected.
-- Contractor routes to mcp-contractor-orchestrator and its task allowlist permits Builder but excludes orchestrators.
+- Contractor routes to opencode-orchestrator-mcp-contractor and its task allowlist permits Builder but excludes orchestrators.
 - Windows process-tree timeout terminated both live E2E child trees; no fixture-referencing process remained.
 - Source self-tests cover core lock, queue, worktree, validation, rollback, and integration paths.
 - npm audit found no known production dependency advisories.
@@ -958,8 +958,8 @@ Validate TOML syntax, paths, quotes/backslashes, command, args, environment valu
 - **shared files:** Frozen paths that must not change in the job.
 - **serial-only paths:** Global/risky files that cannot be written in parallel.
 - **worktree:** Isolated Git checkout used for writer execution.
-- **planning-only orchestrator:** mcp-orchestrator role that cannot edit or call writers.
-- **Contractor:** Explicitly authorized mcp-contractor-orchestrator that coordinates allowlisted nested agents inside one aggregate contract.
+- **planning-only orchestrator:** opencode-orchestrator-mcp-planner role that cannot edit or call writers.
+- **Contractor:** Explicitly authorized opencode-orchestrator-mcp-contractor that coordinates allowlisted nested agents inside one aggregate contract.
 - **legacy orchestrator:** OpenCode backup/standalone orchestrator not used by normal MCP alias routing.
 - **native fallback:** OpenCode silently substituting another agent; treated as an error by the bridge.
 - **final response:** Non-empty terminal assistant text event. The remediated bridge requires one for every non-dry-run success.

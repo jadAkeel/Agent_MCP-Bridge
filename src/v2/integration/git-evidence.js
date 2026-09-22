@@ -41,6 +41,7 @@ export function createGitEvidenceService({
         ["core.checkStat", "default"],
         ["core.ignoreStat", "false"],
         ...(platform === "win32" ? [] : [["core.fileMode", "true"]]),
+        ...(platform === "win32" ? [["core.longpaths", "true"]] : []),
       ];
       let configIndex = Number.parseInt(String(env.GIT_CONFIG_COUNT || "0"), 10);
       if (!Number.isSafeInteger(configIndex) || configIndex < 0) configIndex = 0;

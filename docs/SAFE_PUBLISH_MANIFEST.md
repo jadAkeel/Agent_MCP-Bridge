@@ -40,6 +40,9 @@ Copy files back intentionally. Do not blindly overwrite local config directories
 - Codex skills: `codex/skills/` -> `~/.codex/skills/`
 - OpenCode agents: `opencode/agents/` -> `~/.config/opencode/agents/`
 - OpenCode skills: `opencode/skills/` -> `~/.config/opencode/skills/`
+- When the active MCP entry pins `CODEX_OPENCODE_AGENT_DIR`/`CODEX_OPENCODE_SKILL_DIR` to a dedicated runtime
+  directory, use `npm run sync:runtime` (dry-run) and `npm run sync:runtime -- --apply --remove-stale`
+  instead of copying by hand; it only touches `*.md` profiles and skill trees.
 - `opencode/plugin-integrity-manifest.json` is machine-specific deployment
   evidence with canonical absolute paths and inspected hashes. Regenerate and
   re-review it when the source root, host, OpenCode version, or optional plugin

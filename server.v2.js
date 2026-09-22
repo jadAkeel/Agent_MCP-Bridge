@@ -98,11 +98,12 @@ const {
   BRIDGE_OPENCODE_HOME_DIR,
 } = BRIDGE_PATHS;
 const MCP_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "mcp-orchestrator"
-).trim() || "mcp-orchestrator";
+  process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-planner"
+).trim() || "opencode-orchestrator-mcp-planner";
 const MCP_CONTRACTOR_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT || "mcp-contractor-orchestrator"
-).trim() || "mcp-contractor-orchestrator";
+  process.env.CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-contractor"
+).trim() || "opencode-orchestrator-mcp-contractor";
+const STANDALONE_ORCHESTRATOR_AGENT = "opencode-orchestrator-standalone";
 const MCP_SANITIZED_READER_AGENT = "mcp-sanitized-reader";
 const MCP_SANITIZED_READER_PROFILE = Object.freeze({
   mode: "all",
@@ -118,7 +119,7 @@ const MCP_SANITIZED_READER_PROMPT = [
   "Report the files inspected, conclusions, assumptions, and any evidence that could not be obtained within the sanitized boundary.",
 ].join("\n");
 const MCP_SANITIZED_READER_PROMPT_SHA256 = createHash("sha256").update(MCP_SANITIZED_READER_PROMPT).digest("hex");
-const ORCHESTRATOR_AGENT_ALIASES = new Set(["orchestrator", "principal-engineer-orchestrator"]);
+const ORCHESTRATOR_AGENT_ALIASES = new Set(["orchestrator", "principal-engineer-orchestrator", STANDALONE_ORCHESTRATOR_AGENT]);
 const DEFAULT_SUBAGENT_PROXY_AGENT = "planner";
 const CONTRACTOR_ALLOWED_SUBAGENTS = new Set(["planner", "architect", "builder", "debugger", "reviewer", "tester", "explore"]);
 const WRITE_CAPABLE_AGENTS = new Set(["build", "builder", "debugger", "general"]);
@@ -145,7 +146,7 @@ const SAFE_AGENT_BASH_ALLOW_PATTERNS = new Set([
   "git ls-files --others --exclude-standard",
 ]);
 const REQUIRED_MANAGED_AGENTS = Object.freeze([
-  "orchestrator",
+  STANDALONE_ORCHESTRATOR_AGENT,
   MCP_ORCHESTRATOR_AGENT,
   MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
   "planner",
@@ -2336,7 +2337,12 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
     };
   }
 
-  const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, 1000 * 60);
+  const created = await runCommand(
+    "git",
+    [...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []), "worktree", "add", "-b", branch, worktreePath, baseCommit],
+    repoRoot,
+    1000 * 60
+  );
   if (created.exitCode !== 0) {
     return {
       ok: false,
@@ -10742,7 +10748,7 @@ async function runSelfTests() {
   assert.equal(path.resolve(buildOpenCodeEnv().XDG_CONFIG_HOME), path.dirname(DEFAULT_OPENCODE_CONFIG_DIR));
   assert.equal(path.resolve(buildOpenCodeEnv().XDG_DATA_HOME), path.dirname(DEFAULT_OPENCODE_DATA_DIR));
   assert.equal(path.resolve(buildOpenCodeEnv({ HOME: "isolated-home", USERPROFILE: "isolated-profile" }).HOME), path.resolve("isolated-home"));
-  assert.equal(openCodeRunArgs("mcp-orchestrator", "probe").includes("--pure"), !CONFIG.allowExternalPlugins);
+  assert.equal(openCodeRunArgs(MCP_ORCHESTRATOR_AGENT, "probe").includes("--pure"), !CONFIG.allowExternalPlugins);
   assert.equal(buildValidationEnv().GIT_CONFIG_NOSYSTEM, undefined);
   assert.equal(buildValidationEnv().GIT_ATTR_NOSYSTEM, undefined);
   const safeDiffValidationFixture = await prepareValidationCommand("git diff --check");
@@ -10862,6 +10868,13 @@ async function runSelfTests() {
   assert.equal(nextQueueScheduleDelay([{ status: "blocked" }], false), null);
   assert.equal(isOrchestratorAgent("principal-engineer-orchestrator"), true);
   assert.equal(isManagedReadOnlyAgent("principal-engineer-orchestrator"), true);
+  assert.equal(isOrchestratorAgent(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(isManagedReadOnlyAgent(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(isOrchestratorAgent(MCP_ORCHESTRATOR_AGENT), true);
+  assert.equal(isOrchestratorAgent(MCP_CONTRACTOR_ORCHESTRATOR_AGENT), true);
+  assert.equal(isManagedReadOnlyAgent(MCP_CONTRACTOR_ORCHESTRATOR_AGENT), false);
+  assert.equal(REQUIRED_MANAGED_AGENTS.includes(STANDALONE_ORCHESTRATOR_AGENT), true);
+  assert.equal(REQUIRED_MANAGED_AGENTS.includes("orchestrator"), false);
   assert.match(unsafePathReason(["../secrets"]), /parent traversal/);
   assert.match(unsafePathReason(["~/secret"]), /home-directory/);
   assert.match(unsafePathReason(["."]), /filesystem root/);
