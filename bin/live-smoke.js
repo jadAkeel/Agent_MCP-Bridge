@@ -187,7 +187,7 @@ async function main() {
     report.health.status = field(health, "OpenCode MCP bridge status") || (/status: healthy/i.test(health) ? "healthy" : "unknown");
     report.health.integrity = field(health, "Integrity");
     report.health.externalPlugins = field(health, "External plugins");
-    report.health.missingAgents = field(health, "Missing required agents");
+    report.health.missingAgents = field(health, "Missing required managed agents");
     report.health.text = health;
     if (options.healthOnly) {
       report.ok = /healthy/i.test(report.health.status);
