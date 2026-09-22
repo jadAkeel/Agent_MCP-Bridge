@@ -79,7 +79,7 @@ npm run gc:apply               # remove orphans whose source repository is gone,
 npm run gc -- --include-retained --older-than 14 --apply   # also remove retained worktrees older than 14 days (branches are kept)
 ```
 
-The collector never touches a project whose database shows live jobs, pipelines, locks, or bridge leases, and it deletes an `agent/*` branch only with `--delete-branches`. Inspect kept work with `git log main..agent/<role>/<job>` before deleting branches.
+The collector never touches a project whose database shows live jobs, pipelines, locks, or bridge leases, keeps any worktree that still holds uncommitted or untracked files unless `--force-dirty` is passed, and deletes an `agent/*` branch only with `--delete-branches`. Inspect kept work with `git log main..agent/<role>/<job>` before deleting branches.
 
 `npm run smoke:live` starts the bridge exactly as Codex does (same release entry and environment from `~/.codex/config.toml`) and runs one tiny read-only agent job; it reports health timings, configured versus runtime-observed model, and the error type, so a broken daily profile is caught before real work. Use `npm run smoke:live:health` for the model-free variant.
 

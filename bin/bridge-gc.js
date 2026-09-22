@@ -35,6 +35,7 @@ function usage() {
     "  --include-retained            Also remove worktrees retained for review whose source repository still exists",
     "  --older-than <days>           Minimum age for --include-retained removals (default: 7)",
     "  --delete-branches             Delete the agent/* branch after removing a retained worktree (default: keep)",
+    "  --force-dirty                 Also remove retained worktrees that still hold uncommitted changes (default: keep them)",
     "  --prune-databases             Remove project databases whose repositories no longer exist and have no live rows",
     "  --json                        Machine-readable report",
     "  --self-test                   Run the built-in fixture test",
@@ -49,6 +50,7 @@ function parseArguments(argv) {
     includeRetained: false,
     olderThanDays: 7,
     deleteBranches: false,
+    forceDirty: false,
     pruneDatabases: false,
     json: false,
     selfTest: false,
@@ -68,6 +70,7 @@ function parseArguments(argv) {
     } else if (argument === "--apply") options.apply = true;
     else if (argument === "--include-retained") options.includeRetained = true;
     else if (argument === "--delete-branches") options.deleteBranches = true;
+    else if (argument === "--force-dirty") options.forceDirty = true;
     else if (argument === "--prune-databases") options.pruneDatabases = true;
     else if (argument === "--json") options.json = true;
     else if (argument === "--self-test") options.selfTest = true;
@@ -338,6 +341,21 @@ async function inventory(stateDir, options) {
           ? `Retained for review but only ${ageDays} day(s) old; below --older-than ${options.olderThanDays}.`
           : "Retained for Codex review; pass --include-retained (with --older-than) to remove.";
       }
+      if (item.action === "remove_worktree") {
+        // Integration reads the worktree's working tree, not only its branch, so
+        // uncommitted or untracked files there are unintegrated work. Removing the
+        // directory would lose them even though the branch is kept.
+        const status = await runGit(["status", "--porcelain=v1", "--untracked-files=all"], worktreePath, 1000 * 30);
+        const dirtyEntries = status.exitCode === 0 ? status.stdout.split(/\r?\n/).filter(Boolean).length : -1;
+        item.uncommittedEntries = dirtyEntries;
+        if (dirtyEntries !== 0 && !options.forceDirty) {
+          item.classification = "retained_uncommitted_work";
+          item.action = "keep";
+          item.reason = dirtyEntries > 0
+            ? `The worktree still holds ${dirtyEntries} uncommitted/untracked entr${dirtyEntries === 1 ? "y" : "ies"}; integrate it, commit it onto ${item.branch || "its branch"}, or pass --force-dirty to discard.`
+            : "The worktree's Git status could not be read, so it is kept; pass --force-dirty to discard it anyway.";
+        }
+      }
       report.worktrees.push(item);
     }
   }
@@ -606,8 +624,22 @@ async function selfTest() {
     assert.equal(checkDb.prepare("SELECT status FROM worktree_artifacts WHERE job_id = 'job-1'").get().status, "retained");
     checkDb.close();
 
-    // 3. Retained removal keeps the branch (work stays recoverable) unless --delete-branches.
+    // 3a. A retained worktree with uncommitted work is kept even with --include-retained.
+    const dirtyPath = path.join(stateDir, "worktrees", liveHash, "builder-builder-4-dirty");
+    await git(sourceRepo, "worktree", "add", "--quiet", "-b", "agent/builder/dirty", dirtyPath, "HEAD");
+    await writeFile(path.join(dirtyPath, "unsaved.txt"), "not yet integrated\n", "utf8");
+    const dirtyPreview = await runGc({ stateDir, apply: false, includeRetained: true, olderThanDays: 0, deleteBranches: false, pruneDatabases: false });
+    const dirtyItem = dirtyPreview.report.worktrees.find((item) => item.name === "builder-builder-4-dirty");
+    assert.equal(dirtyItem.classification, "retained_uncommitted_work");
+    assert.equal(dirtyItem.action, "keep");
+    assert.equal(dirtyItem.uncommittedEntries, 1);
+    assert.equal(dirtyPreview.report.worktrees.find((item) => item.name === "builder-builder-1-retained").action, "remove_worktree");
+
+    // 3. Retained removal keeps the branch (work stays recoverable) unless --delete-branches,
+    //    and never touches the worktree that still holds uncommitted work.
     const retainedRemoval = await runGc({ stateDir, apply: true, includeRetained: true, olderThanDays: 0, deleteBranches: false, pruneDatabases: false });
+    assert.equal(existsSync(dirtyPath), true);
+    assert.equal(existsSync(path.join(dirtyPath, "unsaved.txt")), true);
     assert.equal(retainedRemoval.applied.some((outcome) => outcome.path === retainedPath && outcome.ok), true, JSON.stringify(retainedRemoval.applied, null, 2));
     assert.equal(existsSync(retainedPath), false);
     const branches = await git(sourceRepo, "branch", "--list", "agent/builder/retained");
@@ -616,6 +648,11 @@ async function selfTest() {
     const afterDb = new DatabaseSync(path.join(stateDir, "projects", `${liveHash}.sqlite`), { readOnly: true });
     assert.equal(afterDb.prepare("SELECT status FROM worktree_artifacts WHERE job_id = 'job-1'").get().status, "cleaned");
     afterDb.close();
+
+    // 3b. --force-dirty is the only way to discard uncommitted work.
+    const dirtyForced = await runGc({ stateDir, apply: true, includeRetained: true, olderThanDays: 0, deleteBranches: false, forceDirty: true, pruneDatabases: false });
+    assert.equal(dirtyForced.applied.some((outcome) => outcome.path === dirtyPath && outcome.ok), true, JSON.stringify(dirtyForced.applied, null, 2));
+    assert.equal(existsSync(dirtyPath), false);
 
     // 4. Nothing left to do.
     const final = await runGc({ stateDir, apply: false, includeRetained: true, olderThanDays: 0, deleteBranches: false, pruneDatabases: true });
