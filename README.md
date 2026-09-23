@@ -4,7 +4,7 @@ This bridge lets Codex call OpenCode agents through MCP while keeping Codex as t
 
 One-sentence architecture: Codex decides what to delegate and merge, MCP Bridge enforces scope/routing/scheduling/validation, and OpenCode agents execute bounded tasks.
 
-For the concise operator decision tree, agent roles, daily workflow, and release checklist, read [docs/OPERATOR_QUICKSTART.md](docs/OPERATOR_QUICKSTART.md). Production uses `server.js`; `server.v2.js` remains an explicitly gated experimental modularization target.
+New users should start with the plain-language [docs/USER_GUIDE.md](docs/USER_GUIDE.md) (what it is, how it works, daily usage, troubleshooting). For the concise operator decision tree, agent roles, daily workflow, and release checklist, read [docs/OPERATOR_QUICKSTART.md](docs/OPERATOR_QUICKSTART.md). Production uses `server.js`; `server.v2.js` remains an explicitly gated experimental modularization target.
 
 ## Official Safety Model
 
