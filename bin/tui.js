@@ -6,7 +6,6 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
 const MCP_TOOL_TIMEOUT_MS = Number(process.env.CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS) || 25 * 60 * 1000;
@@ -26,21 +25,13 @@ Codex OpenCode MCP Pipeline TUI
 9. Quit
 `;
 
-const TuiState = Annotation.Root({
-  action: Annotation(),
-  done: Annotation(),
-  lastText: Annotation(),
-  client: Annotation(),
-  rl: Annotation(),
-});
-
 function usage() {
   return [
     "Usage:",
     "  npm run tui",
     "  node bin/tui.js",
     "",
-    "The TUI starts this MCP bridge over stdio and drives its tools through a LangGraph workflow.",
+    "The TUI starts this MCP bridge over stdio and drives its tools through a simple menu loop.",
     "Create-pipeline input is a JSON file with the same arguments as create_multi_agent_pipeline.",
   ].join("\n");
 }
@@ -369,48 +360,36 @@ async function printResult(state) {
   return { action: "" };
 }
 
-function route(state) {
-  if (state.action === "quit") {
-    return END;
+// Menu actions and their handlers. Every handler returns a partial state update
+// that is merged into the loop state; after each action the result is printed and
+// the menu is shown again, until the user picks quit.
+const ACTION_HANDLERS = {
+  create: createPipeline,
+  run: runPipeline,
+  get: getPipeline,
+  monitor: monitorPipeline,
+  listPipelines: listPipelines,
+  integrate,
+  finalize: finalizePipeline,
+  listJobs,
+};
+
+function assertTuiActions() {
+  for (const [action, handler] of Object.entries(ACTION_HANDLERS)) {
+    if (typeof handler !== "function") throw new Error(`TUI action ${action} has no handler.`);
   }
-  return state.action || "menu";
 }
 
-function buildTuiGraph() {
-  return new StateGraph(TuiState)
-    .addNode("menu", chooseAction)
-    .addNode("create", createPipeline)
-    .addNode("run", runPipeline)
-    .addNode("get", getPipeline)
-    .addNode("monitor", monitorPipeline)
-    .addNode("listPipelines", listPipelines)
-    .addNode("integrate", integrate)
-    .addNode("finalize", finalizePipeline)
-    .addNode("listJobs", listJobs)
-    .addNode("print", printResult)
-    .addEdge(START, "menu")
-    .addConditionalEdges("menu", route, {
-      create: "create",
-      run: "run",
-      get: "get",
-      monitor: "monitor",
-      listPipelines: "listPipelines",
-      integrate: "integrate",
-      finalize: "finalize",
-      listJobs: "listJobs",
-      menu: "menu",
-      [END]: END,
-    })
-    .addEdge("create", "print")
-    .addEdge("run", "print")
-    .addEdge("get", "print")
-    .addEdge("monitor", "print")
-    .addEdge("listPipelines", "print")
-    .addEdge("integrate", "print")
-    .addEdge("finalize", "print")
-    .addEdge("listJobs", "print")
-    .addEdge("print", "menu")
-    .compile();
+async function runTuiLoop(initialState) {
+  let state = { ...initialState };
+  for (;;) {
+    state = { ...state, ...(await chooseAction(state)) };
+    if (state.action === "quit") return;
+    const handler = ACTION_HANDLERS[state.action];
+    if (!handler) continue;
+    state = { ...state, ...(await handler(state)) };
+    state = { ...state, ...(await printResult(state)) };
+  }
 }
 
 async function main() {
@@ -420,7 +399,7 @@ async function main() {
   }
 
   if (process.argv.includes("--smoke")) {
-    buildTuiGraph();
+    assertTuiActions();
     const dashboard = await renderPipelineDashboard({
       pipelineId: "smoke",
       name: "smoke",
@@ -437,7 +416,7 @@ async function main() {
     if (!dashboard.includes("Smoke task") || !dashboard.includes("model=")) {
       throw new Error("TUI dashboard smoke render failed.");
     }
-    console.log("TUI graph compiled.");
+    console.log("TUI smoke passed.");
     return;
   }
 
@@ -446,14 +425,13 @@ async function main() {
   try {
     const connected = await createMcpClient();
     transport = connected.transport;
-    const graph = buildTuiGraph();
-    await graph.invoke({
+    await runTuiLoop({
       client: connected.client,
       rl,
       action: "",
       done: false,
       lastText: "",
-    }, { recursionLimit: 1000 });
+    });
   } finally {
     rl.close();
     if (transport) {

@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const entries = ["server.js", "server.v2.js"];
+const entries = ["server.js"];
 const requestOptions = { timeout: 30_000, maxTotalTimeout: 30_000 };
 
 function textOf(result) {
@@ -108,7 +108,7 @@ async function verifyEntry(entry, fixtureRoot) {
 const fixtureRoot = await mkdtemp(path.join(tmpdir(), "codex-opencode-pipeline-abandon-"));
 try {
   for (const entry of entries) await verifyEntry(entry, fixtureRoot);
-  process.stdout.write("Pipeline abandonment tests passed for V1 and V2.\n");
+  process.stdout.write("Pipeline abandonment tests passed.\n");
 } finally {
   await rm(fixtureRoot, { recursive: true, force: true });
 }

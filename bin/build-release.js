@@ -14,6 +14,7 @@ const LEGACY_PUBLISH_ENTRIES = Object.freeze([
   "package.json",
   "package-lock.json",
   "bin",
+  "tests",
   "opencode/agents",
   "opencode/skills",
   "opencode/.gitignore",
@@ -21,22 +22,9 @@ const LEGACY_PUBLISH_ENTRIES = Object.freeze([
   "node_modules",
 ]);
 
-const V2_PUBLISH_ENTRIES = Object.freeze([
-  { source: "server.v2.js", target: "server.js" },
-  { source: "package.json", target: "package.json" },
-  { source: "package-lock.json", target: "package-lock.json" },
-  { source: "bin", target: "bin" },
-  { source: "opencode/agents", target: "opencode/agents" },
-  { source: "opencode/skills", target: "opencode/skills" },
-  { source: "opencode/.gitignore", target: "opencode/.gitignore" },
-  { source: "opencode/plugin-integrity-manifest.json", target: "opencode/plugin-integrity-manifest.json" },
-  { source: "node_modules", target: "node_modules" },
-  { source: "src/v2", target: "src/v2" },
-]);
 
 const RELEASE_PROFILES = Object.freeze({
   legacy: LEGACY_PUBLISH_ENTRIES,
-  v2: V2_PUBLISH_ENTRIES,
 });
 
 function normalizeFilesystemCase(value) {
@@ -432,7 +420,7 @@ async function main() {
   const profile = profileIndex >= 0 ? String(process.argv[profileIndex + 1] || "").trim() : "legacy";
   const rawDestination = String(process.argv.filter((arg, index) => index !== profileIndex && index !== profileIndex + 1 && index > 1)[0] || "").trim();
   if (!rawDestination) {
-    throw new Error("Usage: node bin/build-release.js [--profile legacy|v2] <new-absolute-release-directory>");
+    throw new Error("Usage: node bin/build-release.js [--profile legacy] <new-absolute-release-directory>");
   }
   const result = await buildRelease({ destination: rawDestination, profile });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

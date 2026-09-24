@@ -952,7 +952,9 @@ async function main() {
         ...fakeManagedEnv,
         CODEX_OPENCODE_PASSTHROUGH_ENV: "FAKE_METADATA_COUNTER_PATH,FAKE_UNSAFE_METADATA_AFTER,FAKE_RUN_SENTINEL_PATH",
         FAKE_METADATA_COUNTER_PATH: metadataCounterPath,
-        FAKE_UNSAFE_METADATA_AFTER: "3",
+        // Read 1 is discovery (then served from the attestation cache); read 2 is the
+        // uncached immediate pre-spawn read, which must see the drift and fail closed.
+        FAKE_UNSAFE_METADATA_AFTER: "2",
         FAKE_RUN_SENTINEL_PATH: runSentinelPath,
       },
     });

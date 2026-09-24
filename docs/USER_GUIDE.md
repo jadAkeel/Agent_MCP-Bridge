@@ -51,17 +51,13 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 | Piece | What it is | Where it lives |
 | --- | --- | --- |
 | **Codex** | The AI you talk to. It is the orchestrator and the only one allowed to integrate changes. | The Codex app/CLI |
-| **Codex orchestrator profile** | The Codex agent you select for work, normally `principal-engineer-orchestrator-plain`. | `codex/agents/*.toml`, installed into `~/.codex` |
+| **Codex orchestrator profile** | The Codex agent you select for work, `principal-engineer-orchestrator`. | `codex/agents/*.toml`, installed into `~/.codex` |
 | **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 22 tools to Codex. | Production runs from an immutable release folder, not this checkout |
 | **OpenCode** | The agent runtime that actually runs the helper agents. Pinned to version `1.17.13`. | Installed on `PATH` |
-| **OpenCode agents** | Role profiles such as `builder`, `reviewer` and `debugger`. Each has fixed permissions and a pinned model. | `opencode/agents/*.md`, synced to the runtime folder |
+| **OpenCode agents** | Role profiles such as `builder`, `reviewer` and `debugger`. Each has fixed permissions and a pinned model. | `opencode/agents/*.md`, copied to the runtime folder automatically when a release starts |
 | **Skills** | Reusable instruction packs the agents load, such as `code-review-checklist` and `debugging-investigation`. | `opencode/skills/` |
 | **State store** | SQLite databases (one per project) holding jobs, locks, queues and audit records, plus retained worktrees. | `~/.codex/codex-opencode-mcp` |
 
-**Production vs. experimental:**
-
-- `server.js` is the production bridge.
-- `server.v2.js` (with `src/v2/`) is an experimental modular rewrite. It is kept for future testing and only runs when you explicitly opt in with `CODEX_OPENCODE_SERVER_ENTRY=server.v2.js` and `CODEX_OPENCODE_ENABLE_EXPERIMENTAL_V2=true`.
 
 ---
 
@@ -132,7 +128,7 @@ What this means in practice:
 ### Steps
 
 1. Open Codex **in the project you want to work on**, not in this bridge repository.
-2. Select the agent **`principal-engineer-orchestrator-plain`**.
+2. Select the agent **`principal-engineer-orchestrator`**.
 3. Type:
    > Run `get_opencode_bridge_status` for this project, then ask an OpenCode reviewer for a short opinion on the code.
 4. Wait about 1–2 minutes. You should see:
@@ -179,12 +175,9 @@ Talk to Codex like you would talk to a senior engineer. You do not need to name 
 
 ## 7. Choosing agents and models
 
-### Codex orchestrator profiles
+### Codex orchestrator profile
 
-| Profile | Use for |
-| --- | --- |
-| `principal-engineer-orchestrator-plain` | **Default.** Normal repository work. |
-| `principal-engineer-orchestrator` | Repositories that use GitHub Spec Kit, or when you ask for Spec Kit. |
+There is one profile: `principal-engineer-orchestrator`. It uses GitHub Spec Kit only when you ask for it by name or the repository already has `.specify/` or `specs/`.
 
 ### OpenCode roles
 
@@ -286,6 +279,7 @@ Run all of these from `C:\Users\10User\codex-opencode-mcp`, the bridge repositor
 | `npm run smoke:live:health` | Same as above, without the model call. | Quick check |
 | `npm run audit:state` | Read-only SQLite integrity report. | Investigating problems |
 | `npm run tui` | Terminal dashboard of jobs, pipelines, locks and worktrees. | Watching work live |
+| `npm run release:activate -- --prune` | Runs a normal release, then deletes old releases and config backups. It keeps the active release, the previous one, and the two newest backups. | When releases pile up |
 
 The garbage collector is conservative:
 
@@ -313,6 +307,8 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `missing_scope_contract` / `empty_allowed_edits` | A write job was submitted without a proper contract. | Ask Codex to validate the plan with explicit allowed edits. |
 | `integration_preview_stale` | Something changed between preview and apply. | Run the dry-run preview again. |
 | `dependency_required` | The agent needs a new package. | Let Codex add it, commit, and retry. |
+| `validation_command_untrusted` | The job's `validationCommand` cannot run: its program is not in `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST`, or it uses `npx`, a shell, or inline eval. It is rejected before any agent starts. | Use a plain command such as `npm test`, or add the program to the allowlist. |
+| `validation_command_failed` | The validation command ran and returned a non-zero exit code. | Read the validation output in the result; fix the code or the command. |
 | `queue_write_requires_worktree` | A queued write job needs worktree mode. | Keep `CODEX_OPENCODE_WORKTREE_MODE=write`. |
 | `agent_empty_final_response` | The agent exited without an answer. | Retry. If it repeats, run `npm run smoke:live`. |
 | `essential_output_truncated` | The output was too large to trust. | Narrow the task. |
@@ -334,49 +330,52 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 
 ## 12. Updating and rolling back
 
-Production never runs this mutable checkout. It runs an **immutable release folder** whose `server.js` hash is pinned in `~/.codex/config.toml`.
+Production never runs this mutable checkout. It runs a **release folder** whose `server.js` hash is pinned in `~/.codex/config.toml`.
 
-### Changing only agent profiles or skills
+### Changing bridge code, agent profiles, or skills
+
+Run one command from the bridge repository:
 
 ```bash
-npm run sync:runtime
-```
-```bash
-npm run sync:runtime -- --apply --remove-stale
-```
-```bash
-npm run smoke:live:health
+npm run release:activate
 ```
 
-The first command is a dry run that shows what would change. The second copies the files, and the third checks that no required agents are missing.
+It does the whole release in order and stops at the first failure:
 
-### Changing bridge code
+1. Runs `npm test`. If it fails, nothing is built.
+2. Builds a new folder next to the active release, for example `server-daily-20260924-3`.
+3. Writes a candidate config with the new path and hash and checks it in a fresh bridge process.
+4. Backs up `~/.codex/config.toml` as `config.toml.rollback-<time>`, then swaps in the new config.
+5. Runs the health smoke against the live config. If it fails, it restores the backup automatically.
+6. Lists old releases and backups. Add `--prune` to delete them.
 
-1. Run the release gates: `npm test`, `npm run test:v2`, `npm run test:concurrency`, `npm audit --omit=dev`. Or run all of them at once with `npm run test:release`.
-2. Build a new release: `npm run release:build -- C:\Users\10User\codex-opencode-mcp-releases\<new-name>`.
-3. Update the `[mcp_servers.opencode]` entry in `~/.codex/config.toml`:
-   - set `args` to the new `server.js`;
-   - set `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` to its hash;
-   - keep a backup of the old file.
-4. Verify with `npm run smoke:live`, then restart Codex.
+Then **restart Codex** so new sessions use the new bridge.
 
-The full procedure is in [SAFE_PUBLISH_MANIFEST.md](SAFE_PUBLISH_MANIFEST.md).
+Useful options: `--check-only` builds and health-checks a candidate without activating it. `--skip-tests` skips step 1 right after a green `npm test`.
+
+Agent and skill profiles ship inside the release. When the release starts, it copies them into the runtime folder named by `CODEX_OPENCODE_AGENT_DIR` and `CODEX_OPENCODE_SKILL_DIR`. It only adds and updates files, never deletes. `npm run sync:runtime` still exists for a manual dry run.
 
 ### Rolling back
 
-1. Copy the backup config over `~/.codex/config.toml`. Backups are named `config.toml.rollback-*` and `config.toml.activation-backup-*`.
+1. Copy the newest `config.toml.rollback-*` over `~/.codex/config.toml`.
 2. Restart Codex.
 3. Run `npm run smoke:live`.
 
-Keep the active release and one known-good previous release. Older ones can be archived.
+### Before pushing source changes
+
+```bash
+npm run test:release
+```
+
+This runs `npm test`, the concurrency test, and `npm audit --omit=dev`.
 
 ### Current state on this machine
 
 | Item | Value |
 | --- | --- |
-| Active release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260922` |
-| Rollback release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260910-v2` |
-| Config backup | `~/.codex/config.toml.rollback-20260922195407` |
+| Active release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260924-3` |
+| Rollback release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260924-2` |
+| Config backup | `~/.codex/config.toml.rollback-20260924065005` |
 | Runtime agents | `~/.codex/opencode-gemini-runtime-v1/opencode/agents` |
 | State | `~/.codex/codex-opencode-mcp` |
 
@@ -423,7 +422,9 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_WORKTREE_MODE` | `write` | Writers run in isolated worktrees. |
 | `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Worktrees live in the state folder, not inside your projects. |
 | `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable queue with restart recovery. |
-| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `2` | Maximum simultaneous model calls across all sessions. |
+| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `4` | Maximum simultaneous model calls across all sessions. The built-in default is `2`. |
+| `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git,npm,node,pnpm,yarn,python,pytest` | Programs a job's `validationCommand` may start. The built-in default is `git` only. |
+| `CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS` | default (30 min) | Reuses agent and plugin checks between jobs. Any change to an agent, skill, or config file resets it. `0` turns it off. |
 | `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | release hash | Pins the exact bridge build. It must match the release. |
 | `startup_timeout_sec` / `tool_timeout_sec` | `120` / `1500` | Needed so long agent jobs are not cut off at 60 s. |
 
@@ -435,7 +436,7 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_BUILDER_TIMEOUT_MS` | 15 min |
 | `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS` | 6 min per attempt |
 
-The complete variable table is in the [README](../README.md#configuration).
+The complete variable table is in [REFERENCE.md](REFERENCE.md#configuration).
 
 ### Optional project policy
 
@@ -446,7 +447,7 @@ A project can add `.mcp/agent-policy.json` to declare:
 - shared files;
 - serial-only files.
 
-Policy can only make things **stricter**. See the README section "Project Policy".
+Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md](REFERENCE.md#project-policy).
 
 ---
 
@@ -455,7 +456,6 @@ Policy can only make things **stricter**. See the README section "Project Policy
 | Path | Contents |
 | --- | --- |
 | `server.js` | Production MCP bridge, the single file that is deployed. |
-| `server.v2.js`, `src/v2/` | Experimental modular rewrite, kept for later testing. |
 | `opencode/agents/` | Managed OpenCode agent profiles. |
 | `opencode/skills/` | Managed skills. |
 | `opencode/*.jsonc`, `*.json` | Reviewed, non-secret OpenCode and plugin config. |
@@ -464,25 +464,27 @@ Policy can only make things **stricter**. See the README section "Project Policy
 | `bin/daily-doctor.js` | `npm run doctor` |
 | `bin/bridge-gc.js` | `npm run gc` / `gc:apply` |
 | `bin/live-smoke.js` | `npm run smoke:live` |
-| `bin/sync-managed-runtime.js` | `npm run sync:runtime` |
-| `bin/build-release.js` | `npm run release:build` |
+| `bin/sync-managed-runtime.js` | Agent/skill copy used at startup; `npm run sync:runtime` for a manual dry run |
+| `bin/release-activate.js` | `npm run release:activate` |
+| `bin/build-release.js` | Release builder used by `release:activate` |
 | `bin/fresh-healthcheck.js` | Fresh-process health check used during activation. |
 | `bin/tui.js` | `npm run tui` dashboard. |
 | `bin/e2e*.js` | Live and concurrency end-to-end tests. |
-| `tests/` | Unit and parity tests, mostly for v2. |
-| `docs/` | This guide, the operator quickstart, the publish procedure, and design notes. |
-| `MCP_BRIDGE_COMPLETE_GUIDE.md` | Detailed operating rules and manual examples. |
+| `tests/server-self-test.js` | The bridge's self-test suite (`npm test` runs it). |
+| `tests/pipeline-*.js` | Pipeline admin and abandonment tests. |
+| `docs/USER_GUIDE.md` | This guide. |
+| `docs/REFERENCE.md` | Detailed rules, tool behavior, and the full configuration table. |
+| `docs/archive/` | Historical audits, hardening reports, and design notes. Not current. |
 
 ### Test commands
 
 | Command | Use |
 | --- | --- |
 | `npm run test:quick` | Fast loop while editing. |
-| `npm test` | Production (v1) gate. |
-| `npm run test:v2` | Experimental v2 and v1/v2 parity. |
+| `npm test` | Production gate. |
 | `npm run test:concurrency` | Multi-process stress, with no model calls. |
 | `npm run test:e2e` | Live end-to-end with real models. Slower and uses your quota. |
-| `npm run test:release` | Everything above except e2e, plus a dependency audit. |
+| `npm run test:release` | `npm test`, the concurrency test, and a dependency audit. |
 
 ---
 

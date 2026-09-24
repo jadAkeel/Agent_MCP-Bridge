@@ -12,7 +12,8 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -67,6 +68,16 @@ async function git(cwd, args) {
   await execFileAsync("git", args, { cwd, windowsHide: true });
 }
 
+function processIsRunning(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
 // The smoke runs against the real state directory (that is the point), so the
 // throwaway repository leaves one per-project database behind. Remove it when it
 // holds nothing but this run, so the smoke cleans up after itself.
@@ -79,6 +90,16 @@ async function removeSmokeProjectDatabase(stateDir, repo) {
     return { removed: false, reason: "no projects directory" };
   }
   const target = path.resolve(repo).toLowerCase();
+  // The bridge names each project database after a hash of the repository's real
+  // path (lowercased on Windows); try that exact file first.
+  let canonicalRepo = path.resolve(repo);
+  try {
+    canonicalRepo = realpathSync(canonicalRepo);
+  } catch {
+    // The fallback scan below still matches by recorded path.
+  }
+  const keyedName = `${createHash("sha256").update(process.platform === "win32" ? canonicalRepo.toLowerCase() : canonicalRepo).digest("hex").slice(0, 24)}.sqlite`;
+  names.sort((left, right) => (left === keyedName ? -1 : right === keyedName ? 1 : 0));
   for (const name of names) {
     const dbPath = path.join(projectsRoot, name);
     let matches = false;
@@ -89,20 +110,27 @@ async function removeSmokeProjectDatabase(stateDir, repo) {
         for (const table of ["opencode_direct_runs", "opencode_jobs", "locks", "worktree_artifacts"]) {
           const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
           if (!exists) continue;
-          const hasCwd = db.prepare(`PRAGMA table_info(${table})`).all().some((column) => column.name === "cwd");
-          if (!hasCwd) continue;
-          const rows = db.prepare(`SELECT DISTINCT cwd FROM ${table} WHERE cwd IS NOT NULL AND cwd <> ''`).all();
+          const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name);
+          // Direct-run audit rows record the repository as project_key, not cwd.
+          const pathColumn = columns.includes("cwd") ? "cwd" : columns.includes("project_key") ? "project_key" : "";
+          if (!pathColumn) continue;
+          const rows = db.prepare(`SELECT DISTINCT ${pathColumn} AS cwd FROM ${table} WHERE ${pathColumn} IS NOT NULL AND ${pathColumn} <> ''`).all();
           for (const row of rows) {
             const cwd = path.resolve(String(row.cwd)).toLowerCase();
             if (cwd === target) matches = true;
             else busy = true;
           }
         }
+        // Parallel read-only runs record no repository path, so the exactly named
+        // database counts as this run's when no other repository appears in it.
+        if (!matches && !busy && name === keyedName) matches = true;
         if (matches) {
-          const live = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_instances'").get()
-            ? db.prepare("SELECT COUNT(*) AS count FROM bridge_instances WHERE lease_expires_at > ?").get(new Date().toISOString())
-            : { count: 0 };
-          if (Number(live?.count || 0) > 0) busy = true;
+          // A bridge that already exited leaves an unexpired lease row behind; only a
+          // lease whose process is still running makes the database busy.
+          const instances = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_instances'").get()
+            ? db.prepare("SELECT process_id FROM bridge_instances WHERE lease_expires_at > ?").all(new Date().toISOString())
+            : [];
+          if (instances.some((row) => processIsRunning(Number(row.process_id)))) busy = true;
         }
       } finally {
         db.close();

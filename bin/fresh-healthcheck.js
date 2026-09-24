@@ -196,7 +196,7 @@ async function validateCandidateReleaseEntry(entry) {
     throw new Error("Candidate release manifest must contain version 1 and a files object.");
   }
   const profile = releaseManifest.profile || "legacy";
-  if (!["legacy", "v2"].includes(profile)) {
+  if (profile !== "legacy") {
     throw new Error(`Candidate release manifest has an unsupported profile: ${profile}.`);
   }
   const releaseFiles = releaseManifest.files;
@@ -230,10 +230,6 @@ async function validateCandidateReleaseEntry(entry) {
     || !Object.keys(releaseFiles).some((relative) => relative.startsWith("opencode/skills/") && relative.endsWith("/SKILL.md"))
   ) {
     throw new Error("Candidate release manifest does not bind the required server, config, agent, skill, and plugin files.");
-  }
-  const hasV2Source = Object.keys(releaseFiles).some((relative) => relative.startsWith("src/v2/") && relative.endsWith(".js"));
-  if (profile === "v2" && (!hasV2Source || Object.hasOwn(releaseFiles, "server.v2.js"))) {
-    throw new Error("V2 candidate release must contain src/v2 modules and must not publish a second server.v2.js entry.");
   }
   const expectedAgentDir = path.join(releaseRoot, "opencode", "agents");
   const expectedSkillDir = path.join(releaseRoot, "opencode", "skills");

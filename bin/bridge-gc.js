@@ -288,7 +288,9 @@ async function inventory(stateDir, options) {
       const worktreePath = path.join(projectPath, entry.name);
       if (!isPathInside(worktreeRoot, worktreePath)) continue;
       const details = await stat(worktreePath);
-      const ageDays = Math.floor((now - details.mtimeMs) / DAY_MS);
+      // Windows clock ticks can trail filesystem timestamps by a few milliseconds, which
+      // made a brand-new directory -1 days old; an age is never negative.
+      const ageDays = Math.max(0, Math.floor((now - details.mtimeMs) / DAY_MS));
       const link = entry.isDirectory() ? await readWorktreeGitLink(worktreePath) : { kind: "not_a_directory", sourceRepo: "", gitDir: "" };
       const registryRow = info?.registry.get(path.resolve(worktreePath)) || null;
       const sourceRepo = link.sourceRepo || registryRow?.cwd || "";
