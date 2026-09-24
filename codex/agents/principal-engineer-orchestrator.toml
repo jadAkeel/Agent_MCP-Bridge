@@ -36,11 +36,12 @@ Read-only job:
     "scopeContract": { "mode": "read", "read": ["src/payments.ts"] } }
 Write job:
   { "agent": "builder", "task": "...", "cwd": "<absolute repo path>", "write": true, "lockMode": "simple",
-    "lockedPaths": ["src/cli"], "allowedEdits": ["src/cli/flags.ts"], "validationCommand": "npm test",
+    "lockedPaths": ["src/cli"], "allowedEdits": ["src/cli/flags.ts"], "validationCommand": "git diff --check",
     "scopeContract": { "mode": "write", "read": ["src/cli"], "write": ["src/cli/flags.ts"],
-      "allowedEdits": ["src/cli/flags.ts"], "forbidden": [".env"], "validationCommand": "npm test" } }
+      "allowedEdits": ["src/cli/flags.ts"], "forbidden": [".env"], "validationCommand": "git diff --check" } }
 - Parallel writers use lockMode "strict" and disjoint lockedPaths.
-- validationCommand runs after the agent with no shell: use plain commands such as npm test, pnpm test, node --test, pytest, or git diff --check. npx, shells, and inline eval are rejected before the agent starts.
+- Writers run in a worktree that has no node_modules or other installed dependencies. For writers, use git diff --check as validationCommand, then run the full tests (npm test, pytest, ...) in the real checkout after integration. Use npm test as validationCommand only for read-only jobs or projects that need no installed dependencies.
+- validationCommand runs with no shell; npx, shells, and inline eval are rejected before the agent starts.
 - Give each agent a narrow task: goal, files to read, files it may change, constraints, and definition of done.
 
 REVIEW AND INTEGRATE
