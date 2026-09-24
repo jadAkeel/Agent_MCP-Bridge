@@ -216,6 +216,24 @@ Orchestrator profiles (advanced):
 
 ---
 
+## 7b. Using the bridge from Claude Code
+
+The same bridge works from Claude Code. It was registered once with the same command and environment as the Codex entry:
+
+```bash
+claude mcp get opencode
+```
+
+If it is missing, register it from this repository (`--sync-clients` reads the active release from `~/.codex/config.toml`):
+
+```bash
+npm run release:activate -- --sync-clients
+```
+
+Every `release:activate` re-registers Claude Code automatically, so both clients always run the same release. Claude's delegation rules live in `~/.claude/CLAUDE.md` (a copy is kept in `claude/CLAUDE.md`). Codex and Claude Code may work on the same repository at the same time: locks and the provider limit are shared, so overlapping writers wait or fail with a clear lock message.
+
+---
+
 ## 8. Parallel work
 
 The bridge lets several agents run together **only when their write scopes cannot collide**:
