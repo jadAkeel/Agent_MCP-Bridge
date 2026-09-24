@@ -8,9 +8,13 @@
 //   npm run release:activate -- --check-only build and health-check a candidate, do not activate
 //   npm run release:activate -- --skip-tests skip `npm test` (use only right after a green run)
 //   npm run release:activate -- --prune      also delete releases/backups beyond the kept set
+//   npm run release:activate -- --inspect    show the active release, releases still in use, and
+//                                            what --prune would delete; builds nothing
 //
 // Old releases and config backups are only listed unless --prune is passed. The kept
-// set is the new release, the previously active release, and the two newest backups.
+// set is the new release, the previously active release, every release a running bridge
+// process still loads, and the two newest backups. A candidate that fails before it
+// becomes the live release is removed again (except with --check-only).
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -32,6 +36,7 @@ function parseArguments(argv) {
     checkOnly: false,
     skipTests: false,
     prune: false,
+    inspect: false,
     healthCwd: SOURCE_ROOT,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -45,8 +50,9 @@ function parseArguments(argv) {
     } else if (argument === "--check-only") options.checkOnly = true;
     else if (argument === "--skip-tests") options.skipTests = true;
     else if (argument === "--prune") options.prune = true;
+    else if (argument === "--inspect") options.inspect = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node bin/release-activate.js [--check-only] [--skip-tests] [--prune] [--config <config.toml>] [--health-cwd <git checkout>]\n");
+      process.stdout.write("Usage: node bin/release-activate.js [--check-only] [--skip-tests] [--prune] [--inspect] [--config <config.toml>] [--health-cwd <git checkout>]\n");
       process.exit(0);
     } else throw new Error(`Unknown argument: ${argument}`);
   }
@@ -63,6 +69,11 @@ async function sha256File(filePath) {
 
 function timestamp() {
   return new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "");
+}
+
+function comparablePath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function runNpmTest() {
@@ -131,10 +142,47 @@ async function listByAge(directory, filter) {
   return entries.sort((left, right) => right.mtimeMs - left.mtimeMs);
 }
 
+// Releases whose files a running node process still loads. A bridge started by an
+// earlier Codex session spawns bin/process-supervisor.js from its own release folder
+// on every job, so that folder must survive pruning until the session ends.
+function releasesInUse(releasesRoot) {
+  const listing = process.platform === "win32"
+    ? spawnSync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | ForEach-Object { $_.CommandLine }",
+    ], { encoding: "utf8", windowsHide: true })
+    : spawnSync("ps", ["-eo", "args="], { encoding: "utf8" });
+  if (listing.error || listing.status !== 0) {
+    return { ok: false, releases: new Set(), error: String(listing.error?.message || listing.stderr || `exit ${listing.status}`).trim() };
+  }
+  const root = comparablePath(releasesRoot);
+  const releases = new Set();
+  for (const line of String(listing.stdout || "").split(/\r?\n/)) {
+    const haystack = process.platform === "win32" ? line.toLowerCase() : line;
+    let at = haystack.indexOf(root);
+    while (at >= 0) {
+      const rest = line.slice(at + root.length).replace(/^[\\/]/, "");
+      const segment = rest.split(/[\\/"'\s]/)[0];
+      if (segment) releases.add(comparablePath(path.join(releasesRoot, segment)));
+      at = haystack.indexOf(root, at + root.length);
+    }
+  }
+  return { ok: true, releases };
+}
+
 async function housekeeping({ releasesRoot, keepReleases, configPath, prune }) {
   const releases = await listByAge(releasesRoot, (name) => name.startsWith("server-") && !name.includes(".staging-"));
-  const keep = new Set(keepReleases.map((item) => path.resolve(item).toLowerCase()));
-  const staleReleases = releases.filter((item) => !keep.has(path.resolve(item.full).toLowerCase()));
+  const keep = new Set(keepReleases.map(comparablePath));
+  const inUse = releasesInUse(releasesRoot);
+  if (!inUse.ok) {
+    process.stdout.write(`Could not list running bridge processes (${inUse.error}); nothing is pruned.\n`);
+    return;
+  }
+  for (const release of inUse.releases) {
+    if (!keep.has(release)) process.stdout.write(`Kept (a running bridge still uses it): ${release}\n`);
+    keep.add(release);
+  }
+  const staleReleases = releases.filter((item) => !keep.has(comparablePath(item.full)));
   const configDir = path.dirname(configPath);
   const backups = await listByAge(configDir, (name) => /^config\.toml\.(rollback|activation-backup|pre-|bak)/.test(name));
   const staleBackups = backups.slice(KEEP_CONFIG_BACKUPS);
@@ -160,6 +208,12 @@ async function main() {
   const releasesRoot = path.dirname(activeRelease);
   process.stdout.write(`Active release: ${activeRelease}\n`);
 
+  if (options.inspect) {
+    step("Inspect only: nothing is built or changed");
+    await housekeeping({ releasesRoot, keepReleases: [activeRelease], configPath: options.configPath, prune: false });
+    return;
+  }
+
   if (options.skipTests) {
     step("Skipping npm test (--skip-tests)");
   } else {
@@ -178,6 +232,7 @@ async function main() {
   const candidateText = rewriteConfig(originalConfig, serverPath, serverSha256);
   const candidateDir = await mkdtemp(path.join(tmpdir(), "release-activate-"));
   const candidateConfig = path.join(candidateDir, "config.toml");
+  let activated = false;
   try {
     await writeFile(candidateConfig, candidateText, "utf8");
     const candidateEntry = await loadMcpEntry(candidateConfig, SERVER_NAME);
@@ -216,6 +271,7 @@ async function main() {
       await rename(`${options.configPath}.restoring-${stamp}`, options.configPath);
       throw new Error(`Post-activation health failed; the previous config was restored from ${backupPath}.`);
     }
+    activated = true;
 
     step("Housekeeping");
     await housekeeping({ releasesRoot, keepReleases: [destination, activeRelease], configPath: options.configPath, prune: options.prune });
@@ -224,6 +280,13 @@ async function main() {
     process.stdout.write(`Active release: ${destination}\nRollback release: ${activeRelease}\nRestart Codex so new sessions start the new bridge.\n`);
   } finally {
     await rm(candidateDir, { recursive: true, force: true }).catch(() => {});
+    // A candidate that never became the live release is not worth keeping. --check-only
+    // is the one case where leaving it in place is the point.
+    if (!activated && !options.checkOnly) {
+      await rm(destination, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+        .then(() => process.stdout.write(`Removed unactivated release: ${destination}\n`))
+        .catch((error) => process.stdout.write(`Could not remove unactivated release ${destination}: ${error?.message || error}\n`));
+    }
   }
 }
 
