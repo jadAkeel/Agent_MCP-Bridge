@@ -30,3 +30,10 @@ Never report success based only on an agent's own claim.
 - Start with `get_opencode_bridge_status`; use `diagnose_opencode_bridge` when something looks stuck.
 - `dirty_worktree_requires_checkpoint`: commit or revert the files the job needs, then retry.
 - Codex may be using the same bridge on the same repo at the same time; a lock conflict message means wait or pick disjoint paths.
+
+## opencode-delegate skill vs. the `opencode` MCP bridge
+Two ways exist to hand work to OpenCode; pick by isolation need:
+- **`opencode-delegate` skill** (edits the working tree directly, you review `git diff` and commit): quick bounded edits when the tree is clean and no other agent is working in the repo.
+- **`opencode` MCP bridge** (worktree per writer, scope contract, preview receipt): anything touching shared files, parallel writers, or when Codex may be active in the same repo.
+Never run both on the same repository at the same time; the bridge's locks do not see the skill.
+Allowed OpenCode models for the skill: `google/antigravity-gemini-3.8-flash` (variant `high`). Do not pick other models from the catalog; they may be metered.
