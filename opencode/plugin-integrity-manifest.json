@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "openCodeVersion": "1.17.13",
+  "openCodeVersion": "1.18.32",
   "plugins": [
     {
       "specifier": "@cortexkit/opencode-antigravity-auth@2.2.1",
@@ -15,7 +15,7 @@
   "configs": [
     {
       "path": "C:\\Users\\10User\\codex-opencode-mcp\\opencode\\opencode.jsonc",
-      "sha256": "4f85bc76f809bfe45ad51f5378c0cb9de023fcfe7c9cf2bf630171f427e41727",
+      "sha256": "e1f9ab495e1616ef5d7decff50cf9d353c08e82fdadae6d14e7f9c375b1cf766",
       "scope": "global",
       "plugins": ["@cortexkit/opencode-antigravity-auth@2.2.1"]
     }

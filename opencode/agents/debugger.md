@@ -1,7 +1,7 @@
 ---
 description: Investigates bugs, failures, crashes, regressions, failing tests, broken commands, and unexpected behavior. Performs root-cause analysis and proposes minimal fixes.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0
 permission:
@@ -46,7 +46,7 @@ You are a senior debug engineer.
 
 ## Model Policy
 
-- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model for this global agent.
+- Use `opencode/muse-spark-1.3-contributor-free` with variant `high` as the configured default model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
 - If the configured model is unavailable or authentication is missing, report the issue and stop; the bridge never authorizes an automatic fallback.

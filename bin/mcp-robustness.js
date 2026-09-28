@@ -24,22 +24,23 @@ async function createFixtureRepository(fixtureRoot) {
   return repo;
 }
 
-function serverEnvironment(stateDir) {
+function serverEnvironment(stateDir, extraEnv = {}) {
   return {
     ...process.env,
     CODEX_OPENCODE_QUEUE_MODE: "sqlite",
     CODEX_OPENCODE_STATE_DIR: stateDir,
     CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "false",
+    ...extraEnv,
   };
 }
 
-async function connectClient(name, stateDir) {
+async function connectClient(name, stateDir, extraEnv = {}) {
   const client = new Client({ name, version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.resolve("server.js")],
     cwd: process.cwd(),
-    env: serverEnvironment(stateDir),
+    env: serverEnvironment(stateDir, extraEnv),
     stderr: "pipe",
   });
   await client.connect(transport);
@@ -203,6 +204,22 @@ async function main() {
     assert.match(postFuzzLocks, /No active temporary locks\./i, "Rejected MCP input must not create a lock.");
     await first.client.close();
     first = null;
+
+    // A client that asks for progress must get heartbeats during a long call, so an idle
+    // timeout on the client side (Claude Code: 30 min for stdio) never cuts a running job.
+    const progressClient = await connectClient("mcp-robustness-progress", stateDir, { CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS: "10" });
+    try {
+      const progressEvents = [];
+      await progressClient.client.callTool(
+        { name: "get_opencode_bridge_status", arguments: { cwd: repo } },
+        undefined,
+        { timeout: TOOL_TIMEOUT_MS, maxTotalTimeout: TOOL_TIMEOUT_MS, onprogress: (event) => progressEvents.push(event) }
+      );
+      assert.ok(progressEvents.length >= 1, "A long tool call with a progressToken sent no progress notifications.");
+      assert.match(String(progressEvents[0].message || ""), /Still running/);
+    } finally {
+      await progressClient.client.close().catch(() => {});
+    }
 
     crashed = await connectClient("mcp-robustness-crash-owner", stateDir);
     const acquired = resultText(await callTool(crashed.client, "acquire_agent_lock", {

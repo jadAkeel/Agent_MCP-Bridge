@@ -61,7 +61,14 @@ Rules:
 - `get_opencode_bridge_status`: run the quick daily OpenCode/Git/agent/config check. Pass `deep: true` for full managed-role attestation during activation or audits; every actual agent execution still re-attests its selected role immediately before spawn.
 - `validate_delegation_plan`: preflight one or more jobs without running OpenCode or acquiring locks.
 - `run_opencode_agent`: run one bounded OpenCode agent.
-- `run_opencode_parallel`: run independent jobs only when their write scopes are safe.
+- `integrate_opencode_worktree`: a dry run whose patch adds a line that looks like a credential gets no receipt (`integration_preview_contains_sensitive_text`). After checking the flagged lines in the worktree, `acceptFlaggedSecretLines: true` on the dry run issues the receipt. Integration waits for readers of the checkout, other integrations, and manual or in-place writers; worktree builders on other paths do not block it.
+- A write job that changed no files has its worktree removed at once; failed jobs with changes are still retained.
+- A dry run whose patch carries a source/text file (`.py`, `.cpp`, `.h`, `.md`, `CMakeLists.txt`, ...) as a `GIT binary patch` hunk gets no receipt (`integration_preview_unreadable_text_file`): the reviewer could not read it.
+- The managed `opencode.jsonc` sets `"snapshot": false`; bridge jobs track changes with their own Git snapshots, so OpenCode's per-step undo snapshots only cost time and disk.
+- A containment quarantine records the whole live process tree (supervisor, payload and their descendants) and is released only when all of them are gone.
+- `diagnose_opencode_bridge` returns every unfinished job and direct run plus the 25 most recent finished ones; its summary counts cover all.
+- `release-activate.js --sync-clients` lists the uncommitted bridge files it is trusting when it re-pins server.js.
+- `run_opencode_parallel`: run independent jobs only when their write scopes are safe. Batches with more non-dry-run jobs than `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` are rejected (`parallel_batch_exceeds_provider_capacity`): the extra jobs would wait for a slot and then run their full timeout inside the same call, past Codex's `tool_timeout_sec`.
 - `enqueue_opencode_job`: schedule a job through the MCP queue.
 - `diagnose_opencode_bridge`: show correlated jobs, pipelines, locks, provider leases, preserved work, retry safety, and recovery actions for one repository.
 - `create_multi_agent_pipeline`: create an audited multi-agent plan with ownership, worktree, integration, and final-validation checks.
@@ -109,7 +116,7 @@ Contractor mode is rejected when the capability is unconfigured/invalid or the e
 Every managed agent profile pins one `provider/model` and variant in its frontmatter, and the bridge passes that pin explicitly on the OpenCode command line. Codex can ask for a different model per job without editing profiles: set `CODEX_OPENCODE_MODEL_ALLOWLIST` to the models the operator trusts, then send `scopeContract.modelRequirement` with the wanted `provider`, `model`, and optional `variant`. When the requirement matches an allowlist entry the bridge pins it for that job, reports `Model selection: operator_allowlist_override` together with the profile model it replaced, and still compares runtime-observed identity against the pinned model. A requirement outside the allowlist is rejected before any process starts, exactly as before. Silent fallback stays disabled and the sanitized reader always keeps its exact profile.
 
 ```text
-CODEX_OPENCODE_MODEL_ALLOWLIST=google/antigravity-gemini-3.8-flash@high,opencode/gpt-5.3-codex,opencode/claude-sonnet-5@high
+CODEX_OPENCODE_MODEL_ALLOWLIST=opencode/muse-spark-1.3-contributor-free@high,opencode/gpt-5.3-codex,opencode/claude-sonnet-5@high
 ```
 
 An entry without `@variant` accepts any requested variant and keeps the profile variant when the job does not name one; an entry with `@variant` accepts only that variant.
@@ -129,7 +136,7 @@ Worktree output is never merged automatically. The safe integration flow is:
 integrate_opencode_worktree(dryRun: true)
 -> bridge returns a full-patch SHA-256, source/base identity, target-state digest, contract digest, and previewReceipt
 -> Codex reviews the bounded patch preview, changed files, and immutable digests
--> integrate_opencode_worktree(reviewed: true, previewReceipt: <exact receipt>, cleanupAfterSuccess: true)
+-> integrate_opencode_worktree(reviewed: true, previewReceipt: <exact receipt>, validationCommand: "git diff --check")  # cleanupAfterSuccess defaults to true for bridge-created worktrees
 -> validationCommand runs
 -> rollback on validation failure
 -> source is re-hashed; cleanup occurs only after an explicit passing gate
@@ -212,6 +219,7 @@ CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE=strict
 CODEX_OPENCODE_WORKTREE_CLEANUP=never
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT=2
 CODEX_OPENCODE_QUEUE_HEARTBEAT_MS=15000
+CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS=15000
 CODEX_OPENCODE_QUEUE_LEASE_MS=60000
 CODEX_OPENCODE_QUEUE_RETENTION_DAYS=30
 CODEX_OPENCODE_AUDIT_RETENTION_DAYS=90
@@ -243,13 +251,19 @@ The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.js
 
 ### Managed Gemini OAuth profile
 
-The managed non-sanitized agents default to `google/antigravity-gemini-3.8-flash` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
+The current local Codex entry uses the tested source `server.js` with its exact SHA-256 pin and the
+managed writable OAuth profile. After editing server code, re-test it and update the server pin.
+`CODEX_OPENCODE_BUILDER_MODEL_FALLBACK=true` permits one recorded switch from Muse to Gemini
+for an eligible builder provider failure before any tools execute. Exact per-job model requirements
+disable this switch; other agents do not receive this fallback.
+
+The managed non-sanitized agents default to `opencode/muse-spark-1.3-contributor-free` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
 
 `bin/fresh-healthcheck.js` supports both profiles. With a release-manifest pin it performs the complete immutable tree verification. Without that pin it verifies the exact server hash, starts a fresh MCP process, and relies on bridge health to attest the managed Gemini runtime and external-plugin policy; the result identifies this as `server-pinned` mode.
 
-This is a deliberate reduction from full immutable-release assurance: OAuth refresh requires a writable runtime, and the managed agent and skill files in that runtime are attested against their effective OpenCode metadata but are not pinned by the release manifest. The bridge passes `--model google/antigravity-gemini-3.8-flash --variant high` explicitly and disables silent fallback. OpenCode `1.17.13` does not emit authoritative runtime model identity in every JSON stream, so successful live smoke tests prove the configured command and provider response, not cryptographic runtime-model attestation.
+This is a deliberate reduction from full immutable-release assurance: OAuth refresh requires a writable runtime, and the managed agent and skill files in that runtime are attested against their effective OpenCode metadata but are not pinned by the release manifest. The bridge passes `--model opencode/muse-spark-1.3-contributor-free --variant high` explicitly and disables silent fallback. OpenCode `1.17.13` does not emit authoritative runtime model identity in every JSON stream, so successful live smoke tests prove the configured command and provider response, not cryptographic runtime-model attestation.
 
-The reviewed plugin manifest requires OpenCode to report exactly `1.17.13`; upgrades require regenerating and re-pinning it. The MCP bridge does not use the optional plugin TUI, so this machine installs only the server plugin and its exact OpenCode host dependency. If the OpenCode plugin cache is cleared, rebuild that pinned server-only install from the repository root:
+The reviewed plugin manifest requires OpenCode to report exactly `1.18.32`; upgrades require regenerating and re-pinning it. The MCP bridge does not use the optional plugin TUI, so this machine installs only the server plugin and its exact OpenCode host dependency. If the OpenCode plugin cache is cleared, rebuild that pinned server-only install from the repository root:
 
 ```powershell
 $pluginCache = Join-Path $env:USERPROFILE '.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.2.1'
@@ -261,7 +275,7 @@ npm audit --prefix $pluginCache --omit=dev
 
 This is an unofficial OAuth plugin. It stores a Google refresh token in the provider-owned local Antigravity account file and its maintainers warn that using it may violate Google's terms or lead to account restrictions. The package remains independently audited and its integrity verifier remains tested, but it is incompatible with the full immutable production profile. The bridge never reads, hashes, copies, logs, returns, or writes its account file or credentials. Only the reviewed nonsecret `opencode.jsonc` and `antigravity.json` inputs are hash-pinned. Keep debug, automatic updates, and quota/account fallback disabled; never commit the credential file, and prefer a dedicated low-privilege account.
 
-On the Codex MCP server entry, set `startup_timeout_sec = 120` and `tool_timeout_sec = 1500`. Codex otherwise defaults MCP tool calls to 60 seconds, which is shorter than the bridge's builder and orchestrator limits. The bundled TUI uses the same 25-minute client timeout; override it with `CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS` only when needed.
+On the Codex MCP server entry, set `startup_timeout_sec = 120` and `tool_timeout_sec = 1500`. Codex otherwise defaults MCP tool calls to 60 seconds, which is shorter than the bridge's builder and orchestrator limits. `tool_timeout_sec` must exceed the longest agent timeout plus `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` plus a margin: when you raise the bridge timeouts, raise it too, or Codex abandons long jobs while they still run and their result is lost. `npm run release:activate -- --sync-clients` prints a warning with the required value. The bundled TUI uses the same 25-minute client timeout; override it with `CODEX_OPENCODE_MCP_CLIENT_TIMEOUT_MS` only when needed.
 
 The bridge resolves `opencode` from `PATH` by default instead of using a machine-specific executable path. Portable overrides are available through `CODEX_OPENCODE_EXECUTABLE`, `CODEX_OPENCODE_AGENT_DIR`, `CODEX_OPENCODE_SKILL_DIR`, and `CODEX_OPENCODE_STATE_DIR`; production source-evidence paths are bound to the verified release as described below.
 
@@ -313,18 +327,22 @@ Useful defaults:
 | `CODEX_OPENCODE_MODEL_ALLOWLIST` | unset | Comma-separated `provider/model` or `provider/model@variant` entries a job may select through `scopeContract.modelRequirement`. A matching requirement becomes an explicit `--model`/`--variant` pin for that job and is attested against runtime evidence like any other run; a requirement that is not listed still fails with `configured_model_requirement_mismatch`. The sanitized reader is never overridable. |
 | `CODEX_OPENCODE_SOURCE_DIRT_POLICY` | `strict` | `strict` rejects any uncommitted change in the source checkout before a writer worktree. `unrelated_ok` tolerates changes outside the job's locked/allowed paths (overlapping changes are still rejected) so daily work does not need a checkpoint for every unrelated edit; the tolerated files are reported on the worktree summary, and integration into that dirty target then requires `allowDirtyTarget: true` after review. A freshly created worktree must always be clean. |
 | `CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS` | `12000` | Maximum exact patch preview eligible for a single-use review receipt; oversized or redacted evidence fails closed. |
-| `CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES` | `20000` | Fail-closed cap for metadata-only ignored-file snapshots; ignored contents are not read. |
+| `CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES` | `20000` | Cap on ignored-file snapshot entries. Ignored files inside build/cache directories (`build/`, `dist/`, `out/`, `obj/`, `bin/`, `.venv/`, `node_modules/`, `__pycache__/`, `.pytest_cache/`, `CMakeFiles/`, `cmake-build-*/`, ...) always count as one entry per directory, fingerprinted over their member names; `.env`, `*.pem`, `*.key` and `secrets/` files keep their own entry. Only more other ignored files than this fails closed. `CODEX_OPENCODE_MAX_SNAPSHOT_FILES` counts non-ignored changed files only. Ignored contents are not read. |
+| `CODEX_OPENCODE_GIT_HEAVY_TIMEOUT_MS` | `300000` | Timeout for `git worktree add/remove` and temporary-index rebuilds, which rehash the whole checkout. |
+| `CODEX_OPENCODE_CONTAINMENT_RELEASE_GRACE_MS` | `600000` | A containment quarantine (unconfirmed process-tree termination) is released only after every recorded process is gone and this long has passed, because children OpenCode started are not recorded and can outlive it on Windows. |
 | `CODEX_OPENCODE_MAX_SNAPSHOT_FILES` | `25000` | Fail-closed cap for the complete changed-file snapshot set. |
 | `CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES` | `1048576` | Files above this size and secret-pattern paths use metadata-only snapshots and are never retained for rollback. |
 | `CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES` | `134217728` | Aggregate rollback-content budget; execution fails closed when exceeded. |
 | `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Generated worktree root under the bridge state directory; set an explicit path only when needed. |
-| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `2` | Cross-process provider/account lease limit shared by direct, queued, and parallel calls. |
+| `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `2` | Cross-process provider/account lease limit shared by direct, queued, and parallel calls. Without an explicit `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY`, each configured provider (OpenCode Zen builders, Google Antigravity reviewers/testers) has its own slots. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` | `opencode-default-account` | Operator-defined account-pool key used by the global provider lease. |
 | `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable default with restart recovery and cross-process idempotency; use `memory` only for explicitly ephemeral single-process experiments. |
 | `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Per-process queue scheduling limit; provider/account leases impose the cross-process execution cap. |
 | `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY` | `wait` | `wait` or `reject`. |
 | `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` | `2000` | Retry interval for jobs blocked by a lock held by another bridge process. |
 | `CODEX_OPENCODE_QUEUE_HEARTBEAT_MS` | `15000` | Owner-instance/job heartbeat interval. |
+| `CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS` | `30000` | Interval of MCP progress notifications during a tool call whose request carries a `progressToken`; `0` disables them. Claude Code aborts a stdio tool call after 30 idle minutes, and these notifications keep a long builder job from looking idle. |
+| `CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS` | `15000` | Longest interval between orphaned-work scans while the bridge is idle. Scans run every 5 s while any state database has non-terminal work, then back off by doubling; databases whose size and mtime are unchanged are not reopened. This bounds how long another bridge's crashed job can stay `running` before it is marked `interrupted`. |
 | `CODEX_OPENCODE_QUEUE_LEASE_MS` | `60000` | Queue ownership lease; reconciliation also requires an expired instance lease and dead PID where verifiable. |
 | `CODEX_OPENCODE_QUEUE_STALE_AFTER_MS` | `7200000` | Legacy/unowned pending-record age before explicit startup/operator reconciliation as `not_resumable`. |
 | `CODEX_OPENCODE_QUEUE_RETENTION_DAYS` | `30` | Strictly positive terminal job/pipeline retention; `0` is rejected because no durable archive mode exists. |

@@ -1,7 +1,7 @@
 ---
 description: Produces bounded read-only implementation plans exclusively for Codex MCP delegation.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0
 permission:

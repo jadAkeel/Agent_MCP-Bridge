@@ -1,0 +1,50 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { builderFallbackEligible, runBuilderModelFallback } from "./builder-model-fallback.js";
+
+const failed = { configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free",
+  errorType: "opencode_rate_limited", streamIntegrity: "valid", treeTerminationConfirmed: true, toolOutcomes: [] };
+const policy = { enabled: true, timeoutMs: 10000,
+  fallbackRequirement: { provider: "google", model: "antigravity-gemini-3.8-flash", variant: "high" } };
+
+test("only builder provider failure before any tool is eligible", () => {
+  assert.equal(builderFallbackEligible("builder", failed, policy), true);
+  for (const agent of ["build", "debugger", "planner", "mcp-sanitized-reader"]) {
+    assert.equal(builderFallbackEligible(agent, failed, policy), false);
+  }
+  for (const patch of [{ errorType: null }, { errorType: "validation_failed" },
+    { toolOutcomes: [{ tool: "edit", status: "running" }] }, { cancelled: true },
+    { timedOut: true }, { streamIntegrity: "malformed" }, { treeTerminationConfirmed: false },
+    { rawOutputTruncated: true }, { assistantFinalResponseDetected: true },
+    { configuredModel: "another-model" }, { permissionDeniedCount: 1 }]) {
+    assert.equal(builderFallbackEligible("builder", { ...failed, ...patch }, policy), false);
+  }
+  for (const patch of [{ enabled: false }, { forcePure: true }, { modelRequirement: policy.fallbackRequirement }]) {
+    assert.equal(builderFallbackEligible("builder", failed, { ...policy, ...patch }), false);
+  }
+});
+
+test("one explicit fallback within the original budget, with recorded evidence", async () => {
+  const calls = [];
+  const result = await runBuilderModelFallback("builder", async (model, timeout) => {
+    calls.push({ model, timeout });
+    return calls.length === 1 ? failed : { ...failed, configuredProvider: "google", errorType: null };
+  }, policy);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].model, null);
+  assert.deepEqual(calls[1].model, policy.fallbackRequirement);
+  assert.ok(calls[1].timeout <= calls[0].timeout);
+  assert.equal(result.modelFallbackUsed, true);
+  assert.equal(result.modelFallbackReason, failed.errorType);
+  assert.equal(result.errorType, null);
+});
+
+test("failed fallback is returned without a third attempt; no allowlist means no fallback", async () => {
+  let calls = 0;
+  const result = await runBuilderModelFallback("builder", async () => { calls++; return failed; }, policy);
+  assert.equal(calls, 2);
+  assert.equal(result.errorType, failed.errorType);
+  calls = 0;
+  await runBuilderModelFallback("builder", async () => { calls++; return failed; }, { ...policy, fallbackRequirement: null });
+  assert.equal(calls, 1);
+});

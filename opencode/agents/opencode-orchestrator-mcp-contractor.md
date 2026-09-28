@@ -1,7 +1,7 @@
 ---
 description: Executes explicitly authorized Codex MCP contracts by coordinating bounded OpenCode subagents.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0
 permission:

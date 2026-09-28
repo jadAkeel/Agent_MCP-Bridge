@@ -22,9 +22,12 @@ async function configurePureOpenCodeAgents(agentDirectory) {
     const agentPath = path.join(agentDirectory, name);
     const source = await readFile(agentPath, "utf8");
     const configured = source
+      // Builder runs on OpenCode Zen and reviewer/tester on the Antigravity plugin; the pure
+      // fixture has neither, so every profile is pointed at the built-in OpenAI transport.
+      .replaceAll("opencode/muse-spark-1.3-contributor-free", "openai/gpt-5.6-terra")
       .replaceAll("google/antigravity-gemini-3.8-flash", "openai/gpt-5.6-terra")
       .replace(
-        "This model authenticates through the reviewed Antigravity OAuth plugin in the dedicated Gemini runtime.",
+        "This default model uses OpenCode Zen.",
         "This model authenticates through OpenCode's built-in Codex OAuth transport; the immutable production profile runs in pure mode with external plugins disabled."
       );
     await writeFile(agentPath, configured, "utf8");
@@ -159,7 +162,7 @@ async function main() {
     await cp(path.resolve("opencode", "skills"), path.join(isolatedOpenCodeConfig, "skills"), { recursive: true });
     const isolatedBuilderPath = path.join(isolatedOpenCodeConfig, "agents", "builder.md");
     const isolatedBuilderSource = await readFile(isolatedBuilderPath, "utf8");
-    assert.match(isolatedBuilderSource, /^model: google\/antigravity-gemini-3\.8-flash$/m, "Contractor E2E requires the managed Gemini Builder default.");
+    assert.match(isolatedBuilderSource, /^model: opencode\/muse-spark-1\.3-contributor-free$/m, "Contractor E2E requires the managed Muse Builder default.");
     assert.match(isolatedBuilderSource, /^variant: high$/m, "Contractor E2E requires high reasoning for the managed Gemini Builder default.");
     await configurePureOpenCodeAgents(path.join(isolatedOpenCodeConfig, "agents"));
     const pureBuilderSource = await readFile(isolatedBuilderPath, "utf8");

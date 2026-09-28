@@ -1,7 +1,7 @@
 ---
 description: Explores repositories read-only to locate relevant files, patterns, dependencies, commands, and risks.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0
 permission:

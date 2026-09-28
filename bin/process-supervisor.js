@@ -89,6 +89,27 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// taskkill exits 128 when the PID no longer exists.
+const TASKKILL_PROCESS_NOT_FOUND = 128;
+
+// Windows best-effort containment verdict. taskkill success plus a gone direct child is
+// the normal case. A payload that exited on its own just before taskkill ran makes taskkill
+// report "not found"; that is still contained when the direct child's stdio has closed,
+// because a surviving descendant would keep the inherited pipes open.
+function windowsTerminationSucceeded({ taskkill, directChildGone, directChildClosed }) {
+  if (!directChildGone) return false;
+  if (taskkill?.started && taskkill.exitCode === 0) return true;
+  return Boolean(directChildClosed && taskkill?.started && taskkill.exitCode === TASKKILL_PROCESS_NOT_FOUND);
+}
+
+// Longest time terminateWindows can take before it reports: two bounded taskkill runs, two
+// direct-child polls, the retry pause, and the final stdio-close wait. The bridge's own
+// fallback deadline must exceed this, or it kills the supervisor mid-containment.
+function windowsTerminationBudgetMs(terminationConfirmMs = DEFAULT_TERMINATION_CONFIRM_MS) {
+  const confirmMs = Math.max(1, Number(terminationConfirmMs) || DEFAULT_TERMINATION_CONFIRM_MS);
+  return 2 * Math.max(1_000, confirmMs) + 2 * confirmMs + 250 + 1_000;
+}
+
 async function pollUntil(probe, timeoutMs, pollMs = PROCESS_GROUP_POLL_MS) {
   const deadline = performance.now() + Math.max(0, timeoutMs);
   let state = probe();
@@ -325,7 +346,7 @@ function createSupervisor({ supervisorIdentity = "", identityValid = true } = {}
       directChildGone = await pollUntil(() => !processExists(payloadPid), terminationConfirmMs);
     }
     if (directChildGone) await waitForDirectClose();
-    const bestEffortSucceeded = taskkill.started && taskkill.exitCode === 0 && directChildGone;
+    const bestEffortSucceeded = windowsTerminationSucceeded({ taskkill, directChildGone, directChildClosed });
     if (!bestEffortSucceeded) {
       emit("termination_unconfirmed", {
         reason,
@@ -456,6 +477,9 @@ function createSupervisor({ supervisorIdentity = "", identityValid = true } = {}
     payloadPid = Number(payload.pid || 0);
     payloadStartedAt = new Date().toISOString();
     launched = payloadPid > 0;
+    // The bridge records this PID with any containment quarantine, so the quarantine can be
+    // lifted once the payload is provably gone, even if this supervisor is killed first.
+    if (launched) emit("launched", { payloadPid, payloadStartedAt });
     const forwardPayloadOutput = (source, target, channel) => {
       if (!source) return null;
       const onDestinationError = () => {
@@ -717,7 +741,23 @@ async function waitForChildExit(child, timeoutMs = 5_000) {
   assert.equal(exited, true, "Timed out waiting for the supervisor process to exit.");
 }
 
+function selfTestTerminationVerdicts() {
+  const ok = { started: true, exitCode: 0 };
+  const notFound = { started: true, exitCode: TASKKILL_PROCESS_NOT_FOUND };
+  const denied = { started: true, exitCode: 1 };
+  assert.equal(windowsTerminationSucceeded({ taskkill: ok, directChildGone: true, directChildClosed: true }), true);
+  assert.equal(windowsTerminationSucceeded({ taskkill: ok, directChildGone: false, directChildClosed: false }), false);
+  assert.equal(windowsTerminationSucceeded({ taskkill: notFound, directChildGone: true, directChildClosed: true }), true,
+    "A payload that exited before taskkill ran, with its pipes closed, is contained.");
+  assert.equal(windowsTerminationSucceeded({ taskkill: notFound, directChildGone: true, directChildClosed: false }), false,
+    "Open pipes after the direct child died mean a descendant may still be alive.");
+  assert.equal(windowsTerminationSucceeded({ taskkill: denied, directChildGone: true, directChildClosed: true }), false);
+  assert.equal(windowsTerminationSucceeded({ taskkill: { started: false, exitCode: null }, directChildGone: true, directChildClosed: true }), false);
+  assert.equal(windowsTerminationBudgetMs(5_000), 21_250);
+}
+
 async function runSelfTest() {
+  selfTestTerminationVerdicts();
   const tempRoot = await mkdtemp(path.join(tmpdir(), "codex-opencode-process-supervisor-"));
   const resolvedTempRoot = path.resolve(tempRoot);
   const resolvedTempBase = path.resolve(tmpdir());

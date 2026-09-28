@@ -152,7 +152,7 @@ Talk to Codex like you would talk to a senior engineer. You do not need to name 
 | Build a feature | "Add a `--verbose` flag to the CLI. Let a builder implement it, then show me the diff." |
 | Review before merge | "Before integrating, have a reviewer and a tester check the builder's worktree." |
 | Parallel work | "Run two builders in parallel: one on `apps/web`, one on `apps/api`." |
-| Pick a model | "Use `google/antigravity-gemini-3.8-flash@high` for this job." |
+| Pick a model | "Use `opencode/muse-spark-1.3-contributor-free@high` for this job." |
 | Check state | "Run `diagnose_opencode_bridge` and tell me if anything is stuck." |
 
 ### What you will see for a code change
@@ -201,10 +201,10 @@ Orchestrator profiles (advanced):
 
 ### Models
 
-- Each role pins one model in its profile. The managed roles default to `google/antigravity-gemini-3.8-flash` with variant `high`.
+- Each role pins one model in its profile. The managed roles default to `opencode/muse-spark-1.3-contributor-free` with variant `high`.
 - You can ask for a **different model per job**, but only if it is in the operator allowlist `CODEX_OPENCODE_MODEL_ALLOWLIST`, for example:
   ```text
-  CODEX_OPENCODE_MODEL_ALLOWLIST=google/antigravity-gemini-3.8-flash@high,opencode/gpt-5.3-codex
+  CODEX_OPENCODE_MODEL_ALLOWLIST=opencode/muse-spark-1.3-contributor-free@high,opencode/gpt-5.3-codex
   ```
   - `provider/model` accepts any variant.
   - `provider/model@variant` accepts only that variant.
@@ -224,13 +224,13 @@ The same bridge works from Claude Code. It was registered once with the same com
 claude mcp get opencode
 ```
 
-If it is missing, register it from this repository (`--sync-clients` reads the active release from `~/.codex/config.toml`):
+If it is missing, or the bridge fails to start with `External plugin manifest hash mismatch` or a `server.js` hash mismatch, run the sync (it reads the active entry from `~/.codex/config.toml`):
 
 ```bash
 npm run release:activate -- --sync-clients
 ```
 
-Every `release:activate` re-registers Claude Code automatically, so both clients always run the same release. Claude's delegation rules live in `~/.claude/CLAUDE.md` (a copy is kept in `claude/CLAUDE.md`). Codex and Claude Code may work on the same repository at the same time: locks and the provider limit are shared, so overlapping writers wait or fail with a clear lock message.
+The sync first re-pins `CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256` from the manifest file itself (a model switch or an OpenCode upgrade regenerates the manifest, so the hash is never copied by hand) and `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` from the `server.js` the entry points at (this only moves while the entry runs a working tree instead of an immutable release), health-checks the result, then re-registers Claude Code with the same command and environment. Every `release:activate` does both automatically, so both clients always run the same release. Restart the Claude Code session afterwards. Claude's delegation rules live in `~/.claude/CLAUDE.md` (a copy is kept in `claude/CLAUDE.md`). Codex and Claude Code may work on the same repository at the same time: locks and the provider limit are shared, so overlapping writers wait or fail with a clear lock message.
 
 ---
 
@@ -266,7 +266,7 @@ Writer output is **never merged automatically**. Integration happens in two step
    - its SHA-256;
    - the source and target identity;
    - a single-use, expiring **preview receipt**.
-2. **Apply.** `integrate_opencode_worktree(reviewed: true, previewReceipt: <receipt>, cleanupAfterSuccess: true)`:
+2. **Apply.** `integrate_opencode_worktree(reviewed: true, previewReceipt: <receipt>, validationCommand: "git diff --check")` (`cleanupAfterSuccess` defaults to true):
    - applies exactly that patch;
    - runs the validation command;
    - **rolls back** if validation fails;

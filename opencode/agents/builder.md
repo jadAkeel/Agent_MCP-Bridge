@@ -1,7 +1,7 @@
 ---
 description: Implements approved plans with minimal, production-safe code changes and runs relevant verification.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0.1
 permission:
@@ -46,11 +46,11 @@ You are a senior implementation engineer.
 
 ## Model Policy
 
-- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured default model.
-- This model authenticates through the reviewed Antigravity OAuth plugin in the dedicated Gemini runtime.
+- Use `opencode/muse-spark-1.3-contributor-free` with variant `high` as the configured default model.
+- This default model uses OpenCode Zen.
 - Keep temperature low for deterministic coding behavior.
 - Do not silently switch models.
-- If the configured model is unavailable, report the issue and do not switch providers automatically.
+- The MCP bridge may retry once with `google/antigravity-gemini-3.8-flash@high` when its explicit builder fallback policy is enabled and the provider fails before any tool execution. Report the selected model; the agent must not switch providers itself.
 - Include the model and temperature used in the final report.
 
 ## Required Skill Usage

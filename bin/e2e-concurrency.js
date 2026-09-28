@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -401,6 +401,7 @@ async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extra
       CODEX_OPENCODE_STATE_DIR: stateDir,
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
       CODEX_OPENCODE_QUEUE_HEARTBEAT_MS: "100",
+      CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS: "1000",
       CODEX_OPENCODE_QUEUE_LEASE_MS: "500",
       CODEX_OPENCODE_QUEUE_STALE_AFTER_MS: "300",
       CODEX_OPENCODE_QUEUE_READONLY_RETRIES: "0",
@@ -999,6 +1000,59 @@ async function main() {
     ));
     assert.ok(maxProviderOverlap <= 2, `Cross-process provider concurrency exceeded the configured account limit: ${maxProviderOverlap}`);
     assert.ok(providerIntervals.some((item) => item.waitedMs >= Math.floor(providerHoldMs / 2)), "At least one provider worker should wait for shared cross-process capacity.");
+    // A client that keeps an older bridge alive keeps its old limit. A newer bridge with a
+    // different limit must wait under the stricter one, never fail the job.
+    const mixedEnv = (limit) => ({
+      ...serverChildEnvironment(),
+      CODEX_OPENCODE_STATE_DIR: stateDir,
+      CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT: String(limit),
+      CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY: "concurrency-mixed-limit-account",
+    });
+    const mixedHoldMs = 1500;
+    const strictWorker = spawn(process.execPath, [serverEntrypoint, "--provider-lease-worker", String(mixedHoldMs)], {
+      cwd: process.cwd(), windowsHide: true, env: mixedEnv(1), stdio: ["ignore", "pipe", "pipe"],
+    });
+    let strictStdout = "";
+    let strictStderr = "";
+    strictWorker.stdout.on("data", (chunk) => { strictStdout += chunk.toString(); });
+    strictWorker.stderr.on("data", (chunk) => { strictStderr += chunk.toString(); });
+    const strictExit = new Promise((resolve) => strictWorker.on("exit", resolve));
+    const strictAcquired = await waitFor(() => {
+      const line = strictStdout.split(/\r?\n/).find((item) => item.trim().startsWith("{"));
+      return line ? JSON.parse(line) : null;
+    }, () => `The limit-1 provider worker never acquired a lease.\n${strictStderr}`, 30_000);
+    const looseWorkers = await Promise.all(Array.from({ length: 2 }, () => execFileAsync(
+      process.execPath,
+      [serverEntrypoint, "--provider-lease-worker", "200"],
+      { cwd: process.cwd(), windowsHide: true, timeout: 30_000, env: mixedEnv(3) }
+    )));
+    assert.equal(await strictExit, 0, `The limit-1 provider worker failed:\n${strictStderr}`);
+    for (const worker of looseWorkers) {
+      const line = String(worker.stdout || "").split(/\r?\n/).find((item) => item.trim().startsWith("{"));
+      assert.ok(line, `A limit-3 worker failed instead of waiting under the stricter active limit:\n${worker.stdout}\n${worker.stderr}`);
+      assert.ok(JSON.parse(line).acquiredAt >= strictAcquired.acquiredAt + mixedHoldMs - 50,
+        "A limit-3 worker ran beside an active limit-1 lease; the stricter limit must hold while its leases are active.");
+    }
+
+    // A containment quarantine whose recorded processes are all gone must free its slot;
+    // before this it held capacity forever.
+    const quarantineKey = "concurrency-quarantine-account";
+    withDatabase(path.join(stateDir, "provider-concurrency.sqlite"), (db) => {
+      db.prepare("INSERT OR REPLACE INTO provider_capacities (provider_key, capacity, updated_at) VALUES (?, 1, ?)").run(quarantineKey, Date.now());
+      db.prepare(`INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment)
+        VALUES ('stale-quarantine', ?, 'gone-instance', ?, ?, ?, ?, ?)`)
+        .run(quarantineKey, 2 ** 30 + 7, Date.now() - 60_000, Date.now() - 60_000, Number.MAX_SAFE_INTEGER,
+          JSON.stringify({ pids: [2 ** 30 + 8, 2 ** 30 + 9], complete: true }));
+    });
+    const reclaimWorker = await execFileAsync(process.execPath, [serverEntrypoint, "--provider-lease-worker", "100"], {
+      cwd: process.cwd(), windowsHide: true, timeout: 30_000,
+      env: { ...serverChildEnvironment(), CODEX_OPENCODE_STATE_DIR: stateDir, CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT: "1", CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY: quarantineKey },
+    });
+    assert.match(String(reclaimWorker.stdout || ""), /"acquiredAt"/, `A quarantine with provably dead processes still blocked the only slot:\n${reclaimWorker.stdout}\n${reclaimWorker.stderr}`);
+    withDatabase(path.join(stateDir, "provider-concurrency.sqlite"), (db) => {
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM provider_leases WHERE lease_id = 'stale-quarantine'").get().n, 0);
+    });
+
     assertDatabaseHealthy(dbPath, "Project state database after cross-process stress");
     const providerDatabasePath = path.join(stateDir, "provider-concurrency.sqlite");
     await access(providerDatabasePath);

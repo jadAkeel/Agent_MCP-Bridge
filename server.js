@@ -14,12 +14,21 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDirectRunAudit, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
+import { runBuilderModelFallback } from "./bin/builder-model-fallback.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_SERVER_PATH = fileURLToPath(import.meta.url);
 const BRIDGE_SOURCE_SHA256 = createHash("sha256").update(await readFile(fileURLToPath(import.meta.url))).digest("hex");
 const PROCESS_SUPERVISOR_PATH = path.join(BRIDGE_RUNTIME_DIR, "bin", "process-supervisor.js");
+const SUPERVISOR_KILL_GRACE_MS = 5_000;
+const SUPERVISOR_TERMINATION_CONFIRM_MS = 5_000;
+// Must outlast the supervisor's own worst case (Windows: two bounded taskkill runs, two
+// child polls, a retry pause, the stdio-close wait = 21.25 s at 5 s confirm; POSIX: grace +
+// confirm + close wait = 11 s). A shorter deadline kills the supervisor mid-containment and
+// reports a job as unconfirmed even when termination was about to succeed.
+const SUPERVISOR_TERMINATION_FALLBACK_MS = 2 * Math.max(1_000, SUPERVISOR_TERMINATION_CONFIRM_MS)
+  + 2 * SUPERVISOR_TERMINATION_CONFIRM_MS + 250 + 1_000 + SUPERVISOR_KILL_GRACE_MS + 5_000;
 const USER_HOME_DIR = homedir();
 const DEFAULT_OPENCODE_CONFIG_DIR = process.env.XDG_CONFIG_HOME
   ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
@@ -153,6 +162,9 @@ const CONFIG = Object.freeze({
   parallelLimit: readPositiveIntEnv("CODEX_OPENCODE_PARALLEL_LIMIT", 6),
   logLevel: readChoiceEnv("CODEX_OPENCODE_LOG_LEVEL", ["off", "error", "warn", "info", "debug"], "warn"),
   worktreeMode: readChoiceEnv("CODEX_OPENCODE_WORKTREE_MODE", ["off", "write", "all"], "off"),
+  // Worktree add/remove and temp-index rebuilds rehash the whole checkout; 60 s was short
+  // for a large repository on Windows.
+  gitHeavyTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_GIT_HEAVY_TIMEOUT_MS", 1000 * 60 * 5),
   worktreeRoot: String(process.env.CODEX_OPENCODE_WORKTREE_ROOT || "global").trim() || "global",
   worktreeCleanup: readChoiceEnv("CODEX_OPENCODE_WORKTREE_CLEANUP", ["always", "on_success", "never"], "never"),
   sourceDirtPolicy: readChoiceEnv("CODEX_OPENCODE_SOURCE_DIRT_POLICY", ["strict", "unrelated_ok"], "strict"),
@@ -166,6 +178,11 @@ const CONFIG = Object.freeze({
   queueReadOnlyRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_READONLY_RETRIES", 0),
   queueWriteRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_WRITE_RETRIES", 0),
   queueHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_HEARTBEAT_MS", 1000 * 15),
+  // Idle bridges re-scan the state databases for orphaned work; back off to this interval when nothing is pending.
+  deferredRecoveryIdleMaxMs: readPositiveIntEnv("CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS", 1000 * 15),
+  // 0 disables progress notifications for long tool calls.
+  toolProgressIntervalMs: readNonNegativeIntEnv("CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS", 1000 * 30),
+  containmentReleaseGraceMs: readNonNegativeIntEnv("CODEX_OPENCODE_CONTAINMENT_RELEASE_GRACE_MS", 1000 * 60 * 10),
   queueLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_LEASE_MS", 1000 * 60),
   queueRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_QUEUE_RETENTION_DAYS", 30),
   auditRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_AUDIT_RETENTION_DAYS", 90),
@@ -194,6 +211,7 @@ const CONFIG = Object.freeze({
   providerLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_MS", 1000 * 60 * 4),
   providerHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS", 1000 * 20),
   providerConcurrencyKey: String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "opencode-default-account").trim() || "opencode-default-account",
+  providerConcurrencyKeyExplicit: Boolean(String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "").trim()),
   sanitizedMaxFiles: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_FILES", 25000),
   sanitizedMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_BYTES", 1024 * 1024 * 1024),
   policyMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_POLICY_MAX_BYTES", 1024 * 128),
@@ -292,6 +310,9 @@ let stateMaintenanceTimer = null;
 let stateMaintenanceCursor = 0;
 let deferredRecoveryTimer = null;
 let deferredRecoveryRunning = false;
+let deferredRecoveryIdlePasses = 0;
+// dbPath -> { fingerprint, pending }: an unchanged database with no non-terminal work is not reopened.
+const DEFERRED_RECOVERY_DB_MEMO = new Map();
 const QUEUE_REQUEST_KEY_PROMISES = new Map();
 let stateDirectoryOverride = "";
 let queueModeOverride = "";
@@ -314,6 +335,46 @@ const server = new McpServer({
   name: "codex-opencode-bridge",
   version: "1.0.0",
 });
+
+// Long tool calls (builders can run 45 minutes) look idle to the client while OpenCode
+// works. Claude Code aborts a stdio tool call after 30 idle minutes unless progress
+// notifications arrive, so every handler whose request carries a progressToken sends one
+// on an interval until it returns. Requests without a token get nothing extra.
+function startToolProgressHeartbeat(extra) {
+  const progressToken = extra?._meta?.progressToken;
+  const intervalMs = CONFIG.toolProgressIntervalMs;
+  if (progressToken === undefined || progressToken === null || typeof extra?.sendNotification !== "function" || !intervalMs) {
+    return () => {};
+  }
+  const startedAt = Date.now();
+  let progress = 0;
+  const timer = setInterval(() => {
+    progress += 1;
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    extra.sendNotification({
+      method: "notifications/progress",
+      params: { progressToken, progress, message: `Still running (${elapsedSeconds} s elapsed).` },
+    }).catch(() => { /* A closed client simply stops receiving progress. */ });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+const registerToolWithoutProgress = server.tool.bind(server);
+server.tool = (...registration) => {
+  const handler = registration[registration.length - 1];
+  if (typeof handler === "function") {
+    registration[registration.length - 1] = async (...handlerArgs) => {
+      const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
+      try {
+        return await handler(...handlerArgs);
+      } finally {
+        stop();
+      }
+    };
+  }
+  return registerToolWithoutProgress(...registration);
+};
 
 const scopePathSetSchema = z
   .object({
@@ -927,13 +988,42 @@ async function inspectRepositoryGitControlSurface(cwd) {
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
 }
 
+// Private key blocks are cut in one forward pass: a lazy BEGIN...END regex rescanned the
+// rest of the text from every unterminated BEGIN line, which is quadratic on agent output.
+// An unterminated block (a truncated answer) loses its header and base64 body lines.
+function redactPrivateKeyBlocks(text) {
+  const begin = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/gi;
+  const endMarker = /-----END [A-Z ]{0,40}PRIVATE KEY-----/gi;
+  const bodyLines = /(?:\r?\n[A-Za-z0-9+\/=]{16,128})+/y;
+  let output = "";
+  let cursor = 0;
+  let endSearchExhausted = false;
+  for (let match = begin.exec(text); match; match = begin.exec(text)) {
+    let blockEnd = -1;
+    if (!endSearchExhausted) {
+      endMarker.lastIndex = begin.lastIndex;
+      const end = endMarker.exec(text);
+      if (end) blockEnd = endMarker.lastIndex;
+      else endSearchExhausted = true;
+    }
+    if (blockEnd < 0) {
+      bodyLines.lastIndex = begin.lastIndex;
+      const body = bodyLines.exec(text);
+      blockEnd = begin.lastIndex + (body ? body[0].length : 0);
+    }
+    output += `${text.slice(cursor, match.index)}[private key redacted]`;
+    cursor = blockEnd;
+    begin.lastIndex = cursor;
+  }
+  return output + text.slice(cursor);
+}
+
 function redactSensitiveText(value) {
-  let text = String(value || "");
+  let text = redactPrivateKeyBlocks(String(value || ""));
   const replacements = [
-    [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi, "[private key redacted]"],
     [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
     [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
-    [/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[jwt redacted]"],
+    [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}/g, "[jwt redacted]"],
     [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
     [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
     [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
@@ -944,6 +1034,94 @@ function redactSensitiveText(value) {
     text = text.replace(pattern, replacement);
   }
   return text;
+}
+
+// Gate for integration previews. redactSensitiveText() is deliberately greedy because it
+// scrubs logs, where over-redaction is harmless; used as a patch gate it rejected ordinary
+// code ("// Basic usage", "password = getpass()"), and a rejected preview gets no receipt,
+// so the patch could never be integrated. This only matches values shaped like real
+// credentials: key material, well-known token formats, and literal secrets assigned to
+// credential-named keys.
+const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/;
+// Every repeat is bounded and every token pattern refuses to start inside a longer run:
+// unbounded runs rescanned the rest of an agent answer from each position (seconds per
+// answer, which freezes the bridge event loop). Key names need a digit+letter value and a
+// real credential word, so lexer code such as token_type = TokenType.INT64 still passes.
+const LIKELY_SECRET_PATTERNS = [
+  PRIVATE_KEY_HEADER,
+  /\bBearer\s+[A-Za-z0-9._~+\/-]{20,4096}=*/,
+  // Base64 credentials almost always contain a digit; "Basic auth/authorization" does not.
+  /\bBasic\s+(?=[A-Za-z0-9+\/]{0,512}[0-9])[A-Za-z0-9+\/]{12,4096}={0,2}(?![A-Za-z0-9+\/=])/,
+  /(?<![A-Za-z0-9._-])(?:ya29\.[A-Za-z0-9._-]{20,4096}|1\/\/0[A-Za-z0-9._-]{20,4096})/,
+  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}(?![A-Za-z0-9_-])/,
+  // sk-proj-..., sk-ant-...: dash form with a digit (CSS names like sk-spinner-plane pass).
+  /(?<![A-Za-z0-9_-])(?:sk|rk|pk)-(?=[A-Za-z0-9_-]{0,256}[0-9])[A-Za-z0-9_-]{20,256}(?![A-Za-z0-9_-])/,
+  // Stripe sk_live_/pk_test_...; plain identifiers like pk_index_for_table_1 pass.
+  /(?<![A-Za-z0-9_])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,256}(?![A-Za-z0-9])/,
+  /(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,512}(?![A-Za-z0-9-])/,
+  /(?<![A-Za-z0-9_])(?:gh[pousr]_|github_pat_)[_A-Za-z0-9]{20,512}(?![A-Za-z0-9_])/,
+  /(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])/,
+  /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,512}(?![A-Za-z0-9_-])/,
+  /(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/,
+  /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{1,64}\/B[A-Z0-9]{1,64}\/[A-Za-z0-9]{16,256}/,
+  // scheme://user:password@host with a password that has a digit (not user:user@localhost).
+  /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s:\/@]{1,256}:(?=[^\s\/@]{0,256}[0-9])[^\s\/@]{6,256}@/i,
+  // Quoted literal assigned to a credential-named key (not a suffix of a longer word such as
+  // invalid_token); the value needs a letter and a digit, so "test-password" passes.
+  /(?<![A-Za-z0-9])(?:authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|password|passwd|secret|client[-_]?secret|credential)["']?\s*[:=]\s*(["'])(?=[^"'\s]{0,256}[0-9])(?=[^"'\s]{0,256}[A-Za-z])[^"'\s]{8,256}\1/i,
+  // Unquoted .env / YAML value that is the whole rest of the line (DB_PASSWORD=..., password:
+  // ...). No dots in the value, so attribute access such as settings.API_KEY passes.
+  /(?:^\+?|\s)(?:export\s+)?[A-Za-z0-9_]{0,40}(?:password|passwd|secret|api_?key|access_?key|private_?key|auth_?token|access_?token|refresh_?token|credential)[A-Za-z0-9_]{0,40}\s*[:=]\s*(?=[^\s"'#]{0,256}[0-9])(?=[^\s"'#]{0,256}[A-Za-z])[^\s"'#(){}\[\].$,;]{8,256}\s*;?\s*(?:#.{0,256})?$/im,
+];
+
+// Agent answers quote code back to the coordinator. The greedy log redaction turned
+// "password = getpass.getpass()" into "password = [redacted]", which misreports what the
+// agent wrote. Only values shaped like real credentials are masked here; persisted
+// records and logs keep the greedy redactSensitiveText().
+const LIKELY_SECRET_GLOBAL_PATTERNS = LIKELY_SECRET_PATTERNS.map((pattern) => new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`));
+function redactLikelySecrets(value) {
+  // Whole key blocks first: the header pattern alone left the base64 body in the answer.
+  let text = redactPrivateKeyBlocks(String(value || ""));
+  for (const pattern of LIKELY_SECRET_GLOBAL_PATTERNS) text = text.replace(pattern, "[credential redacted]");
+  return text;
+}
+
+// A NUL byte or a .gitattributes "binary" entry turns a source file into a base85
+// "GIT binary patch" hunk the reviewer cannot read, so the preview would approve content
+// nobody saw. Source and text extensions must arrive as readable text hunks.
+const REVIEWABLE_TEXT_EXTENSION = /\.(?:py|pyi|pyx|c|cc|cpp|cxx|h|hh|hpp|hxx|inl|ipp|cmake|txt|md|rst|json|toml|yaml|yml|ini|cfg|js|mjs|cjs|ts|tsx|jsx|sh|ps1|bat|cmd|html|css|xml|csv|sql|gitattributes|gitignore)$/i;
+function binaryTextFilesInPatch(patchText) {
+  const files = [];
+  let current = "";
+  for (const line of String(patchText || "").split(/\r?\n/)) {
+    const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (header) { current = header[2]; continue; }
+    if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
+      && (REVIEWABLE_TEXT_EXTENSION.test(current) || /(?:^|\/)(?:CMakeLists\.txt|Makefile|\.gitattributes)$/i.test(current))) {
+      files.push(current);
+      current = "";
+    }
+  }
+  return files;
+}
+
+function patchLikelySecretLines(patchText) {
+  const hits = [];
+  const lines = String(patchText || "").split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    // Only added lines introduce new content; context and removed lines already exist.
+    // "+++ b/..." is a file header; an added line that itself starts with "++" is content.
+    if (!line.startsWith("+") || /^\+\+\+ (?:b\/|\/dev\/null)/.test(line)) continue;
+    const keyHeader = PRIVATE_KEY_HEADER.test(line);
+    if (keyHeader) {
+      // A test comment naming the header is not a key; a following base64 body line is.
+      if (/^\+[A-Za-z0-9+\/=]{40,}\s*$/.test(lines[index + 1] || "")) hits.push(index + 1);
+      continue;
+    }
+    if (LIKELY_SECRET_PATTERNS.some((pattern) => pattern.test(line))) hits.push(index + 1);
+  }
+  return hits;
 }
 
 function sanitizePersistedValue(value, depth = 0) {
@@ -1096,6 +1274,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let heartbeatTimer = null;
     let terminationFallbackTimer = null;
     let controlExitEvent = null;
+    let observedPayloadPid = 0;
     let controlTerminationUnconfirmed = false;
     let controlProtocolCompromised = false;
     let gateFailureType = "";
@@ -1145,6 +1324,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       result.stdoutSha256 = stdoutHash.digest("hex");
       result.stderrSha256 = stderrHash.digest("hex");
       result.supervisorProcessId = Number(supervisor.pid || 0);
+      result.payloadProcessId = observedPayloadPid;
       result.supervisorIdentity = supervisorIdentity;
       // Both ends use wall-clock epoch milliseconds: the supervisor reports its start as
       // an ISO timestamp, and mixing that with the monotonic nowMs() clock made every
@@ -1198,7 +1378,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
           "process_tree_termination_unconfirmed",
           "The process supervisor did not confirm containment termination before the bounded deadline."
         );
-      }, 15_000);
+      }, SUPERVISOR_TERMINATION_FALLBACK_MS);
       terminationFallbackTimer.unref?.();
     };
 
@@ -1229,8 +1409,8 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         timeoutMs,
         watchdogMs: supervisorWatchdogMs,
         watchdogDeadlineAt,
-        killGraceMs: 5_000,
-        terminationConfirmMs: 5_000,
+        killGraceMs: SUPERVISOR_KILL_GRACE_MS,
+        terminationConfirmMs: SUPERVISOR_TERMINATION_CONFIRM_MS,
       });
       if (!launchSent) {
         finishInfrastructureFailure("process_supervisor_control_failed");
@@ -1321,6 +1501,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         requestTermination("protocol_error");
         return;
       }
+      const reportedPayloadPid = Number(event.payloadPid);
+      if (Number.isSafeInteger(reportedPayloadPid) && reportedPayloadPid > 0) observedPayloadPid = reportedPayloadPid;
+      if (event.type === "launched") return;
       if (event.type === "ready") {
         if (Number(event.protocolVersion) !== 1 || Number(event.supervisorPid) !== Number(supervisor.pid || 0)) {
           gateFailureType = "process_supervisor_identity_mismatch";
@@ -1854,8 +2037,21 @@ async function runValidationGate({ command, cwd, dryRun = false, timeoutMs = CON
   }
 
   const started = nowMs();
-  let result = await runCommand(prepared.executablePath, prepared.args, cwd || process.cwd(), timeoutMs, buildValidationEnv(), { signal });
   const executable = path.basename(prepared.executablePath).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
+  // Bridge-owned Git ignores the operator's global config, so core.autocrlf is off and
+  // `git diff --check` reports every CRLF line an agent writes on Windows as trailing
+  // whitespace, failing an otherwise clean job. Treat CR at end of line as allowed unless
+  // the repository's own core.whitespace says otherwise; real trailing blanks, space-before-tab
+  // and conflict markers are still caught.
+  let whitespaceConfig = [];
+  if (executable === "git" && prepared.args[0] === "diff" && prepared.args.includes("--check")) {
+    const configured = await runCommand(prepared.executablePath, ["config", "--get", "core.whitespace"], cwd || process.cwd(), 1000 * 15, buildValidationEnv(), { signal });
+    const existing = configured.exitCode === 0 ? String(configured.stdout || "").trim() : "";
+    if (!/(^|,)\s*-?cr-at-eol\s*(,|$)/i.test(existing)) {
+      whitespaceConfig = ["-c", `core.whitespace=${existing ? `${existing},` : ""}cr-at-eol`];
+    }
+  }
+  let result = await runCommand(prepared.executablePath, [...whitespaceConfig, ...prepared.args], cwd || process.cwd(), timeoutMs, buildValidationEnv(), { signal });
   const isUnstagedDiffCheck = executable === "git"
     && prepared.args[0] === "diff"
     && prepared.args.slice(1).includes("--check")
@@ -1863,6 +2059,7 @@ async function runValidationGate({ command, cwd, dryRun = false, timeoutMs = CON
   if (result.exitCode === 0 && isUnstagedDiffCheck) {
     const remainingTimeoutMs = Math.max(1, timeoutMs - (nowMs() - started));
     const stagedResult = await runCommand(prepared.executablePath, [
+      ...whitespaceConfig,
       "diff",
       "--cached",
       ...prepared.args.slice(1),
@@ -1997,6 +2194,7 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
         );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
+      ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
       return db;
     } catch (error) {
       if (db) closeDb(db);
@@ -2024,6 +2222,7 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   const waitBudgetMs = Math.max(1, timeoutMs);
   const deadlineAt = started + waitBudgetMs;
   while (Date.now() < deadlineAt) {
+    await reclaimProvenGoneProviderQuarantines();
     if (signal?.aborted) {
       return { ok: false, errorType: "agent_cancelled", error: "Cancelled while waiting for provider capacity." };
     }
@@ -2035,21 +2234,24 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
       const active = Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases WHERE provider_key = ?").get(providerKey)?.count || 0);
       const configuredCapacity = CONFIG.providerConcurrencyLimit;
+      let effectiveCapacity = configuredCapacity;
       const capacityRow = db.prepare("SELECT capacity FROM provider_capacities WHERE provider_key = ?").get(providerKey);
       if (!capacityRow) {
         db.prepare("INSERT INTO provider_capacities (provider_key, capacity, updated_at) VALUES (?, ?, ?)").run(providerKey, configuredCapacity, now);
       } else if (Number(capacityRow.capacity) !== configuredCapacity) {
         if (active > 0) {
-          db.exec("ROLLBACK");
-          return {
-            ok: false,
-            errorType: "provider_concurrency_config_mismatch",
-            error: `Provider concurrency key ${providerKey} is active with capacity ${capacityRow.capacity}, but this process requested ${configuredCapacity}.`,
-          };
+          // Another bridge process (often an older one a client kept alive with the previous
+          // env) holds leases under a different limit. Honour the stricter of the two and wait,
+          // instead of failing the job; the stored limit follows the config once leases drain.
+          const storedCapacity = Number(capacityRow.capacity);
+          effectiveCapacity = Number.isInteger(storedCapacity) && storedCapacity > 0
+            ? Math.min(storedCapacity, configuredCapacity)
+            : configuredCapacity;
+        } else {
+          db.prepare("UPDATE provider_capacities SET capacity = ?, updated_at = ? WHERE provider_key = ?").run(configuredCapacity, now, providerKey);
         }
-        db.prepare("UPDATE provider_capacities SET capacity = ?, updated_at = ? WHERE provider_key = ?").run(configuredCapacity, now, providerKey);
       }
-      if (active < configuredCapacity) {
+      if (active < effectiveCapacity) {
         const lease = {
           id: `${BRIDGE_INSTANCE_ID}-${randomBytes(6).toString("hex")}`,
           providerKey,
@@ -2187,16 +2389,190 @@ async function releaseProviderLease(lease) {
   }
 }
 
-async function quarantineProviderLease(lease) {
+// A containment quarantine (expires_at = MAX_SAFE_INTEGER) keeps a provider slot or a set
+// of path locks reserved while an OpenCode process tree might still be running. It used to
+// be permanent: one unconfirmed termination on 2026-09-26 held one of two provider slots and
+// eight path locks forever. The quarantine now records the processes it is waiting on and is
+// lifted only when that is proven: every recorded PID is gone, or, for records without a
+// complete PID set, the owning bridge is gone and no OpenCode process runs on the machine.
+// Children that OpenCode started (test runners, language servers) are not recorded and can
+// outlive it on Windows, so a recorded quarantine is also held for a grace period.
+// Every live descendant of the given PIDs, read from the process table once, when a
+// quarantine is written. Windows keeps a child's ParentProcessId after its parent dies, so
+// orphans of a killed OpenCode payload (a test runner, an LSP server) are still found.
+// Temporary Git index directories are removed in a finally block, but a bridge killed in
+// the middle of a patch build leaves one behind. Startup removes those older than a day;
+// a younger one may belong to a live bridge.
+async function sweepStaleIndexScratchDirs(maxAgeMs = 1000 * 60 * 60 * 24) {
+  let removed = 0;
+  try {
+    for (const entry of await readdir(tmpdir(), { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith("codex-opencode-index-")) continue;
+      const dir = path.join(tmpdir(), entry.name);
+      const details = await lstat(dir);
+      if (details.isSymbolicLink() || Date.now() - details.mtimeMs < maxAgeMs) continue;
+      await rm(dir, { recursive: true, force: true });
+      removed += 1;
+    }
+  } catch (error) {
+    logEvent("warn", "scratch.sweep_failed", { error: error.message || String(error) });
+  }
+  return removed;
+}
+
+async function processDescendants(rootPids) {
+  const listed = process.platform === "win32"
+    ? await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
+    : await runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20);
+  if (listed.exitCode !== 0) return { ok: false, pids: [] };
+  const children = new Map();
+  for (const line of String(listed.stdout || "").split(/\r?\n/)) {
+    const [pid, ppid] = line.trim().split(/[\s,]+/).map(Number);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0 || pid === ppid) continue;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  const found = new Set();
+  const queue = [...rootPids];
+  while (queue.length && found.size < 4096) {
+    for (const child of children.get(queue.shift()) || []) {
+      if (found.has(child) || rootPids.includes(child)) continue;
+      found.add(child);
+      queue.push(child);
+    }
+  }
+  return { ok: true, pids: [...found] };
+}
+
+async function containmentRecord(result = {}) {
+  const payloadPid = Number(result?.payloadProcessId || 0);
+  const supervisorPid = Number(result?.supervisorProcessId || 0);
+  const roots = [supervisorPid, payloadPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [] })) : { ok: false, pids: [] };
+  return JSON.stringify({
+    pids: [...roots, ...descendants.pids],
+    complete: payloadPid > 0 && descendants.ok,
+    recordedAt: Date.now(),
+  });
+}
+
+function containmentProcessExists(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return error?.code === "EPERM";
+  }
+}
+
+let openCodeProcessProbe = { at: 0, running: true };
+async function openCodeProcessRunning() {
+  if (Date.now() - openCodeProcessProbe.at < 1000 * 30) return openCodeProcessProbe.running;
+  const base = path.basename(OPENCODE_EXE).replace(/\.(exe|cmd|bat|ps1)$/i, "") || "opencode";
+  let running = true;
+  if (process.platform === "win32") {
+    const listed = await runCommand("tasklist", ["/FO", "CSV", "/NH"], BRIDGE_RUNTIME_DIR, 1000 * 15);
+    if (listed.exitCode === 0) {
+      const names = new Set(String(listed.stdout || "").split(/\r?\n/).map((line) => (line.match(/^"([^"]+)"/) || [])[1]?.toLowerCase()).filter(Boolean));
+      running = names.has(`${base.toLowerCase()}.exe`) || names.has("opencode.exe");
+    }
+  } else {
+    const probe = await runCommand("pgrep", ["-x", base], BRIDGE_RUNTIME_DIR, 1000 * 15);
+    running = probe.exitCode !== 1;
+  }
+  openCodeProcessProbe = { at: Date.now(), running };
+  return running;
+}
+
+async function containmentStillPossible(containmentJson, ownerPid = 0) {
+  let info = {};
+  try { info = JSON.parse(containmentJson || "{}") || {}; } catch { info = {}; }
+  const pids = Array.isArray(info.pids) ? info.pids.map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
+  if (pids.some(containmentProcessExists)) return true;
+  const recordedAt = Number(info.recordedAt || 0);
+  if (recordedAt > 0 && Date.now() - recordedAt < CONFIG.containmentReleaseGraceMs) return true;
+  if (info.complete === true && pids.length) return false;
+  if (containmentProcessExists(Number(ownerPid))) return true;
+  return await openCodeProcessRunning();
+}
+
+let providerQuarantineReclaimAt = 0;
+async function reclaimProvenGoneProviderQuarantines({ force = false } = {}) {
+  if (!force && Date.now() - providerQuarantineReclaimAt < 1000 * 60) return 0;
+  providerQuarantineReclaimAt = Date.now();
+  let db = null;
+  let released = 0;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 1000 * 10 });
+    const rows = db.prepare("SELECT lease_id, owner_pid, containment FROM provider_leases WHERE expires_at = ?").all(Number.MAX_SAFE_INTEGER);
+    for (const row of rows) {
+      if (await containmentStillPossible(row.containment, row.owner_pid)) continue;
+      released += Number(db.prepare("DELETE FROM provider_leases WHERE lease_id = ? AND expires_at = ?").run(row.lease_id, Number.MAX_SAFE_INTEGER).changes || 0);
+    }
+    if (released) logEvent("warn", "provider.containment_quarantine_released", { released });
+  } catch (error) {
+    logEvent("warn", "provider.containment_reclaim_failed", { error: error.message || String(error) });
+  } finally {
+    if (db) closeDb(db);
+  }
+  return released;
+}
+
+async function reclaimProvenGoneLockQuarantines(db) {
+  let released = 0;
+  const runs = db.prepare(`
+    SELECT DISTINCT locks.run_id AS run_id, runs.containment AS containment
+    FROM locks LEFT JOIN runs ON runs.run_id = locks.run_id
+    WHERE locks.expires_at = ?
+  `).all(Number.MAX_SAFE_INTEGER);
+  for (const run of runs) {
+    if (await containmentStillPossible(run.containment, 0)) continue;
+    // The lock rows and the run's status change together or not at all.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      released += Number(db.prepare("DELETE FROM locks WHERE run_id = ? AND expires_at = ?").run(run.run_id, Number.MAX_SAFE_INTEGER).changes || 0);
+      db.prepare("UPDATE runs SET status = 'quarantine_released', finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status = 'quarantined'").run(Date.now(), run.run_id);
+      db.exec("COMMIT");
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* keep the original error */ }
+      throw error;
+    }
+  }
+  if (released) logEvent("warn", "lock.containment_quarantine_released", { released });
+  return released;
+}
+
+const lockQuarantineReclaimAt = new Map();
+async function reclaimLockQuarantinesForRoot(projectRoot) {
+  const key = normalizePathForCompare(projectRoot);
+  if (Date.now() - (lockQuarantineReclaimAt.get(key) || 0) < 1000 * 60) return 0;
+  lockQuarantineReclaimAt.set(key, Date.now());
+  let db = null;
+  try {
+    db = await openLockDb(projectRoot);
+    if (!db.prepare("SELECT 1 FROM locks WHERE expires_at = ? LIMIT 1").get(Number.MAX_SAFE_INTEGER)) return 0;
+    return await reclaimProvenGoneLockQuarantines(db);
+  } catch (error) {
+    logEvent("warn", "lock.containment_reclaim_failed", { error: error.message || String(error) });
+    return 0;
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+async function quarantineProviderLease(lease, containment = "") {
   if (!lease?.id) return { ok: false };
   let db = null;
   try {
     const now = Date.now();
     db = await openProviderLeaseDb({ deadlineAt: now + 1000 * 30 });
     const quarantined = db.prepare(`
-      UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
+      UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?, containment = ?
       WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
-    `).run(now, Number.MAX_SAFE_INTEGER, lease.id, BRIDGE_INSTANCE_ID, now);
+    `).run(now, Number.MAX_SAFE_INTEGER, String(containment || ""), lease.id, BRIDGE_INSTANCE_ID, now);
     return { ok: Number(quarantined.changes || 0) === 1 };
   } catch (error) {
     logEvent("error", "provider.containment_quarantine_failed", {
@@ -2209,6 +2585,17 @@ async function quarantineProviderLease(lease) {
   }
 }
 
+// Builders (OpenCode Zen) and reviewers/testers (Google Antigravity) are different
+// accounts with separate rate limits, but one shared key gave them two slots in total, so a
+// builder often spent part of its timeout waiting behind a reviewer. Without an explicit
+// CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY each configured provider gets its own slots.
+function providerKeyForMetadata(metadata = null) {
+  const provider = String(metadata?.provider || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  return CONFIG.providerConcurrencyKeyExplicit || !provider
+    ? CONFIG.providerConcurrencyKey
+    : `${CONFIG.providerConcurrencyKey}:${provider}`;
+}
+
 async function providerCapacitySnapshot() {
   let db = null;
   try {
@@ -2217,10 +2604,11 @@ async function providerCapacitySnapshot() {
     db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
     const capacity = db.prepare("SELECT capacity, updated_at FROM provider_capacities WHERE provider_key = ?").get(CONFIG.providerConcurrencyKey);
     const leases = db.prepare(`
-      SELECT lease_id, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at
-      FROM provider_leases WHERE provider_key = ? ORDER BY created_at
-    `).all(CONFIG.providerConcurrencyKey).map((row) => ({
+      SELECT lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at
+      FROM provider_leases WHERE provider_key = ? OR provider_key LIKE ? ORDER BY created_at
+    `).all(CONFIG.providerConcurrencyKey, `${CONFIG.providerConcurrencyKey}:%`).map((row) => ({
       leaseId: row.lease_id,
+      providerKey: row.provider_key,
       ownerInstanceId: row.owner_instance_id,
       ownerProcessId: Number(row.owner_pid || 0),
       createdAt: new Date(Number(row.created_at)).toISOString(),
@@ -3305,16 +3693,20 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
         }
       }
     }
-    if (manifest.openCodeVersion) {
-      const version = await runCommand(OPENCODE_EXE, ["--pure", "--version"], cwd, 1000 * 30, buildOpenCodeEnv());
-      if (version.exitCode !== 0 || version.stdout.trim() !== String(manifest.openCodeVersion)) {
-        throw new Error(`OpenCode host version mismatch. Expected ${manifest.openCodeVersion}, got ${(version.stdout || version.stderr || "unavailable").trim()}.`);
-      }
-    }
-    // Probe the same non-pure mode used for allowlisted execution. All explicit
+    // Both probes are read-only and independent; each OpenCode cold start costs seconds,
+    // so run them together. The version check is still evaluated first.
+    // The config probe uses the same non-pure mode as allowlisted execution. All explicit
     // plugin bytes/config origins were verified above and implicit defaults are
     // disabled in buildOpenCodeEnv(), so mode-specific config drift fails closed.
-    const effectiveConfig = await runCommand(OPENCODE_EXE, ["debug", "config"], cwd, 1000 * 60, buildOpenCodeEnv());
+    const [version, effectiveConfig] = await Promise.all([
+      manifest.openCodeVersion
+        ? runCommand(OPENCODE_EXE, ["--pure", "--version"], cwd, 1000 * 30, buildOpenCodeEnv())
+        : Promise.resolve(null),
+      runCommand(OPENCODE_EXE, ["debug", "config"], cwd, 1000 * 60, buildOpenCodeEnv()),
+    ]);
+    if (version && (version.exitCode !== 0 || version.stdout.trim() !== String(manifest.openCodeVersion))) {
+      throw new Error(`OpenCode host version mismatch. Expected ${manifest.openCodeVersion}, got ${(version.stdout || version.stderr || "unavailable").trim()}.`);
+    }
     if (effectiveConfig.exitCode !== 0) {
       throw new Error(`OpenCode effective config could not be attested (exit ${effectiveConfig.exitCode}): ${summarizeStderr([effectiveConfig.stderr, effectiveConfig.stdout].filter(Boolean).join("\n"))}`);
     }
@@ -3807,7 +4199,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     streamIntegrity: malformedEventLines ? "malformed" : "valid",
     malformedEventLines,
     finalResponseDetected,
-    finalText: redactSensitiveText(finalTextTruncated ? `${finalText.slice(0, CONFIG.maxAssistantResponseChars)}\n... [assistant response truncated by bridge]` : finalText),
+    finalText: redactLikelySecrets(finalTextTruncated ?`${finalText.slice(0, CONFIG.maxAssistantResponseChars)}\n... [assistant response truncated by bridge]` : finalText),
     finalTextTruncated,
     toolOutcomes,
     parsedEvents,
@@ -4549,10 +4941,11 @@ function scopeContractTimeout(scopeContract, lockType) {
     : scopeContract.timeoutPolicy.writeTimeoutMs;
 }
 
-function formatScopeContractForPrompt(scopeContract) {
+function formatScopeContractForPrompt(scopeContract, spell = (values) => normalizeList(values)) {
   if (!scopeContract) {
     return "";
   }
+  const list = (values) => spell(values).join(", ");
 
   return [
     `Agent: ${scopeContract.agent || "not specified"}`,
@@ -4563,12 +4956,12 @@ function formatScopeContractForPrompt(scopeContract) {
       `Required variant: ${scopeContract.modelRequirement.variant || "not specified"}`,
       `Runtime model evidence required: ${scopeContract.modelRequirement.requireRuntimeEvidence ? "yes" : "no"}`,
     ] : []),
-    `Read paths: ${scopeContract.scope.read.length ? scopeContract.scope.read.join(", ") : "not specified"}`,
-    `Write paths: ${scopeContract.scope.write.length ? scopeContract.scope.write.join(", ") : "none"}`,
-    `Allowed edits: ${scopeContract.allowedEdits.length ? scopeContract.allowedEdits.join(", ") : "not specified"}`,
-    `Forbidden paths: ${scopeContract.scope.forbidden.length ? scopeContract.scope.forbidden.join(", ") : "none"}`,
-    `Shared/frozen paths: ${scopeContract.shared.length ? scopeContract.shared.join(", ") : "none"}`,
-    `Serial-only paths: ${scopeContract.serialOnly.length ? scopeContract.serialOnly.join(", ") : "none"}`,
+    `Read paths: ${scopeContract.scope.read.length ? list(scopeContract.scope.read) : "not specified"}`,
+    `Write paths: ${scopeContract.scope.write.length ? list(scopeContract.scope.write) : "none"}`,
+    `Allowed edits: ${scopeContract.allowedEdits.length ? list(scopeContract.allowedEdits) : "not specified"}`,
+    `Forbidden paths: ${scopeContract.scope.forbidden.length ? list(scopeContract.scope.forbidden) : "none"}`,
+    `Shared/frozen paths: ${scopeContract.shared.length ? list(scopeContract.shared) : "none"}`,
+    `Serial-only paths: ${scopeContract.serialOnly.length ? list(scopeContract.serialOnly) : "none"}`,
     `Validation command: ${scopeContract.validationCommand || "not specified"}`,
     `Allowed actions: ${scopeContract.actions.length ? scopeContract.actions.join(", ") : "not specified"}`,
     `Validation changedFilesMustBeWithinWriteScope: ${scopeContract.validation.changedFilesMustBeWithinWriteScope ? "yes" : "no"}`,
@@ -4657,10 +5050,35 @@ function firstNonEmptyList(...values) {
   return [];
 }
 
+// Lock plans compare paths case-folded on case-insensitive filesystems, so their lists are
+// lower-case. Agents must see the caller's spelling: told "Allowed edits: src/parser.py"
+// for a requested src/Parser.py, a builder may create the wrong file name, which breaks
+// case-sensitive imports once the code leaves Windows.
+function callerPathSpellings(job = {}) {
+  const contract = job.scopeContract || {};
+  return [
+    job.lockedPaths, job.allowedEdits, job.forbiddenEdits, job.sharedFiles, job.serialOnly,
+    contract.read, contract.write, contract.forbidden, contract.allowedEdits, contract.shared, contract.serialOnly,
+    contract.scope?.read, contract.scope?.write, contract.scope?.forbidden,
+  ].flatMap((value) => normalizeList(value)).filter((value) => typeof value === "string");
+}
+
+function pathSpeller(spellings = []) {
+  const byFolded = new Map();
+  for (const raw of spellings) {
+    const normalized = normalizeLockPath(raw);
+    const folded = normalized.toLowerCase();
+    if (normalized && !byFolded.has(folded)) byFolded.set(folded, normalized);
+  }
+  const spell = (value) => byFolded.get(normalizeLockPath(value).toLowerCase()) || value;
+  return (values) => normalizeList(values).map(spell);
+}
+
 function buildCompactPrompt(agent, task, delegation = {}) {
   if (!delegation || Object.keys(delegation).length === 0) {
     return task;
   }
+  const spell = pathSpeller(delegation.pathSpellings);
 
   return [
     `Role: ${agent}`,
@@ -4671,7 +5089,7 @@ function buildCompactPrompt(agent, task, delegation = {}) {
     Array.isArray(delegation.scope) ? normalizeList(delegation.scope).join("\n") || "Not specified." : "Not specified.",
     "",
     "Scope Contract:",
-    formatScopeContractForPrompt(delegation.scopeContract) || "Not specified.",
+    formatScopeContractForPrompt(delegation.scopeContract, spell) || "Not specified.",
     "",
     `Lock mode: ${delegation.lockMode || "not specified"}`,
     "",
@@ -4686,15 +5104,15 @@ function buildCompactPrompt(agent, task, delegation = {}) {
       : null,
     "",
     "Lock granted:",
-    normalizeList(delegation.lockedPaths).join("\n") || "Not specified.",
+    spell(delegation.lockedPaths).join("\n") || "Not specified.",
     "",
     "Allowed edits:",
-    normalizeList(delegation.allowedEdits).join("\n") || "none",
+    spell(delegation.allowedEdits).join("\n") || "none",
     "",
     "Forbidden edits:",
-    normalizeList(delegation.forbiddenEdits).join("\n") || "none specified",
+    spell(delegation.forbiddenEdits).join("\n") || "none specified",
     "",
-    `Shared files frozen: ${normalizeList(delegation.sharedFiles).join(", ") || "Not specified."}`,
+    `Shared files frozen: ${spell(delegation.sharedFiles).join(", ") || "Not specified."}`,
     "",
     "Permissions:",
     delegation.permissions || "Not specified.",
@@ -4724,9 +5142,15 @@ const dependencyRequestPayloadSchema = z.object({
   reason: z.string().min(1).max(2000),
 }).strict();
 
+// The report template has a "DEPENDENCY_REQUIRED" section, so agents also write
+// "DEPENDENCY_REQUIRED None." or "DEPENDENCY_REQUIRED - not required"; that failed a finished
+// job as an invalid dependency request. A stated absence is not a request; any other text
+// still fails, so a real request written as prose ("DEPENDENCY_REQUIRED numpy") is not lost.
+const DEPENDENCY_ABSENT = /^(?:[-\u2013\u2014:]\s*)?(?:none|n\/a|no|not\s+(?:required|needed|applicable)|nothing)\b/i;
 function parseDependencyRequest(text) {
   const match = String(text || "").match(/^DEPENDENCY_REQUIRED\s+([^\r\n]+)\s*$/m);
   if (!match) return { request: null, error: "" };
+  if (DEPENDENCY_ABSENT.test(match[1].trim())) return { request: null, error: "" };
   try {
     const parsed = dependencyRequestPayloadSchema.safeParse(JSON.parse(match[1]));
     if (!parsed.success) {
@@ -4919,7 +5343,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
 
-  const providerKey = CONFIG.providerConcurrencyKey;
+  const providerKey = providerKeyForMetadata(configuredMetadata);
   const providerWaitBudgetMs = Math.max(1, timeoutMs - (nowMs() - started));
   const providerLease = await acquireProviderLease({ providerKey, timeoutMs: providerWaitBudgetMs, signal });
   if (!providerLease.ok) {
@@ -5123,7 +5547,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   } finally {
     stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
-      const quarantined = await quarantineProviderLease(providerLease.lease);
+      const quarantined = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
       if (!quarantined.ok) {
         logEvent("error", "provider.containment_quarantine_unconfirmed", { leaseId: providerLease.lease.id });
       }
@@ -5145,7 +5569,9 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const openCodeFallbackDetected = detectsOpenCodeFallback(result.stderr);
   const inspection = inspectOpenCodeEventStream(result.stdout, result.stderr);
   const runResult = {
-    stdout: redactSensitiveText(inspection.finalText),
+    supervisorProcessId: Number(result?.supervisorProcessId || 0),
+    payloadProcessId: Number(result?.payloadProcessId || 0),
+    stdout: redactLikelySecrets(inspection.finalText),
     stderr: summarizeStderr(result.stderr),
     exitCode: result.exitCode,
     durationMs: nowMs() - started,
@@ -5260,13 +5686,21 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   };
 
   if (lockPlan?.lockType !== "read") {
-    const result = await runOpenCode(agent, prompt, cwd, dryRun, timeoutMs, {
+    const fallbackRequirement = { provider: "google", model: "antigravity-gemini-3.8-flash", variant: "high" };
+    const result = await runBuilderModelFallback(agent, (modelRequirement, attemptTimeoutMs) => runOpenCode(agent, prompt, cwd, dryRun, attemptTimeoutMs, {
       signal,
       agentMetadata,
-      metadataPolicyOptions,
+      metadataPolicyOptions: { ...metadataPolicyOptions, modelRequirement },
       forcePure,
       onSpawn,
       onSupervisorHeartbeat,
+    }), {
+      enabled: process.env.CODEX_OPENCODE_BUILDER_MODEL_FALLBACK === "true" && !dryRun,
+      modelRequirement: metadataPolicyOptions.modelRequirement,
+      forcePure,
+      timeoutMs,
+      signal,
+      fallbackRequirement: allowlistedModelOverride(fallbackRequirement, agent),
     });
     result.retryAttempt = 0;
     result.maxRetries = 0;
@@ -5277,9 +5711,12 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   let lastResult = null;
   const childExecutionIntervals = [];
   const policyStarted = nowMs();
+  // The retry budget bounds retries; it must never shorten the first attempt below the
+  // configured read-only timeout (an 8 min budget silently capped a 15 min reviewer).
+  const retryBudgetMs = Math.max(CONFIG.readOnlyRetryMaxElapsedMs, Number(timeoutMs) || 0);
   for (let attempt = 0; attempt <= maxReadOnlyAgentRetries; attempt += 1) {
     const elapsedMs = nowMs() - policyStarted;
-    const remainingBudgetMs = CONFIG.readOnlyRetryMaxElapsedMs - elapsedMs;
+    const remainingBudgetMs = retryBudgetMs - elapsedMs;
     if (remainingBudgetMs <= 0) break;
     lastResult = await runOpenCode(agent, prompt, cwd, dryRun, Math.min(timeoutMs, remainingBudgetMs), {
       signal,
@@ -5300,7 +5737,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     const exponential = CONFIG.readOnlyRetryBaseDelayMs * (2 ** attempt);
     const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(exponential / 2)));
     const delayMs = Math.max(lastResult.retryAfterMs || 0, exponential + jitter);
-    if (nowMs() - policyStarted + delayMs >= CONFIG.readOnlyRetryMaxElapsedMs) {
+    if (nowMs() - policyStarted + delayMs >= retryBudgetMs) {
       break;
     }
     try {
@@ -5370,6 +5807,8 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Event stream integrity: ${result?.streamIntegrity || "not inspected"}`,
     `Permission denials observed: ${result?.permissionDeniedCount || 0}`,
     "Silent model fallback: disabled",
+    `Builder model fallback used: ${result?.modelFallbackUsed ? "yes" : "no"}`,
+    result?.modelFallbackUsed ? `Builder model fallback: ${result.modelFallbackFrom} -> ${result.modelFallbackTo}; reason: ${result.modelFallbackReason}` : null,
     `Provider/account concurrency key: ${result?.providerConcurrencyKey || "not acquired"}`,
     `Provider capacity wait ms: ${result?.providerConcurrencyWaitMs || 0}`,
     `Assistant final response detected: ${result?.assistantFinalResponseDetected ? "yes" : "no"}`,
@@ -5751,24 +6190,61 @@ async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
   const allFiles = includeIgnored ? await gitChangedFiles(cwd, { includeIgnored: true }) : ordinaryFiles;
   const ordinarySet = new Set(ordinaryFiles);
   const ignoredFiles = allFiles.filter((file) => !ordinarySet.has(file));
-  if (allFiles.length > CONFIG.maxSnapshotFiles) {
-    const error = new Error(`Changed-file snapshot limit exceeded: ${allFiles.length} files exceeds CODEX_OPENCODE_MAX_SNAPSHOT_FILES=${CONFIG.maxSnapshotFiles}.`);
+  // Ignored files have their own bound (groupIgnoredFiles); counting them here made any
+  // checkout with a large .venv/ or build/ fail every job and integration.
+  if (ordinaryFiles.length > CONFIG.maxSnapshotFiles) {
+    const error = new Error(`Changed-file snapshot limit exceeded: ${ordinaryFiles.length} files exceeds CODEX_OPENCODE_MAX_SNAPSHOT_FILES=${CONFIG.maxSnapshotFiles}.`);
     error.errorType = "snapshot_safety_limit_exceeded";
     throw error;
   }
-  if (ignoredFiles.length > CONFIG.maxIgnoredSnapshotFiles) {
-    const error = new Error(`Ignored-file snapshot limit exceeded: ${ignoredFiles.length} files exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${CONFIG.maxIgnoredSnapshotFiles}.`);
-    error.errorType = "snapshot_safety_limit_exceeded";
-    throw error;
-  }
+  const ignoredGroups = groupIgnoredFiles(ignoredFiles);
   const snapshot = new Map();
   for (const file of ordinaryFiles) {
     snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
   }
-  for (const file of ignoredFiles) {
-    snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: true }));
+  for (const [entry, files] of ignoredGroups) {
+    if (files.length === 1 && files[0] === entry) {
+      snapshot.set(entry, await fileFingerprint(cwd, entry, { metadataOnly: true }));
+      continue;
+    }
+    // Names only: git already listed every member, so files added to or removed from a
+    // cache directory still change the snapshot without an lstat per file.
+    const hash = createHash("sha256");
+    for (const file of files) hash.update(`${file}\0`);
+    snapshot.set(entry, `group:${files.length}:${hash.digest("hex")}`);
   }
   return snapshot;
+}
+
+// Ignored files inside regenerable directories (build outputs, virtualenvs, caches) are
+// grouped under that directory, always, whatever their count: grouping only above a limit
+// flooded changedFilesBetween with thousands of paths when a build crossed the limit
+// mid-job. Files matching the default forbidden paths (.env, *.pem, *.key, secrets/) keep
+// their own entry so scope checks still see them, and all other ignored files stay per file.
+const REGENERABLE_IGNORED_DIRECTORY = /^(?:node_modules|\.venv|venv|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.tox|\.nox|\.cache|\.gradle|\.next|\.vs|build|dist|out|target|obj|bin|debug|release|x64|x86|coverage|htmlcov|\.eggs|cmakefiles|cmake-build-[^/]*|[^/]*\.egg-info)$/i;
+
+// Same set as DEFAULT_FORBIDDEN_EDIT_PATHS, as one regex: isWithinAnyPath per ignored file
+// cost about 6 s per snapshot on 30000 build files, several times per integration.
+const FORBIDDEN_LOOKING_PATH = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.pem|[^/]*\.key)$|(?:^|\/)secrets\//i;
+
+function groupIgnoredFiles(ignoredFiles, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
+  const groups = new Map();
+  for (const file of [...ignoredFiles].sort()) {
+    const segments = file.split("/");
+    const groupDepth = segments.slice(0, -1).findIndex((segment) => REGENERABLE_IGNORED_DIRECTORY.test(segment));
+    const entry = groupDepth >= 0 && !FORBIDDEN_LOOKING_PATH.test(file)
+      ? `${segments.slice(0, groupDepth + 1).join("/")}/`
+      : file;
+    const members = groups.get(entry) || [];
+    members.push(file);
+    groups.set(entry, members);
+  }
+  if (groups.size > limit) {
+    const error = new Error(`Ignored-file snapshot limit exceeded: ${groups.size} ignored entries outside build/cache directories exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${limit}.`);
+    error.errorType = "snapshot_safety_limit_exceeded";
+    throw error;
+  }
+  return groups;
 }
 
 function changedFilesBetween(before, after) {
@@ -5863,12 +6339,10 @@ async function captureRollbackBaseline(cwd) {
   const allFiles = await gitChangedFiles(base, { includeIgnored: true });
   const ordinarySet = new Set(ordinaryFiles);
   const ignoredFiles = allFiles.filter((file) => !ordinarySet.has(file));
-  if (allFiles.length > CONFIG.maxSnapshotFiles) {
-    throw new Error(`Rollback snapshot limit exceeded: ${allFiles.length} files exceeds CODEX_OPENCODE_MAX_SNAPSHOT_FILES=${CONFIG.maxSnapshotFiles}.`);
+  if (ordinaryFiles.length > CONFIG.maxSnapshotFiles) {
+    throw new Error(`Rollback snapshot limit exceeded: ${ordinaryFiles.length} files exceeds CODEX_OPENCODE_MAX_SNAPSHOT_FILES=${CONFIG.maxSnapshotFiles}.`);
   }
-  if (ignoredFiles.length > CONFIG.maxIgnoredSnapshotFiles) {
-    throw new Error(`Ignored-file rollback limit exceeded: ${ignoredFiles.length} files exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${CONFIG.maxIgnoredSnapshotFiles}.`);
-  }
+  groupIgnoredFiles(ignoredFiles);
   const preExisting = new Map();
   let totalRestorableBytes = 0;
   for (const file of ordinaryFiles) {
@@ -6880,6 +7354,17 @@ function truncateText(value, limit = 12000) {
   return text.length > limit ? `${text.slice(0, limit)}\n... [truncated]` : text;
 }
 
+// Default integration cleanup removes only worktrees the bridge created; a worktree path
+// the caller made by hand keeps its branch and history unless cleanup is asked for.
+function isBridgeGeneratedWorktree(cwd, worktreePath) {
+  if (!worktreePath) return false;
+  const configured = String(CONFIG.worktreeRoot || "").trim();
+  const root = configured.toLowerCase() === "global"
+    ? path.join(effectiveBridgeStateDirectory(), "worktrees")
+    : generatedWorktreeRootForCwd(cwd);
+  return Boolean(root) && isPathInside(path.resolve(root), path.resolve(worktreePath));
+}
+
 function generatedWorktreeRootForCwd(cwd) {
   const base = cwd || process.cwd();
   const configured = String(CONFIG.worktreeRoot || "").trim();
@@ -7330,7 +7815,7 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
     };
   }
 
-  const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, 1000 * 60);
+  const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, CONFIG.gitHeavyTimeoutMs);
   if (created.exitCode !== 0) {
     await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
     return {
@@ -7454,7 +7939,7 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
     : null;
   const expectedBranchOid = expectedBranch?.exitCode === 0 ? expectedBranch.stdout.trim() : "";
 
-  const removed = await runCommand("git", removeArgs, worktree.repoRoot, 1000 * 60);
+  const removed = await runCommand("git", removeArgs, worktree.repoRoot, CONFIG.gitHeavyTimeoutMs);
   if (removed.exitCode !== 0) {
     await updateRetainedWorktreeMeasurement(worktree);
     await markWorktreeArtifactState(worktree, "cleanup_failed");
@@ -7630,11 +8115,11 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
         };
       }
     }
-    const readTree = await runCommand("git", ["read-tree", base.stdout.trim()], sourcePath, 1000 * 30, gitEnv);
+    const readTree = await runCommand("git", ["read-tree", base.stdout.trim()], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv);
     if (readTree.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: readTree.stderr || "Could not create an isolated temporary Git index." };
     }
-    const add = await runCommand("git", ["add", "-A", "--", "."], sourcePath, 1000 * 60, gitEnv);
+    const add = await runCommand("git", ["add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv);
     if (add.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
     }
@@ -7837,7 +8322,7 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal =
       return { exitCode: 1, stdout: "", stderr: "Temporary integration index escaped its bounded root." };
     }
     const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
-    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), 1000 * 30, env, { signal });
+    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), CONFIG.gitHeavyTimeoutMs, env, { signal });
     if (seeded.exitCode !== 0) {
       return { exitCode: seeded.exitCode, stdout: seeded.stdout || "", stderr: seeded.stderr || "Could not seed the isolated integration index." };
     }
@@ -7929,7 +8414,7 @@ async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, fi
       GIT_CONFIG_GLOBAL: nullConfig,
       GIT_CONFIG_SYSTEM: nullConfig,
     });
-    const readTree = await runCommand("git", ["read-tree", targetHead], cwd, 1000 * 30, gitEnv);
+    const readTree = await runCommand("git", ["read-tree", targetHead], cwd, CONFIG.gitHeavyTimeoutMs, gitEnv);
     if (readTree.exitCode !== 0) {
       return { ok: false, errorType: "integration_simulation_failed", error: readTree.stderr || "Could not seed the isolated integration index." };
     }
@@ -8397,6 +8882,7 @@ async function integratePatchWithoutSerialLock({
   validationPolicyTrust = null,
   dryRun = false,
   allowDirtyTarget = false,
+  acceptFlaggedSecretLines = false,
   reviewed = false,
   previewReceipt = null,
   expectedSourceIdentity = null,
@@ -8591,13 +9077,27 @@ async function integratePatchWithoutSerialLock({
     }
 
     if (dryRun) {
-      const safePatchPreview = redactSensitiveText(patch.patch);
-      if (safePatchPreview !== patch.patch) {
+      const binaryTextFiles = binaryTextFilesInPatch(patch.patch);
+      if (binaryTextFiles.length) {
+        return {
+          ok: false,
+          status: "preview_rejected",
+          errorType: "integration_preview_unreadable_text_file",
+          error: `The patch carries source/text files as binary hunks the reviewer cannot read: ${binaryTextFiles.slice(0, 10).join(", ")}. Remove NUL bytes or other binary content (or a .gitattributes binary/-diff entry) from those files in the worktree and preview again.`,
+          changedFiles: patch.changedFiles,
+          patchSha256: patch.patchSha256,
+          patchPreview: "",
+          patchPreviewTruncated: false,
+          previewReceipt: null,
+        };
+      }
+      const secretLines = patchLikelySecretLines(patch.patch);
+      if (secretLines.length && !acceptFlaggedSecretLines) {
         return {
           ok: false,
           status: "preview_rejected",
           errorType: "integration_preview_contains_sensitive_text",
-          error: "The patch matched credential-redaction rules. No review receipt was issued because the bridge cannot expose or silently redact essential review evidence.",
+          error: `The patch adds what looks like a real credential (patch lines ${secretLines.slice(0, 10).join(", ")}${secretLines.length > 10 ? ", ..." : ""}). No review receipt was issued because the bridge cannot expose or silently redact essential review evidence. Remove the secret from the worktree and preview again, or, if you inspected those lines in the worktree and they hold no real credential, preview again with acceptFlaggedSecretLines: true.`,
           changedFiles: patch.changedFiles,
           patchSha256: patch.patchSha256,
           patchPreview: "",
@@ -8664,7 +9164,7 @@ async function integratePatchWithoutSerialLock({
         targetTree: targetState.targetTree,
         targetStateSha256: targetState.targetStateSha256,
         contractSha256,
-        patchPreview: safePatchPreview,
+        patchPreview: patch.patch,
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
         allowDirtyTarget: Boolean(allowDirtyTarget),
@@ -9330,7 +9830,7 @@ function lockPaths(lock) {
   return normalizeLockPathList(lock.paths || lock.lockedPaths || lock.allowedEdits || []);
 }
 
-function conflictsWithActiveLock(request, activeLock) {
+function conflictsWithActiveLock(request, activeLock, worktreeMode = CONFIG.worktreeMode) {
   const requestType = request.lockType;
   const activeType = activeLock.lockType;
 
@@ -9340,7 +9840,18 @@ function conflictsWithActiveLock(request, activeLock) {
 
   const requestPaths = lockPaths(request);
   const activePaths = lockPaths(activeLock);
-  const requiresRepositorySerialization = requestType === "serial_integration" || activeType === "serial_integration";
+  // Integration changes the real checkout, so it waits for every reader of the checkout and
+  // for other integrations. With worktrees on, writers work in their own worktree and only
+  // conflict when paths overlap; blocking integration on every running builder meant a
+  // reviewed patch could not land while any other builder (from either client) still ran.
+  // Manual acquire_agent_lock writers, legacy rows, and CODEX_OPENCODE_WORKTREE_MODE=off
+  // writers edit the checkout itself, so they still serialize with integration.
+  const involvesIntegration = requestType === "serial_integration" || activeType === "serial_integration";
+  const worktreeJobWriter = (lock) => lock.lockType === "write" && (lock.origin || "internal") === "internal";
+  const writerAndIntegration = involvesIntegration
+    && worktreeMode !== "off"
+    && (worktreeJobWriter(request) || worktreeJobWriter(activeLock));
+  const requiresRepositorySerialization = involvesIntegration && !writerAndIntegration;
   const overlap = requiresRepositorySerialization
     ? overlaps(requestPaths, activePaths) || [requestPaths[0], activePaths[0]]
     : overlaps(requestPaths, activePaths);
@@ -9795,12 +10306,12 @@ function prunePersistedState(db, dbPath) {
       DELETE FROM changed_files
       WHERE run_id IN (
         SELECT run_id FROM runs
-        WHERE status IN ('released', 'expired') AND finished_at IS NOT NULL AND finished_at < ?
+        WHERE status IN ('released', 'expired', 'quarantine_released') AND finished_at IS NOT NULL AND finished_at < ?
       )
     `).run(auditCutoff);
     db.prepare(`
       DELETE FROM runs
-      WHERE status IN ('released', 'expired') AND finished_at IS NOT NULL AND finished_at < ?
+      WHERE status IN ('released', 'expired', 'quarantine_released') AND finished_at IS NOT NULL AND finished_at < ?
         AND NOT EXISTS (SELECT 1 FROM locks WHERE locks.run_id = runs.run_id)
     `).run(auditCutoff);
     db.prepare(`
@@ -10355,6 +10866,7 @@ async function openLockDb(cwd = "") {
       ensureDirectRunAuditSchema(db);
       ensureLockTableSchema(db);
       ensureTableColumn(db, "locks", "acquisition_origin", "TEXT NOT NULL DEFAULT 'legacy'");
+      ensureTableColumn(db, "runs", "containment", "TEXT NOT NULL DEFAULT ''");
       ensureQueueLeaseSchema(db);
       ensurePipelineRevisionSchema(db);
       ensureIntegrationJournalSchema(db);
@@ -10501,6 +11013,7 @@ async function acquireHardLock({
   const requestedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : paths;
   const unsafeReason = repositoryScope ? "" : unsafePathReason(requestedPaths, projectRoot);
   const lockPathsRequested = normalizeLockPathListForCwd(requestedPaths, projectRoot);
+  await reclaimLockQuarantinesForRoot(projectRoot);
 
   if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(projectRoot))
     && normalizedLockType !== "read"
@@ -10554,7 +11067,7 @@ async function acquireHardLock({
   const tokenSha256 = `sha256:${createHash("sha256").update(token).digest("hex")}`;
   const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
   const expiresAt = now + Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
-  const request = { lockType: normalizedLockType, paths: lockPathsRequested };
+  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin };
 
   try {
     db.exec("BEGIN IMMEDIATE");
@@ -10675,7 +11188,7 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
   }
 }
 
-async function quarantineHardLock(lock) {
+async function quarantineHardLock(lock, containment = "") {
   if (!lock?.id || !lock?.token) return { ok: false };
   const db = await openLockDb(lock.cwd);
   try {
@@ -10690,7 +11203,7 @@ async function quarantineHardLock(lock) {
       db.exec("ROLLBACK");
       return { ok: false };
     }
-    db.prepare("UPDATE runs SET status = 'quarantined', finished_at = NULL WHERE run_id = ?").run(lock.id);
+    db.prepare("UPDATE runs SET status = 'quarantined', finished_at = NULL, containment = ? WHERE run_id = ?").run(String(containment || ""), lock.id);
     db.exec("COMMIT");
     lock.expiresAt = Number.MAX_SAFE_INTEGER;
     return { ok: true };
@@ -11211,6 +11724,7 @@ server.tool(
             `Queue write conflict policy: ${effectiveQueueWriteConflictPolicy()}`,
             `Queue blocked poll ms: ${CONFIG.queueBlockedPollMs}`,
             `Queue stale after ms: ${CONFIG.queueStaleAfterMs}`,
+            `Deferred recovery idle max ms: ${CONFIG.deferredRecoveryIdleMaxMs}`,
             `Read lock mode: ${CONFIG.defaultReadLockMode}`,
             `Write lock mode: ${CONFIG.defaultWriteLockMode}`,
             `Parallel write lock mode: ${CONFIG.defaultParallelWriteLockMode}`,
@@ -11218,7 +11732,7 @@ server.tool(
             `Bridge state directory: ${GLOBAL_BRIDGE_STATE_DIR}`,
             `OpenCode external plugins: ${CONFIG.allowExternalPlugins ? "enabled (exact allowlist and pinned tree verified)" : "disabled (--pure)"}`,
             `External plugin manifest SHA-256: ${pluginPolicy.manifestSha256 || "not applicable"}`,
-            `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}`,
+            `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
             `Provider active leases: ${providerCapacity.leases.length}`,
             ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId}: pid=${lease.ownerProcessId}, remainingMs=${lease.remainingMs}, heartbeat=${lease.heartbeatAt || "none"}`),
             `Bridge instance id: ${BRIDGE_INSTANCE_ID}`,
@@ -11248,6 +11762,17 @@ server.tool(
     ]);
     const nonterminal = jobs.filter((job) => !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
     const failed = jobs.filter((job) => ["failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
+    // The report goes into the caller's context. After a long run it listed every audit row
+    // and job (up to thousands); summary counts stay complete, detail keeps every unfinished
+    // item plus the most recent ones.
+    const DIAGNOSE_DETAIL_LIMIT = 25;
+    const newestFirst = (list, key) => [...list].sort((left, right) => String(right[key] || "").localeCompare(String(left[key] || "")));
+    const unfinishedJobs = new Set(nonterminal.map((job) => job.jobId));
+    const detailJobs = [...nonterminal, ...newestFirst(jobs.filter((job) => !unfinishedJobs.has(job.jobId)), "createdAt").slice(0, DIAGNOSE_DETAIL_LIMIT)];
+    const detailDirectRuns = [
+      ...directRunAudit.records.filter((run) => run.status === "started"),
+      ...newestFirst(directRunAudit.records.filter((run) => run.status !== "started"), "startedAt").slice(0, DIAGNOSE_DETAIL_LIMIT),
+    ];
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
@@ -11264,12 +11789,13 @@ server.tool(
         providerCapacity: provider.capacity,
         providerActiveLeases: provider.leases.length,
       },
-      directRuns: directRunAudit.records,
+      directRuns: detailDirectRuns,
       diagnosticCoverage: {
         jobs: "queued_jobs_only",
         directRuns: directRunAudit.coverage,
+        detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs and direct runs; counts in summary cover all`,
       },
-      jobs: jobs.map((job) => ({
+      jobs: detailJobs.map((job) => ({
         jobId: job.jobId,
         pipelineId: job.parentJobId || "",
         status: job.status,
@@ -12512,8 +13038,9 @@ server.tool(
     dryRun: z.boolean().optional().describe("Check source paths and merge conflicts without applying the patch."),
     reviewed: z.boolean().optional().describe("Required true for non-dry-run integration after Codex reviews the patch preview."),
     previewReceipt: integrationPreviewReceiptSchema.optional().describe("Exact identity receipt returned by the reviewed dry run. Required for apply."),
-    cleanupAfterSuccess: z.boolean().optional().describe("Remove the source worktree and its local branch only after reviewed integration and validation succeed. Defaults to false."),
+    cleanupAfterSuccess: z.boolean().optional().describe("Remove the source worktree and its local branch only after reviewed integration and a passing validationCommand. Defaults to true for worktrees the bridge created; pass false to keep the source."),
     allowDirtyTarget: z.boolean().optional().describe("Allow integration into a target repo that already has changes. Defaults to false."),
+    acceptFlaggedSecretLines: z.boolean().optional().describe("Dry run only: issue the receipt even though the secret gate flagged patch lines, after you inspected those lines in the worktree and found no real credential. Defaults to false."),
   },
   async ({
     cwd = "",
@@ -12528,8 +13055,9 @@ server.tool(
     dryRun = false,
     reviewed = false,
     previewReceipt = null,
-    cleanupAfterSuccess = false,
+    cleanupAfterSuccess = undefined,
     allowDirtyTarget = false,
+    acceptFlaggedSecretLines = false,
   }) => {
     const started = nowMs();
     let pipeline = null;
@@ -12622,6 +13150,7 @@ server.tool(
         };
       }
     }
+    const effectiveCleanupAfterSuccess = cleanupAfterSuccess ?? isBridgeGeneratedWorktree(cwd || process.cwd(), worktreePath);
     const result = await integratePatchSerially({
       cwd: cwd || process.cwd(),
       worktreePath,
@@ -12637,7 +13166,8 @@ server.tool(
       reviewed,
       previewReceipt,
       allowDirtyTarget,
-      cleanupAfterSuccess,
+      acceptFlaggedSecretLines,
+      cleanupAfterSuccess: effectiveCleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
       pipelineId,
       pipelineJobId: pipelineItem?.jobId || "",
@@ -12695,7 +13225,7 @@ server.tool(
                       : "rejected",
                 errorType: result.errorType || "",
                 operationId: result.operationId || item.operationId || "",
-                cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && cleanupAfterSuccess && worktreePath),
+                cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && effectiveCleanupAfterSuccess && worktreePath),
                 sourceBaseCommit: result.sourceBaseCommit || "",
                 patchSha256: result.patchSha256 || "",
                 sourceStateSha256: result.sourceStateSha256 || "",
@@ -12774,6 +13304,7 @@ server.tool(
             `Shared files frozen: ${normalizeLockPathList(sharedFiles).length ? normalizeLockPathList(sharedFiles).join(", ") : "none specified"}`,
             result.sourceCleanup ? `Source worktree cleanup: ${result.sourceCleanup.cleanup}` : "Source worktree cleanup: not requested",
             result.sourceCleanup?.branchCleanup ? `Source branch cleanup: ${result.sourceCleanup.branchCleanup}` : null,
+            result.sourceCleanup?.reason ? `Source worktree cleanup reason: ${result.sourceCleanup.reason}` : null,
             result.cleanupWarning ? `Cleanup warning: ${result.cleanupWarning}` : null,
             formatValidationGateResult(result.validationGate),
           ].filter(Boolean).join("\n"),
@@ -13349,6 +13880,20 @@ async function verifySanitizedJobsBeforeDiscovery(jobs, phase) {
   return { ok: true, index: -1, verification: null, verifications };
 }
 
+// run_opencode_parallel is one synchronous tool call. Jobs beyond the provider slots wait
+// for one (up to their timeout) and then run their full timeout, so the call could take
+// twice the agent timeout and outlive Codex's tool_timeout_sec. Pipelines and queued jobs
+// take a lease per job and are not limited here. Dry runs take no slot.
+function parallelBatchCapacityError(jobs) {
+  const leasedJobCount = jobs.filter((job) => !job.dryRun).length;
+  if (leasedJobCount <= CONFIG.providerConcurrencyLimit) return null;
+  return {
+    error: `${leasedJobCount} parallel jobs exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
+    errorType: "parallel_batch_exceeds_provider_capacity",
+    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
+  };
+}
+
 function validateParallelWritePlan(jobs) {
   const lockPlans = jobs.map((job, index) => createLockPlan(job, index));
   if (jobs.length > CONFIG.parallelLimit) {
@@ -13358,7 +13903,6 @@ function validateParallelWritePlan(jobs) {
       lockPlans,
     };
   }
-
   const writePlans = lockPlans.filter((plan) => plan.lockType === "write");
   if (writePlans.length > 1) {
     for (const plan of writePlans) {
@@ -13973,6 +14517,7 @@ async function executeOpenCodeJob(requestedJob, {
     sharedFiles: lockPlan.sharedFiles,
     scopeContract: lockPlan.scopeContract,
     validationCommand: lockPlan.validationCommand,
+    pathSpellings: callerPathSpellings(requestedJob),
   };
 
   let prompt = buildCompactPrompt(resolution.requestedAgent, task, normalizedDelegation);
@@ -13987,6 +14532,7 @@ async function executeOpenCodeJob(requestedJob, {
   let worktreeDiff = null;
   let worktreeCleanup = null;
   let containmentQuarantined = false;
+  let containmentEvidence = "";
   const shouldAcquireLock = !dryRun;
   let executionCwd = cwd || process.cwd();
   let sanitizedBefore = null;
@@ -14227,6 +14773,7 @@ async function executeOpenCodeJob(requestedJob, {
     );
     containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
       || result?.terminationErrorType === "process_tree_termination_unconfirmed";
+    if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
     if (stopLockHeartbeat.signal?.aborted) {
       result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
       result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
@@ -14348,12 +14895,25 @@ async function executeOpenCodeJob(requestedJob, {
           rollbackResult.unresolvedFiles = normalizeLockPathList(rollbackResult.unresolvedFiles.concat(unrepresentableFiles));
         }
       }
-      worktreeCleanup = {
-        cleanup: "retained_for_review",
-        reason: result.errorType || validation.disallowedFiles.length
-          ? "failed or rejected write output is retained for diagnosis and recovery"
-          : "successful write output is retained until reviewed integration and a passing validation gate",
-      };
+      // A job that changed nothing (most failures: provider errors, early timeouts) leaves
+      // nothing to review or integrate. Keeping those worktrees filled the retained-worktree
+      // cap (worktree_capacity_exceeded) over a long run, and GC cannot run while any
+      // bridge is alive. Only a verified empty diff is removed.
+      const producedNothing = worktreeDiff
+        && !worktreeDiff.errorType
+        && !(worktreeDiff.changedFiles || []).length
+        && !(result.changedFiles || []).length
+        && !(result.unrepresentableFiles || []).length
+        && !validation.disallowedFiles.length;
+      worktreeCleanup = producedNothing
+        // A failed removal of an empty worktree is reported, never turned into a job failure.
+        ? { ...(await cleanupWorktree(worktree, "always", true)), errorType: undefined, reason: "the job changed no files, so there was nothing to retain" }
+        : {
+          cleanup: "retained_for_review",
+          reason: result.errorType || validation.disallowedFiles.length
+            ? "failed or rejected write output is retained for diagnosis and recovery"
+            : "successful write output is retained until reviewed integration and a passing validation gate",
+        };
       result.worktree = {
         path: worktree.path,
         branch: worktree.branch,
@@ -14501,7 +15061,7 @@ async function executeOpenCodeJob(requestedJob, {
     stopLockHeartbeat();
     if (acquiredLock) {
       if (containmentQuarantined) {
-        const quarantined = await quarantineHardLock(acquiredLock);
+        const quarantined = await quarantineHardLock(acquiredLock, containmentEvidence);
         if (!quarantined.ok) {
           logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
         }
@@ -14977,9 +15537,28 @@ function propagatePipelineTerminalInTransaction(db, childJobId, terminalStatus, 
   };
 }
 
+// Lease renewal bumps the row revision without touching record_json. A terminal commit
+// built from a copy taken before that bump used to lose its exact-revision compare, mark
+// ownership lost and drop the job from QUEUE_JOBS, so it stayed "running" forever while
+// the owning bridge lived. A bump that only a heartbeat made is not a competing write.
+function heartbeatOnlyQueueAdvance(current, record, attemptedRevision) {
+  if (!current
+    || current.owner_instance_id !== BRIDGE_INSTANCE_ID
+    || !record.ownerGeneration
+    || String(current.owner_generation || "") !== String(record.ownerGeneration)
+    || Number(current.revision || 0) <= attemptedRevision) return false;
+  try {
+    const summary = JSON.parse(current.record_json || "{}");
+    const summaryRevision = Number(summary.revision ?? -1);
+    return summaryRevision >= 0 && summaryRevision <= attemptedRevision && String(summary.status || "") === current.status;
+  } catch {
+    return false;
+  }
+}
+
 function persistTerminalQueueRecord(db, record) {
   const activeStatuses = "'running', 'validating', 'reviewing', 'testing'";
-  const attemptedRevision = Number(record.revision || 0);
+  let attemptedRevision = Number(record.revision || 0);
   const attemptedOwnerGeneration = String(record.ownerGeneration || "");
   const selectCurrent = db.prepare(`
     SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
@@ -14992,6 +15571,7 @@ function persistTerminalQueueRecord(db, record) {
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
     let current = selectCurrent.get(record.jobId);
+    if (heartbeatOnlyQueueAdvance(current, record, attemptedRevision)) attemptedRevision = Number(current.revision || 0);
     const terminalRecord = {
       ...record,
       ownerInstanceId: current?.owner_instance_id || record.ownerInstanceId || "",
@@ -18194,7 +18774,10 @@ server.tool(
   async ({ jobs }) => {
     jobs = await Promise.all(jobs.map((job) => normalizeJobCwd(job)));
     const toolStarted = nowMs();
-    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = validateParallelWritePlan(jobs);
+    const capacityError = parallelBatchCapacityError(jobs);
+    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = capacityError
+      ? { ...capacityError, lockPlans: [] }
+      : validateParallelWritePlan(jobs);
     if (writePlanError) {
       const requestedAgents = lockPlans?.map((plan) => plan.agent).filter(Boolean).join(", ") || "multiple";
       const lockMode = lockPlans?.map((plan) => plan.lockMode).filter(Boolean).join(", ") || "unknown";
@@ -18648,6 +19231,7 @@ server.tool(
           permissions: job.delegation?.permissions || (lockPlan.lockType === "write" ? "write allowed only inside Lock granted; bash ask" : "read-only; no edits; bash ask"),
           validationCommand: lockPlan.validationCommand,
           returnFormat: job.delegation?.returnFormat,
+          pathSpellings: callerPathSpellings(job),
         };
 
         let prompt = buildCompactPrompt(resolution.requestedAgent, job.task, delegation);
@@ -19344,23 +19928,55 @@ function failPersistedQueueStartupRecovery(db, row, failedRecord, encryptedDetai
   }
 }
 
-function ensureDeferredRecoveryTimer() {
+function deferredRecoveryBaseMs() {
+  return Math.max(1000, Math.min(Number(CONFIG.queueHeartbeatMs) || 5000, 5000));
+}
+
+// Busy passes (non-terminal work or a failed scan) keep the short interval; idle passes double it
+// up to CONFIG.deferredRecoveryIdleMaxMs so an idle bridge stops hammering the state databases.
+function nextDeferredRecoveryDelayMs(busy) {
+  const base = deferredRecoveryBaseMs();
+  if (busy) {
+    deferredRecoveryIdlePasses = 0;
+    return base;
+  }
+  deferredRecoveryIdlePasses = Math.min(deferredRecoveryIdlePasses + 1, 16);
+  return Math.min(base * 2 ** deferredRecoveryIdlePasses, Math.max(base, CONFIG.deferredRecoveryIdleMaxMs));
+}
+
+// Size + mtime of the database and its WAL: cheap enough to run on every pass instead of opening the file.
+async function stateDbFingerprint(dbPath) {
+  let fingerprint = "";
+  for (const file of [dbPath, `${dbPath}-wal`]) {
+    try {
+      const info = await stat(file);
+      fingerprint += `${info.size}:${Math.trunc(info.mtimeMs)};`;
+    } catch {
+      fingerprint += "-;";
+    }
+  }
+  return fingerprint;
+}
+
+function scheduleDeferredRecovery(delayMs) {
   if (process.argv.includes("--self-test") || deferredRecoveryTimer) return;
-  const intervalMs = Math.max(1000, Math.min(Number(CONFIG.queueHeartbeatMs) || 5000, 5000));
-  deferredRecoveryTimer = setInterval(() => {
+  deferredRecoveryTimer = setTimeout(() => {
+    deferredRecoveryTimer = null;
     void reconcileQueueStateAtStartup({ busyTimeoutMs: 250 }).catch((error) => {
       logEvent("warn", "state.deferred_recovery_failed", {
         errorType: error?.errorType || "deferred_recovery_failed",
       });
     });
-  }, intervalMs);
+  }, delayMs);
   deferredRecoveryTimer.unref?.();
 }
 
 async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   if (deferredRecoveryRunning) return;
   deferredRecoveryRunning = true;
+  let passBusy = true;
   try {
+  let anyPending = false;
   const queuePersistenceEnabled = effectiveQueueMode() === "sqlite";
   const stateRoot = effectiveBridgeStateDirectory();
   const candidates = [path.join(stateRoot, "bridge-state.sqlite")];
@@ -19379,12 +19995,26 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const dbPath of candidates) {
     if (!existsSync(dbPath)) continue;
+    const fingerprint = await stateDbFingerprint(dbPath);
+    const memo = DEFERRED_RECOVERY_DB_MEMO.get(dbPath);
+    if (memo && !memo.pending && memo.fingerprint === fingerprint) continue;
     let db = null;
+    let dbPending = false;
     try {
       db = new DatabaseSync(dbPath);
       db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, Number(busyTimeoutMs) || 250))};`);
       db.exec("PRAGMA foreign_keys = ON;");
       db.exec("PRAGMA synchronous = FULL;");
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='locks'").get()
+        && db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").get()) {
+        ensureTableColumn(db, "runs", "containment", "TEXT NOT NULL DEFAULT ''");
+        if (db.prepare("SELECT 1 FROM locks WHERE expires_at = ? LIMIT 1").get(Number.MAX_SAFE_INTEGER)) {
+          await reclaimProvenGoneLockQuarantines(db);
+          // A process dying does not touch the database file, so the unchanged-file memo
+          // would skip this database; keep it pending until its quarantine is gone.
+          if (db.prepare("SELECT 1 FROM locks WHERE expires_at = ? LIMIT 1").get(Number.MAX_SAFE_INTEGER)) dbPending = true;
+        }
+      }
       const hasJobs = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get();
       if (!hasJobs) continue;
       ensureQueueLeaseSchema(db);
@@ -19400,6 +20030,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         SELECT DISTINCT cwd FROM integration_operations
         WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
       `).all()) {
+        dbPending = true;
         if (row.cwd) integrationRecoveryCandidates.add(path.resolve(row.cwd));
       }
       const hasPipelines = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_pipelines'").get();
@@ -19433,6 +20064,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
           WHERE (status = 'cleanup_pending' AND cleanup_state = 'authorized')
              OR (status = 'cleanup_failed' AND cleanup_state = 'failed_retryable')
         `).all();
+        if (cleanupRows.length) dbPending = true;
         for (const pipelineRow of cleanupRows) {
           try {
             const snapshot = JSON.parse(pipelineRow.record_json || "{}");
@@ -19458,6 +20090,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
                 AND job.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'not_resumable')
             )
         `).all();
+        if (aggregateRows.length) dbPending = true;
         for (const pipelineRow of aggregateRows) {
           try {
             const snapshot = JSON.parse(pipelineRow.record_json || "{}");
@@ -19470,6 +20103,11 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       KNOWN_STATE_DB_PATHS.add(dbPath);
       if (!queuePersistenceEnabled) continue;
       reconcileStaleQueueRecords(db);
+      if (db.prepare(`
+        SELECT 1 FROM opencode_jobs
+        WHERE status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
+        LIMIT 1
+      `).get()) dbPending = true;
       const resumableRows = db.prepare(`
         SELECT job_id, status, revision, owner_instance_id, owner_generation, lease_expires_at,
                record_json, idempotency_key, request_encrypted
@@ -19524,9 +20162,12 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         }
       }
     } catch (error) {
+      dbPending = true;
       logEvent("warn", "queue.startup_recovery_failed", { dbPath, error: error.message || String(error) });
     } finally {
       if (db) closeDb(db);
+      DEFERRED_RECOVERY_DB_MEMO.set(dbPath, { fingerprint, pending: dbPending });
+      if (dbPending) anyPending = true;
     }
   }
   for (const blockedRoot of INTEGRATION_RECOVERY_BLOCKED_ROOTS) {
@@ -19587,9 +20228,10 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
     ensureQueueHeartbeatTimer();
     if (QUEUE_JOBS.size) scheduleQueue();
   }
-  ensureDeferredRecoveryTimer();
+  passBusy = anyPending;
   } finally {
     deferredRecoveryRunning = false;
+    scheduleDeferredRecovery(nextDeferredRecoveryDelayMs(passBusy));
   }
 }
 
@@ -19733,6 +20375,12 @@ export const __selfTest = {
     formatRejectedExecution,
     gitChangedFileSnapshot,
     gitChangedFiles,
+    groupIgnoredFiles,
+    binaryTextFilesInPatch,
+    processDescendants,
+    conflictsWithActiveLock,
+    providerKeyForMetadata,
+    parallelBatchCapacityError,
     hardLockTtlForPlan,
     hashExactTree,
     immutableReleasePluginModeError,
@@ -19797,6 +20445,11 @@ export const __selfTest = {
     reconcileStaleQueueRecords,
     recordMatchesProject,
     recoverIntegrationOperationsWhileLocked,
+    patchLikelySecretLines,
+    containmentStillPossible,
+    buildCompactPrompt,
+    callerPathSpellings,
+    redactLikelySecrets,
     redactSensitiveText,
     refreshPipelineRecord,
     releaseHardLock,
@@ -19910,6 +20563,8 @@ if (!BRIDGE_RUN_AS_MAIN) {
     throw new Error(`OpenCode external plugin policy rejected startup: ${startupPluginPolicy.error}`);
   }
   await reconcileQueueStateAtStartup();
+  void reclaimProvenGoneProviderQuarantines({ force: true });
+  void sweepStaleIndexScratchDirs();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

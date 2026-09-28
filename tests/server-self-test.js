@@ -93,6 +93,12 @@ const {
   formatRejectedExecution,
   gitChangedFileSnapshot,
   gitChangedFiles,
+  groupIgnoredFiles,
+  binaryTextFilesInPatch,
+  processDescendants,
+  conflictsWithActiveLock,
+  providerKeyForMetadata,
+  parallelBatchCapacityError,
   hardLockTtlForPlan,
   hashExactTree,
   immutableReleasePluginModeError,
@@ -157,6 +163,11 @@ const {
   reconcileStaleQueueRecords,
   recordMatchesProject,
   recoverIntegrationOperationsWhileLocked,
+  patchLikelySecretLines,
+  containmentStillPossible,
+  buildCompactPrompt,
+  callerPathSpellings,
+  redactLikelySecrets,
   redactSensitiveText,
   refreshPipelineRecord,
   releaseHardLock,
@@ -310,6 +321,95 @@ function runEventEvidenceSelfTests() {
     }
   }
   assert.equal(redactSensitiveText("github_pat_example ghp_short normal report"), "github_pat_example ghp_short normal report");
+  // The integration-preview gate must pass ordinary code and still stop real credentials.
+  const ordinaryCode = [
+    "+// Basic usage: build the lexer then parse tokens",
+    '+"""Basic implementation of the interpreter."""',
+    "+# convert basic types (int, float) to Python",
+    "+password = getpass.getpass()",
+    "+self.secret = secret",
+    "+cookie = request.cookies.get('session')",
+    "+access_token = response['access_token']",
+    '+PASSWORD_PROMPT = "Enter password: "',
+    "+tokens = tokenize(source)",
+    "+headers['Authorization'] = f'Bearer {token}'",
+    "-api_key = 'sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX1234' # removed lines are not new exposure",
+    "+// Basic auth/authorization flow",
+    "+# Basic src/components/Button setup",
+    '+password: "test-password"',
+    '+secret: "my-app-tls"',
+    "+.sk-spinner-rotating-plane-anim { color: red; }",
+    "+SECRET_KEY = os.environ['SECRET_KEY']",
+    "+API_KEY = settings.API_KEY",
+    "+max_tokens = 1024",
+    "+DATABASE_URL = 'postgres://postgres:postgres@localhost/db'",
+    // Lexer/compiler code from a C++ port.
+    "+token_type = TokenType.INT64",
+    "+tokens = lexer.tokenize_v2",
+    "+token_width = WIDTH_32BIT",
+    "+x = pk_index_for_primary_table_1",
+    '+invalid_token = "bad-token-123"',
+    "+token_url: https://oauth2.example.com/token",
+    "+# Test fixture: -----BEGIN RSA PRIVATE KEY----- marks a key block",
+    "+++counter;  // pre-increment added as content",
+  ].join("\n");
+  assert.deepEqual(patchLikelySecretLines(ordinaryCode), [], "Ordinary code must not block integration.");
+  // Agent answers keep ordinary code intact and still mask real credentials.
+  assert.equal(redactLikelySecrets("password = getpass.getpass()\n\"\"\"Basic usage: x\"\"\""), "password = getpass.getpass()\n\"\"\"Basic usage: x\"\"\"");
+  assert.doesNotMatch(redactLikelySecrets(`token = "ghp_${"B".repeat(36)}"`), /ghp_B{36}/);
+  assert.equal(redactSensitiveText("a\n-----BEGIN RSA PRIVATE KEY-----\nxyz\n-----END RSA PRIVATE KEY-----\nb"), "a\n[private key redacted]\nb");
+  // Redaction runs on the bridge event loop over whole agent answers; quadratic patterns
+  // froze it for seconds (queue heartbeats stop). These inputs took 3-30 s before the bounds.
+  for (const adversarial of ["a-".repeat(100000), "a.".repeat(100000), "sk-aaaaaaaaaaaaaa-".repeat(12000), "-----BEGIN PRIVATE KEY-----\n".repeat(8000), "eyJ-".repeat(50000), `${"+password=1a".repeat(16000)};`]) {
+    const redactStarted = Date.now();
+    redactLikelySecrets(adversarial);
+    redactSensitiveText(adversarial);
+    patchLikelySecretLines(adversarial);
+    assert.ok(Date.now() - redactStarted < 2000, `Redaction must stay linear: ${adversarial.slice(0, 20)} took ${Date.now() - redactStarted} ms`);
+  }
+  // Agents see the caller's path spelling even though lock plans compare case-folded.
+  const casedJob = { lockedPaths: ["src"], allowedEdits: ["src/Parser.py", "src\\Lexer.py"], scopeContract: { mode: "write", read: ["src"], write: ["src/Parser.py"] } };
+  const casedPrompt = buildCompactPrompt("builder", "Create the parser.", {
+    lockMode: "simple",
+    lockType: "write",
+    lockedPaths: ["src"],
+    allowedEdits: ["src/parser.py", "src/lexer.py"],
+    forbiddenEdits: [],
+    sharedFiles: [],
+    pathSpellings: callerPathSpellings(casedJob),
+  });
+  assert.match(casedPrompt, /Allowed edits:\nsrc\/Parser\.py\nsrc\/Lexer\.py\n/, casedPrompt);
+  assert.doesNotMatch(casedPrompt, /src\/parser\.py/);
+  assert.deepEqual(patchLikelySecretLines(`+ok\n+-----BEGIN RSA PRIVATE KEY-----\n+${"MIIEowIBAAKCAQEA".repeat(4)}`), [2], "A key header followed by a key body blocks integration.");
+  assert.deepEqual(patchLikelySecretLines(`+ok\n+++token = "${"ghp_"}${"C".repeat(36)}"`), [2], "An added line that starts with ++ is content, not a file header.");
+  assert.deepEqual(binaryTextFilesInPatch("diff --git a/src/a.py b/src/a.py\nnew file mode 100644\nGIT binary patch\nliteral 3\nKcmZ\n\ndiff --git a/img/logo.png b/img/logo.png\nGIT binary patch\nliteral 1\nx"), ["src/a.py"], "A source file sent as a binary hunk is unreadable review evidence; real binaries are fine.");
+  assert.deepEqual(binaryTextFilesInPatch("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x\n+y"), []);
+  assert.equal(providerKeyForMetadata({ provider: "opencode" }), `${CONFIG.providerConcurrencyKey}:opencode`, "Builders and reviewers use separate provider slots.");
+  assert.equal(providerKeyForMetadata({ provider: "google" }), `${CONFIG.providerConcurrencyKey}:google`);
+  assert.equal(providerKeyForMetadata(null), CONFIG.providerConcurrencyKey);
+  const keyAnswer = redactLikelySecrets(`see:\n-----BEGIN RSA PRIVATE KEY-----\n${"MIIEowIBAAKCAQEA".repeat(4)}\n-----END RSA PRIVATE KEY-----\ndone`);
+  assert.equal(keyAnswer, "see:\n[private key redacted]\ndone", "Agent answers lose the whole key block, not only its header.");
+  assert.equal(redactSensitiveText(`x\n-----BEGIN PRIVATE KEY-----\n${"QUJD".repeat(16)}\n${"REVG".repeat(16)}`), "x\n[private key redacted]", "A truncated key block loses its body lines too.");
+  for (const secretLine of [
+    "+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY # prod",
+    `+token = "${"ghp_"}${"A".repeat(36)}"`,
+    "+client = OpenAI(api_key='sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX1234')",
+    "+AWS_KEY = 'AKIAABCDEFGHIJKLMNOP'",
+    "+headers = {'Authorization': 'Bearer abcdefghijklmnopqrstuvwxyz0123456789'}",
+    "+auth = 'Basic dXNlcjpwYXNzd29yZDEyMw=='",
+    '+password = "hunter2-correct-horse"',
+    '+"client_secret": "a1b2c3d4e5f6g7h8"',
+    `+jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"`,
+    `+stripe.api_key = "${"sk_"}live_51HxYzAbCdEfGhIjKlMnOp"`,
+    "+DB_PASSWORD=S3cr3tPassw0rd",
+    "+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "+  password: hunter2hunter2",
+    `+//registry.npmjs.org/:_authToken=${"npm_"}${"a1B2".repeat(9)}`,
+    `+WEBHOOK = "https://hooks.slack.com/services/T0123ABCD/B0456EFGH/${"x1Y2z3".repeat(4)}"`,
+    "+url = 'postgres://app:pa55word@db.internal:5432/app'",
+  ]) {
+    assert.deepEqual(patchLikelySecretLines(`+ok line\n${secretLine}`), [2], `A real credential must block integration: ${secretLine}`);
+  }
   const multipart = inspect([text("draft", "commentary"), text("A"), text("A revised"), text("B", "final", "part-2")]);
   assert.equal(multipart.finalText, "A revised\n\nB");
   assert.equal(multipart.finalResponseDetected, true);
@@ -1158,6 +1258,12 @@ async function runSelfTests() {
   assert.equal(invalidDependencyRequestFixture.request, null);
   assert.match(invalidDependencyRequestFixture.error, /required schema/);
   assert.equal(classifyResultError({ exitCode: 0, assistantFinalResponseDetected: true, dependencyRequestError: invalidDependencyRequestFixture.error }), "dependency_request_invalid");
+  // The report template names a DEPENDENCY_REQUIRED section; saying there is none must not
+  // fail a finished job, while an unparseable real request still does.
+  for (const absent of ["DEPENDENCY_REQUIRED None.", "DEPENDENCY_REQUIRED - not required", "DEPENDENCY_REQUIRED — Not needed", "DEPENDENCY_REQUIRED: none", "DEPENDENCY_REQUIRED n/a"]) {
+    assert.deepEqual(parseDependencyRequest(`report\n${absent}\nend`), { request: null, error: "" }, absent);
+  }
+  assert.match(parseDependencyRequest("DEPENDENCY_REQUIRED numpy for arrays").error, /not valid single-line JSON/);
   assert.equal(detectsOpenCodeApiError('{"type":"error","message":"No payment method"}\n'), true);
   assert.equal(detectsOpenCodeApiError('{"type":"text","message":"ok"}\n'), false);
   assert.equal(detectsOpenCodeApiError("APIError: request failed\n"), true);
@@ -1286,6 +1392,23 @@ async function runSelfTests() {
     parseCommandLine('node "C:\\Program Files\\Example\\check.js" C:\\repo\\src'),
     ["node", "C:\\Program Files\\Example\\check.js", "C:\\repo\\src"]
   );
+  // A containment quarantine lifts only on proof: every recorded process gone.
+  const deadPid = 2 ** 30 + 12345;
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid, deadPid + 1], complete: true })), false);
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [process.pid], complete: true })), true, "A live recorded process keeps the quarantine.");
+  assert.equal(await containmentStillPossible("", process.pid), true, "A legacy record with a live owner keeps the quarantine.");
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: false }), process.pid), true, "An incomplete record needs more than dead supervisors.");
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: true, recordedAt: Date.now() })), true, "A fresh quarantine waits out the grace period for unrecorded children.");
+  // A quarantine records the whole live process tree, so a grandchild keeps it closed.
+  const treeParent = spawn(process.execPath, ["-e", "const c=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'ignore'});console.log(c.pid);setTimeout(()=>{},30000)"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  const grandchildPid = await new Promise((resolve) => treeParent.stdout.once("data", (chunk) => resolve(Number(String(chunk).trim()))));
+  try {
+    assert.ok((await processDescendants([treeParent.pid])).pids.includes(grandchildPid), "Quarantine evidence must include grandchildren.");
+  } finally {
+    treeParent.kill();
+    try { process.kill(grandchildPid); } catch { /* already gone */ }
+  }
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: true, recordedAt: Date.now() - 1000 * 60 * 11 })), false, "After the grace period dead recorded processes release it.");
   const validationVersionProbe = await runValidationGate({ command: "git --version", cwd: process.cwd() });
   assert.equal(validationVersionProbe.status, "passed", JSON.stringify(validationVersionProbe));
   assert.equal((await runValidationGate({ command: '"unterminated', cwd: process.cwd() })).errorType, "validation_command_parse_error");
@@ -1793,6 +1916,23 @@ async function runSelfTests() {
   assert.equal(nonOverlappingParallel.error, null);
   assert.deepEqual(nonOverlappingParallel.lockPlans[0].allowedEdits, ["apps/web"]);
   assert.equal(nonOverlappingParallel.lockPlans[0].lockMode, "strict");
+  // A reviewed integration may land while a worktree builder runs on other paths; readers of
+  // the checkout, manual/legacy writers, and in-place writers (worktree mode off) still block it.
+  const integrationLock = { lockType: "serial_integration", paths: ["docs"], origin: "internal" };
+  const jobWriter = { id: "w", lockType: "write", paths: ["src"], origin: "internal" };
+  assert.equal(conflictsWithActiveLock(integrationLock, jobWriter, "write"), null);
+  assert.ok(conflictsWithActiveLock(integrationLock, { ...jobWriter, paths: ["docs/a.md"] }, "write"), "Overlapping paths still conflict.");
+  assert.ok(conflictsWithActiveLock(integrationLock, { ...jobWriter, origin: "manual" }, "write"), "A manual writer edits the checkout.");
+  assert.ok(conflictsWithActiveLock(integrationLock, { ...jobWriter, origin: "legacy" }, "write"));
+  assert.ok(conflictsWithActiveLock(integrationLock, jobWriter, "off"), "In-place writers still serialize.");
+  assert.ok(conflictsWithActiveLock(integrationLock, { ...jobWriter, lockType: "read" }, "write"), "Readers of the checkout still block integration.");
+  assert.equal(conflictsWithActiveLock(jobWriter, { ...integrationLock, id: "i" }, "write"), null, "A worktree builder may start during a disjoint integration.");
+  const readJob = (task) => ({ agent: "reviewer", task, write: false, lockMode: "off" });
+  const overCapacity = parallelBatchCapacityError([readJob("a"), readJob("b"), readJob("c")]);
+  assert.equal(overCapacity.errorType, "parallel_batch_exceeds_provider_capacity", "A batch larger than the provider slots would run a hidden second wave.");
+  assert.match(overCapacity.suggestedFix, /enqueue_opencode_job/);
+  assert.equal(parallelBatchCapacityError([readJob("a"), readJob("b"), { ...readJob("c"), dryRun: true }]), null, "Dry runs take no provider slot.");
+  assert.equal(validateParallelWritePlan([readJob("a"), readJob("b"), readJob("c")]).error, null, "Plans for pipelines and queued jobs are not capped by provider slots.");
 
   const absoluteWebPath = path.join(process.cwd(), "apps", "web");
   const mixedAbsoluteRelativeParallel = validateParallelWritePlan([
@@ -3058,6 +3198,31 @@ async function runSelfTests() {
       assert.equal(currentOwnerTerminal.cancellationWon, false);
       assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(currentOwnerRecord.jobId).status, "completed");
 
+      // A lease renewal between copying the record and committing its terminal status only
+      // bumps the revision; the commit must still land instead of dropping the job.
+      const heartbeatRaceRecord = { ...currentOwnerRecord, jobId: "terminal-heartbeat-race-self-test", status: "running", finishedAt: "", ownerGeneration: "heartbeat-race-generation", heartbeatAt: recentCreatedAt, leaseExpiresAt: futureLease, revision: 0 };
+      insertLeased.run(
+        heartbeatRaceRecord.jobId, tempDir, heartbeatRaceRecord.status, heartbeatRaceRecord.agent, heartbeatRaceRecord.mode,
+        heartbeatRaceRecord.createdAt, heartbeatRaceRecord.startedAt, "", JSON.stringify(queueRecordSnapshot(heartbeatRaceRecord)),
+        heartbeatRaceRecord.ownerInstanceId, heartbeatRaceRecord.ownerProcessId, heartbeatRaceRecord.ownerGeneration,
+        heartbeatRaceRecord.heartbeatAt, heartbeatRaceRecord.heartbeatAt, heartbeatRaceRecord.leaseExpiresAt
+      );
+      staleQueueDb.prepare("UPDATE opencode_jobs SET revision = revision + 2 WHERE job_id = ?").run(heartbeatRaceRecord.jobId);
+      const heartbeatRaceTerminal = persistTerminalQueueRecord(staleQueueDb, { ...heartbeatRaceRecord, status: "completed", finishedAt: new Date().toISOString(), heartbeatAt: "", leaseExpiresAt: "" });
+      assert.equal(heartbeatRaceTerminal.persisted, true, "A heartbeat-only revision bump must not reject the terminal commit.");
+      assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(heartbeatRaceRecord.jobId).status, "completed");
+      // A real competing write (record_json moved on) still wins over a stale terminal copy.
+      const competingRecord = { ...heartbeatRaceRecord, jobId: "terminal-competing-write-self-test", ownerGeneration: "competing-generation" };
+      insertLeased.run(
+        competingRecord.jobId, tempDir, competingRecord.status, competingRecord.agent, competingRecord.mode,
+        competingRecord.createdAt, competingRecord.startedAt, "", JSON.stringify(queueRecordSnapshot({ ...competingRecord, revision: 3 })),
+        competingRecord.ownerInstanceId, competingRecord.ownerProcessId, competingRecord.ownerGeneration,
+        competingRecord.heartbeatAt, competingRecord.heartbeatAt, competingRecord.leaseExpiresAt
+      );
+      staleQueueDb.prepare("UPDATE opencode_jobs SET revision = 3 WHERE job_id = ?").run(competingRecord.jobId);
+      assert.equal(persistTerminalQueueRecord(staleQueueDb, { ...competingRecord, status: "completed", finishedAt: new Date().toISOString() }).persisted, false);
+      staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?)").run(heartbeatRaceRecord.jobId, competingRecord.jobId);
+
       const expiredOwnerRecord = {
         ...currentOwnerRecord,
         jobId: "terminal-expired-lease-self-test",
@@ -3559,6 +3724,36 @@ async function runSelfTests() {
     assert.equal((await runValidationGate({ command: "git diff --check", cwd: tempDir })).status, "failed");
     assert.equal((await runCommand("git", ["restore", "--staged", "--worktree", "--", "src/api.txt"], tempDir, 1000 * 15)).exitCode, 0);
     assert.deepEqual(await gitChangedFiles(tempDir), []);
+    // CRLF written by an agent on Windows is not trailing whitespace; real trailing blanks still fail.
+    await writeFile(path.join(tempDir, "src", "api.txt"), "crlf line one\r\ncrlf line two\r\n", "utf8");
+    const crlfGate = await runValidationGate({ command: "git diff --check", cwd: tempDir });
+    assert.equal(crlfGate.status, "passed", `CRLF line endings must pass git diff --check: ${JSON.stringify(crlfGate)}`);
+    await writeFile(path.join(tempDir, "src", "api.txt"), "crlf with blanks   \r\n", "utf8");
+    assert.equal((await runValidationGate({ command: "git diff --check", cwd: tempDir })).status, "failed", "Trailing blanks before CRLF must still fail.");
+    assert.equal((await runCommand("git", ["restore", "--worktree", "--", "src/api.txt"], tempDir, 1000 * 15)).exitCode, 0);
+    assert.deepEqual(await gitChangedFiles(tempDir), []);
+    // Ignored files inside build/cache directories group under that directory whatever their
+    // count; forbidden-looking files and other ignored files keep their own entry.
+    const excludePath = path.join(tempDir, ".git", "info", "exclude");
+    const excludeBefore = await readFile(excludePath, "utf8").catch(() => "");
+    await writeFile(excludePath, `${excludeBefore}\nbig-ignored-build/\n`, "utf8");
+    for (const name of ["a", "b", "c"]) {
+      await mkdir(path.join(tempDir, "big-ignored-build", "obj", name), { recursive: true });
+      await writeFile(path.join(tempDir, "big-ignored-build", "obj", name, "unit.o"), "o", "utf8");
+    }
+    const ignoredEntries = (await gitChangedFiles(tempDir, { includeIgnored: true })).filter((file) => file.startsWith("big-ignored-build"));
+    assert.equal(ignoredEntries.length, 3, `Ignored files are listed individually: ${JSON.stringify(ignoredEntries)}`);
+    const grouped = groupIgnoredFiles(["z.log", ...ignoredEntries, ".venv/lib/site.py", "src/pkg/__pycache__/m.pyc", "src/pkg/.env", "build/.env"], { cwd: tempDir });
+    assert.deepEqual([...grouped.keys()].sort(), [".venv/", "big-ignored-build/obj/", "build/.env", "src/pkg/.env", "src/pkg/__pycache__/", "z.log"]);
+    assert.equal(grouped.get("big-ignored-build/obj/").length, 3);
+    assert.equal(groupIgnoredFiles(ignoredEntries.slice(0, 1), { cwd: tempDir }).has("big-ignored-build/obj/"), true, "Grouping must not depend on how many ignored files exist.");
+    assert.throws(() => groupIgnoredFiles(["a.log", "b.log", "c.log"], { limit: 2 }), /ignored entries outside build\/cache directories/);
+    const buildSnapshotBefore = await gitChangedFileSnapshot(tempDir);
+    assert.equal(buildSnapshotBefore.has("big-ignored-build/obj/"), true);
+    await writeFile(path.join(tempDir, "big-ignored-build", "obj", "a", "new.o"), "o", "utf8");
+    assert.deepEqual(changedFilesBetween(buildSnapshotBefore, await gitChangedFileSnapshot(tempDir)), ["big-ignored-build/obj/"], "A file added inside an ignored build directory changes only its group.");
+    await rm(path.join(tempDir, "big-ignored-build"), { recursive: true, force: true });
+    await writeFile(excludePath, excludeBefore, "utf8");
 
     selfTestProgress("pipeline persistence");
     const previousPipelinePersistenceMode = selfTestHooks.queueModeOverride;

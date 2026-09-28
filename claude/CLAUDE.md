@@ -6,7 +6,7 @@ The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded
 1. Tiny or obvious change: do it yourself.
 2. Second opinion, exploration, review, or a plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester).
 3. One bounded fix or feature: one `builder` or `debugger` via `run_opencode_agent` with a write Scope Contract.
-4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
+4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most 2 real (non-dry-run) jobs per call, the provider slot limit; queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
 Do not call the OpenCode orchestrator unless the user names it. Do not call `acquire_agent_lock`/`release_agent_lock`; the bridge manages locks.
 
 ## Job shape
@@ -21,15 +21,16 @@ Write:
 
 ## Review and integrate
 1. Read the agent report, the changed-file list, and the diff. Reject scope violations or unrelated edits.
-2. Preview with `integrate_opencode_worktree` (`dryRun: true`), show the user the patch, then apply with `reviewed: true` and the exact `previewReceipt`.
+2. Preview with `integrate_opencode_worktree` (`dryRun: true`), show the user the patch, then apply with `reviewed: true`, the exact `previewReceipt`, and `validationCommand: "git diff --check"`. A passing validation lets the bridge delete the used worktree and branch; without it every worktree is kept and they pile up.
 3. After integration, run the project's checks in the real checkout.
 4. `DEPENDENCY_REQUIRED` in a report means: add the dependency yourself, commit, retry the job.
 Never report success based only on an agent's own claim.
 
 ## Troubleshooting
 - Start with `get_opencode_bridge_status`; use `diagnose_opencode_bridge` when something looks stuck.
-- `dirty_worktree_requires_checkpoint`: commit or revert the files the job needs, then retry.
+- `dirty_worktree_requires_checkpoint`: the job's files have uncommitted changes. If they are yours (a finished integration), commit them and retry. If another client (Codex) owns them, wait for it to commit; never commit or revert another client's work. Use `allowDirtyTarget: true` only for dirt on paths the patch does not touch.
 - Codex may be using the same bridge on the same repo at the same time; a lock conflict message means wait or pick disjoint paths.
+- `integration_preview_contains_sensitive_text`: open the flagged patch lines in the worktree; if none is a real credential, dry-run again with `acceptFlaggedSecretLines: true`.
 
 ## opencode-delegate skill vs. the `opencode` MCP bridge
 Two ways exist to hand work to OpenCode; pick by isolation need:

@@ -1,7 +1,7 @@
 ---
 description: Plans implementation work by inspecting relevant files, identifying risks, affected areas, and verification steps before any code changes.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0.1
 permission:
@@ -35,7 +35,7 @@ You are a senior implementation planner.
 
 ## Model Policy
 
-- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured model for this global agent.
+- Use `opencode/muse-spark-1.3-contributor-free` with variant `high` as the configured model for this global agent.
 - If a different model is explicitly configured later, do not silently switch away from it.
 - Do not silently switch models.
 - If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
