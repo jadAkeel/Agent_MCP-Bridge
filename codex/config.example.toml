@@ -15,18 +15,31 @@ service_tier = "default"
 command = "node"
 args = ["C:\\path\\to\\codex-opencode-mcp\\server.js"]
 startup_timeout_sec = 120
-# Must cover the provider-slot wait (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS, 20 min) + the longest
-# agent timeout (contractor 20 min here) + validation (5 min) + 5 min margin = 50 min.
-tool_timeout_sec = 3000
+# Must cover the longest job the bridge allows, or Codex abandons a job that is still running:
+#   provider-slot wait (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS, default 20 min)
+# + longest agent timeout (builder 45 min below; contractor 20 min, other defaults are shorter)
+# + validation (CODEX_OPENCODE_VALIDATION_TIMEOUT_MS, 15 min below)
+# + 5 min margin
+# = 85 min = 5100 s, the operator's current value. With every timeout at its built-in default
+# (contractor 20 min, validation 5 min) the bound is 50 min = 3000 s. Raise this value whenever you
+# raise one of those timeouts. `npm run release:activate -- --sync-clients` computes the bound from
+# the env below and warns when this value is too low. A job's own timeoutMs is not counted.
+tool_timeout_sec = 5100
 
 [mcp_servers.opencode.env]
 CODEX_OPENCODE_WORKTREE_MODE = "write"
 CODEX_OPENCODE_WORKTREE_ROOT = "global"
-# Executed writer worktrees are always retained. This legacy setting applies only
-# to empty/pre-execution cleanup paths; reviewed integration owns deletion.
+# Legacy: the bridge validates this and shows it in get_opencode_bridge_status, but it changes no
+# behaviour. An executed writer worktree is kept until reviewed integration, which removes a
+# bridge-created worktree by default (integrate_opencode_worktree cleanupAfterSuccess, default true);
+# a job that changed no files has its worktree removed at once.
 CODEX_OPENCODE_WORKTREE_CLEANUP = "never"
 # Must be strictly positive; the bridge rejects 0 at startup because no durable archive mode exists.
 CODEX_OPENCODE_QUEUE_RETENTION_DAYS = "30"
+# Example timeouts behind the 5100 s client bound above (built-in defaults: builder 15 min,
+# validation 5 min).
+CODEX_OPENCODE_BUILDER_TIMEOUT_MS = "2700000"
+CODEX_OPENCODE_VALIDATION_TIMEOUT_MS = "900000"
 CODEX_OPENCODE_PROVIDER_LEASE_MS = "240000"
 CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS = "20000"
 CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS = "24000"
@@ -38,7 +51,9 @@ CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE = "false"
 # CODEX_OPENCODE_MODEL_ALLOWLIST = "google/antigravity-gemini-3.8-flash@high,opencode/gpt-5.3-codex"
 # strict rejects any uncommitted source change before a writer worktree; unrelated_ok tolerates changes outside the job scope.
 CODEX_OPENCODE_SOURCE_DIRT_POLICY = "strict"
-CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS = "12000"
+# Longest exact patch a dry run may preview and issue a review receipt for. 400000 is the operator's
+# current value; the built-in default is 12000. previewMode "stat" is not subject to the cap.
+CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS = "400000"
 CODEX_OPENCODE_MAX_SNAPSHOT_FILES = "25000"
 CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES = "20000"
 CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES = "1048576"
@@ -56,7 +71,10 @@ CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS = "1200000"
 CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES = "2"
 CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS = "1000"
 CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS = "480000"
-CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2"
+# Model calls allowed at once across all sessions (per provider, or per account pool when
+# CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY is set, as below). 4 is the operator's current value;
+# the built-in default is 2.
+CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "4"
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY = "reviewed-provider-account-pool"
 CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git"
 # Repository policy authority is disabled until the canonical repository root,

@@ -35,7 +35,7 @@ You talk to **Codex** as you normally would. When a task would benefit from help
 
 The bridge sits between the two. Its job is to make that hand-off **safe, predictable and tidy**:
 
-- **Scope.** An agent can only touch the files it was explicitly allowed to touch.
+- **Scope.** An agent's edits are checked against the files it was explicitly allowed to edit; anything else is rejected.
 - **Isolation.** Agents that write code work in a separate copy of the project (a *worktree*), never in your real checkout.
 - **Review.** Nothing lands in your project until Codex shows you the exact change and you approve it.
 - **Parallelism.** Several agents can work at once without stepping on each other.
@@ -66,7 +66,7 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 ```text
  You ──► Codex (orchestrator)
            │  1. understands the task, picks the smallest fitting agent
-           │  2. writes a Scope Contract (which files may be read / edited)
+           │  2. writes a Scope Contract (which files to read, which may be edited)
            ▼
         MCP bridge
            │  3. validates the contract (validate_delegation_plan)
@@ -96,7 +96,7 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 ## 4. The safety model
 
 ```text
-Scope Contract           = the law      (what may be touched)
+Scope Contract           = the law      (what may be edited)
 Queue                    = scheduler    (who runs when)
 Worktree                 = isolation    (writers never touch your checkout)
 Lock                     = collision guard (no two jobs on the same files at once)
@@ -107,6 +107,7 @@ Codex                    = final authority (only Codex integrates, only after re
 What this means in practice:
 
 - An agent that edits a file it was not allowed to edit gets its whole result **rejected**.
+- The contract's `read` list only **guides** the agent. It is printed in the agent's prompt and used to decide whether a reader overlaps a writer, but it does not stop an agent from reading other files in the project or worktree. Only edits are enforced. For real read isolation, use a sanitized workspace (`sanitizedWorkspace`, see [REFERENCE.md](REFERENCE.md#sanitized-workspaces)): the agent then runs in a folder that holds only the manifest-pinned files. Even that is a file-level check, not an operating-system sandbox.
 - Read-only roles (`planner`, `architect`, `reviewer`, `tester`, `explore`) **cannot edit**, and cannot launch nested agents.
 - Secrets (`.env`, `*.pem`, `*.key`, `secrets/**`) are forbidden by default.
 - Package manifests, lockfiles, schemas and migrations are **serial-only**, so two agents never change them at the same time.
@@ -266,11 +267,11 @@ Writer output is **never merged automatically**. Integration happens in two step
    - its SHA-256;
    - the source and target identity;
    - a single-use, expiring **preview receipt**.
-2. **Apply.** `integrate_opencode_worktree(reviewed: true, previewReceipt: <receipt>, validationCommand: "git diff --check")` (`cleanupAfterSuccess` defaults to true):
+2. **Apply.** `integrate_opencode_worktree(reviewed: true, previewReceipt: <receipt>, validationCommand: "git diff --check")`:
    - applies exactly that patch;
    - runs the validation command;
    - **rolls back** if validation fails;
-   - removes the worktree only after a passing check.
+   - removes the worktree only after a passing check. This cleanup is on by default for worktrees the bridge created (`cleanupAfterSuccess` defaults to true). Pass `cleanupAfterSuccess: false` to keep the worktree.
 
 Safety checks during integration:
 
@@ -333,7 +334,7 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `worktree_created_dirty` | A new worktree was not clean. It is kept as evidence. | Run `npm run gc` and inspect it. |
 | `git_repository_config_unsafe` | The repository has git config the bridge refuses to run with, such as filters or hooks. | Remove the unsafe local git config. |
 | `Filename too long` | Windows path limit. | Already handled: the bridge forces `core.longpaths=true`. If you see it, you are on an old release. |
-| Tool call times out after 60 s | The Codex MCP entry is missing its timeouts. | Set `startup_timeout_sec = 120` and `tool_timeout_sec = 1500`. |
+| Tool call times out after 60 s, or Codex gives up on a long job that is still running | The Codex MCP entry is missing its timeouts, or `tool_timeout_sec` is below the longest job the bridge allows. | Set `startup_timeout_sec = 120` and `tool_timeout_sec` to the bound in [section 14](#timeouts): `3000` with the built-in timeouts. `npm run release:activate -- --sync-clients` prints the exact value. |
 | Codex acts like the old bridge | The session started before an update. | Restart Codex. |
 | Stuck job / lock | A crash left state behind. | Run `npm run doctor -- --cwd <project>`, then ask Codex to run `diagnose_opencode_bridge`. |
 
@@ -444,15 +445,27 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git,npm,node,pnpm,yarn,python,pytest` | Programs a job's `validationCommand` may start. The built-in default is `git` only. |
 | `CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS` | default (30 min) | Reuses agent and plugin checks between jobs. Any change to an agent, skill, or config file resets it. `0` turns it off. |
 | `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | release hash | Pins the exact bridge build. It must match the release. |
-| `startup_timeout_sec` / `tool_timeout_sec` | `120` / `1500` | Needed so long agent jobs are not cut off at 60 s. |
+| `startup_timeout_sec` / `tool_timeout_sec` | `120` / `3000` | Needed so long agent jobs are not cut off at 60 s. `3000` fits the built-in timeouts; a 45 min builder with a 15 min validation needs `5100`, which is the operator's current value. See [Timeouts](#timeouts). |
 
 ### Timeouts
 
 | Variable | Default |
 | --- | --- |
 | `CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS` | 3 min |
+| `CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS` | 10 min |
 | `CODEX_OPENCODE_BUILDER_TIMEOUT_MS` | 15 min |
 | `CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS` | 6 min per attempt |
+| `CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS` | 20 min |
+| `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | 5 min |
+| `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` | 20 min (how long a job may wait for a provider slot) |
+
+The Codex `tool_timeout_sec` must cover the longest job the bridge allows. Codex gives up on a tool call after that time, and the job's result is lost even if the job is still running. The bound is:
+
+```text
+tool_timeout_sec >= provider slot wait + longest agent timeout + validation timeout + 5 min margin
+```
+
+With the built-in timeouts (20 + 20 for the contractor + 5 + 5 minutes) that is `3000` s. With a 45 min builder and a 15 min validation (20 + 45 + 15 + 5 minutes) it is `5100` s, the operator's current value. When you raise one of the timeouts above, raise `tool_timeout_sec` too. `npm run release:activate -- --sync-clients` computes the bound from your configured timeouts and warns when `tool_timeout_sec` is lower. It does not count a job that asks for its own longer `timeoutMs`.
 
 The complete variable table is in [REFERENCE.md](REFERENCE.md#configuration).
 
@@ -513,7 +526,7 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 | **MCP** | Model Context Protocol. The standard way Codex talks to external tools such as this bridge. |
 | **Orchestrator** | The one agent that plans, delegates and integrates. Here that is always Codex. |
 | **Agent / role** | An OpenCode profile with a fixed job and permissions, such as a builder or a reviewer. |
-| **Scope Contract** | The explicit list of files a job may read and edit, plus forbidden paths and the validation command. |
+| **Scope Contract** | The explicit list of files a job should read (guidance only) and may edit (enforced), plus forbidden paths and the validation command. |
 | **Worktree** | A separate git checkout of your project where a writer agent works. Your real folder is untouched. |
 | **Lock** | A short-lived claim on paths so two jobs do not collide. |
 | **Queue** | Durable job scheduler that survives restarts. |
