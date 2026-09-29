@@ -7,11 +7,17 @@
 // deletes runtime files that are absent from the source tree (for example the
 // three old orchestrator profile names). Credential files are never touched
 // because only *.md agent files and skill trees are considered.
+//
+// The source defaults to the opencode/ folder next to the server.js the client config
+// pins (the tree the bridge actually runs), not to this script's own tree; a warning names
+// the difference. Each file is copied to a temporary file in the target directory and
+// renamed into place, so a concurrent run (both clients' bridges sync at startup) or a
+// reader never sees a half-written profile.
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +31,7 @@ requireSelfTestRun(import.meta.url);
 function parseArguments(argv) {
   const options = {
     configPath: path.join(homedir(), ".codex", "config.toml"),
-    source: path.join(PROJECT_ROOT, "opencode"),
+    source: "",
     agentDir: "",
     skillDir: "",
     apply: false,
@@ -48,7 +54,7 @@ function parseArguments(argv) {
     else if (argument === "--json") options.json = true;
     else if (argument === "--self-test") options.selfTest = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node bin/sync-managed-runtime.js [--config <config.toml>] [--source <release-or-repo>/opencode] [--agent-dir <dir>] [--skill-dir <dir>] [--apply] [--remove-stale] [--json]\n");
+      process.stdout.write("Usage: node bin/sync-managed-runtime.js [--config <config.toml>] [--source <release-or-repo>/opencode (default: next to the pinned server.js)] [--agent-dir <dir>] [--skill-dir <dir>] [--apply] [--remove-stale] [--json]\n");
       process.exit(0);
     } else throw new Error(`Unknown argument: ${argument}`);
   }
@@ -92,6 +98,42 @@ async function planTree({ sourceRoot, targetRoot, filter, label }) {
   return { label, sourceRoot, targetRoot, sourceCount: source.size, targetCount: target.size, actions };
 }
 
+function comparablePath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Windows refuses to replace a file another process has open for a moment (EPERM, EBUSY,
+// EACCES): OpenCode reading a profile, or the other client's bridge renaming the same file.
+async function renameWithRetry(from, to, { renameFile = rename, delays = [50, 100, 250, 500, 1_000] } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameFile(from, to);
+      return;
+    } catch (error) {
+      if (!["EPERM", "EBUSY", "EACCES"].includes(error?.code) || attempt >= delays.length) throw error;
+      await delay(delays[attempt]);
+    }
+  }
+}
+
+// Copies to a temporary file in the target's own directory, then renames it into place:
+// the target is always either the old or the new complete file.
+async function copyFileAtomically(sourcePath, targetPath, renameOptions = {}) {
+  const staged = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.sync-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
+  try {
+    await copyFile(sourcePath, staged);
+    await renameWithRetry(staged, targetPath, renameOptions);
+  } catch (error) {
+    await rm(staged, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function applyPlan(plan, options) {
   const results = [];
   for (const item of plan.actions) {
@@ -100,7 +142,7 @@ async function applyPlan(plan, options) {
     try {
       if (item.action === "add" || item.action === "update") {
         await mkdir(path.dirname(targetPath), { recursive: true });
-        await copyFile(sourcePath, targetPath);
+        await copyFileAtomically(sourcePath, targetPath, options.renameOptions || {});
         results.push({ ...item, ok: (await sha256File(targetPath)) === (await sha256File(sourcePath)) });
       } else if (item.action === "stale" && options.removeStale) {
         await rm(targetPath, { force: true });
@@ -113,9 +155,9 @@ async function applyPlan(plan, options) {
   return results;
 }
 
-async function resolveTargets(options) {
+function resolveTargets(options, entry, entryError) {
   if (options.agentDir && options.skillDir) return { agentDir: options.agentDir, skillDir: options.skillDir, from: "arguments" };
-  const entry = await loadMcpEntry(options.configPath);
+  if (!entry) throw entryError || new Error("No MCP entry to read CODEX_OPENCODE_AGENT_DIR and CODEX_OPENCODE_SKILL_DIR from.");
   const agentDir = options.agentDir || String(entry.env.CODEX_OPENCODE_AGENT_DIR || "").trim();
   const skillDir = options.skillDir || String(entry.env.CODEX_OPENCODE_SKILL_DIR || "").trim();
   if (!agentDir || !skillDir) {
@@ -124,17 +166,49 @@ async function resolveTargets(options) {
   return { agentDir, skillDir, from: options.configPath };
 }
 
+// --source wins; otherwise the opencode/ folder beside the server.js the client config pins,
+// falling back (with a warning) to this script's own tree when that cannot be resolved.
+function resolveSource(options, entry) {
+  const scriptSource = path.join(PROJECT_ROOT, "opencode");
+  if (options.source) return { source: options.source, from: "--source", warnings: [] };
+  const serverPath = String(entry?.args?.[0] || "").trim();
+  if (serverPath && path.isAbsolute(serverPath)) {
+    const pinnedSource = path.join(path.dirname(serverPath), "opencode");
+    if (existsSync(pinnedSource)) {
+      const warnings = comparablePath(pinnedSource) === comparablePath(scriptSource)
+        ? []
+        : [`Syncing from the pinned bridge's tree ${pinnedSource}, not from this script's tree ${scriptSource}; pass --source to choose explicitly.`];
+      return { source: pinnedSource, from: `pinned server.js (${serverPath})`, warnings };
+    }
+  }
+  return {
+    source: scriptSource,
+    from: "this script's tree",
+    warnings: [`Could not resolve the pinned server.js from ${options.configPath || "the client config"}; syncing from this script's tree ${scriptSource}.`],
+  };
+}
+
 async function runSync(options) {
-  const targets = await resolveTargets(options);
+  let entry = null;
+  let entryError = null;
+  if (!options.source || !(options.agentDir && options.skillDir)) {
+    try {
+      entry = await loadMcpEntry(options.configPath);
+    } catch (error) {
+      entryError = error;
+    }
+  }
+  const targets = resolveTargets(options, entry, entryError);
+  const { source, from: sourceFrom, warnings } = resolveSource(options, entry);
   const plans = [
     await planTree({
-      sourceRoot: path.join(options.source, "agents"),
+      sourceRoot: path.join(source, "agents"),
       targetRoot: targets.agentDir,
       filter: (relative) => !relative.includes("/") && relative.endsWith(".md"),
       label: "agents",
     }),
     await planTree({
-      sourceRoot: path.join(options.source, "skills"),
+      sourceRoot: path.join(source, "skills"),
       targetRoot: targets.skillDir,
       filter: (relative) => relative.endsWith("/SKILL.md") || relative.split("/").length > 1,
       label: "skills",
@@ -144,11 +218,16 @@ async function runSync(options) {
   if (options.apply) {
     for (const plan of plans) applied.push(...await applyPlan(plan, options));
   }
-  return { source: options.source, targets, plans, applied };
+  return { source, sourceFrom, warnings, targets, plans, applied };
 }
 
 function formatReport(report, options) {
-  const lines = [`Managed runtime sync (${options.apply ? "apply" : "dry-run"})`, `Source: ${report.source}`, `Targets from: ${report.targets.from}`];
+  const lines = [
+    `Managed runtime sync (${options.apply ? "apply" : "dry-run"})`,
+    `Source: ${report.source} (${report.sourceFrom})`,
+    `Targets from: ${report.targets.from}`,
+    ...(report.warnings || []).map((warning) => `WARNING: ${warning}`),
+  ];
   for (const plan of report.plans) {
     lines.push("");
     lines.push(`[${plan.label}] ${plan.targetRoot} (source ${plan.sourceCount} file(s), target ${plan.targetCount} file(s))`);
@@ -214,6 +293,48 @@ async function selfTest() {
     assert.equal(removed.applied.every((item) => item.ok), true);
     const final = await runSync(base);
     assert.equal(final.plans.every((plan) => plan.actions.length === 0), true);
+
+    // The default source is the tree beside the server.js the client config pins, not the
+    // script's own tree.
+    const pinnedTree = path.join(fixture, "pinned-release");
+    await mkdir(path.join(pinnedTree, "opencode", "agents"), { recursive: true });
+    await mkdir(path.join(pinnedTree, "opencode", "skills"), { recursive: true });
+    await writeFile(path.join(pinnedTree, "server.js"), "// pinned\n", "utf8");
+    await writeFile(path.join(pinnedTree, "opencode", "agents", "pinned-only.md"), "pinned\n", "utf8");
+    const configPath = path.join(fixture, "config.toml");
+    await writeFile(configPath, [
+      "[mcp_servers.opencode]",
+      "command = \"node\"",
+      `args = [${JSON.stringify(path.join(pinnedTree, "server.js"))}]`,
+      "",
+      "[mcp_servers.opencode.env]",
+      `CODEX_OPENCODE_AGENT_DIR = ${JSON.stringify(agentDir)}`,
+      `CODEX_OPENCODE_SKILL_DIR = ${JSON.stringify(skillDir)}`,
+      "",
+    ].join("\n"), "utf8");
+    const pinned = await runSync(parseArguments(["--config", configPath]));
+    assert.equal(pinned.source, path.join(pinnedTree, "opencode"));
+    assert.match(pinned.warnings.join("\n"), /not from this script's tree/);
+    assert.equal(pinned.targets.agentDir, agentDir);
+    assert.equal(pinned.plans[0].actions.find((item) => item.relative === "pinned-only.md")?.action, "add");
+    const unresolved = await runSync({ ...base, source: "", configPath: path.join(fixture, "missing.toml") });
+    assert.equal(unresolved.source, path.join(PROJECT_ROOT, "opencode"));
+    assert.match(unresolved.warnings.join("\n"), /Could not resolve the pinned server\.js/);
+
+    // Copies go through a temporary file and a rename: a busy rename is retried, a failed one
+    // leaves the old complete file and no temporary file behind.
+    await writeFile(path.join(source, "agents", "changed.md"), "v3\n", "utf8");
+    let renames = 0;
+    const flaky = { renameFile: async (from, to) => { renames += 1; if (renames === 1) throw Object.assign(new Error("busy"), { code: "EBUSY" }); await rename(from, to); }, delays: [1, 1] };
+    const retried = await runSync({ ...base, apply: true, renameOptions: flaky });
+    assert.equal(retried.applied.every((item) => item.ok), true, JSON.stringify(retried.applied));
+    assert.equal(await readFile(path.join(agentDir, "changed.md"), "utf8"), "v3\n");
+    await writeFile(path.join(source, "agents", "changed.md"), "v4\n", "utf8");
+    const denied = { renameFile: async () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); }, delays: [1] };
+    const failed = await runSync({ ...base, apply: true, renameOptions: denied });
+    assert.equal(failed.applied.some((item) => !item.ok && /denied/.test(item.error)), true);
+    assert.equal(await readFile(path.join(agentDir, "changed.md"), "utf8"), "v3\n", "a failed replace keeps the previous complete file");
+    assert.deepEqual((await readdir(agentDir)).filter((name) => name.endsWith(".tmp")), [], "no temporary file is left behind");
     process.stdout.write("Managed runtime sync self-test passed.\n");
     selfTestPassed("sync-managed-runtime");
   } finally {
