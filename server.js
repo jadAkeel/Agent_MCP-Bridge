@@ -212,6 +212,9 @@ const CONFIG = Object.freeze({
   providerConcurrencyLimit: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2),
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
+  // How long a job may wait for a provider slot. The wait is not part of the agent's run
+  // timeout: the run clock starts when the slot is granted.
+  providerWaitMaxMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS", 1000 * 60 * 20),
   providerLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_MS", 1000 * 60 * 4),
   providerHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS", 1000 * 20),
   providerConcurrencyKey: String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "opencode-default-account").trim() || "opencode-default-account",
@@ -2308,6 +2311,8 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
   const deadlineAt = started + waitBudgetMs;
+  let observedHolders = 0;
+  let observedCapacity = CONFIG.providerConcurrencyLimit;
   while (Date.now() < deadlineAt) {
     await reclaimProvenGoneProviderQuarantines();
     if (signal?.aborted) {
@@ -2338,6 +2343,8 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
           db.prepare("UPDATE provider_capacities SET capacity = ?, updated_at = ? WHERE provider_key = ?").run(configuredCapacity, now, providerKey);
         }
       }
+      observedHolders = active;
+      observedCapacity = effectiveCapacity;
       if (active < effectiveCapacity) {
         const lease = {
           id: `${BRIDGE_INSTANCE_ID}-${randomBytes(6).toString("hex")}`,
@@ -2356,7 +2363,7 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
         return { ok: false, errorType: "agent_cancelled", error: error.message || String(error) };
       }
       if (error?.code === "PROVIDER_CONCURRENCY_TIMEOUT") {
-        return { ok: false, errorType: "provider_concurrency_timeout", error: error.message || String(error) };
+        return { ok: false, errorType: "provider_slot_wait_timeout", error: error.message || String(error), waitedMs: Date.now() - started, holders: observedHolders, capacity: observedCapacity };
       }
       if (!/database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(error.message || String(error))) {
         return { ok: false, errorType: "provider_concurrency_failed", error: error.message || String(error) };
@@ -2373,7 +2380,14 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       return { ok: false, errorType: "agent_cancelled", error: "Cancelled while waiting for provider capacity." };
     }
   }
-  return { ok: false, errorType: "provider_concurrency_timeout", error: "Timed out waiting for the operator-configured provider/account concurrency limit." };
+  return {
+    ok: false,
+    errorType: "provider_slot_wait_timeout",
+    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs}). The agent was not started.`,
+    waitedMs: Date.now() - started,
+    holders: observedHolders,
+    capacity: observedCapacity,
+  };
 }
 
 function providerLeaseOwnershipLossError(detail = "Durable provider-capacity ownership could not be renewed before expiry.") {
@@ -2439,10 +2453,19 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
         lease.expiresAt = expiresAt;
         lastConfirmedExpiresAt = expiresAt;
         scheduleFence();
-        return true;
+        return { ok: true, deadlineAt: lastConfirmedExpiresAt - expiryGuardMs };
       } catch (error) {
+        // A thrown error (SQLITE_BUSY, a transient open failure) proves nothing about
+        // ownership; the last confirmed expiry still holds. Returning false here killed the
+        // running agent on one busy database read. Fail only once that deadline has passed
+        // (the fence timer enforces it too) or when the renewal changed no row.
         logEvent("warn", "provider.lease_heartbeat_failed", { leaseId: lease.id, error: error.message || String(error) });
-        return false;
+        const deadlineAt = lastConfirmedExpiresAt - expiryGuardMs;
+        if (deadlineAt <= Date.now()) {
+          loseOwnership("The provider-capacity lease could not be renewed before its confirmed expiry.");
+          return false;
+        }
+        return { ok: true, deadlineAt, renewalFailed: true };
       } finally {
         if (db) closeDb(db);
       }
@@ -2507,16 +2530,41 @@ async function sweepStaleIndexScratchDirs(maxAgeMs = 1000 * 60 * 60 * 24) {
   return removed;
 }
 
-async function processDescendants(rootPids) {
+// One process-table read: pid, parent pid and creation time. The creation time tells a
+// recorded process from a later one that reused its PID (Windows reuses PIDs quickly), which
+// otherwise held a containment quarantine indefinitely or attributed a stranger's process.
+async function processTable() {
   const listed = process.platform === "win32"
     ? await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
-    : await runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20);
-  if (listed.exitCode !== 0) return { ok: false, pids: [] };
-  const children = new Map();
+      "Get-CimInstance Win32_Process | ForEach-Object { $c = if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { '' }; \"$($_.ProcessId),$($_.ParentProcessId),$c\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
+    : await runCommand("ps", ["-A", "-o", "pid=,ppid=,lstart="], BRIDGE_RUNTIME_DIR, 1000 * 20, { ...process.env, LC_ALL: "C" })
+      .then((result) => (result.exitCode === 0
+        ? result
+        // A ps without lstart (BusyBox) still yields PID-only evidence.
+        : runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20)));
+  if (listed.exitCode !== 0) return { ok: false, at: Date.now(), rows: [] };
+  const rows = [];
   for (const line of String(listed.stdout || "").split(/\r?\n/)) {
-    const [pid, ppid] = line.trim().split(/[\s,]+/).map(Number);
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0 || pid === ppid) continue;
+    const match = process.platform === "win32"
+      ? /^\s*(\d+),(\d+),(\d*)\s*$/.exec(line)
+      : /^\s*(\d+)\s+(\d+)(?:\s+(.+?))?\s*$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0) continue;
+    rows.push({ pid, ppid, createdAt: String(match[3] || "").trim() });
+  }
+  return { ok: true, at: Date.now(), rows };
+}
+
+async function processDescendants(rootPids) {
+  const table = await processTable();
+  if (!table.ok) return { ok: false, pids: [], processes: [] };
+  const children = new Map();
+  const createdAt = new Map();
+  for (const { pid, ppid, createdAt: created } of table.rows) {
+    createdAt.set(pid, created);
+    if (pid === ppid) continue;
     if (!children.has(ppid)) children.set(ppid, []);
     children.get(ppid).push(pid);
   }
@@ -2529,19 +2577,51 @@ async function processDescendants(rootPids) {
       queue.push(child);
     }
   }
-  return { ok: true, pids: [...found] };
+  const pids = [...found];
+  return {
+    ok: true,
+    pids,
+    processes: [...rootPids, ...pids].map((pid) => ({ pid, createdAt: createdAt.get(pid) || "" })),
+  };
 }
 
 async function containmentRecord(result = {}) {
   const payloadPid = Number(result?.payloadProcessId || 0);
   const supervisorPid = Number(result?.supervisorProcessId || 0);
   const roots = [supervisorPid, payloadPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0);
-  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [] })) : { ok: false, pids: [] };
+  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [], processes: [] })) : { ok: false, pids: [], processes: [] };
+  const processes = (descendants.processes || []).filter((item) => item.createdAt);
+  const pids = [...roots, ...descendants.pids];
   return JSON.stringify({
-    pids: [...roots, ...descendants.pids],
+    pids,
+    // Creation time per PID where the process table reported one. PIDs without one are
+    // evidence by PID only, so reclaim stays as conservative as before for them.
+    processes,
+    pidOnly: processes.length < pids.length,
     complete: payloadPid > 0 && descendants.ok,
     recordedAt: Date.now(),
   });
+}
+
+// Process-table reads are cached briefly so a reclaim pass over several quarantines spawns
+// the listing once. A cached table older than a record cannot prove anything about it.
+let processTableProbe = null;
+async function processTableNewerThan(recordedAt) {
+  if (!processTableProbe || processTableProbe.at < recordedAt || Date.now() - processTableProbe.at > 1000 * 30) {
+    processTableProbe = await processTable().catch(() => ({ ok: false, at: Date.now(), rows: [] }));
+  }
+  return processTableProbe;
+}
+
+async function recordedProcessStillRuns(pid, createdAt, recordedAt) {
+  if (!containmentProcessExists(pid)) return false;
+  if (!createdAt) return true;
+  const table = await processTableNewerThan(recordedAt);
+  if (!table.ok || table.at < recordedAt) return true;
+  const row = table.rows.find((item) => item.pid === pid);
+  // Absent from a listing taken after the record: that process is gone and the live PID
+  // belongs to a process started later. A different creation time: the PID was reused.
+  return Boolean(row) && row.createdAt === createdAt;
 }
 
 function containmentProcessExists(pid) {
@@ -2578,8 +2658,13 @@ async function containmentStillPossible(containmentJson, ownerPid = 0) {
   let info = {};
   try { info = JSON.parse(containmentJson || "{}") || {}; } catch { info = {}; }
   const pids = Array.isArray(info.pids) ? info.pids.map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
-  if (pids.some(containmentProcessExists)) return true;
   const recordedAt = Number(info.recordedAt || 0);
+  const createdAtByPid = new Map((Array.isArray(info.processes) ? info.processes : [])
+    .map((item) => [Number(item?.pid), String(item?.createdAt || "")])
+    .filter(([pid, created]) => Number.isSafeInteger(pid) && pid > 0 && created));
+  for (const pid of pids) {
+    if (await recordedProcessStillRuns(pid, createdAtByPid.get(pid) || "", recordedAt)) return true;
+  }
   if (recordedAt > 0 && Date.now() - recordedAt < CONFIG.containmentReleaseGraceMs) return true;
   if (info.complete === true && pids.length) return false;
   if (containmentProcessExists(Number(ownerPid))) return true;
@@ -2651,22 +2736,36 @@ async function reclaimLockQuarantinesForRoot(projectRoot) {
 }
 
 async function quarantineProviderLease(lease, containment = "") {
-  if (!lease?.id) return { ok: false };
+  if (!lease?.id) return { ok: false, error: "No provider lease to quarantine." };
   let db = null;
   try {
     const now = Date.now();
     db = await openProviderLeaseDb({ deadlineAt: now + 1000 * 30 });
+    db.exec("BEGIN IMMEDIATE");
     const quarantined = db.prepare(`
       UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?, containment = ?
       WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
     `).run(now, Number.MAX_SAFE_INTEGER, String(containment || ""), lease.id, BRIDGE_INSTANCE_ID, now);
-    return { ok: Number(quarantined.changes || 0) === 1 };
+    if (Number(quarantined.changes || 0) === 1) {
+      db.exec("COMMIT");
+      return { ok: true, leaseId: lease.id, inserted: false };
+    }
+    // The lease already expired (a long termination outlived it) or was reclaimed. The
+    // process tree may still run, so the slot must still be held: write a new quarantine row.
+    db.prepare("DELETE FROM provider_leases WHERE lease_id = ? AND owner_instance_id = ?").run(lease.id, BRIDGE_INSTANCE_ID);
+    const leaseId = `${BRIDGE_INSTANCE_ID}-quarantine-${randomBytes(6).toString("hex")}`;
+    db.prepare("INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(leaseId, String(lease.providerKey || CONFIG.providerConcurrencyKey), BRIDGE_INSTANCE_ID, process.pid, now, now, Number.MAX_SAFE_INTEGER, String(containment || ""));
+    db.exec("COMMIT");
+    logEvent("warn", "provider.containment_quarantine_reinserted", { leaseId: lease.id, quarantineLeaseId: leaseId });
+    return { ok: true, leaseId, inserted: true };
   } catch (error) {
+    try { db?.exec("ROLLBACK"); } catch { /* keep the original error */ }
     logEvent("error", "provider.containment_quarantine_failed", {
       leaseId: lease.id,
       error: error.message || String(error),
     });
-    return { ok: false };
+    return { ok: false, error: error.message || String(error) };
   } finally {
     if (db) closeDb(db);
   }
@@ -2683,17 +2782,26 @@ function providerKeyForMetadata(metadata = null) {
     : `${CONFIG.providerConcurrencyKey}:${provider}`;
 }
 
+// LIKE pattern for "<key>:<provider>" rows; "_" and "%" in the operator key are literals.
+function providerKeyLikePattern(baseKey) {
+  return `${String(baseKey).replace(/[\\%_]/g, (item) => `\\${item}`)}:%`;
+}
+
 async function providerCapacitySnapshot() {
   let db = null;
   try {
     db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
     const now = Date.now();
     db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
-    const capacity = db.prepare("SELECT capacity, updated_at FROM provider_capacities WHERE provider_key = ?").get(CONFIG.providerConcurrencyKey);
+    const likePattern = providerKeyLikePattern(CONFIG.providerConcurrencyKey);
+    const capacityRows = db.prepare(`
+      SELECT provider_key, capacity FROM provider_capacities WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'
+    `).all(CONFIG.providerConcurrencyKey, likePattern);
+    const capacityByKey = new Map(capacityRows.map((row) => [row.provider_key, Number(row.capacity)]));
     const leases = db.prepare(`
       SELECT lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at
-      FROM provider_leases WHERE provider_key = ? OR provider_key LIKE ? ORDER BY created_at
-    `).all(CONFIG.providerConcurrencyKey, `${CONFIG.providerConcurrencyKey}:%`).map((row) => ({
+      FROM provider_leases WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\' ORDER BY created_at
+    `).all(CONFIG.providerConcurrencyKey, likePattern).map((row) => ({
       leaseId: row.lease_id,
       providerKey: row.provider_key,
       ownerInstanceId: row.owner_instance_id,
@@ -2702,10 +2810,27 @@ async function providerCapacitySnapshot() {
       heartbeatAt: row.heartbeat_at ? new Date(Number(row.heartbeat_at)).toISOString() : "",
       expiresAt: new Date(Number(row.expires_at)).toISOString(),
       remainingMs: Math.max(0, Number(row.expires_at) - now),
+      quarantined: Number(row.expires_at) === Number.MAX_SAFE_INTEGER,
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: Number(capacity?.capacity || CONFIG.providerConcurrencyLimit), leases };
+    // Leases are stored per "<key>:<provider>"; the base key's capacity said nothing about
+    // them ("capacity 4, 6 leases" across two providers). Report each key on its own.
+    const capacityFor = (key) => {
+      const stored = capacityByKey.get(key);
+      return Number.isInteger(stored) && stored > 0 ? stored : CONFIG.providerConcurrencyLimit;
+    };
+    const keyNames = [...new Set([...capacityByKey.keys(), ...leases.map((lease) => lease.providerKey)])].sort();
+    const keys = keyNames.map((key) => {
+      const held = leases.filter((lease) => lease.providerKey === key);
+      return {
+        providerKey: key,
+        capacity: capacityFor(key),
+        leases: held.length,
+        quarantined: held.filter((lease) => lease.quarantined).length,
+      };
+    });
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases };
   } catch (error) {
-    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, leases: [], error: redactSensitiveText(error.message || String(error)) };
+    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
     if (db) closeDb(db);
   }
@@ -5477,9 +5602,38 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
 
-  const providerKey = providerKeyForMetadata(configuredMetadata);
-  const providerWaitBudgetMs = Math.max(1, timeoutMs - (nowMs() - started));
-  const providerLease = await acquireProviderLease({ providerKey, timeoutMs: providerWaitBudgetMs, signal });
+  // A prompt the platform cannot pass as one argument fails before any slot is taken.
+  const promptLengthError = openCodeCommandLineLengthError(
+    OPENCODE_EXE,
+    openCodeRunArgs(agent, prompt, applyModelOverrideToMetadata(configuredMetadata, modelOverride), { forcePure })
+  );
+  if (promptLengthError) {
+    return {
+      stdout: "",
+      stderr: promptLengthError,
+      exitCode: "prompt_too_long",
+      durationMs: nowMs() - started,
+      commandShape: commandShape(agent, configuredMetadata, { forcePure }),
+      dryRun: false,
+      timeoutMs,
+      errorType: "prompt_too_long",
+      assistantFinalResponseDetected: false,
+      providerErrorType: "",
+      toolOutcomes: [],
+      configuredProvider: configuredMetadata?.provider || "",
+      configuredModel: configuredMetadata?.model || "",
+      configuredVariant: configuredMetadata?.variant || "",
+      modelFallbackAllowed: false,
+    };
+  }
+
+  // The slot belongs to the provider that will actually run: with a model override (or the
+  // builder's Gemini fallback) the managed profile's provider is not the one spawned, and
+  // counting the run against it over-subscribed the real provider.
+  const providerKey = providerKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
+  // The slot wait has its own budget. It used to come out of the run timeout, so a builder
+  // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
+  const providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
   if (!providerLease.ok) {
     return {
       stdout: "",
@@ -5497,8 +5651,14 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       configuredModel: configuredMetadata?.model || "",
       configuredVariant: configuredMetadata?.variant || "",
       modelFallbackAllowed: false,
+      providerConcurrencyKey: providerKey,
+      providerConcurrencyWaitMs: providerLease.waitedMs || 0,
+      providerSlotHolders: Number(providerLease.holders || 0),
+      providerSlotCapacity: Number(providerLease.capacity || 0),
     };
   }
+  // The run budget starts once the slot is granted.
+  const runStarted = nowMs();
   const stopProviderLeaseHeartbeat = startProviderLeaseHeartbeat(providerLease.lease);
   const providerExecutionSignal = combineAbortSignals([signal, stopProviderLeaseHeartbeat.signal]);
   const persistSupervisorAuthority = async (spawnIdentity) => {
@@ -5513,7 +5673,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   };
   const renewSupervisorAuthority = async () => {
     const providerRenewed = await stopProviderLeaseHeartbeat.pulse();
-    if (!providerRenewed) return { ok: false };
+    if (!providerRenewed || providerRenewed.ok === false) return { ok: false };
     const outer = typeof onSupervisorHeartbeat === "function"
       ? await onSupervisorHeartbeat()
       : { ok: true, deadlineAt: Number.POSITIVE_INFINITY };
@@ -5521,12 +5681,13 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       ok: outer?.ok !== false,
       deadlineAt: Math.min(
         Number(providerLease.lease.expiresAt || 0),
+        Number(providerRenewed?.deadlineAt || Number.POSITIVE_INFINITY),
         Number(outer?.deadlineAt || Number.POSITIVE_INFINITY)
       ),
     };
   };
 
-  let remainingRunMs = timeoutMs - (nowMs() - started);
+  let remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
@@ -5635,7 +5796,33 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
   configuredMetadata = applyModelOverrideToMetadata(finalPreSpawnMetadata.metadata, modelOverride);
-  remainingRunMs = timeoutMs - (nowMs() - started);
+  const attestedProviderKey = providerKeyForMetadata(configuredMetadata);
+  if (attestedProviderKey !== providerKey) {
+    const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
+    stopProviderLeaseHeartbeat();
+    await releaseProviderLease(providerLease.lease);
+    return {
+      stdout: "",
+      stderr: cleanup.ok
+        ? `The final pre-spawn attestation resolved provider slot ${attestedProviderKey}, but the run holds a slot on ${providerKey}. No agent was spawned.`
+        : `Isolated OpenCode runtime cleanup failed: ${cleanup.error}`,
+      exitCode: cleanup.ok ? "agent_policy_rejected" : "isolated_runtime_cleanup_failed",
+      durationMs: nowMs() - started,
+      commandShape: commandShape(agent, configuredMetadata, { forcePure }),
+      dryRun: false,
+      timeoutMs,
+      errorType: cleanup.ok ? "provider_lease_key_mismatch" : "isolated_runtime_cleanup_failed",
+      assistantFinalResponseDetected: false,
+      providerErrorType: "",
+      toolOutcomes: [],
+      configuredProvider: configuredMetadata?.provider || "",
+      configuredModel: configuredMetadata?.model || "",
+      configuredVariant: configuredMetadata?.variant || "",
+      modelFallbackAllowed: false,
+      providerConcurrencyKey: providerKey,
+    };
+  }
+  remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
     stopProviderLeaseHeartbeat();
@@ -5663,6 +5850,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   let result;
   let isolatedRuntimeCleanup = { ok: true, error: "" };
   let containmentUnconfirmed = false;
+  let providerQuarantine = null;
   try {
     result = await runSpawnCommand(
       OPENCODE_EXE,
@@ -5681,8 +5869,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   } finally {
     stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
-      const quarantined = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
-      if (!quarantined.ok) {
+      providerQuarantine = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
+      if (!providerQuarantine.ok) {
         logEvent("error", "provider.containment_quarantine_unconfirmed", { leaseId: providerLease.lease.id });
       }
     } else {
@@ -5697,6 +5885,12 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       ...result,
       stderr: `${String(result?.stderr || "")}\nIsolated OpenCode runtime cleanup failed: ${isolatedRuntimeCleanup.error}`.trim(),
       exitCode: "isolated_runtime_cleanup_failed",
+    };
+  }
+  if (providerQuarantine && !providerQuarantine.ok) {
+    result = {
+      ...result,
+      stderr: `${String(result?.stderr || "")}\nThe provider slot could not be quarantined for the unconfirmed process tree (${providerQuarantine.error || "no row written"}); another job may start on this provider while it still runs.`.trim(),
     };
   }
 
@@ -5753,6 +5947,10 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     modelFallbackAllowed: false,
     providerConcurrencyKey: providerKey,
     providerConcurrencyWaitMs: providerLease.waitedMs || 0,
+    providerQuarantine: providerQuarantine
+      ? { ok: Boolean(providerQuarantine.ok), leaseId: providerQuarantine.leaseId || "", inserted: Boolean(providerQuarantine.inserted) }
+      : null,
+    spawnErrorCode: result.spawnErrorCode || "",
     childStartedAtMs: result.childStartedAtMs || 0,
     childFinishedAtMs: result.childFinishedAtMs || 0,
     childExecutionIntervals: result.childStartedAtMs && result.childFinishedAtMs
