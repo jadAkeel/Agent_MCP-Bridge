@@ -19584,6 +19584,82 @@ function settleIndependentParallelJobs(executionPromises) {
   return Promise.allSettled(executionPromises);
 }
 
+// Every job runs its agent, its read-only retries and its validation command under the one
+// group signal, so the deadline covers the longest of those sums; the agent timeout alone
+// aborted a validation that started late in a long builder run.
+const PARALLEL_GROUP_DEADLINE_MARGIN_MS = 1000 * 60;
+
+function parallelGroupDeadlineMs(lockPlans = []) {
+  const budgets = lockPlans.map((plan) => {
+    const agentTimeoutMs = timeoutForAgent(plan.agent, plan, plan.timeoutMs);
+    // runOpenCodeWithPolicy bounds a reader's attempts by max(retry budget, timeout).
+    const agentBudgetMs = plan.lockType === "read"
+      ? Math.max(CONFIG.readOnlyRetryMaxElapsedMs, agentTimeoutMs)
+      : agentTimeoutMs;
+    const validationBudgetMs = String(plan.validationCommand || "").trim() ? CONFIG.validationCommandTimeoutMs : 0;
+    return agentBudgetMs + validationBudgetMs;
+  });
+  return Math.max(0, ...budgets) + PARALLEL_GROUP_DEADLINE_MARGIN_MS;
+}
+
+// Group-scope check of one execution workspace after every job of a parallel batch settled.
+async function parallelGroupScopeReport({ cwdKey, lockPlans, indexesForCwd, results, before, expectedHead, driftTolerated = false }) {
+  const after = await gitChangedFileSnapshot(cwdKey, driftTolerated ? { includeIgnored: false } : {});
+  const afterHead = await captureGitHead(cwdKey);
+  const headChanged = afterHead !== expectedHead;
+  let changedFiles = changedFilesBetween(before, after);
+  let externalDriftFiles = [];
+  if (driftTolerated && changedFiles.length) {
+    // Only edit-denied readers ran here: the change is another client's, reported not rejected.
+    const drift = readOnlyWorkspaceDrift(changedFiles, after, headChanged);
+    externalDriftFiles = drift.files;
+    changedFiles = [];
+  }
+  const plansForCwd = indexesForCwd.map((index) => lockPlans[index]);
+  if (headChanged) {
+    const readOnlyCwd = !changedFiles.length && plansForCwd.every((plan) => plan.lockType === "read");
+    for (const index of indexesForCwd) {
+      const jobResult = results[index];
+      if (!jobResult?.result) continue;
+      const move = readOnlyCwd && !jobResult.result.errorType
+        ? await readOnlyHeadMove(lockPlans[index], cwdKey, expectedHead, afterHead)
+        : null;
+      if (move) jobResult.result.readOnlyHeadMove = move;
+      else jobResult.result.errorType ||= "repository_head_changed_during_execution";
+      jobResult.result.executionHeadBefore = expectedHead;
+      jobResult.result.executionHeadAfter = afterHead;
+    }
+  }
+  const writePlansForCwd = plansForCwd.filter((plan) => plan.lockType === "write");
+  const allowedEditsForCwd = writePlansForCwd.flatMap((plan) => plan.allowedEdits);
+  const forbiddenForCwd = plansForCwd.flatMap((plan) => plan.forbiddenEdits.concat(plan.sharedFiles));
+  const serialOnlyMatches = findSerialOnlyMatches(changedFiles);
+  const disallowedFiles = normalizeLockPathList([
+    ...(writePlansForCwd.length ? unsafeChangedFiles(changedFiles, allowedEditsForCwd, cwdKey) : changedFiles),
+    ...changedFiles.filter((file) => isWithinAnyPath(file, forbiddenForCwd, cwdKey)),
+    ...changedFiles.filter((file) => findSerialOnlyMatches([file]).length),
+  ]);
+  const rollbackResult = disallowedFiles.length
+    ? {
+        rollback: "not_attempted_unattributed_changes",
+        rollbackFiles: [],
+        unresolvedFiles: disallowedFiles,
+        reason: "Parallel path-only evidence cannot safely distinguish OpenCode output from concurrent external edits; affected worktrees/output are retained for inspection.",
+      }
+    : { rollback: "not_needed", rollbackFiles: [], unresolvedFiles: [] };
+  return {
+    cwd: cwdKey,
+    headChanged,
+    expectedHead,
+    actualHead: afterHead,
+    changedFiles,
+    disallowedFiles,
+    serialOnlyMatches,
+    externalDriftFiles,
+    ...rollbackResult,
+  };
+}
+
 function parallelExecutionOverlapEvidence(results) {
   const pairs = [];
   for (let leftIndex = 0; leftIndex < results.length; leftIndex += 1) {
@@ -19934,11 +20010,18 @@ server.tool(
     const parallelSnapshottedCwds = new Set();
     const parallelBefore = new Map();
     const parallelHeadBefore = new Map();
+    // A checkout used only by readers whose attested policy denies edits changes only through
+    // another client, so its group check reports that drift instead of rejecting the batch.
+    const parallelDriftToleratedCwds = new Set(cwdKeys.filter((cwdKey) => {
+      const indexes = jobs.map((_, index) => index).filter((index) => path.resolve(executionCwdForIndex(index)) === cwdKey && !jobs[index].dryRun);
+      return indexes.length > 0 && indexes.every((index) => !jobs[index].sanitizedWorkspace && readOnlyEditsDeniedByAttestation(lockPlans[index], parallelAgentMetadata[index]));
+    }));
+    const parallelRemovedWorktrees = new Set();
     try {
       for (const cwdKey of cwdKeys) {
         const needsGitSnapshot = jobs.some((job, index) => path.resolve(executionCwdForIndex(index)) === cwdKey && !job.dryRun && !job.sanitizedWorkspace);
         if (needsGitSnapshot) parallelSnapshottedCwds.add(cwdKey);
-        parallelBefore.set(cwdKey, needsGitSnapshot ? await gitChangedFileSnapshot(cwdKey) : new Map());
+        parallelBefore.set(cwdKey, needsGitSnapshot ? await gitChangedFileSnapshot(cwdKey, parallelDriftToleratedCwds.has(cwdKey) ? { includeIgnored: false } : {}) : new Map());
         parallelHeadBefore.set(cwdKey, needsGitSnapshot ? await captureGitHead(cwdKey) : "");
       }
     } catch (error) {
@@ -19967,7 +20050,7 @@ server.tool(
       if (heartbeat.signal?.aborted) abortGroupForLostLock();
       else heartbeat.signal?.addEventListener("abort", abortGroupForLostLock, { once: true });
     }
-    const groupDeadlineMs = Math.max(...lockPlans.map((plan) => timeoutForAgent(plan.agent, plan, plan.timeoutMs))) + 1000 * 60;
+    const groupDeadlineMs = parallelGroupDeadlineMs(lockPlans);
     let groupDeadlineExpired = false;
     const groupDeadlineTimer = setTimeout(() => {
       groupDeadlineExpired = true;
@@ -20054,19 +20137,25 @@ server.tool(
               },
               startedAtMs: jobStartedAtMs,
               finishedAtMs: nowMs(),
-              text: formatRejectedExecution({
-                headline: "Sanitized workspace changed between preflight and the parallel wave.",
-                errorType: verification.errorType,
-                reason: verification.error,
-                requestedAgent: resolution.requestedAgent,
-                actualAgent: resolution.actualAgent,
-                conflictingPaths: verification.discrepancies?.map((item) => item.path) || [],
-                suggestedFix: "Retain the workspace for investigation and rebuild it from the trusted manifest.",
-              }),
+              // The JOB label is what the report keys the Run id on.
+              text: [
+                `JOB ${index + 1}`,
+                formatRejectedExecution({
+                  headline: "Sanitized workspace changed between preflight and the parallel wave.",
+                  errorType: verification.errorType,
+                  reason: verification.error,
+                  requestedAgent: resolution.requestedAgent,
+                  actualAgent: resolution.actualAgent,
+                  conflictingPaths: verification.discrepancies?.map((item) => item.path) || [],
+                  suggestedFix: "Retain the workspace for investigation and rebuild it from the trusted manifest.",
+                }),
+              ].join("\n"),
             };
           }
         }
-        const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+        const readerEditsDenied = !job.dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, parallelAgentMetadata[index]);
+        const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
+        const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
         const delegation = {
           scope: job.delegation?.scope,
           lockMode: lockPlan.lockMode,
@@ -20097,7 +20186,10 @@ server.tool(
           lockPlan.timeoutMs,
           { signal: groupController.signal, agentMetadata: parallelAgentMetadata[index] }
         );
-        const afterFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+        const afterFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+        const afterFilesForValidation = job.dryRun || manifestProtected || readerEditsDenied
+          ? afterFiles
+          : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
         const executionHeadAfterAgent = job.dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
         const sanitizedAfter = manifestProtected && !job.dryRun
           ? await verifySanitizedWorkspace(job.sanitizedWorkspace, "after_wave")
@@ -20106,6 +20198,10 @@ server.tool(
           ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
           : changedFilesBetween(beforeFiles, afterFiles);
         const expectedExecutionHead = parallelHeadBefore.get(path.resolve(executionCwd)) || "";
+        if (readerEditsDenied && result.changedFiles.length) {
+          result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, Boolean(executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead));
+          result.changedFiles = [];
+        }
         if (executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead) {
           const move = result.changedFiles.length || result.errorType ? null : await readOnlyHeadMove(lockPlan, executionCwd, expectedExecutionHead, executionHeadAfterAgent);
           if (move) {
@@ -20151,9 +20247,9 @@ server.tool(
         if (validationGate.errorType && !result.errorType) {
           result.errorType = validationGate.errorType;
         }
-        const afterValidationFiles = job.dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd);
+        const afterValidationFiles = job.dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
         const executionHeadAfterValidation = job.dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
-        const validationMutationFiles = job.dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
+        const validationMutationFiles = job.dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
         if (executionHeadAfterValidation && executionHeadAfterValidation !== expectedExecutionHead) {
           const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
             ? null
@@ -20163,7 +20259,7 @@ server.tool(
           result.executionHeadAfter = executionHeadAfterValidation;
         }
         if (validationMutationFiles.length) {
-          result.changedFiles = changedFilesBetween(beforeFiles, afterValidationFiles);
+          result.changedFiles = normalizeLockPathList(result.changedFiles.concat(validationMutationFiles));
           const postValidation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: true });
           unsafeFiles = normalizeLockPathList(postValidation.disallowedFiles.concat(validationMutationFiles));
           result.validationMutationFiles = validationMutationFiles;
@@ -20188,15 +20284,31 @@ server.tool(
             result.stderr = [result.stderr, `Execution output and the integratable Git patch differ at: ${unrepresentableFiles.join(", ")}. The worktree was retained and cannot be reported as successful.`].filter(Boolean).join("\n");
           }
         }
+        // Same rule as a single job: a writer whose verified diff is empty has nothing to
+        // review, so its worktree is removed instead of filling the retained-worktree cap.
+        const producedNothing = Boolean(worktree && worktreeDiff)
+          && !worktreeDiff.errorType
+          && !(worktreeDiff.changedFiles || []).length
+          && !(result.changedFiles || []).length
+          && !(result.unrepresentableFiles || []).length
+          && !unsafeFiles.length;
+        const worktreeCleanup = producedNothing
+          ? { ...(await cleanupWorktree(worktree, "always", true)), errorType: undefined, reason: "the job changed no files, so there was nothing to retain" }
+          : null;
+        const worktreeRemoved = producedNothing && ["success", "partial"].includes(worktreeCleanup.cleanup);
+        if (worktreeRemoved) parallelRemovedWorktrees.add(path.resolve(worktree.path));
+        if (producedNothing) result.noChanges = true;
         if (worktree) {
           result.worktree = {
-            path: worktree.path,
-            branch: worktree.branch,
+            path: worktreeRemoved ? "" : worktree.path,
+            branch: worktreeRemoved ? "" : worktree.branch,
             baseCommit: worktree.baseCommit,
             baseTree: worktree.baseTree,
             patchSha256: worktreeDiff?.patchSha256 || "",
             sourceStateSha256: worktreeDiff?.sourceStateSha256 || "",
-            cleanup: "retained_for_review",
+            cleanup: worktreeCleanup?.cleanup || "retained_for_review",
+            removed: worktreeRemoved,
+            removedPath: worktreeRemoved ? worktree.path : "",
             changedFiles: worktreeDiff?.changedFiles || [],
             diffStat: worktreeDiff?.diffStat || "",
           };
@@ -20205,6 +20317,7 @@ server.tool(
           index,
           lockPlan,
           result,
+          worktreeCleanup,
           startedAtMs: jobStartedAtMs,
           finishedAtMs: nowMs(),
           text: [
@@ -20216,7 +20329,8 @@ server.tool(
             cwd: executionCwd,
             lockPlan,
           }),
-          formatWorktreeSummary(worktree, null),
+          formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
+          formatWorktreeSummary(worktree, worktreeCleanup),
           worktreeDiff?.diffStat ? `Worktree diff stat:\n${worktreeDiff.diffStat}` : null,
           formatValidationGateResult(validationGate),
           `Unsafe changed files: ${unsafeFiles.length ? unsafeFiles.join(", ") : "none detected"}`,
@@ -20247,52 +20361,47 @@ server.tool(
       }));
       for (const cwdKey of cwdKeys) {
         if (!parallelSnapshottedCwds.has(cwdKey)) continue;
-        const after = await gitChangedFileSnapshot(cwdKey);
-        const afterHead = await captureGitHead(cwdKey);
-        const expectedHead = parallelHeadBefore.get(cwdKey) || "";
-        const headChanged = afterHead !== expectedHead;
-        const changedFiles = changedFilesBetween(parallelBefore.get(cwdKey) || new Map(), after);
-        const plansForCwd = lockPlans.filter((_, index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
-        if (headChanged) {
-          const readOnlyCwd = !changedFiles.length && plansForCwd.every((plan) => plan.lockType === "read");
-          for (const [index, jobResult] of results.entries()) {
-            if (path.resolve(executionCwdForIndex(index)) !== cwdKey) continue;
-            const move = readOnlyCwd && !jobResult.result.errorType
-              ? await readOnlyHeadMove(lockPlans[index], cwdKey, expectedHead, afterHead)
-              : null;
-            if (move) jobResult.result.readOnlyHeadMove = move;
-            else jobResult.result.errorType ||= "repository_head_changed_during_execution";
-            jobResult.result.executionHeadBefore = expectedHead;
-            jobResult.result.executionHeadAfter = afterHead;
+        // A writer worktree that produced nothing was removed; there is no group state left there.
+        if (parallelRemovedWorktrees.has(cwdKey)) continue;
+        const indexesForCwd = lockPlans.map((_, index) => index).filter((index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
+        // A snapshot or git failure here (limit exceeded, git error) fails this workspace's
+        // check closed; it must not discard every job result and Run id with it.
+        try {
+          parallelRollbackReports.push(await parallelGroupScopeReport({
+            cwdKey,
+            lockPlans,
+            indexesForCwd,
+            results,
+            before: parallelBefore.get(cwdKey) || new Map(),
+            expectedHead: parallelHeadBefore.get(cwdKey) || "",
+            driftTolerated: parallelDriftToleratedCwds.has(cwdKey),
+          }));
+        } catch (error) {
+          const errorType = error?.errorType || "parallel_group_snapshot_failed";
+          const reason = redactSensitiveText(error?.message || String(error));
+          for (const index of indexesForCwd) {
+            const jobResult = results[index];
+            if (!jobResult?.result) continue;
+            jobResult.result.errorType ||= errorType;
+            jobResult.result.stderr = [jobResult.result.stderr, `Group-scope check of ${cwdKey} failed closed: ${reason}`].filter(Boolean).join("\n");
           }
+          parallelRollbackReports.push({
+            cwd: cwdKey,
+            headChanged: false,
+            expectedHead: parallelHeadBefore.get(cwdKey) || "",
+            actualHead: "unknown",
+            changedFiles: [],
+            disallowedFiles: [],
+            serialOnlyMatches: [],
+            externalDriftFiles: [],
+            checkFailed: true,
+            errorType,
+            error: reason,
+            rollback: "not_attempted_check_failed",
+            rollbackFiles: [],
+            unresolvedFiles: [],
+          });
         }
-        const writePlansForCwd = plansForCwd.filter((plan) => plan.lockType === "write");
-        const allowedEditsForCwd = writePlansForCwd.flatMap((plan) => plan.allowedEdits);
-        const forbiddenForCwd = plansForCwd.flatMap((plan) => plan.forbiddenEdits.concat(plan.sharedFiles));
-        const serialOnlyMatches = findSerialOnlyMatches(changedFiles);
-        const disallowedFiles = normalizeLockPathList([
-          ...(writePlansForCwd.length ? unsafeChangedFiles(changedFiles, allowedEditsForCwd, cwdKey) : changedFiles),
-          ...changedFiles.filter((file) => isWithinAnyPath(file, forbiddenForCwd, cwdKey)),
-          ...changedFiles.filter((file) => findSerialOnlyMatches([file]).length),
-        ]);
-        const rollbackResult = disallowedFiles.length
-          ? {
-              rollback: "not_attempted_unattributed_changes",
-              rollbackFiles: [],
-              unresolvedFiles: disallowedFiles,
-              reason: "Parallel path-only evidence cannot safely distinguish OpenCode output from concurrent external edits; affected worktrees/output are retained for inspection.",
-            }
-          : { rollback: "not_needed", rollbackFiles: [], unresolvedFiles: [] };
-        parallelRollbackReports.push({
-          cwd: cwdKey,
-          headChanged,
-          expectedHead,
-          actualHead: afterHead,
-          changedFiles,
-          disallowedFiles,
-          serialOnlyMatches,
-          ...rollbackResult,
-        });
       }
     } finally {
       clearTimeout(groupDeadlineTimer);
@@ -20302,7 +20411,7 @@ server.tool(
 
     const lockViolations = verifyParallelLockResults(results);
     const parallelSuccess = !lockViolations.length
-      && !parallelRollbackReports.some((report) => report.disallowedFiles.length)
+      && !parallelRollbackReports.some((report) => report.disallowedFiles.length || report.checkFailed)
       && !results.some((jobResult) => jobResult.result?.errorType);
     const executionOverlap = parallelExecutionOverlapEvidence(results);
     const ranConcurrently = executionOverlap.ranConcurrently;
@@ -20312,15 +20421,28 @@ server.tool(
     const parallelWorktreeCleanupReports = parallelWorktrees
       .map((worktree, index) => ({ worktree, index }))
       .filter(({ worktree }) => Boolean(worktree))
-      .map(({ worktree, index }) => ({
-        index,
-        path: worktree.path,
-        branch: worktree.branch,
-        cleanup: "retained_for_review",
-        reason: parallelSuccess
-          ? "successful output awaits reviewed serial integration"
-          : "partial or failed batch output is retained for diagnosis and recovery",
-      }));
+      .map(({ worktree, index }) => {
+        const cleanup = results[index]?.worktreeCleanup || null;
+        return cleanup
+          ? {
+              index,
+              path: worktree.path,
+              branch: worktree.branch,
+              cleanup: cleanup.cleanup,
+              reason: cleanup.reason || "",
+              error: cleanup.error || "",
+            }
+          : {
+              index,
+              path: worktree.path,
+              branch: worktree.branch,
+              cleanup: "retained_for_review",
+              reason: parallelSuccess
+                ? "successful output awaits reviewed serial integration"
+                : "partial or failed batch output is retained for diagnosis and recovery",
+            };
+      });
+    const retainedWorktreeCount = parallelWorktreeCleanupReports.filter((report) => report.cleanup === "retained_for_review" || report.cleanup === "failed").length;
     const verification = [
       "Parallel lock verification:",
       lockViolations.length
@@ -20330,25 +20452,34 @@ server.tool(
     ].join("\n");
     const rollbackVerification = [
       "Parallel rollback verification:",
-      parallelRollbackReports.some((report) => report.disallowedFiles.length)
-        ? "Rejected. Disallowed changed files were detected and rollback was attempted."
+      parallelRollbackReports.some((report) => report.checkFailed)
+        ? "Rejected. A group-scope check could not complete; the affected jobs failed closed and their output was retained."
+        : parallelRollbackReports.some((report) => report.disallowedFiles.length)
+        // The bridge never rolls back parallel output: path-only evidence cannot attribute it.
+        ? "Rejected. Disallowed changed files were detected; no rollback was attempted and the changes and worktrees were retained for inspection."
         : "Accepted. No disallowed changed files detected at group scope.",
       ...parallelRollbackReports.map((report) =>
         [
           `Workspace: ${report.cwd}`,
+          report.checkFailed ? `Group check failed: ${report.errorType}: ${report.error}` : null,
           `Changed files: ${report.changedFiles.length ? report.changedFiles.join(", ") : "none detected"}`,
+          report.externalDriftFiles?.length ? `External changes (another client; the attested readers cannot edit): ${report.externalDriftFiles.join(", ")}` : null,
           `HEAD changed: ${report.headChanged ? `yes (${report.expectedHead} -> ${report.actualHead})` : "no"}`,
           `Disallowed files: ${report.disallowedFiles.length ? report.disallowedFiles.join(", ") : "none detected"}`,
           `Serial-only matches: ${report.serialOnlyMatches.length ? report.serialOnlyMatches.join(", ") : "none detected"}`,
           `Rollback: ${report.rollback}`,
           `Rollback files: ${report.rollbackFiles.length ? report.rollbackFiles.join(", ") : "none"}`,
           `Unresolved files: ${report.unresolvedFiles.length ? report.unresolvedFiles.join(", ") : "none"}`,
-        ].join("\n")
+        ].filter(Boolean).join("\n")
       ),
     ].join("\n");
     const worktreeCleanupVerification = [
       "Parallel worktree cleanup:",
-      parallelWorktreeCleanupReports.length ? "All writer worktrees were retained for review." : "No worktrees used.",
+      !parallelWorktreeCleanupReports.length
+        ? "No worktrees used."
+        : retainedWorktreeCount === parallelWorktreeCleanupReports.length
+        ? "All writer worktrees were retained for review."
+        : `${retainedWorktreeCount} of ${parallelWorktreeCleanupReports.length} writer worktrees were retained; writers that changed nothing had their empty worktree removed.`,
       ...parallelWorktreeCleanupReports.map((report) =>
         [
           `JOB ${report.index + 1}`,
@@ -20367,6 +20498,7 @@ server.tool(
           type: "text",
           text: [
             `Parallel group status: ${groupStatus}`,
+            `Group deadline ms: ${groupDeadlineMs} (longest agent budget plus validation timeout, plus margin)${groupDeadlineExpired ? "; the deadline expired and aborted the remaining work" : ""}`,
             `Ran concurrently (OpenCode child interval overlap): ${ranConcurrently ? "yes" : "no"}`,
             `Concurrent execution pairs: ${executionOverlap.pairs.length ? executionOverlap.pairs.map(([left, right]) => `JOB ${left + 1} + JOB ${right + 1}`).join(", ") : "none"}`,
             "Cancellation: this synchronous tool has no durable operation id; use queue/pipeline tools when cancellation or restart-safe status is required.",
