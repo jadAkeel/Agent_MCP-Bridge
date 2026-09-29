@@ -3790,7 +3790,7 @@ async function runSelfTests() {
     await chmod(rollbackVictim, 0o755);
     const executableOwnedSnapshot = await exactIntegrationFileSnapshot(tempDir, ["src/allowed.txt"]);
     if (process.platform !== "win32") {
-      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:493:"), true);
+      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:73:"), true);
     }
     const safeModeRollback = await rollbackVerifiedOwnedChanges({
       cwd: tempDir,

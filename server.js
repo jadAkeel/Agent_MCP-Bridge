@@ -6180,13 +6180,50 @@ async function fileFingerprint(cwd, file, { metadataOnly = false } = {}) {
   }
 }
 
+// The permission bits a rollback restores (exact on POSIX; libuv never reports exec bits on
+// Windows). Fingerprints never use them directly: see integrationFingerprintMode.
 function durableFileMode(details) {
   return process.platform === "win32" ? details.mode & 0o111 : details.mode & 0o7777;
+}
+
+// Git tracks one bit of a regular file's mode, executable or not, and only where it can see
+// it: never on Windows, never with core.fileMode=false. Every integration fingerprint
+// (`file:<mode>:<sha256>`) uses this one rule, whether it comes from the disk, from a
+// simulated index entry (100755 -> exec) or from a journal preimage. The simulation used to
+// write 0o111 for 100755 while the disk reported 0 on Windows and 0o644/0o755 on POSIX, so
+// every patch touching an executable (and on POSIX every patch) failed as a content mismatch
+// and recovery quarantined it. Journal pre_mode keeps the raw permission bits (rows written
+// on this machine hold 0) and passes through the same rule when read, so no migration.
+const INTEGRATION_WORKTREE_RULES = new Map();
+async function integrationWorktreeRules(cwd) {
+  const key = path.resolve(cwd || process.cwd());
+  if (!INTEGRATION_WORKTREE_RULES.has(key)) {
+    if (INTEGRATION_WORKTREE_RULES.size >= 256) INTEGRATION_WORKTREE_RULES.clear();
+    INTEGRATION_WORKTREE_RULES.set(key, (async () => {
+      const [fileMode, symlinks] = await Promise.all([
+        runCommand("git", ["config", "--bool", "--get", "core.filemode"], key, 1000 * 15),
+        runCommand("git", ["config", "--bool", "--get", "core.symlinks"], key, 1000 * 15),
+      ]);
+      const value = (result) => (result.exitCode === 0 ? String(result.stdout || "").trim() : "");
+      return {
+        execBit: process.platform !== "win32" && value(fileMode) !== "false",
+        // Git for Windows checks a 120000 entry out as a plain file holding the target unless
+        // core.symlinks is true; elsewhere symlinks are the default.
+        symlinks: value(symlinks) ? value(symlinks) === "true" : process.platform !== "win32",
+      };
+    })());
+  }
+  return INTEGRATION_WORKTREE_RULES.get(key);
+}
+
+function integrationFingerprintMode(permissions, rules) {
+  return rules?.execBit && (Number(permissions) & 0o100) ? 0o111 : 0;
 }
 
 async function exactIntegrationFileSnapshot(cwd, files) {
   const snapshot = new Map();
   let totalBytes = 0;
+  const rules = await integrationWorktreeRules(cwd);
   for (const file of normalizeLockPathList(files)) {
     const absolute = path.resolve(cwd || process.cwd(), file);
     try {
@@ -6212,7 +6249,7 @@ async function exactIntegrationFileSnapshot(cwd, files) {
         throw error;
       }
       const content = await readFile(absolute);
-      snapshot.set(file, `file:${durableFileMode(details)}:${createHash("sha256").update(content).digest("hex")}`);
+      snapshot.set(file, `file:${integrationFingerprintMode(durableFileMode(details), rules)}:${createHash("sha256").update(content).digest("hex")}`);
     } catch (error) {
       if (error?.code === "ENOENT") {
         snapshot.set(file, "missing");
@@ -6277,11 +6314,15 @@ async function integrationContentMismatches(cwd, expected, actual, files, { eolR
       continue;
     }
     let eolRecord = eolRecords instanceof Map ? String(eolRecords.get(file) || "") : "";
+    let untrackedInRealIndex = false;
     if (!(eolRecords instanceof Map)) {
-      const eol = await runGitReadOnlyCommand(["ls-files", "--eol", "-z", "--", file], cwd, 1000 * 15);
+      const eol = await runGitReadOnlyCommand(["--literal-pathspecs", "ls-files", "--eol", "-z", "--", file], cwd, 1000 * 15);
       eolRecord = eol.exitCode === 0 ? (String(eol.stdout || "").split("\0").find(Boolean) || "") : "";
+      // Recovery reads the real index, where a file the patch adds has no entry and so no eol
+      // record, although the checkout conversion wrote it with CRLF like any other text file.
+      untrackedInRealIndex = eol.exitCode === 0 && !eolRecord;
     }
-    if (!/^i\/lf\s+w\/crlf\s+/.test(eolRecord)) {
+    if (!untrackedInRealIndex && !/^i\/(?:lf|none)\s+w\/crlf\s+/.test(eolRecord)) {
       mismatches.push(file);
       continue;
     }
@@ -6463,7 +6504,7 @@ async function readFileIfExists(filePath) {
   }
 }
 
-async function captureRollbackBaseline(cwd) {
+async function captureRollbackBaseline(cwd, { files = [] } = {}) {
   const base = cwd || process.cwd();
   const baseCommitResult = await runCommand("git", ["rev-parse", "HEAD"], base, 1000 * 15);
   if (baseCommitResult.exitCode !== 0 || !baseCommitResult.stdout.trim()) {
@@ -6498,6 +6539,28 @@ async function captureRollbackBaseline(cwd) {
   for (const file of ignoredFiles) {
     preExisting.set(file, { exists: true, content: null, restorable: false, ignored: true });
   }
+  // The exact pre-apply bytes of the clean paths a patch will touch. Rebuilding them from a
+  // Git blob loses the checkout conversion (a CRLF checkout came back LF); symlinks still
+  // restore from the commit, which records them exactly.
+  for (const file of normalizeLockPathList(files)) {
+    if (preExisting.has(file)) continue;
+    const target = path.resolve(base, file);
+    let details = null;
+    try {
+      details = await lstat(target);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (details && (details.isSymbolicLink() || !details.isFile())) continue;
+    const captured = details ? await readFileIfExists(target) : { exists: false, content: null };
+    totalRestorableBytes += captured.content?.length || 0;
+    if (totalRestorableBytes > CONFIG.maxSnapshotTotalBytes) {
+      const error = new Error(`Rollback snapshot byte limit exceeded: ${totalRestorableBytes} bytes exceeds CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES=${CONFIG.maxSnapshotTotalBytes}.`);
+      error.errorType = "snapshot_safety_limit_exceeded";
+      throw error;
+    }
+    preExisting.set(file, captured);
+  }
   return { cwd: base, baseCommit: baseCommitResult.stdout.trim(), totalRestorableBytes, preExisting };
 }
 
@@ -6529,7 +6592,15 @@ async function removeRollbackLeaf(target) {
 
 async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
   const parent = await safeRollbackParent(cwd, target);
-  if (!await removeRollbackLeaf(target)) return false;
+  let existing = null;
+  try {
+    existing = await lstat(target);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (existing?.isDirectory() && !existing.isSymbolicLink()) return false;
+  // The replacement is written completely before the target is touched: removing the target
+  // first left it deleted whenever the temporary write or symlink failed.
   const temporary = path.join(parent, `.codex-rollback-${process.pid}-${randomBytes(8).toString("hex")}`);
   try {
     if (kind === "link") {
@@ -6543,7 +6614,17 @@ async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
       await chmod(temporary, exactMode);
     }
     await assertNoLinkedPath(parent, "Rollback parent");
-    await rename(temporary, target);
+    // rename() replaces a regular file atomically; a symlink or a leaf of the other kind is
+    // removed first so the rename never follows or keeps it.
+    if (existing && (existing.isSymbolicLink() || kind === "link")) await rm(target, { force: true });
+    try {
+      await rename(temporary, target);
+    } catch (error) {
+      // Windows refuses to rename over a read-only or briefly locked file.
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EEXIST"].includes(error?.code)) throw error;
+      await rm(target, { force: true });
+      await rename(temporary, target);
+    }
     return true;
   } catch {
     await rm(temporary, { force: true }).catch(() => {});
@@ -6553,35 +6634,42 @@ async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
 
 async function restoreFromGitHead(cwd, file, baseCommit = "HEAD") {
   try {
+    const base = cwd || process.cwd();
     const normalizedFile = file.replace(/\\/g, "/");
-    const entry = await runCommand("git", ["ls-tree", "-z", baseCommit, "--", normalizedFile], cwd || process.cwd(), 1000 * 15, buildValidationEnv());
+    const entry = await runCommand("git", ["ls-tree", "-z", baseCommit, "--", normalizedFile], base, 1000 * 15, buildValidationEnv());
     const match = /^(100644|100755|120000) blob ([0-9a-f]+)\t/.exec((entry.stdout || "").split("\0")[0] || "");
     if (entry.exitCode !== 0 || !match) return false;
     const [, gitMode, objectId] = match;
-    const result = await execFileAsync("git", ["cat-file", "blob", objectId], {
-      cwd: cwd || process.cwd(),
-      shell: false,
-      timeout: 1000 * 15,
-      maxBuffer: 1024 * 1024 * 30,
-      encoding: "buffer",
-    });
-    const target = path.resolve(cwd || process.cwd(), file);
+    const rules = await integrationWorktreeRules(base);
+    const asLink = gitMode === "120000" && rules.symlinks;
+    // A raw `cat-file blob` skipped the checkout conversion, so rolling back a clean file in a
+    // CRLF checkout wrote LF bytes, and recovery then saw a third state and quarantined.
+    // `--filters` converts exactly as a checkout of that path does (autocrlf, eol, attributes).
+    const result = await runCommand(
+      "git",
+      gitMode === "120000" ? ["cat-file", "blob", objectId] : ["cat-file", "--filters", `${baseCommit}:${normalizedFile}`],
+      base,
+      1000 * 15,
+      null,
+      { encoding: "buffer" }
+    );
+    if (result.exitCode !== 0) return false;
+    const content = result.stdout;
+    const permissions = gitMode === "100755" ? 0o755 : 0o644;
+    const target = path.resolve(base, file);
     await ensureParentDir(target);
     const restored = await replaceRollbackLeaf({
       cwd,
       target,
-      kind: gitMode === "120000" ? "link" : "file",
-      content: gitMode === "120000" ? result.stdout.toString("utf8") : result.stdout,
-      mode: gitMode === "100755" ? 0o755 : 0o644,
+      kind: asLink ? "link" : "file",
+      content: asLink ? content.toString("utf8") : content,
+      mode: permissions,
     });
     if (!restored) return false;
-    const actual = await exactIntegrationFileSnapshot(cwd || process.cwd(), [file]);
-    const restoredMode = process.platform === "win32"
-      ? durableFileMode(await lstat(target))
-      : gitMode === "100755" ? 0o755 : 0o644;
-    const expected = gitMode === "120000"
-      ? `link:${result.stdout.toString("utf8")}`
-      : `file:${restoredMode}:${createHash("sha256").update(result.stdout).digest("hex")}`;
+    const actual = await exactIntegrationFileSnapshot(base, [file]);
+    const expected = asLink
+      ? `link:${content.toString("utf8")}`
+      : `file:${integrationFingerprintMode(permissions, rules)}:${createHash("sha256").update(content).digest("hex")}`;
     return actual.get(normalizeLockPath(file)) === expected;
   } catch {
     return false;
@@ -6658,7 +6746,10 @@ async function rollbackUnsafeChanges({ cwd, baseline, files }) {
   };
 }
 
-async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapshot }) {
+// eolRecords (the isolated index's `ls-files --eol`) is passed when ownedSnapshot is the
+// simulated post-patch snapshot: that records index blobs, so a file the checkout
+// conversion wrote with CRLF is still bridge-owned when it matches under that tolerance.
+async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapshot, eolRecords = null }) {
   const uniqueFiles = normalizeLockPathList(files);
   if (!(ownedSnapshot instanceof Map)) {
     return {
@@ -6674,7 +6765,9 @@ async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapsho
   for (const file of uniqueFiles) {
     try {
       const current = await exactIntegrationFileSnapshot(cwd, [file]);
-      if (current.get(file) === ownedSnapshot.get(file)) {
+      if (current.get(file) === ownedSnapshot.get(file)
+        || (eolRecords instanceof Map
+          && !(await integrationContentMismatches(cwd, ownedSnapshot, current, [file], { eolRecords })).length)) {
         verifiedOwnedFiles.push(file);
       } else {
         ownershipMismatches.push(file);
@@ -7253,7 +7346,7 @@ async function readIntegrationJournalFileEvidence(operation, row) {
     ? "missing"
     : row.pre_kind === "link"
       ? `link:${preContent.toString("utf8")}`
-      : `file:${Number(row.pre_mode || 0)}:${createHash("sha256").update(preContent).digest("hex")}`;
+      : `file:${integrationFingerprintMode(Number(row.pre_mode || 0), await integrationWorktreeRules(operation.cwd))}:${createHash("sha256").update(preContent).digest("hex")}`;
   return { ...row, preContent, preFingerprint, postFingerprint };
 }
 
@@ -8733,6 +8826,7 @@ async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, fi
 
     const snapshot = new Map();
     const indexSnapshot = new Map();
+    const rules = await integrationWorktreeRules(cwd);
     let totalBytes = 0;
     for (const file of normalizeLockPathList(files)) {
       const entry = await runCommand("git", ["ls-files", "--stage", "-z", "--", file], cwd, 1000 * 15, gitEnv);
@@ -8779,10 +8873,13 @@ async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, fi
       } catch (error) {
         return { ok: false, errorType: "integration_simulation_failed", error: redactSensitiveText(error?.message || `Could not read simulated blob: ${file}`) };
       }
-      if (mode === "120000") {
+      if (mode === "120000" && rules.symlinks) {
         snapshot.set(file, `link:${blob.toString("utf8")}`);
+      } else if (mode === "120000") {
+        // core.symlinks=false: the checkout holds a plain file whose bytes are the target.
+        snapshot.set(file, `file:0:${createHash("sha256").update(blob).digest("hex")}`);
       } else if (mode === "100644" || mode === "100755") {
-        snapshot.set(file, `file:${mode === "100755" ? 0o111 : 0}:${createHash("sha256").update(blob).digest("hex")}`);
+        snapshot.set(file, `file:${integrationFingerprintMode(mode === "100755" ? 0o755 : 0o644, rules)}:${createHash("sha256").update(blob).digest("hex")}`);
       } else {
         return { ok: false, errorType: "snapshot_safety_limit_exceeded", error: `Integration evidence contains unsupported Git mode ${mode}: ${file}` };
       }
@@ -9598,7 +9695,7 @@ async function integratePatchWithoutSerialLock({
     expectedPostApplySnapshot = simulation.snapshot;
     preApplyExactSnapshot = await exactIntegrationFileSnapshot(targetCwd, patch.changedFiles);
     preApplyIndexSnapshot = await gitIndexPathSnapshot(targetCwd, patch.changedFiles);
-    rollbackBaseline = await captureRollbackBaseline(targetCwd);
+    rollbackBaseline = await captureRollbackBaseline(targetCwd, { files: patch.changedFiles });
     before = await gitChangedFileSnapshot(targetCwd);
     const finalPreApplyState = await captureIntegrationTargetState(targetCwd);
     if (!finalPreApplyState.ok
@@ -9714,6 +9811,7 @@ async function integratePatchWithoutSerialLock({
         baseline: rollbackBaseline,
         files: changedSincePreApply,
         ownedSnapshot: expectedPostApplySnapshot,
+        eolRecords: applied.isolatedEolRecords || null,
       });
       return {
         ok: false,
@@ -9761,6 +9859,7 @@ async function integratePatchWithoutSerialLock({
         baseline: rollbackBaseline,
         files: patch.changedFiles,
         ownedSnapshot: expectedPostApplySnapshot,
+        eolRecords: applied.isolatedEolRecords || null,
       });
       return {
         ok: false,
@@ -20971,6 +21070,10 @@ export const __selfTest = {
     activatePipelineBatch,
     allowlistedModelOverride,
     applyModelOverrideToMetadata,
+    applyPatchFile,
+    inspectRepositoryGitControlSurface,
+    replaceRollbackLeaf,
+    writeTemporaryPatchFile,
     assert,
     assertSupportedCallerModel,
     assertSupportedQueueRetryConfig,
