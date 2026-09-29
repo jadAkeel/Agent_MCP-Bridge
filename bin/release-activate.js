@@ -276,6 +276,9 @@ const BRIDGE_TIMEOUT_DEFAULTS_MS = {
   CODEX_OPENCODE_VALIDATION_TIMEOUT_MS: 1000 * 60 * 5,
   CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS: 1000 * 60 * 6,
   CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS: 1000 * 60 * 20,
+  // Waiting for a provider slot has its own budget (server.js CONFIG.providerWaitMaxMs) and
+  // is no longer taken out of the agent's run timeout, so the client must cover it too.
+  CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS: 1000 * 60 * 20,
 };
 const CLIENT_TIMEOUT_MARGIN_MS = 1000 * 60 * 5;
 
@@ -299,12 +302,12 @@ function clientToolTimeoutWarning(text, env = {}) {
     limit("CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS"),
     limit("CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS"),
   );
-  const neededSec = Math.ceil((longestAgentMs + limit("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS") + CLIENT_TIMEOUT_MARGIN_MS) / 1000);
+  const neededSec = Math.ceil((limit("CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS") + longestAgentMs + limit("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS") + CLIENT_TIMEOUT_MARGIN_MS) / 1000);
   if (toolTimeoutSec === null) {
     return `WARNING: [mcp_servers.${SERVER_NAME}] has no tool_timeout_sec; Codex defaults to 60 s. Set tool_timeout_sec = ${neededSec}.0`;
   }
   if (toolTimeoutSec < neededSec) {
-    return `WARNING: tool_timeout_sec = ${toolTimeoutSec} is shorter than the longest bridge job (agent + validation + margin = ${neededSec} s). Codex would abandon long jobs while they still run. Set tool_timeout_sec = ${neededSec}.0`;
+    return `WARNING: tool_timeout_sec = ${toolTimeoutSec} is shorter than the longest bridge job (provider-slot wait + agent + validation + margin = ${neededSec} s). Codex would abandon long jobs while they still run. Set tool_timeout_sec = ${neededSec}.0`;
   }
   return `Client tool timeout covers the longest bridge job (${toolTimeoutSec} s >= ${neededSec} s).`;
 }
@@ -786,10 +789,12 @@ function selfTestRewrite() {
 
   const withTimeout = (seconds) => `[mcp_servers.other]\ntool_timeout_sec = 99999\n[mcp_servers.opencode]\ntool_timeout_sec = ${seconds}\n[mcp_servers.opencode.env]\n`;
   const raised = { CODEX_OPENCODE_BUILDER_TIMEOUT_MS: "2700000", CODEX_OPENCODE_VALIDATION_TIMEOUT_MS: "900000" };
-  assert.match(clientToolTimeoutWarning(withTimeout("1500.0"), raised), /^WARNING: .*3900/);
-  assert.match(clientToolTimeoutWarning(withTimeout("3900.0"), raised), /^Client tool timeout covers/);
-  assert.match(clientToolTimeoutWarning(withTimeout("1800.0"), {}), /^Client tool timeout covers/, "defaults (contractor 20 + 5 + 5 min) fit in 1800 s");
-  assert.match(clientToolTimeoutWarning(withTimeout("1500.0"), {}), /^WARNING: .*1800/, "The contractor timeout counts too.");
+  // 20 min provider-slot wait + 45 min builder + 15 min validation + 5 min margin = 5100 s.
+  assert.match(clientToolTimeoutWarning(withTimeout("3900.0"), raised), /^WARNING: .*provider-slot wait.*5100/, "the slot wait is no longer part of the agent timeout, so the client must cover it");
+  assert.match(clientToolTimeoutWarning(withTimeout("5100.0"), raised), /^Client tool timeout covers/);
+  assert.match(clientToolTimeoutWarning(withTimeout("3000.0"), {}), /^Client tool timeout covers/, "defaults (wait 20 + contractor 20 + 5 + 5 min) fit in 3000 s");
+  assert.match(clientToolTimeoutWarning(withTimeout("1800.0"), {}), /^WARNING: .*3000/, "The contractor timeout and the slot wait count too.");
+  assert.match(clientToolTimeoutWarning(withTimeout("1801.0"), { CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS: "1000" }), /^Client tool timeout covers/, "a configured slot-wait budget (1 s) replaces the default");
   assert.match(clientToolTimeoutWarning("[mcp_servers.opencode]\n", {}), /no tool_timeout_sec/);
 }
 

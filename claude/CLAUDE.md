@@ -34,6 +34,11 @@ Never report success based only on an agent's own claim.
 - `dirty_worktree_requires_checkpoint`: the job's files have uncommitted changes. If they are yours (a finished integration), commit them and retry. If another client (Codex) owns them, wait for it to commit; never commit or revert another client's work. Use `allowDirtyTarget: true` only for dirt on paths the patch does not touch.
 - Codex may be using the same bridge on the same repo at the same time; a lock conflict message means wait or pick disjoint paths.
 - `integration_preview_contains_sensitive_text`: open the flagged patch lines in the worktree; if none is a real credential, dry-run again with `acceptFlaggedSecretLines: true`.
+- `integration_preview_unreadable_text_file`: the patch carries a file as a binary hunk (NUL bytes, or an extension that is not a known image/font/archive type). Inspect the file in the worktree; if it is meant to be binary, dry-run again with `acceptBinaryHunks: true`; otherwise have a debugger remove the binary content.
+- `integration_recovery_pending`: an integration operation of that repository is unresolved (running in the other client, or quarantined). `diagnose_opencode_bridge` lists it under `integrationOperations`; a quarantined one needs the recovery pass, not waiting. A queued writer shows the same errorType while it waits.
+- `startup_recovery_pending`: the bridge just started and is still recovering durable state; retry the call after a moment.
+- `provider_slot_wait_timeout`: every slot of that provider stayed held for the whole wait budget (`CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS`, 20 min); the agent never started, so the job's own timeout was not used. Check `get_opencode_bridge_status` for the holders.
+- `lock_request_rejected` on a queued job: its lock paths can never be granted (wildcards, paths outside the repository, repository-wide write scope); fix the job's `lockedPaths`/`allowedEdits` and enqueue again.
 
 ## opencode-delegate skill vs. the `opencode` MCP bridge
 Two ways exist to hand work to OpenCode; pick by isolation need:
