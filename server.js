@@ -139,6 +139,7 @@ const DISABLED_GIT_HOOKS_PATH = path.join(
 );
 const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
+const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -10056,10 +10057,16 @@ function conflictsWithActiveLock(request, activeLock, worktreeMode = CONFIG.work
   // reviewed patch could not land while any other builder (from either client) still ran.
   // Manual acquire_agent_lock writers, legacy rows, and CODEX_OPENCODE_WORKTREE_MODE=off
   // writers edit the checkout itself, so they still serialize with integration.
+  // Whether a writer edits the checkout is recorded on its lock row by the process that took
+  // it (editsCheckout); deciding from this process's CONFIG.worktreeMode was wrong whenever the
+  // two bridges (Codex, Claude) ran with different worktree modes. Rows without the flag are
+  // legacy and count as editing the checkout; in-memory requests without it keep the mode rule.
+  const editsCheckout = (lock) => typeof lock.editsCheckout === "boolean"
+    ? lock.editsCheckout
+    : !(worktreeMode !== "off" && (lock.origin || "internal") === "internal");
   const involvesIntegration = requestType === "serial_integration" || activeType === "serial_integration";
-  const worktreeJobWriter = (lock) => lock.lockType === "write" && (lock.origin || "internal") === "internal";
+  const worktreeJobWriter = (lock) => lock.lockType === "write" && !editsCheckout(lock);
   const writerAndIntegration = involvesIntegration
-    && worktreeMode !== "off"
     && (worktreeJobWriter(request) || worktreeJobWriter(activeLock));
   const requiresRepositorySerialization = involvesIntegration && !writerAndIntegration;
   const overlap = requiresRepositorySerialization
@@ -10701,10 +10708,13 @@ function lockTableHasCompositePrimaryKey(db) {
 }
 
 function ensureLockTableSchema(db) {
-  if (lockTableHasCompositePrimaryKey(db)) {
-    return;
-  }
+  if (!lockTableHasCompositePrimaryKey(db)) migrateLegacyLockTable(db);
+  // 1 when the lock holder edits the checkout itself, 0 for a writer in its own worktree;
+  // NULL rows come from older bridges and are treated as editing the checkout.
+  ensureTableColumn(db, "locks", "edits_checkout", "INTEGER");
+}
 
+function migrateLegacyLockTable(db) {
   db.exec("BEGIN IMMEDIATE");
   try {
     if (!lockTableHasCompositePrimaryKey(db)) {
@@ -11156,6 +11166,7 @@ function rowsToLocks(rows) {
       taskSha256: String(row.task || "").replace(/^sha256:/i, ""),
       createdAt: row.created_at,
       expiresAt: row.expires_at,
+      editsCheckout: row.edits_checkout === null || row.edits_checkout === undefined ? true : Number(row.edits_checkout) !== 0,
     };
     lock.paths.push(row.normalized_path);
     grouped.set(key, lock);
@@ -11216,9 +11227,20 @@ async function acquireHardLock({
   paths = [],
   repositoryScope = false,
   ttlMs = DEFAULT_LOCK_TTL_MS,
+  editsCheckout = undefined,
+  // Internal-only: set by recoverIntegrationRepositorySerially so journal recovery can take its
+  // lock while the journal blocks writers. The tool never passes it (the exemption used to key
+  // on the caller-controlled agent name).
+  integrationRecoveryAuthority = false,
 }) {
   const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
   const normalizedOrigin = origin === "manual" ? "manual" : "internal";
+  const recoveryAuthority = integrationRecoveryAuthority === true && normalizedOrigin === "internal";
+  // A writer edits the checkout unless it is an internal job writer while this process runs
+  // writers in worktrees; the flag is persisted so other bridge processes decide from it.
+  const lockEditsCheckout = typeof editsCheckout === "boolean"
+    ? editsCheckout
+    : !(normalizedOrigin === "internal" && normalizedLockType === "write" && CONFIG.worktreeMode !== "off");
   const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
   const requestedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : paths;
   const unsafeReason = repositoryScope ? "" : unsafePathReason(requestedPaths, projectRoot);
@@ -11227,7 +11249,7 @@ async function acquireHardLock({
 
   if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(projectRoot))
     && normalizedLockType !== "read"
-    && agent !== "integration_recovery") {
+    && !recoveryAuthority) {
     return {
       ok: false,
       errorType: "integration_recovery_pending",
@@ -11276,12 +11298,13 @@ async function acquireHardLock({
   const token = makeLockToken();
   const tokenSha256 = `sha256:${createHash("sha256").update(token).digest("hex")}`;
   const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
-  const expiresAt = now + Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
-  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin };
+  const expiresAt = now + Math.min(MAX_LOCK_TTL_MS, Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS));
+  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin, editsCheckout: lockEditsCheckout };
 
+  let committed = false;
   try {
     db.exec("BEGIN IMMEDIATE");
-    if (normalizedLockType !== "read" && agent !== "integration_recovery") {
+    if (normalizedLockType !== "read" && !recoveryAuthority) {
       const unresolvedIntegration = db.prepare(`
         SELECT operation_id, status
         FROM integration_operations
@@ -11317,12 +11340,17 @@ async function acquireHardLock({
       "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
     ).run(runId, agent, "running", normalizedLockType, now);
     const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
+      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`, lockEditsCheckout ? 1 : 0);
     }
+    // Read inside the transaction: after COMMIT a SQLITE_BUSY in this listing (it expires
+    // rows) reported the acquire as rejected while the lock rows stayed committed with a
+    // token nobody had, orphaning the lock for its whole TTL.
+    const activeLocks = listLocksFromDb(db, now);
     db.exec("COMMIT");
+    committed = true;
 
     const lock = {
       id: runId,
@@ -11338,14 +11366,17 @@ async function acquireHardLock({
       paths: lockPathsRequested,
       createdAt: now,
       expiresAt,
+      editsCheckout: lockEditsCheckout,
       pid: process.pid,
     };
-    return { ok: true, lock, activeLocks: listLocksFromDb(db) };
+    return { ok: true, lock, activeLocks };
   } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after failed begin/commit.
+      }
     }
     return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
   } finally {
@@ -11362,7 +11393,15 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
     return { ok: false, released: false, error: "Lock release token is required." };
   }
 
-  const db = await openLockDb(cwd);
+  let db;
+  try {
+    db = await openLockDb(cwd);
+  } catch (error) {
+    // Callers release in finally blocks; an unopenable state database must not replace their
+    // result with an exception. The lease expires on its own.
+    return { ok: false, released: false, error: error.message || String(error) };
+  }
+  let committed = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     const requestedPaths = normalizeLockPathList(paths);
@@ -11384,13 +11423,17 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
     if (!remaining) {
       db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
     }
+    const activeLocks = listLocksFromDb(db);
     db.exec("COMMIT");
-    return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
+    committed = true;
+    return { ok: true, released: true, activeLocks };
   } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after failed begin/commit.
+      }
     }
     return { ok: false, released: false, error: error.message || String(error) };
   } finally {
@@ -11427,6 +11470,45 @@ async function quarantineHardLock(lock, containment = "") {
   } finally {
     closeDb(db);
   }
+}
+
+// A containment quarantine sets expires_at to Number.MAX_SAFE_INTEGER, beyond the largest
+// Date, so new Date(...).toISOString() threw RangeError and list_agent_locks failed.
+function formatLockExpiry(expiresAt) {
+  const value = Number(expiresAt);
+  if (value >= Number.MAX_SAFE_INTEGER) return "quarantined (no expiry)";
+  const date = new Date(value);
+  return Number.isFinite(value) && !Number.isNaN(date.getTime()) ? date.toISOString() : "unknown";
+}
+
+function formatAgentLockList(locks = []) {
+  return locks.length
+    ? [
+        "Active temporary locks:",
+        "",
+        ...locks.map((lock) =>
+          [
+            `- ${lock.id}`,
+            `  owner: ${lock.owner}`,
+            `  agent: ${lock.agent}`,
+            `  type: ${lock.lockType}`,
+            `  paths: ${lock.paths.join(", ")}`,
+            `  expires: ${formatLockExpiry(lock.expiresAt)}`,
+          ].join("\n")
+        ),
+      ].join("\n")
+    : "No active temporary locks.";
+}
+
+// Agent names the bridge's own internal locks use. The recovery bypass used to key on the
+// agent name, which acquire_agent_lock takes from the caller.
+const RESERVED_LOCK_AGENT_NAMES = new Set(["integration_recovery", "merge_manager", "pipeline_finalizer"]);
+
+function reservedLockAgentError(name) {
+  const normalized = String(name || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  return RESERVED_LOCK_AGENT_NAMES.has(normalized)
+    ? `Lock rejected: "${name}" is reserved for the bridge's internal locks.`
+    : "";
 }
 
 function hardLockPathsForPlan(lockPlan) {
@@ -11517,9 +11599,25 @@ function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs =
           renewed = (await refreshLease({ lock, expiresAt })) !== false;
         } else {
           db = await openLockDb(lock.cwd);
+          if (stopped || controller.signal.aborted) return false;
           const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ?").run(expiresAt, lock.id, tokenSha256, now);
+          // expires_at = MAX_SAFE_INTEGER is a containment quarantine; a pulse that was already
+          // running when quarantineHardLock ran must not renew it back into an expiring lease.
+          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ? AND expires_at <> ?")
+            .run(expiresAt, lock.id, tokenSha256, now, Number.MAX_SAFE_INTEGER);
           renewed = Number(updated.changes || 0) === Math.max(1, lock.paths?.length || 0);
+          if (!renewed && Number(updated.changes || 0) === 0) {
+            const quarantined = db.prepare("SELECT COUNT(*) AS count FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
+              .get(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER);
+            if (Number(quarantined?.count || 0) > 0) {
+              // Held without expiry until containment is resolved; nothing left to renew.
+              if (fenceTimer) clearTimeout(fenceTimer);
+              fenceTimer = null;
+              clearInterval(timer);
+              lastConfirmedExpiresAt = Number.MAX_SAFE_INTEGER;
+              return true;
+            }
+          }
         }
         if (!renewed) {
           loseOwnership("The durable lock row or fencing token no longer belongs to this execution.");
@@ -11546,10 +11644,14 @@ function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs =
   scheduleFence();
   const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
+  // stop() returns a promise that settles once an in-flight pulse finished, so a caller that
+  // awaits it (before releasing or quarantining the lock) never races a renewal; callers that
+  // do not await it keep working.
   const stop = Object.assign(() => {
     stopped = true;
     clearInterval(timer);
     if (fenceTimer) clearTimeout(fenceTimer);
+    return refreshPromise ? refreshPromise.then(() => undefined, () => undefined) : Promise.resolve();
   }, {
     signal: controller.signal,
     pulse,
@@ -11682,10 +11784,13 @@ server.tool(
     cwd: z.string().min(1).describe("Canonical repository path."),
     lockType: z.enum(["read", "write", "serial_integration"]).optional(),
     paths: z.array(z.string()).min(1).describe("Concrete files or directories to lock."),
-    ttlMs: z.number().int().positive().optional().describe("Lease duration in milliseconds. Defaults to 30 minutes."),
+    ttlMs: z.number().int().positive().max(MAX_LOCK_TTL_MS).optional().describe("Lease duration in milliseconds. Defaults to 30 minutes; at most 24 hours."),
   },
   async ({ owner = "codex", agent = "opencode", task = "", cwd = "", lockType = "write", paths, ttlMs = DEFAULT_LOCK_TTL_MS }) => {
-    const result = await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
+    const reservedAgentError = reservedLockAgentError(agent) || reservedLockAgentError(owner);
+    const result = reservedAgentError
+      ? { ok: false, error: reservedAgentError }
+      : await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
     return {
       content: [
         {
@@ -11700,7 +11805,7 @@ server.tool(
                 `Agent: ${result.lock.agent}`,
                 `Type: ${result.lock.lockType}`,
                 `Paths: ${result.lock.paths.join(", ")}`,
-                `Expires at: ${new Date(result.lock.expiresAt).toISOString()}`,
+                `Expires at: ${formatLockExpiry(result.lock.expiresAt)}`,
               ].join("\n")
             : [
                 "Temporary lock rejected.",
@@ -11755,22 +11860,7 @@ server.tool(
       content: [
         {
           type: "text",
-          text: locks.length
-            ? [
-                "Active temporary locks:",
-                "",
-                ...locks.map((lock) =>
-                  [
-                    `- ${lock.id}`,
-                    `  owner: ${lock.owner}`,
-                    `  agent: ${lock.agent}`,
-                    `  type: ${lock.lockType}`,
-                    `  paths: ${lock.paths.join(", ")}`,
-                    `  expires: ${new Date(lock.expiresAt).toISOString()}`,
-                  ].join("\n")
-                ),
-              ].join("\n")
-            : "No active temporary locks.",
+          text: formatAgentLockList(locks),
         },
       ],
     };
