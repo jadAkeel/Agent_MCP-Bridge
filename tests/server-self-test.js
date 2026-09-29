@@ -3350,10 +3350,11 @@ async function runSelfTests() {
         heartbeatAt: "",
         leaseExpiresAt: "",
       });
+      // A lapsed lease under the same owner generation and revision is not lost ownership: the
+      // terminal commit lands instead of leaving the row "running" forever.
       const expiredOwnerTerminal = persistTerminalQueueRecord(staleQueueDb, expiredOwnerRecord);
-      assert.equal(expiredOwnerTerminal.persisted, false);
-      assert.equal(expiredOwnerTerminal.ownershipLost, true);
-      assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(expiredOwnerRecord.jobId).status, "running");
+      assert.equal(expiredOwnerTerminal.persisted, true);
+      assert.equal(staleQueueDb.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(expiredOwnerRecord.jobId).status, "completed");
 
       staleQueueDb.prepare("DELETE FROM opencode_jobs WHERE job_id IN (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
         "stale-self-test",
