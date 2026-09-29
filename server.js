@@ -8671,6 +8671,28 @@ async function staleBridgeProcessHint(currentSha256) {
   return "";
 }
 
+// A client keeps its bridge process alive across a deploy (closing the window, or Codex keeping
+// idle bridges, does not end it), so a restart that did not happen looked exactly like one that
+// did: status printed the startup hash and "healthy" while the process ran the old code, and the
+// synced runtime profiles no longer matched that code's rules. Compare against the file on disk.
+async function bridgeSourceFreshness(serverPath = BRIDGE_SERVER_PATH, startupSha256 = BRIDGE_SOURCE_SHA256) {
+  try {
+    const onDiskSha256 = createHash("sha256").update(await readFile(serverPath)).digest("hex");
+    return { startedAt: BRIDGE_PROCESS_STARTED_AT, startupSha256, onDiskSha256, stale: onDiskSha256 !== startupSha256, error: "" };
+  } catch (error) {
+    return { startedAt: BRIDGE_PROCESS_STARTED_AT, startupSha256, onDiskSha256: "", stale: false, error: error?.message || String(error) };
+  }
+}
+
+function bridgeSourceFreshnessLines(freshness) {
+  if (freshness.error) return [`Bridge source on disk: unreadable (${freshness.error})`];
+  if (!freshness.stale) return ["Bridge source on disk: same as at startup"];
+  return [
+    `Bridge source on disk: ${freshness.onDiskSha256} (differs from startup)`,
+    `Warning: server.js changed after this bridge process started (${freshness.startedAt}); this process still runs the old code. Restart the client that launched it (quit Claude fully, not just the window, or start a new Claude Code session; restart Codex) so it launches the current bridge.`,
+  ];
+}
+
 function truncateText(value, limit = 12000) {
   const text = String(value || "");
   return text.length > limit ? `${text.slice(0, limit)}\n... [truncated]` : text;
@@ -13523,6 +13545,7 @@ server.tool(
       managedSkillSourceEvidence(),
       providerCapacitySnapshot(),
     ]);
+    const sourceFreshness = await bridgeSourceFreshness();
     if (!pluginPolicy.ok) {
       return { content: [{ type: "text", text: `OpenCode MCP bridge status: attention required.\n\nPlugin policy: rejected\nReason: ${pluginPolicy.error}` }] };
     }
@@ -13546,7 +13569,8 @@ server.tool(
       && gitVersion.exitCode === 0
       && agentDiscovery.result.exitCode === 0
       && missingRequiredAgents.length === 0
-      && managedSkillEvidence.ok;
+      && managedSkillEvidence.ok
+      && !sourceFreshness.stale;
     const deepHealthy = safeOrchestratorEnforced
       && contractorOrchestratorEnforced
       && contractorSubagentAllowlistEnforced
@@ -13564,6 +13588,8 @@ server.tool(
             `OpenCode executable: ${OPENCODE_EXE}`,
             `OpenCode version: ${(openCodeVersion.stdout || openCodeVersion.stderr || "unavailable").trim()}`,
             `Bridge source SHA-256 at startup: ${BRIDGE_SOURCE_SHA256}`,
+            `Bridge process started: ${BRIDGE_PROCESS_STARTED_AT}`,
+            ...bridgeSourceFreshnessLines(sourceFreshness),
             `Bridge release root: ${BRIDGE_RUNTIME_DIR}`,
             `Bridge release manifest pin: ${String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "not pinned")}`,
             `Health depth: ${deep ? "deep managed-role attestation" : "quick daily check"}`,
@@ -13666,6 +13692,7 @@ server.tool(
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
+      bridgeProcess: await bridgeSourceFreshness(),
       summary: {
         jobs: jobs.length,
         nonterminalJobs: nonterminal.length,
@@ -23582,6 +23609,8 @@ export const __selfTest = {
     queueAgentTiming,
     queueRunStage,
     staleBridgeProcessHint,
+    bridgeSourceFreshness,
+    bridgeSourceFreshnessLines,
     truncateResultText,
     diffStatFromPatch,
     readOnlyHeadMove,

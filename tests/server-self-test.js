@@ -139,6 +139,8 @@ const {
   queueAgentTiming,
   queueRunStage,
   staleBridgeProcessHint,
+  bridgeSourceFreshness,
+  bridgeSourceFreshnessLines,
   truncateResultText,
   diffStatFromPatch,
   readOnlyHeadMove,
@@ -3606,6 +3608,21 @@ async function runSelfTests() {
     assert.match(integratedRow.recoveryAction, /worktree is gone/, "An integrated writer is not offered for integration again.");
     assert.match(diagnoseJobView({ jobId: "builder-8", status: "completed", mode: "write", worktreePath: tmpdir() }).recoveryAction, /integrate it with integrate_opencode_worktree/);
     assert.equal(await staleBridgeProcessHint("0".repeat(64)), "", "An unpinned hash gives no stale-process hint.");
+    const freshnessDir = await mkdtemp(path.join(tmpdir(), "codex-opencode-freshness-self-test-"));
+    const freshnessFile = path.join(freshnessDir, "server.js");
+    await writeFile(freshnessFile, "old");
+    const changedOnDisk = await bridgeSourceFreshness(freshnessFile, "0".repeat(64));
+    assert.equal(changedOnDisk.stale, true, "A server.js that changed after startup marks the process stale.");
+    assert.match(bridgeSourceFreshnessLines(changedOnDisk).join(" "), /still runs the old code. Restart the client/, "Status tells the operator the restart did not take effect.");
+    const unchangedOnDisk = await bridgeSourceFreshness(freshnessFile, changedOnDisk.onDiskSha256);
+    assert.equal(unchangedOnDisk.stale, false);
+    assert.deepEqual(bridgeSourceFreshnessLines(unchangedOnDisk), ["Bridge source on disk: same as at startup"]);
+    const unreadable = await bridgeSourceFreshness(path.join(freshnessDir, "missing.js"), "0".repeat(64));
+    assert.equal(unreadable.stale, false, "An unreadable file is reported, not treated as a stale process.");
+    assert.match(bridgeSourceFreshnessLines(unreadable)[0], /unreadable/);
+    const live = await bridgeSourceFreshness();
+    assert.equal(live.stale, false, "The bridge under test runs the file on disk.");
+    await rm(freshnessDir, { recursive: true, force: true });
     const truncatedQueueRecord = makeQueuePersistenceRecord("queue-result-truncation-self-test");
     assert.equal((await persistQueueRecord(truncatedQueueRecord)).persisted, true);
     assert.equal((await claimQueueRecord(truncatedQueueRecord)).ok, true);
