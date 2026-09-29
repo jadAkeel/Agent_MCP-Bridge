@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1264,11 +1265,16 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
   }
 }
 
+// After the control channel reports "exit", stdout/stderr may still hold the payload's last
+// bytes; the result waits for the supervisor's "close" (all pipes drained) this long at most.
+const SUPERVISOR_EXIT_CLOSE_GRACE_MS = 5_000;
+
 async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, {
   signal = null,
   terminateOnProviderError = false,
   onSpawn = null,
   beforeHeartbeat = null,
+  supervisorScriptForTest = "",
 } = {}) {
   return new Promise((resolve) => {
     let stdout = "";
@@ -1278,7 +1284,13 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let stdoutChars = 0;
     let stderrChars = 0;
     let stdoutLineBuffer = "";
+    let stderrLineBuffer = "";
     let controlLineBuffer = "";
+    // One decoder per stream: a multi-byte UTF-8 character split across two pipe reads
+    // decoded chunk by chunk became two U+FFFD (Arabic text, emoji). Hashes stay on raw bytes.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let exitCloseFallbackTimer = null;
     const stdoutHash = createHash("sha256");
     const stderrHash = createHash("sha256");
     let stdoutTruncated = false;
@@ -1312,7 +1324,10 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     );
     const supervisorHeartbeatMs = Math.max(50, Math.min(5_000, Math.floor(supervisorWatchdogMs / 3)));
 
-    const supervisor = spawn(process.execPath, [PROCESS_SUPERVISOR_PATH, "--identity", supervisorIdentity], {
+    const supervisorScript = supervisorScriptForTest && process.argv.includes("--self-test")
+      ? supervisorScriptForTest
+      : PROCESS_SUPERVISOR_PATH;
+    const supervisor = spawn(process.execPath, [supervisorScript, "--identity", supervisorIdentity], {
       cwd: BRIDGE_RUNTIME_DIR,
       shell: false,
       windowsHide: true,
@@ -1325,9 +1340,11 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       if (startupTimer) clearTimeout(startupTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (terminationFallbackTimer) clearTimeout(terminationFallbackTimer);
+      if (exitCloseFallbackTimer) clearTimeout(exitCloseFallbackTimer);
       startupTimer = null;
       heartbeatTimer = null;
       terminationFallbackTimer = null;
+      exitCloseFallbackTimer = null;
     };
 
     const finish = (result) => {
@@ -1482,11 +1499,16 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       timedOut ||= reason === "timeout";
       const watchdogExpired = reason === "watchdog_expired";
       const terminationUnconfirmed = controlTerminationUnconfirmed || event.errorType === "termination_unconfirmed";
+      // The supervisor could not start the payload (ENOENT, E2BIG, a Windows command line
+      // over 32,767 characters). That used to surface as a bare nonzero exit.
+      const spawnFailed = event.errorType === "spawn_failed" || reason === "spawn_failed";
       const terminationErrorType = terminationUnconfirmed
         ? "process_tree_termination_unconfirmed"
         : watchdogExpired
           ? "process_supervisor_watchdog_expired"
-          : "";
+          : spawnFailed
+            ? "spawn_failed"
+            : "";
       const verifiedTermination = Boolean(event.treeTerminationConfirmed);
       const exitCode = cancelled
         ? 130
@@ -1512,6 +1534,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         terminationErrorType,
         containmentGuarantee: event.containmentGuarantee || "process_supervisor",
         terminationBestEffortSucceeded: Boolean(event.terminationBestEffortSucceeded),
+        spawnErrorCode: spawnFailed ? String(event.spawnErrorCode || event.errorCode || "spawn_failed") : "",
         stdoutTruncated,
         stderrTruncated,
       });
@@ -1545,7 +1568,20 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         if (!gateFailureType) gateFailureType = "process_supervisor_protocol_error";
         return;
       }
-      if (event.type === "exit") finishFromControlExit(event);
+      if (event.type === "exit") {
+        // Output the payload wrote before exiting may still be in the stdout/stderr pipes;
+        // finishing here dropped it (every later chunk hit `if (settled) return`). The
+        // supervisor's "close" fires once every pipe has drained; the timer bounds the wait.
+        controlExitEvent = event;
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+        if (!exitCloseFallbackTimer) {
+          exitCloseFallbackTimer = setTimeout(() => {
+            if (!settled) finishFromControlExit(controlExitEvent);
+          }, SUPERVISOR_EXIT_CLOSE_GRACE_MS);
+          exitCloseFallbackTimer.unref?.();
+        }
+      }
     };
 
     supervisor.stdio[3].setEncoding("utf8");
@@ -1572,11 +1608,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
     });
 
-    supervisor.stdout.on("data", (chunk) => {
-      if (settled) return;
-      const text = chunk.toString();
+    const consumeStdout = (text) => {
+      if (!text) return;
       stdoutChars += text.length;
-      stdoutHash.update(chunk);
       stdoutTail = `${stdoutTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stdout.length);
       if (remaining) stdout += text.slice(0, remaining);
@@ -1603,25 +1637,47 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
           }
         }
       }
-    });
+    };
 
-    supervisor.stderr.on("data", (chunk) => {
-      if (settled) return;
-      const text = chunk.toString();
+    const consumeStderr = (text) => {
+      if (!text) return;
       stderrChars += text.length;
-      stderrHash.update(chunk);
       stderrTail = `${stderrTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stderr.length);
       if (remaining) stderr += text.slice(0, remaining);
       stderrTruncated ||= text.length > remaining;
-      const recentErrorLines = text.split(/\r?\n/)
+      // Classify whole lines only: a diagnostic split across two reads was judged as two
+      // fragments, each of which could miss or mis-match the classifier.
+      stderrLineBuffer += text;
+      const lines = stderrLineBuffer.split(/\r?\n/);
+      stderrLineBuffer = (lines.pop() || "").slice(-64 * 1024);
+      const recentErrorLines = lines
         .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
         .filter((line) => /level\s*=\s*ERROR|\berror\b\s*[:=.]|APIError|CreditsError|HTTP\s+[45]\d\d/i.test(line))
         .slice(-20)
         .join("\n");
-      if (terminateOnProviderError && !providerTerminated && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
+      if (terminateOnProviderError && !providerTerminated && recentErrorLines && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
         requestTermination("provider_error");
       }
+    };
+
+    supervisor.stdout.on("data", (chunk) => {
+      if (settled) return;
+      stdoutHash.update(chunk);
+      consumeStdout(stdoutDecoder.write(chunk));
+    });
+    supervisor.stdout.on("end", () => {
+      if (!settled) consumeStdout(stdoutDecoder.end());
+    });
+
+    supervisor.stderr.on("data", (chunk) => {
+      if (settled) return;
+      stderrHash.update(chunk);
+      consumeStderr(stderrDecoder.write(chunk));
+    });
+    supervisor.stderr.on("end", () => {
+      if (settled) return;
+      consumeStderr(stderrDecoder.end());
     });
 
     supervisor.once("error", () => {
@@ -1655,6 +1711,14 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         processRole: "supervisor",
         containmentIdentity: supervisorIdentity,
       })).then((authority) => {
+        // An explicit refusal from the launch gate is a failure like a thrown error; it used
+        // to be ignored and the payload launched anyway.
+        if (authority?.ok === false) {
+          gateFailureType = "child_identity_persistence_failed";
+          logEvent("warn", "opencode.supervisor_launch_gate_rejected", { errorType: String(authority?.errorType || "") });
+          requestTermination("launch_gate_rejected");
+          return;
+        }
         launchAuthorityDeadlineAt = Number(authority?.deadlineAt || Date.now() + supervisorWatchdogMs);
         identityPersisted = true;
         maybeLaunch();
