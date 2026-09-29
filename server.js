@@ -145,6 +145,10 @@ const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
 // than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
 const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
 const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
+// setTimeout and setInterval cannot represent more than 2^31-1 ms: a longer delay fires after
+// 1 ms, so a progress heartbeat interval of 2147483648 became a notification flood. Every
+// CODEX_OPENCODE_*_MS setting is a timer, lease or timeout, so readIntegerEnv caps them here.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -421,7 +425,9 @@ async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT
   let timer = null;
   try {
     return await Promise.race([
-      pending.then(() => ({ ok: true }), () => ({ ok: true })),
+      // A rejected recovery is a failure: turning it into ok let early tool calls act on
+      // unrecovered queue, pipeline and integration state.
+      pending.then(() => ({ ok: true }), (error) => ({ ok: false, failed: true, error })),
       new Promise((resolve) => {
         timer = setTimeout(() => resolve({ ok: false }), Math.max(0, Number(timeoutMs) || 0));
       }),
@@ -429,6 +435,36 @@ async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+// Starts startup recovery and remembers it for awaitBridgeStartupRecovery. The failure is
+// logged here but the promise stays rejected, so every tool call answers startup_recovery_failed
+// instead of running on unrecovered state. `run` is a seam for tests.
+function beginBridgeStartupRecovery(run = reconcileQueueStateAtStartup) {
+  const recovery = Promise.resolve().then(run);
+  recovery.catch((error) => {
+    logEvent("error", "state.startup_recovery_failed", {
+      errorType: error?.errorType || "startup_recovery_failed",
+      error: redactSensitiveText(error?.message || String(error)),
+    });
+  });
+  bridgeStartupRecovery = recovery;
+  return recovery;
+}
+
+function startupRecoveryFailedResult(error) {
+  return {
+    isError: true,
+    content: [{
+      type: "text",
+      text: [
+        "Bridge startup recovery failed.",
+        "errorType: startup_recovery_failed",
+        `The bridge could not recover durable queue, pipeline and integration state, so it refuses tool calls instead of acting on unrecovered state: ${redactSensitiveText(error?.message || String(error))}`,
+        "Restart the bridge. The failure is in the bridge log as state.startup_recovery_failed.",
+      ].join("\n"),
+    }],
+  };
 }
 
 function startupRecoveryPendingResult() {
@@ -452,7 +488,8 @@ server.tool = (...registration) => {
     registration[registration.length - 1] = async (...handlerArgs) => {
       const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
       try {
-        if (!(await awaitBridgeStartupRecovery()).ok) return startupRecoveryPendingResult();
+        const recovery = await awaitBridgeStartupRecovery();
+        if (!recovery.ok) return recovery.failed ? startupRecoveryFailedResult(recovery.error) : startupRecoveryPendingResult();
         return await handler(...handlerArgs);
       } finally {
         stop();
@@ -591,18 +628,25 @@ const projectAgentPolicySchema = z
   })
   .strict();
 
+// Unset or blank keeps the default (Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS=""
+// used to disable progress heartbeats). Anything else must be an integer in range: a typo
+// (PROVIDER_CONCURRENCY_LIMIT=foo) used to fall back to the default silently, like the unknown
+// choice values readChoiceEnv already rejects at startup.
+function readIntegerEnv(name, fallback, minimum) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
+  const maximum = name.endsWith("_MS") ? MAX_TIMER_MS : Number.MAX_SAFE_INTEGER;
+  const value = Number(raw);
+  if (Number.isInteger(value) && value >= minimum && value <= maximum) return value;
+  throw new Error(`${name} must be an integer from ${minimum} to ${maximum} (or unset for ${fallback}); got ${JSON.stringify(String(raw).trim())}.`);
+}
+
 function readPositiveIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) && value > 0 ? value : fallback;
+  return readIntegerEnv(name, fallback, 1);
 }
 
 function readNonNegativeIntEnv(name, fallback) {
-  // Blank is unset: Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS="" silently
-  // disabled progress heartbeats instead of keeping the default.
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
-  const value = Number(raw);
-  return Number.isInteger(value) && value >= 0 ? value : fallback;
+  return readIntegerEnv(name, fallback, 0);
 }
 
 function readStrictPositiveIntEnv(name, fallback) {
@@ -1032,25 +1076,32 @@ const USER_LINE_ENDING_GIT_CONFIG_KEYS = new Map([
 ]);
 const NULL_GIT_CONFIG_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
 
-async function readUserLineEndingGitConfig() {
+// These reads run at import, before the transport connects, so they count against the client's
+// 30 s MCP startup deadline. Two sequential 15 s reads could use all of it; the levels are now
+// read together under one short bound (worst case 10 s).
+const USER_GIT_CONFIG_READ_TIMEOUT_MS = 1000 * 10;
+
+async function readUserLineEndingGitConfig({ execFile = execFileAsync } = {}) {
   const values = new Map();
-  // Later levels win, as in Git: global overrides system.
-  for (const scope of ["--system", "--global"]) {
-    let stdout = "";
+  const readLevel = async (scope) => {
     try {
-      ({ stdout } = await execFileAsync("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
+      const { stdout } = await execFile("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
         cwd: tmpdir(),
         shell: false,
-        timeout: 1000 * 15,
+        timeout: USER_GIT_CONFIG_READ_TIMEOUT_MS,
         maxBuffer: 64 * 1024,
         windowsHide: true,
         env: process.env,
-      }));
+      });
+      return String(stdout || "");
     } catch (error) {
       // Exit 1 means no key is set at that level; a missing git leaves Git's defaults.
-      stdout = String(error?.stdout || "");
+      return String(error?.stdout || "");
     }
-    for (const line of String(stdout || "").split(/\r?\n/)) {
+  };
+  // Later levels win, as in Git: global overrides system, whichever read finishes first.
+  for (const stdout of await Promise.all(["--system", "--global"].map(readLevel))) {
+    for (const line of stdout.split(/\r?\n/)) {
       const match = /^(\S+)\s+(.+)$/.exec(line.trim());
       if (!match) continue;
       const key = match[1].toLowerCase();
@@ -14034,6 +14085,11 @@ server.tool(
       ...directRunAudit.records.filter((run) => run.status === "started"),
       ...newestFirst(directRunAudit.records.filter((run) => run.status !== "started"), "startedAt").slice(0, DIAGNOSE_DETAIL_LIMIT),
     ];
+    // Pipelines follow the same rule (R-138): every unfinished one plus the newest finished ones.
+    const pipelineFinished = (pipeline) => ["completed", "failed", "cancelled"].includes(pipeline.status);
+    let finishedPipelinesShown = 0;
+    const detailPipelines = newestFirst(pipelines, "createdAt")
+      .filter((pipeline) => !pipelineFinished(pipeline) || (finishedPipelinesShown += 1) <= DIAGNOSE_DETAIL_LIMIT);
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
@@ -14046,7 +14102,7 @@ server.tool(
         failedDirectRuns: directRunAudit.records.filter((run) => ["failed", "rejected", "abandoned"].includes(run.status)).length,
         unfinishedDirectRuns: directRunAudit.records.filter((run) => run.status === "started").length,
         pipelines: pipelines.length,
-        nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,
+        nonterminalPipelines: pipelines.filter((item) => !pipelineFinished(item)).length,
         locks: locks.length,
         unresolvedIntegrationOperations: integrationOperations.unresolvedCount ?? "unavailable",
         retainedWorktrees: Array.isArray(retainedWorktrees) ? retainedWorktrees.filter((item) => item.present && !item.inFlight).length : "unavailable",
@@ -14060,11 +14116,11 @@ server.tool(
         jobs: "queued_jobs_only",
         directRuns: directRunAudit.coverage,
         retainedWorktrees: "every bridge-created worktree still registered (queued, direct and parallel jobs); owner says which",
-        detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs and direct runs; counts in summary cover all`,
+        detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs, direct runs and pipelines; counts in summary cover all`,
       },
       jobs: detailJobs.map((job) => diagnoseJobView(job)),
       retainedWorktrees,
-      pipelines: pipelines.map((pipeline) => ({
+      pipelines: detailPipelines.map((pipeline) => ({
         pipelineId: pipeline.pipelineId,
         status: pipeline.status,
         ownerInstanceId: pipeline.ownerInstanceId || "",
@@ -15499,8 +15555,9 @@ server.tool(
   {
     cwd: z.string().min(1),
     status: z.enum(["planned", "running", "awaiting_integration", "awaiting_finalization", "finalizing", "integrating", "cleanup_pending", "cleanup_failed", "completed", "failed", "cancelled"]).optional(),
+    limit: z.number().int().positive().max(200).optional().describe("Newest pipelines to show; default 20. The count line always covers every pipeline."),
   },
-  async ({ cwd = "", status = "" }) => {
+  async ({ cwd = "", status = "", limit = 20 }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const records = (effectiveQueueMode() === "sqlite"
       ? await listPersistedPipelineRecords(projectRoot || cwd, status)
@@ -15509,13 +15566,14 @@ server.tool(
         .map((record) => pipelineRecordSnapshot(record))
         .filter((record) => !status || record.status === status)
     ).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const shown = records.slice(0, limit);
     return {
       content: [
         {
           type: "text",
           text: [
-            `Pipelines: ${records.length}`,
-            JSON.stringify(records, null, 2),
+            `Pipelines: ${records.length}${shown.length < records.length ? ` (showing the newest ${shown.length})` : ""}`,
+            JSON.stringify(shown, null, 2),
           ].join("\n"),
         },
       ],
@@ -24297,6 +24355,10 @@ export const __selfTest = {
     readOnlyWorkspaceDrift,
     reconcilePipelineIntegrationOperationStates,
     trackedTargetStateSha256,
+    // tests/review2-a.js
+    beginBridgeStartupRecovery,
+    readPositiveIntEnv,
+    readUserLineEndingGitConfig,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -24375,15 +24437,11 @@ if (!BRIDGE_RUN_AS_MAIN) {
   }
   // Connect first so the client's MCP startup timeout never waits on recovery; tool calls
   // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
-  bridgeStartupRecovery = reconcileQueueStateAtStartup().catch((error) => {
-    logEvent("error", "state.startup_recovery_failed", {
-      errorType: error?.errorType || "startup_recovery_failed",
-      error: redactSensitiveText(error?.message || String(error)),
-    });
-  });
+  beginBridgeStartupRecovery();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  await bridgeStartupRecovery;
+  // A failed recovery is already logged and answered per tool call; it must not end the process.
+  await bridgeStartupRecovery.catch(() => {});
   void reclaimProvenGoneProviderQuarantines({ force: true });
   void sweepStaleIndexScratchDirs();
 }
