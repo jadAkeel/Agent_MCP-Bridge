@@ -1951,16 +1951,42 @@ function validationCommandTrustError(parsed, { strictProjectPolicy = false } = {
   if (!allowed.has(executable)) {
     return `Validation executable is not operator-allowlisted: ${parsed[0]}`;
   }
-  if (["cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx"].includes(executable)) {
+  if (["cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx", "pnpx", "bunx"].includes(executable)) {
     return `Shell, interpreter, and package-executor validation commands are forbidden: ${parsed[0]}`;
   }
-  if (["node", "python", "python3", "bun", "deno"].includes(executable)
-    && parsed.some((argument) => ["-e", "-c", "--eval", "--print"].includes(String(argument).toLowerCase()))) {
-    return `Inline evaluation is forbidden in validation commands: ${parsed[0]}`;
+  // Interpreter options that run inline code or preload modules: -e/-p/-c and bundles such as
+  // -pe or -Ic, -r (node --require), and the long forms. Python stops reading interpreter
+  // options at "-m <module>", so the module's own arguments (pytest -p ...) are not checked.
+  const interpreterCodeOption = /^-(?:[a-z]*[ecpr][a-z]*|-(?:eval|print|import|require|loader|experimental-loader|experimental-default-type|env-file|inspect[a-z-]*))(?:=|$)/i;
+  if (["node", "python", "python3", "py", "bun", "deno"].includes(executable)) {
+    const pythonLike = ["python", "python3", "py"].includes(executable);
+    for (const argument of parsed.slice(1).map(String)) {
+      if (pythonLike && argument === "-m") break;
+      if (interpreterCodeOption.test(argument)) {
+        return `Inline evaluation and module preloading are forbidden in validation commands: ${parsed[0]} ${argument}`;
+      }
+    }
+    if (executable === "deno" && ["eval", "repl"].includes(String(parsed.find((argument, index) => index > 0 && !String(argument).startsWith("-")) || "").toLowerCase())) {
+      return `Inline evaluation is forbidden in validation commands: ${parsed.join(" ")}`;
+    }
   }
-  if (["npm", "pnpm", "yarn", "bun"].includes(executable)
-    && parsed.some((argument) => ["exec", "x", "dlx"].includes(String(argument).toLowerCase()))) {
-    return `Package-executor validation subcommands are forbidden: ${parsed.join(" ")}`;
+  // Package managers: only the subcommand position selects an executor. Any other argument
+  // equal to "x" or "exec" ("pnpm test --filter x") used to be rejected. When options come
+  // before the subcommand their values cannot be told apart from it, so every bare word up
+  // to "--" is checked then.
+  if (["npm", "pnpm", "yarn", "bun"].includes(executable)) {
+    const executorSubcommands = new Set(["exec", "x", "dlx", "create", "init", "explore", "node"]);
+    const rest = parsed.slice(1).map(String);
+    const separator = rest.indexOf("--");
+    const beforeSeparator = separator === -1 ? rest : rest.slice(0, separator);
+    const subcommandIndex = beforeSeparator.findIndex((argument) => !argument.startsWith("-"));
+    const candidates = subcommandIndex <= 0
+      ? beforeSeparator.slice(subcommandIndex === -1 ? 0 : subcommandIndex, subcommandIndex === -1 ? 0 : subcommandIndex + 1)
+      : beforeSeparator.filter((argument) => !argument.startsWith("-"));
+    const executor = candidates.find((argument) => executorSubcommands.has(argument.toLowerCase()));
+    if (executor) {
+      return `Package-executor validation subcommands are forbidden: ${parsed.join(" ")}`;
+    }
   }
   if (strictProjectPolicy && executable !== "git") {
     return "Untrusted project policy may execute only a hash-pinned Git read/check vector. Package scripts and repository interpreters require an external sandbox.";
@@ -2043,15 +2069,22 @@ async function resolveValidationExecutable(command) {
   }
   for (const candidate of candidates) {
     try {
+      // Package managers install binaries as symlinks (/usr/bin/python3, Homebrew, nvm):
+      // resolve the link and require the target to be a regular file. The allowlist and hash
+      // checks compare this canonical target.
       const details = await lstat(candidate);
-      if (details.isSymbolicLink() || !details.isFile()) continue;
-      const canonicalPath = realpathSync(candidate);
+      const canonicalPath = details.isSymbolicLink() ? await realpath(candidate) : candidate;
+      const targetDetails = details.isSymbolicLink() ? await stat(canonicalPath) : details;
+      if (!targetDetails.isFile()) continue;
+      const resolvedPath = realpathSync(canonicalPath);
       return {
-        path: canonicalPath,
-        sha256: await sha256File(canonicalPath),
+        path: resolvedPath,
+        sha256: await sha256File(resolvedPath),
       };
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      // A PATH entry that is a file (ENOTDIR), unreadable (EACCES/EPERM) or a dangling link
+      // is skipped like a missing one instead of failing every validation command.
+      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP"].includes(error?.code)) throw error;
     }
   }
   throw new Error(`Validation executable could not be resolved through the trusted process PATH: ${raw}`);
