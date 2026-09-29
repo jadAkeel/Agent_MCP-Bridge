@@ -123,6 +123,18 @@ function truncate(value, limit = 140) {
   return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
 
+// Job and pipeline text (task summaries, model output, error text) is untrusted, and a terminal
+// obeys the control sequences it contains: OSC titles, hyperlinks and clipboard writes, cursor
+// movement, screen clears. Control characters, the C1 range (0x9b is a one-byte CSI) and the
+// bidi overrides are printed as "?"; tab and newline (CRLF included) are kept. Everything that
+// reaches the terminal from a tool result goes through this. The TUI's own screen clear is
+// written separately.
+function sanitizeTerminal(text) {
+  return String(text)
+    .replace(/\r\n/g, "\n")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu, "?");
+}
+
 function list(value) {
   return Array.isArray(value) && value.length ? value.join(", ") : "none";
 }
@@ -228,7 +240,7 @@ async function renderPipelineDashboard(pipeline, queueJobs = []) {
   }
 
   lines.push("=".repeat(96));
-  return lines.join("\n");
+  return sanitizeTerminal(lines.join("\n"));
 }
 
 async function createPipeline(state) {
@@ -281,15 +293,15 @@ async function monitorPipeline(state) {
       consecutiveFailures += 1;
       lastDashboard = `Monitoring error (${consecutiveFailures}/${maxConsecutiveFailures}): ${truncate(error?.message || String(error), 300)}`;
       output.write("\x1Bc");
-      output.write(`${lastDashboard}\n`);
+      output.write(`${sanitizeTerminal(lastDashboard)}\n`);
       if (consecutiveFailures >= maxConsecutiveFailures) break;
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
       continue;
     }
     lastDashboard = await renderPipelineDashboard(pipeline, jobs);
     output.write("\x1Bc");
-    output.write(`${lastDashboard}\n`);
-    output.write(`\nMonitoring ${pipelineId}. Ctrl+C to stop. Refresh #${count + 1}\n`);
+    output.write(`${sanitizeTerminal(lastDashboard)}\n`);
+    output.write(sanitizeTerminal(`\nMonitoring ${pipelineId}. Ctrl+C to stop. Refresh #${count + 1}\n`));
 
     count += 1;
     if (pipeline && ["completed", "failed", "cancelled"].includes(pipeline.status)) {
@@ -356,7 +368,7 @@ async function listJobs(state) {
 
 async function printResult(state) {
   if (state.lastText) {
-    output.write(`\n${state.lastText}\n`);
+    output.write(`\n${sanitizeTerminal(state.lastText)}\n`);
   }
   return { action: "" };
 }
@@ -417,6 +429,21 @@ async function main() {
     if (!dashboard.includes("Smoke task") || !dashboard.includes("model=")) {
       throw new Error("TUI dashboard smoke render failed.");
     }
+    // Job text can carry terminal control sequences: a clear-screen, an OSC title and clipboard
+    // write, a one-byte CSI, a carriage return that overwrites the line.
+    const hostile = "\u001b[2J\u001b]0;pwned\u0007\u001b]52;c;ZXZpbA==\u0007\u009b31m\rgone";
+    const hostileDashboard = await renderPipelineDashboard({
+      pipelineId: `p${hostile}`,
+      status: "failed",
+      jobs: [{ agent: "builder", task: `Smoke task ${hostile}` }],
+      queueJobIds: ["job-1"],
+      events: [{ type: `event${hostile}` }],
+      errors: [{ error: hostile }],
+    }, [{ jobId: "job-1", status: "failed", errorType: hostile }]);
+    if (/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(hostileDashboard) || !hostileDashboard.includes("Smoke task")) {
+      throw new Error("TUI dashboard printed control characters from job text.");
+    }
+    if (sanitizeTerminal("a\r\nb\tc\u001bd") !== "a\nb\tc?d") throw new Error("TUI sanitizer smoke failed.");
     console.log("TUI smoke passed.");
     return;
   }
@@ -441,4 +468,8 @@ async function main() {
   }
 }
 
-await main();
+await main().catch((error) => {
+  // An error message can carry server or job text too.
+  process.stderr.write(`${sanitizeTerminal(error?.stack || error)}\n`);
+  process.exitCode = 1;
+});

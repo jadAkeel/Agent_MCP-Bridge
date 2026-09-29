@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -180,12 +182,46 @@ function normalizePublishEntries(entries) {
   return normalized;
 }
 
+// node_modules is published, but a working tree's copy is only as trustworthy as the last
+// hand that touched it, and git ignores it, so no clean-tree check ever looked at it. With
+// installDependencies the release installs it fresh from package-lock.json instead: npm ci
+// checks every tarball against the lockfile's integrity hashes and refuses a lockfile that
+// disagrees with package.json, and lifecycle scripts stay off, so no dependency code runs
+// during a build. npm is started as `node npm-cli.js`: npm.cmd needs a shell on Windows, and
+// a shell would re-parse the arguments.
+function resolveNpmCli({ env = process.env, execPath = process.execPath, exists = existsSync } = {}) {
+  const candidates = [];
+  const viaNpm = String(env.npm_execpath || "");
+  if (path.basename(viaNpm).toLowerCase() === "npm-cli.js") candidates.push(viaNpm);
+  const nodeDirectory = path.dirname(execPath);
+  candidates.push(
+    path.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
+    path.join(nodeDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  );
+  return candidates.find((candidate) => exists(candidate)) || null;
+}
+
+async function installProductionDependencies(directory, { env = process.env, npmCli = resolveNpmCli({ env }) } = {}) {
+  if (!npmCli) {
+    throw new Error("Could not find npm-cli.js next to this Node.js install; the release needs npm to install node_modules from package-lock.json.");
+  }
+  const result = spawnSync(process.execPath, [
+    npmCli, "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", directory,
+  ], { cwd: directory, env, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024 });
+  if (result.error || result.status !== 0) {
+    const output = `${result.stderr || ""}${result.stdout || ""}`.trim().split(/\r?\n/).slice(-15).join("\n");
+    throw new Error(`npm ci failed (${result.error?.message || `exit ${result.status}`}); nothing was published.${output ? `\n${output}` : ""}`);
+  }
+}
+
 async function buildRelease({
   sourceRoot = SOURCE_ROOT,
   destination,
   profile = "legacy",
   publishEntries = null,
   afterStagingHook = null,
+  installDependencies = false,
+  dependencyInstaller = installProductionDependencies,
 } = {}) {
   const resolvedSourceRoot = path.resolve(sourceRoot);
   const resolvedDestination = path.resolve(destination || "");
@@ -196,6 +232,11 @@ async function buildRelease({
     throw new Error(`Unknown release profile: ${profile}.`);
   }
   const mappings = normalizePublishEntries(publishEntries || RELEASE_PROFILES[profile]);
+  if (installDependencies && !mappings.some(({ target }) => target === "node_modules")) {
+    throw new Error("Installing dependencies requires a node_modules publish mapping.");
+  }
+  // With installDependencies the working tree's node_modules is never read or copied.
+  const copiedMappings = mappings.filter(({ target }) => !(installDependencies && target === "node_modules"));
   if (
     resolvedDestination === path.parse(resolvedDestination).root
     || isPathInside(resolvedSourceRoot, resolvedDestination)
@@ -213,7 +254,7 @@ async function buildRelease({
     if (error?.code !== "ENOENT") throw error;
   }
 
-  for (const { source } of mappings) {
+  for (const { source } of copiedMappings) {
     const sourceEntry = path.join(resolvedSourceRoot, source);
     const details = await lstat(sourceEntry);
     if (details.isSymbolicLink() || (!details.isFile() && !details.isDirectory())) {
@@ -226,7 +267,7 @@ async function buildRelease({
   if (!isPathInside(destinationParent, staging)) throw new Error("Release staging path escaped its bounded parent.");
   try {
     await mkdir(staging, { recursive: false });
-    for (const { source, target: targetRelative } of mappings) {
+    for (const { source, target: targetRelative } of copiedMappings) {
       const target = path.join(staging, targetRelative);
       await mkdir(path.dirname(target), { recursive: true });
       await cp(path.join(resolvedSourceRoot, source), target, {
@@ -237,6 +278,7 @@ async function buildRelease({
         preserveTimestamps: false,
       });
     }
+    if (installDependencies) await dependencyInstaller(staging);
     await stageReleaseOpenCodeConfig({ sourceRoot: resolvedSourceRoot, staging, destination: resolvedDestination });
     if (afterStagingHook) await afterStagingHook({ staging, destination: resolvedDestination });
 
@@ -394,6 +436,53 @@ async function runSelfTest() {
     await assert.rejects(lstat(escapedChild), (error) => error?.code === "ENOENT");
     await rm(destinationJunction, { recursive: true, force: true });
 
+    // R-163: node_modules is git-ignored, so an edited dependency passed the clean-tree check
+    // and was copied into the release. With installDependencies it is installed fresh into the
+    // staging tree instead, and the working tree's copy is never read.
+    const trojan = "tampered dependency\n";
+    await writeFile(path.join(source, "node_modules", "fixture", "index.js"), trojan, "utf8");
+    const freshDestination = path.join(releases, "fresh-dependencies");
+    const stagingSeen = [];
+    const fresh = await buildRelease({
+      sourceRoot: source,
+      destination: freshDestination,
+      publishEntries,
+      installDependencies: true,
+      dependencyInstaller: async (staging) => {
+        stagingSeen.push(staging);
+        assert.equal(existsSync(path.join(staging, "node_modules")), false, "the working tree's node_modules is not copied before the install");
+        await mkdir(path.join(staging, "node_modules", "fixture"), { recursive: true });
+        await writeFile(path.join(staging, "node_modules", "fixture", "index.js"), "from the lockfile\n", "utf8");
+      },
+    });
+    assert.equal(stagingSeen.length, 1);
+    assert.equal(await readFile(path.join(freshDestination, "node_modules", "fixture", "index.js"), "utf8"), "from the lockfile\n");
+    const freshManifest = JSON.parse(await readFile(path.join(freshDestination, "release-manifest.json"), "utf8"));
+    assert.equal(freshManifest.files["node_modules/fixture/index.js"], createHash("sha256").update("from the lockfile\n").digest("hex"));
+    assert.equal(fresh.fileCount, expectedFiles.length);
+    // Without it the working tree's copy is published as before.
+    const copied = await buildRelease({ sourceRoot: source, destination: path.join(releases, "copied-dependencies"), publishEntries });
+    assert.equal(await readFile(path.join(copied.releaseDirectory, "node_modules", "fixture", "index.js"), "utf8"), trojan);
+    await rm(copied.releaseDirectory, { recursive: true, force: true });
+    // A failed install publishes nothing and leaves no staging folder; a source tree without
+    // node_modules is fine because nothing is read from it.
+    await rm(path.join(source, "node_modules"), { recursive: true, force: true });
+    const failedInstall = path.join(releases, "failed-install");
+    await assert.rejects(
+      buildRelease({ sourceRoot: source, destination: failedInstall, publishEntries, installDependencies: true, dependencyInstaller: async () => { throw new Error("npm ci failed (simulated)"); } }),
+      /npm ci failed \(simulated\)/,
+    );
+    await assert.rejects(lstat(failedInstall), (error) => error?.code === "ENOENT");
+    await assert.rejects(
+      buildRelease({ sourceRoot: source, destination: path.join(releases, "no-mapping"), publishEntries: publishEntries.filter((entry) => entry !== "node_modules"), installDependencies: true, dependencyInstaller: async () => {} }),
+      /requires a node_modules publish mapping/,
+    );
+    assert.equal(resolveNpmCli({ env: { npm_execpath: "C:\\x\\yarn.js" }, execPath: "/n/bin/node", exists: (file) => file === path.join("/n/bin", "node_modules", "npm", "bin", "npm-cli.js") }), path.join("/n/bin", "node_modules", "npm", "bin", "npm-cli.js"));
+    assert.equal(resolveNpmCli({ env: { npm_execpath: path.join("/via", "npm-cli.js") }, execPath: "/n/bin/node", exists: () => true }), path.join("/via", "npm-cli.js"));
+    assert.equal(resolveNpmCli({ env: {}, execPath: "/n/bin/node", exists: () => false }), null);
+    await mkdir(path.join(source, "node_modules", "fixture"), { recursive: true });
+    await writeFile(path.join(source, "node_modules", "fixture", "index.js"), "node_modules/fixture/index.js\n", "utf8");
+
     const failedDestination = path.join(releases, "injected-failure");
     await assert.rejects(
       buildRelease({
@@ -425,7 +514,7 @@ async function main() {
   if (!rawDestination) {
     throw new Error("Usage: node bin/build-release.js [--profile legacy] <new-absolute-release-directory>");
   }
-  const result = await buildRelease({ destination: rawDestination, profile });
+  const result = await buildRelease({ destination: rawDestination, profile, installDependencies: true });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
@@ -436,4 +525,4 @@ if (isMainModule(import.meta.url)) {
   });
 }
 
-export { buildRelease, listExactFiles, normalizePublishEntries, prepareUnlinkedDestinationParent };
+export { buildRelease, installProductionDependencies, listExactFiles, normalizePublishEntries, prepareUnlinkedDestinationParent, resolveNpmCli };
