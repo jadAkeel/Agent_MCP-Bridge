@@ -20889,6 +20889,13 @@ function scheduleDeferredRecovery(delayMs) {
   deferredRecoveryTimer.unref?.();
 }
 
+// dbPath -> repository root keys with non-terminal integration operations at its last
+// successful scan, so a failed scan keeps its roots blocked.
+const INTEGRATION_RECOVERY_ROOTS_BY_DB = new Map();
+// root key -> last requalification attempt for a repository with only quarantined operations.
+const INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS = new Map();
+const INTEGRATION_QUARANTINE_RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
+
 async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   if (deferredRecoveryRunning) return;
   deferredRecoveryRunning = true;
@@ -20900,7 +20907,8 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   const candidates = [path.join(stateRoot, "bridge-state.sqlite")];
   const cleanupRecoveryCandidates = [];
   const pipelineAggregationCandidates = [];
-  const integrationRecoveryCandidates = new Set();
+  // root key -> { cwd, needsRecovery, quarantinedOnly }; only databases scanned in this pass.
+  const integrationRecoveryCandidates = new Map();
   try {
     const projectsDir = path.join(stateRoot, "projects");
     for (const entry of await readdir(projectsDir, { withFileTypes: true })) {
@@ -20909,7 +20917,15 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       }
     }
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    // A missing projects directory means no project databases yet. Any other error must not
+    // abort the pass (at startup it crashed the bridge): log it and recover what is readable.
+    if (error?.code !== "ENOENT") {
+      anyPending = true;
+      logEvent("warn", "state.recovery_projects_scan_failed", { errorCode: error?.code || "", error: redactSensitiveText(error?.message || String(error)) });
+    }
+  }
+  for (const knownDbPath of [...INTEGRATION_RECOVERY_ROOTS_BY_DB.keys()]) {
+    if (!candidates.includes(knownDbPath) || !existsSync(knownDbPath)) INTEGRATION_RECOVERY_ROOTS_BY_DB.delete(knownDbPath);
   }
   for (const dbPath of candidates) {
     if (!existsSync(dbPath)) continue;
@@ -20918,6 +20934,9 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
     if (memo && !memo.pending && memo.fingerprint === fingerprint) continue;
     let db = null;
     let dbPending = false;
+    let dbScanFailed = false;
+    let dbOperationsScanned = false;
+    const dbIntegrationRoots = new Set();
     try {
       db = new DatabaseSync(dbPath);
       db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, Number(busyTimeoutMs) || 250))};`);
@@ -20944,13 +20963,33 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         lease_expires_at TEXT NOT NULL
       )`);
       ensureIntegrationJournalSchema(db);
+      const scanAt = Date.now();
+      // An operation whose owner process holds a live lease while a serial-integration lock is
+      // active is an ordinary integration in progress (possibly in the other client's bridge),
+      // not something to recover: recovering it only failed on the serial lock and blocked
+      // the repository's writers with a false "quarantined integration" reason.
+      const serialIntegrationActive = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='locks'").get()
+        && db.prepare("SELECT 1 FROM locks WHERE lock_mode = 'serial_integration' AND expires_at > ? LIMIT 1").get(scanAt));
       for (const row of db.prepare(`
-        SELECT DISTINCT cwd FROM integration_operations
-        WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
-      `).all()) {
+        SELECT operation.cwd, operation.status,
+               EXISTS (
+                 SELECT 1 FROM bridge_instances AS instance
+                 WHERE instance.instance_id = operation.owner_instance_id AND instance.lease_expires_at > ?
+               ) AS owner_live
+        FROM integration_operations AS operation
+        WHERE operation.status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      `).all(new Date(scanAt).toISOString())) {
         dbPending = true;
-        if (row.cwd) integrationRecoveryCandidates.add(path.resolve(row.cwd));
+        if (!row.cwd) continue;
+        const rootKey = RepositoryRootSet.key(row.cwd);
+        dbIntegrationRoots.add(rootKey);
+        const live = row.status !== "quarantined" && Boolean(row.owner_live) && serialIntegrationActive;
+        const candidate = integrationRecoveryCandidates.get(rootKey) || { cwd: path.resolve(row.cwd), needsRecovery: false, quarantinedOnly: true };
+        if (!live) candidate.needsRecovery = true;
+        if (row.status !== "quarantined") candidate.quarantinedOnly = false;
+        integrationRecoveryCandidates.set(rootKey, candidate);
       }
+      dbOperationsScanned = true;
       const hasPipelines = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_pipelines'").get();
       if (hasPipelines) {
         ensurePipelineRevisionSchema(db);
@@ -21081,31 +21120,60 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       }
     } catch (error) {
       dbPending = true;
+      dbScanFailed = true;
       logEvent("warn", "queue.startup_recovery_failed", { dbPath, error: error.message || String(error) });
     } finally {
       if (db) closeDb(db);
       DEFERRED_RECOVERY_DB_MEMO.set(dbPath, { fingerprint, pending: dbPending });
       if (dbPending) anyPending = true;
+      // A database whose scan failed (SQLITE_BUSY at the short deferred busy timeout) keeps
+      // the roots it had: its quarantined repositories must not unblock for one pass.
+      if (!dbScanFailed || dbOperationsScanned) INTEGRATION_RECOVERY_ROOTS_BY_DB.set(dbPath, dbIntegrationRoots);
     }
   }
-  for (const blockedRoot of INTEGRATION_RECOVERY_BLOCKED_ROOTS) {
-    if (!integrationRecoveryCandidates.has(blockedRoot)) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(blockedRoot);
+  const knownIntegrationRoots = new Set();
+  for (const roots of INTEGRATION_RECOVERY_ROOTS_BY_DB.values()) {
+    for (const root of roots) knownIntegrationRoots.add(root);
   }
-  for (const cwd of integrationRecoveryCandidates) {
+  for (const blockedRoot of [...INTEGRATION_RECOVERY_BLOCKED_ROOTS]) {
+    if (!knownIntegrationRoots.has(blockedRoot)) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(blockedRoot);
+  }
+  for (const [rootKey, candidate] of integrationRecoveryCandidates) {
+    const { cwd } = candidate;
+    if (!candidate.needsRecovery) continue;
+    // A repository with only quarantined operations needs the requalification pass once per
+    // start and then every few minutes, not a repository-wide serial lock every 5 s.
+    const lastAttemptAt = INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.get(rootKey) || 0;
+    if (candidate.quarantinedOnly && lastAttemptAt && Date.now() - lastAttemptAt < INTEGRATION_QUARANTINE_RECOVERY_INTERVAL_MS) {
+      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
+      continue;
+    }
+    if (candidate.quarantinedOnly) INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.set(rootKey, Date.now());
     try {
       const recovery = await recoverIntegrationRepositorySerially(cwd);
+      if (!recovery.ok && recovery.errorType === "integration_recovery_lock_conflict") {
+        // Someone holds the repository's serial lock (a live integration, the other bridge's
+        // recovery): the state is unknown, so leave the blocked set as it is and retry later.
+        INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.delete(rootKey);
+        logEvent("info", "integration.startup_recovery_deferred", {
+          cwdSha256: createHash("sha256").update(cwd).digest("hex"),
+          errorType: recovery.errorType,
+        });
+        continue;
+      }
       if (!recovery.ok) {
-        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
         logEvent("error", "integration.startup_recovery_blocked", {
           cwdSha256: createHash("sha256").update(cwd).digest("hex"),
           errorType: recovery.errorType || "integration_recovery_quarantined",
           operationIds: recovery.operationIds || [],
         });
       } else {
-        INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(path.resolve(cwd));
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(cwd);
+        INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.delete(rootKey);
       }
     } catch (error) {
-      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
       logEvent("error", "integration.startup_recovery_failed", {
         cwdSha256: createHash("sha256").update(cwd).digest("hex"),
         errorType: error?.errorType || "integration_recovery_failed",
@@ -21114,10 +21182,15 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of pipelineAggregationCandidates) {
     try {
+      // The live finalizer removes these worktrees itself; resuming its cleanup concurrently
+      // removed the same worktrees twice. Recovery resumes only cleanup nobody drives: a
+      // foreign or dead owner's, or this process's own once it rests in cleanup_failed.
+      if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok) continue;
+      if (!claim.ok || FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
+      if ((claim.alreadyOwnedLive || claim.reacquired) && record.status !== "cleanup_failed") continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await refreshPipelineRecord(record);
     } catch (error) {
@@ -21129,10 +21202,12 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of cleanupRecoveryCandidates) {
     try {
+      // A pipeline this process is finalizing or already drives live is not recovery's to touch.
+      if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok) continue;
+      if (!claim.ok || claim.alreadyOwnedLive || claim.reacquired) continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await resumeAuthorizedPipelineCleanup(record);
     } catch (error) {
