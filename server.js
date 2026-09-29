@@ -139,6 +139,9 @@ const DISABLED_GIT_HOOKS_PATH = path.join(
 );
 const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
+// Agent timeouts are handed to the supervisor's setTimeout, which cannot represent more
+// than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
+const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -409,16 +412,21 @@ const scopeValidationSchema = z
 
 const scopeTimeoutPolicySchema = z
   .object({
-    timeoutMs: z.number().int().positive().optional(),
-    readOnlyTimeoutMs: z.number().int().positive().optional(),
-    writeTimeoutMs: z.number().int().positive().optional(),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
+    readOnlyTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
+    writeTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
   })
   .strict();
 
+// These values become `opencode run` arguments. A value starting with "-" (variant
+// "--attach=http://host:4096") was parsed by the CLI as an extra option.
+// Model IDs may contain "/" (openrouter/anthropic/...); they still may not start with "-".
+const MODEL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const modelRequirementSchema = z.object({
-  provider: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
-  model: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
-  variant: z.string().trim().min(1).max(128).regex(/^[^\s\x00-\x1f\x7f]+$/).optional(),
+  provider: z.string().trim().min(1).max(256).regex(MODEL_IDENTIFIER_PATTERN),
+  model: z.string().trim().min(1).max(256).regex(MODEL_NAME_PATTERN),
+  variant: z.string().trim().min(1).max(128).regex(MODEL_IDENTIFIER_PATTERN).optional(),
   requireRuntimeEvidence: z.boolean().optional(),
 }).strict();
 
@@ -437,7 +445,7 @@ const scopeContractSchema = z
     scope: scopePathSetSchema.optional(),
     actions: z.array(z.string()).optional(),
     validation: scopeValidationSchema.optional(),
-    timeoutMs: z.number().int().positive().optional(),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
     modelRequirement: modelRequirementSchema.optional().describe("Pin provider/model[@variant] for this job. It must be in CODEX_OPENCODE_MODEL_ALLOWLIST or match the managed profile."),
   })
@@ -471,11 +479,11 @@ const jobInputShape = {
   sharedFiles: z.array(z.string()).optional(),
   serialOnly: z.array(z.string()).optional(),
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
-  timeoutMs: z.number().int().positive().optional(),
+  timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
   allowFallbackToBuild: z.boolean().optional(),
-  subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
+  subagentStrategy: z.enum(["proxy", "reject"]).optional(),
   proxyAgent: z.string().optional(),
   orchestratorMode: z.enum(["planning-only", "contractor", "bounded-writer"]).optional().describe("Only when the user named the OpenCode Orchestrator."),
   userAuthorizedOrchestrator: z.boolean().optional(),
@@ -3085,7 +3093,11 @@ function parseModelAllowlistEntry(entry) {
   const slash = modelPart.indexOf("/");
   if (slash <= 0 || slash === modelPart.length - 1) return null;
   if (at > 0 && !variant) return null;
-  return { provider: modelPart.slice(0, slash).trim(), model: modelPart.slice(slash + 1).trim(), variant };
+  const provider = modelPart.slice(0, slash).trim();
+  const model = modelPart.slice(slash + 1).trim();
+  // The same identifier rules as modelRequirementSchema: these become CLI arguments.
+  if (!MODEL_IDENTIFIER_PATTERN.test(provider) || !MODEL_NAME_PATTERN.test(model) || (variant && !MODEL_IDENTIFIER_PATTERN.test(variant))) return null;
+  return { provider, model, variant };
 }
 
 function activeModelOverrideAllowlist() {
@@ -3122,7 +3134,9 @@ function applyModelOverrideToMetadata(metadata, override) {
     ...metadata,
     provider: override.provider,
     model: override.model,
-    variant: override.variant || metadata.variant || "",
+    // The managed profile's variant belongs to the managed model; a different overridden
+    // model runs with the override's variant only (none when the allowlist pins none).
+    variant: override.variant || "",
     modelSelection: "operator_allowlist_override",
     profileProvider: metadata.provider,
     profileModel: metadata.model,
@@ -4303,21 +4317,25 @@ async function resolveAgent(requestedAgent, cwd, allowFallbackToBuild = false, s
         fallbackUsed: false,
         proxyUsed: false,
         subagentStrategy: normalizedStrategy,
-        error: `OpenCode agent "${agent}" is a subagent. This OpenCode CLI version does not run subagents as top-level agents through "opencode run --agent ${agent}". Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}", or "direct" only if you want to test native CLI behavior.`,
+        error: `OpenCode agent "${agent}" is a subagent. This OpenCode CLI version does not run subagents as top-level agents through "opencode run --agent ${agent}". Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}".`,
         availableAgents: availableAgentLabels(agents),
         discoveryExitCode: result.exitCode,
       };
     }
 
+    // "direct" used to return the subagent as the actual agent, which could never succeed:
+    // `opencode run --agent <subagent>` falls back to the default agent, so the attested
+    // profile is not the one that would run, and the pre-spawn attestation requires a
+    // primary/all mode. It is rejected with the reason instead of failing later.
     if (normalizedStrategy === "direct") {
       return {
         requestedAgent: agent,
         requestedAgentMode: mode,
-        actualAgent: routedAgent,
+        actualAgent: null,
         fallbackUsed: false,
         proxyUsed: false,
         subagentStrategy: normalizedStrategy,
-        error: null,
+        error: `OpenCode agent "${agent}" is a subagent, and subagentStrategy "direct" cannot run it: "opencode run --agent ${agent}" falls back to the default agent, which the bridge cannot attest as the requested role. Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}".`,
         availableAgents: availableAgentLabels(agents),
         discoveryExitCode: result.exitCode,
       };
@@ -5179,31 +5197,66 @@ function parseDependencyRequest(text) {
   }
 }
 
+// `opencode run` (yargs) documents no "--" end-of-options marker, so the prompt positional
+// must never look like an option. buildCompactPrompt starts with "Role:", but a bare task
+// or a proxied prompt could start with "-"; prefix those with a fixed label.
+function openCodePromptArgument(prompt) {
+  const text = String(prompt ?? "");
+  return /^\s*-/.test(text) ? `Task:\n${text}` : text;
+}
+
 function openCodeRunArgs(agent, prompt, metadata = null, { forcePure = false } = {}) {
   const args = ["--print-logs", "--log-level", "ERROR"];
   if (forcePure || !CONFIG.allowExternalPlugins) {
     args.push("--pure");
   }
   args.push("run");
-  args.push("--format", "json", "--title", "Codex MCP bridge task", "--agent", agent);
+  args.push("--format", "json", "--title", "Codex MCP bridge task", `--agent=${agent}`);
+  // Option and value in one token: a value can never be parsed as a separate option.
   if (metadata?.provider && metadata?.model) {
-    args.push("--model", `${metadata.provider}/${metadata.model}`);
+    args.push(`--model=${metadata.provider}/${metadata.model}`);
   }
   if (metadata?.variant) {
-    args.push("--variant", metadata.variant);
+    args.push(`--variant=${metadata.variant}`);
   }
-  args.push(prompt);
+  args.push(openCodePromptArgument(prompt));
   return args;
+}
+
+// Windows CreateProcess caps the whole command line at 32,767 UTF-16 units; Linux caps one
+// argument at 128 KiB (MAX_ARG_STRLEN). A longer prompt failed as an opaque spawn error.
+const OPENCODE_WINDOWS_COMMAND_LINE_LIMIT = 32_767;
+const OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT = 128 * 1024 - 1;
+function openCodeCommandLineLengthError(command, args, platform = process.platform) {
+  if (platform === "win32") {
+    // Upper bound of Node's quoting: each argument may be quoted and every quote or
+    // backslash escaped, plus the separating space.
+    const length = [command, ...args].reduce((total, item) => {
+      const text = String(item);
+      return total + text.length + (text.match(/["\\]/g) || []).length + 3;
+    }, 0);
+    return length > OPENCODE_WINDOWS_COMMAND_LINE_LIMIT
+      ? `The OpenCode command line would be about ${length} characters; Windows allows at most ${OPENCODE_WINDOWS_COMMAND_LINE_LIMIT}. Shorten the task prompt.`
+      : "";
+  }
+  const longest = Math.max(0, ...args.map((item) => Buffer.byteLength(String(item), "utf8")));
+  return longest > OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT
+    ? `The OpenCode prompt argument is ${longest} bytes; the platform allows at most ${OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT} bytes per argument. Shorten the task prompt.`
+    : "";
 }
 
 function commandShape(agent, metadata = null, { forcePure = false } = {}) {
   const pluginMode = forcePure || !CONFIG.allowExternalPlugins ? " --pure" : "";
-  const model = metadata?.provider && metadata?.model ? ` --model ${metadata.provider}/${metadata.model}` : "";
-  const variant = metadata?.variant ? ` --variant ${metadata.variant}` : "";
-  return `${OPENCODE_EXE} --print-logs --log-level ERROR run${pluginMode} --format json --title "Codex MCP bridge task" --agent ${agent}${model}${variant} <prompt>`;
+  const model = metadata?.provider && metadata?.model ? ` --model=${metadata.provider}/${metadata.model}` : "";
+  const variant = metadata?.variant ? ` --variant=${metadata.variant}` : "";
+  return `${OPENCODE_EXE} --print-logs --log-level ERROR run${pluginMode} --format json --title "Codex MCP bridge task" --agent=${agent}${model}${variant} <prompt>`;
 }
 
 function timeoutForAgent(agent, lockPlan, requestedTimeoutMs = null) {
+  return Math.min(MAX_AGENT_TIMEOUT_MS, unboundedTimeoutForAgent(agent, lockPlan, requestedTimeoutMs));
+}
+
+function unboundedTimeoutForAgent(agent, lockPlan, requestedTimeoutMs = null) {
   const explicit = Number(requestedTimeoutMs);
   if (Number.isInteger(explicit) && explicit > 0) {
     return explicit;

@@ -298,7 +298,7 @@ function runEventEvidenceSelfTests() {
   assert.equal(overriddenMetadata.canEdit, false);
   assert.equal(applyModelOverrideToMetadata(modelMetadata.metadata, null), modelMetadata.metadata);
   assert.equal(applyModelOverrideToMetadata(null, { provider: "x", model: "y", variant: "" }), null);
-  assert.ok(openCodeRunArgs("planner", "probe", overriddenMetadata).join(" ").includes("--model opencode/gpt-5.3-codex --variant high"));
+  assert.ok(openCodeRunArgs("planner", "probe", overriddenMetadata).join(" ").includes("--model=opencode/gpt-5.3-codex --variant=high"));
   selfTestHooks.selfTestModelOverrideAllowlist = ["opencode/gpt-5.3-codex@high"];
   try {
     const overrideScope = normalizeScopeContract({ agent: "planner", scopeContract: { mode: "read", read: ["src"], modelRequirement: overrideRequirement } });
