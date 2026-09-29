@@ -1328,7 +1328,14 @@ function logEvent(level, event, data = {}) {
   }));
 }
 
-async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null } = {}) {
+// encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
+// The default utf8 decoding turned every non-UTF-8 byte of a patch into U+FFFD.
+async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null, encoding = "utf8" } = {}) {
+  const binary = encoding === "buffer";
+  const output = (value) => binary
+    ? (Buffer.isBuffer(value) ? value : Buffer.from(String(value || ""), "utf8"))
+    : (Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""));
+  const text = (value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || "");
   try {
     const gitCommand = isGitExecutable(command);
     const result = await execFileAsync(command, gitCommand ? trustedGitArgs(args) : args, {
@@ -1337,25 +1344,26 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
       timeout: timeoutMs,
       maxBuffer: 1024 * 1024 * 30,
       env: gitCommand ? buildTrustedGitEnv(env) : (env === null ? process.env : env),
+      ...(binary ? { encoding: "buffer" } : {}),
       ...(signal ? { signal } : {}),
     });
 
     return {
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
+      stdout: output(result.stdout),
+      stderr: text(result.stderr),
       exitCode: 0,
     };
   } catch (error) {
     if (/maxBuffer|ENOBUFS/i.test(String(error?.message || error))) {
       return {
-        stdout: String(error?.stdout || ""),
+        stdout: output(error?.stdout),
         stderr: "Process output exceeded the bridge capture budget; the command was terminated by the bridge instead of returning truncated evidence.",
         exitCode: "process_output_limit_exceeded",
       };
     }
     return {
-      stdout: error.stdout || "",
-      stderr: error.stderr || String(error),
+      stdout: output(error.stdout),
+      stderr: text(error.stderr) || String(error),
       exitCode: error.code || (error.killed ? "timeout" : 1),
     };
   }
@@ -8371,15 +8379,18 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
     }
     const [diff, changed, status] = await Promise.all([
-      runCommand("git", ["diff", "--cached", "--binary", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 60, gitEnv),
+      runCommand("git", ["diff", "--cached", "--binary", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 60, gitEnv, { encoding: "buffer" }),
       runCommand("git", ["diff", "--cached", "--name-only", "-z", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 30, gitEnv),
       runGitReadOnlyCommand(["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], sourcePath, 1000 * 30),
     ]);
     if (diff.exitCode !== 0 || changed.exitCode !== 0 || status.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: diff.stderr || changed.stderr || status.stderr || "Could not create a complete source patch." };
     }
-    const patch = diff.stdout || "";
-    const patchSha256 = createHash("sha256").update(patch).digest("hex");
+    // The exact patch bytes are hashed and applied; the decoded text is only for the
+    // preview, the secret scan and the diffstat.
+    const patchBytes = diff.stdout;
+    const patch = patchBytes.toString("utf8");
+    const patchSha256 = createHash("sha256").update(patchBytes).digest("hex");
     const sourceStateSha256 = createHash("sha256")
       .update([base.stdout.trim(), head.stdout.trim(), status.stdout || "", patchSha256, realIndex.indexSha256].join("\0"))
       .digest("hex");
@@ -8389,6 +8400,7 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       sourceHead: head.stdout.trim(),
       changedFiles: normalizeLockPathList(changed.stdout.split("\0")),
       patch,
+      patchBytes,
       patchSha256,
       indexSha256: realIndex.indexSha256,
       sourceStateSha256,
@@ -8488,6 +8500,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       source: sourcePath,
       changedFiles: createdPatch.changedFiles,
       patch: createdPatch.patch,
+      patchBytes: createdPatch.patchBytes,
       patchSha256: createdPatch.patchSha256,
       sourceStateSha256: createdPatch.sourceStateSha256,
       sourceBaseCommit: createdPatch.baseCommit,
@@ -8515,23 +8528,25 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       return { ok: false, errorType: "integration_source_invalid", error: base.stderr || "Could not resolve the reviewed branch base commit." };
     }
     const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 15);
-    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30);
+    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30, null, { encoding: "buffer" });
     if (diff.exitCode !== 0) {
       return {
         ok: false,
         errorType: "integration_patch_create_failed",
-        error: diff.stderr || diff.stdout || "Could not create patch from branch.",
+        error: diff.stderr || diff.stdout.toString("utf8") || "Could not create patch from branch.",
       };
     }
 
+    const patchBytes = diff.stdout;
     return {
       ok: true,
       sourceType: "branch",
       source: branch,
       changedFiles: changed.exitCode === 0 ? normalizeLockPathList(changed.stdout.split("\0")) : [],
-      patch: diff.stdout || "",
-      patchSha256: createHash("sha256").update(diff.stdout || "").digest("hex"),
-      sourceStateSha256: createHash("sha256").update([branch, verified.stdout || "", diff.stdout || ""].join("\0")).digest("hex"),
+      patch: patchBytes.toString("utf8"),
+      patchBytes,
+      patchSha256: createHash("sha256").update(patchBytes).digest("hex"),
+      sourceStateSha256: createHash("sha256").update(`${branch}\0${verified.stdout || ""}\0`).update(patchBytes).digest("hex"),
       sourceBaseCommit: base.stdout.trim(),
       sourceHead: verified.stdout.trim().split(/\s+/)[0] || "",
     };
@@ -8547,7 +8562,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
 async function writeTemporaryPatchFile(patch) {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-opencode-patch-"));
   const patchFile = path.join(dir, "changes.patch");
-  await writeFile(patchFile, patch, "utf8");
+  await writeFile(patchFile, Buffer.isBuffer(patch) ? patch : Buffer.from(String(patch || ""), "utf8"));
   return { dir, patchFile };
 }
 
@@ -9354,7 +9369,7 @@ async function integratePatchWithoutSerialLock({
     };
   }
 
-  const { dir, patchFile } = await writeTemporaryPatchFile(patch.patch);
+  const { dir, patchFile } = await writeTemporaryPatchFile(patch.patchBytes || patch.patch);
   let rollbackBaseline = null;
   let before = null;
   let patchApplied = false;
