@@ -16,6 +16,51 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-29
 
+### Maturity measurement run (Codex, 2026-09-29)
+
+Start: 2026-09-29 13:27:33 UTC. Preflight get_opencode_bridge_status on charGPT-python reported server.js SHA-256 prefix 3a623472 and provider concurrency limit 4. Initial diagnose_opencode_bridge found no quarantine, held lease/lock, or unresolved integration. It omitted the three preserved P4-B/C/D parallel worktrees; git worktree list found them, plus one pre-existing stale/prunable Claude scratch worktree. The bridge tree was clean at 47c6f98. No bridge code or configuration was changed in this run.
+
+Jobs below separate bridge completion from the real pytest gate. A dash means the field was unavailable, not zero. The four P4 builders started before this measurement; their original job timing was unavailable. P4-B/C/D received fresh integration receipts during this run. All eight new migration writer jobs completed at the bridge level, had errorType none, needed zero manual retries, and received an integration receipt on the first dry run. Parallel runs do not expose startupMs. Queued jobs expose waitBeforeAgentMs, reported here as startup. The two reviewers and two large-repo jobs are excluded from the writer success denominator.
+
+| Id | Kind | Repo | Outcome | errorType | Duration ms | Agent run ms | providerWaitMs | startupMs | Receipt first try | Retries |
+|---|---|---|---|---|---:|---:|---:|---:|---|---:|
+| P4-A (original Run id unavailable) | builder | charGPT | previously integrated; test result unavailable | - | - | - | - | - | - | - |
+| P4-D builder-1790673045912-99863e1d | builder | charGPT | integrated; 3 parity tests failed, later fixed | none | - | - | - | - | yes | 0 |
+| P4-B (original Run id unavailable) | builder | charGPT | integrated; suite had inherited P4-D failures | none | - | - | - | - | yes | 0 |
+| P4-C (original Run id unavailable) | builder | charGPT | integrated; suite had inherited P4-D failures | none | - | - | - | - | yes | 0 |
+| debugger-1790688867550-8e9d65df (D1) | debugger | charGPT | completed; full pytest passed | none | 89149 | 82919 | 13 | - | yes | 0 |
+| reviewer-1790689172440-16e2fb4d | reviewer | charGPT | completed; found TF graph/parity gaps | none | 270625 | 256505 | 21 | - | n/a | 0 |
+| reviewer-1790689172440-94096049 | reviewer | charGPT | completed; found TF train validation gaps | none | 249575 | 235479 | 12 | - | n/a | 0 |
+| debugger-1790689604167-5c19f059 (D2) | debugger | charGPT | completed; 2 new pytest failures (L-023) | none | 377949 | 370567 | 23 | - | yes | 0 |
+| debugger-1790689604167-120ed45b (D3) | debugger | charGPT | completed; own tests passed, full suite retained D2 failures | none | 209504 | 202258 | 10 | - | yes | 0 |
+| debugger-1790690320064-96ce8870 (D4) | debugger | charGPT | completed; full pytest passed | none | 91434 | 69546 | 14 | 21946 | yes | 0 |
+| builder-1790690614859-305ab6aa (P5-A) | builder | charGPT | completed; full pytest passed | none | 301384 | 285956 | 12 | - | yes | 0 |
+| builder-1790690614859-387eef03 (P5-B) | builder | charGPT | completed; 6 new pytest failures (L-024) | none | 340794 | 326069 | 29 | - | yes | 0 |
+| debugger-1790691360510-9fda621d (P5-B fix) | debugger | charGPT | completed; full pytest passed | none | 150393 | 117504 | 18 | 33009 | yes | 0 |
+| builder-1790691375221-f4dbb958 (P5-C) | builder | charGPT | completed; full pytest passed | none | 119067 | 77295 | 13 | 41873 | yes | 0 |
+| reviewer-1790689518205-aed2b4ea | reviewer | PyTorch | completed; no snapshot-size refusal | none | 48523 | 42637 | 18 | - | n/a | 0 |
+| builder-1790689664283-459d868b | builder | PyTorch | completed; one comment typo fixed | none | 116495 | 68758 | 22 | 47787 | yes | 0 |
+
+**Metric 1, real writer success:** 12 real P4/P5 builder/debugger jobs in the migration: four P4 jobs already launched before the measurement and eight launched during it. For the timed cohort, bridge completion was **8/8 (100%)** with no terminal errorType, zero manual tool retries and 8/8 first-try preview receipts. The stricter immediate full-pytest gate was **5/8 (62.5%)**: D2 and P5-B introduced test failures; D3's full suite inherited D2's failures. All three failing gates were resolved in later debugger integrations; the final full pytest passed. The four prior jobs cannot be included in a timed or first-test-pass rate because their original records are not available. Reviewer findings were checked and turned into D2/D3 jobs; integration and pytest followed each applied patch.
+
+**Metric 2, large-repo latency:** shallow/partial clone of PyTorch at 71d9ed2, C:\Users\10User\Desktop\bench-large: **22,708 tracked files, 5,253,949 text lines**, 280 binary files and 36 unreadable symlink/submodule entries in the local count. The scoped reviewer took **48,523 ms** total and 42,637 ms agent run; startupMs was not emitted. It was not rejected by snapshot safety, infrastructure, or worktree capacity limits. The one-line comment builder took **116,495 ms** total, 68,758 ms agent run and 47,787 ms pre-agent startup. The measured integration dry run took **29,099 ms** and apply **123,953 ms**, separately; the apply passed git diff --check. No build was run. The edit remains uncommitted in the benchmark checkout under that repository's CLAUDE.md instruction.
+
+**Metric 3, cost per 1,000 ported lines:** **unavailable**. Neither parallel result text nor get_opencode_job with detail:true for queued jobs exposes input/output tokens, turn count, or per-job price; parallel Run ids cannot be queried as queue jobs. No monetary estimate was made. The eight timed writer jobs accumulated 1,532,114 agent-run ms and 1,121 added patch lines (from integration stats / git numstat, excluding migration-log lines); a *time-only proxy* is **22.78 agent minutes per 1,000 added patch lines**. That denominator includes tests and README, so it is not a ported-source-line cost.
+
+Findings (exact error text is retained; causes marked operator guess were not checked in bridge code):
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-020 | diagnose_opencode_bridge({cwd:"C:\\Users\\10User\\Desktop\\charGPT-python"}) omitted the preserved P4-B/C/D worktrees; diagnosticCoverage excludes parallel_runs. Manual git worktree list was needed to discover three patches that the requested diagnose path could not find. | Parallel runs are excluded from its audit, consistent with B-018 (operator guess for this occurrence). | - | - | open |
+| B-021 | get_opencode_job({cwd:"C:\\Users\\10User\\Desktop\\charGPT-python",jobId:"debugger-1790688867550-8e9d65df",detail:true}) returned "OpenCode queue job not found: debugger-1790688867550-8e9d65df". run_opencode_parallel also omitted startupMs for its reviewer/writer jobs, so the requested per-job detail could not be recovered. | Parallel Run ids are not queue records (operator guess; diagnosticCoverage says parallel_runs excluded). | - | - | open |
+| B-022 | get_opencode_job({cwd:"C:\\Users\\10User\\Desktop\\charGPT-python",jobId:"debugger-1790691360510-9fda621d",detail:true}) and the analogous P5-C detail contained no token/usage/turn fields; parallel result text also gave no input/output tokens. The requested cost per 1,000 ported lines is unmeasurable. | Usage data is not exposed by these bridge results (operator guess). | - | - | open |
+| B-023 | run_opencode_parallel P5-A/P5-B and other writer results contained stderr error.error="AI_APICallError: Rate limit exceeded. Please retry after a brief wait."; P5-B also contained error.error="AI_APICallError: Output token rate limit exceeded. Please retry after a brief wait." Yet those same results said "Provider warning type: none" and "Recovered transient provider error: no" and completed. The queued P5-B debugger result had the same rate-limit stderr. | OpenCode may retry internally while bridge classification only sees the eventual successful exit (operator guess). | - | - | open |
+| B-024 | get_opencode_job({cwd:"C:\\Users\\10User\\Desktop\\charGPT-python",jobId:"debugger-1790690320064-96ce8870",detail:true}) reported durationMs 91434, agentRunMs 69546 and waitBeforeAgentMs 21946; its resultText said Duration ms 72559 and Agent run ms 66143. The PyTorch builder similarly showed queue durationMs 116495 / agentRunMs 68758 versus inner result Duration ms 55433 / Agent run ms 48087. | Queue and inner agent clocks cover different phases, but the labels do not explain the mismatch (operator guess). | - | - | open |
+| B-025 | get_opencode_job detail for D4, P5-B debugger, P5-C and PyTorch builder showed waitBeforeAgentMs 21946, 33009, 41873 and 47787 respectively, while providerWaitMs was only 14, 18, 13 and 22. The job stage was starting_agent, but these long waits cost wall time before agent execution. | Role attestation and worktree setup likely dominate, consistent with earlier L-016 (operator guess for the individual timings). | - | - | open |
+| B-026 | integrate_opencode_worktree dryRun:true for the one-line PyTorch header patch took 29099 ms; its reviewed apply with the exact previewReceipt took 123953 ms for a clean checkout and git diff --check validation. No progress breakdown exposed a reason for the roughly two-minute apply. | Whole-repository snapshots/integration checks on 22,708 files may dominate (operator guess). | - | - | open |
+
+End state: charGPT-python HEAD 2b2edfe, clean. P4-A/B/C/D and all P5-A/B/C are integrated; the D1-D4 and P5-B debugger fixes are integrated; final full pytest passed. Diagnose reported zero nonterminal jobs, active locks, provider leases, and unresolved integrations; its two failed jobs are historical queue records. No managed worktree from this run remains. One older Claude scratch worktree remains prunable in git worktree list. PyTorch benchmark checkout at C:\Users\10User\Desktop\bench-large remains at 71d9ed2 with only the one-line comment edit uncommitted. No bridge repository files other than this log were edited.
+
 ### Deep code review of the whole bridge (after the Phase 4 incident)
 
 The user asked whether the system was now free of problems. It was not: eight parallel
