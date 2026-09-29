@@ -31,6 +31,15 @@
 // live release is removed again (except with --check-only), but only once a re-read of the
 // live config proves it does not point at it.
 //
+// The release's node_modules is installed fresh from package-lock.json (npm ci --omit=dev
+// --ignore-scripts, preferring the npm cache), never copied from the working tree, and the
+// source tree is checked again once the release files are staged.
+// Claude Code's entry is replaced with remove-then-add. Until the add succeeds, the previous
+// entry is kept in <claude config>.opencode-entry-recovery.json, and a run that finds the
+// entry missing next to that file restores it first.
+// The Codex config is only replaced while it still holds what this run read (and only rolled
+// back while it still holds what this run wrote); a concurrent edit is reported, not overwritten.
+//
 // Exit code 1 whenever something was not done: a failed step, a refused re-pin, or a
 // Claude Code entry that was not brought in line with the Codex entry.
 
@@ -38,10 +47,10 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
@@ -333,16 +342,42 @@ async function renameWithRetry(from, to, { renameFile = rename, delays = RENAME_
   }
 }
 
-async function replaceConfigAtomically(configPath, text, stamp) {
-  const stagedPath = `${configPath}.activating-${stamp}`;
-  await writeFile(stagedPath, text, "utf8");
-  await renameWithRetry(stagedPath, configPath);
+// The config is replaced by renaming a staged copy over it. Both the activation and the
+// rollback re-read the live file immediately before the rename and refuse when it is not
+// what this run last read or wrote, so an edit made in between (an editor, Codex itself,
+// another release run) is reported instead of silently overwritten. The remaining gap is
+// the instant between that read and the rename.
+async function assertLiveConfigIs(configPath, expected, when) {
+  let live;
+  try {
+    live = await readFile(configPath, "utf8");
+  } catch (error) {
+    throw new Error(`The live config could not be re-read ${when} (${error?.code || error?.message || error}); refusing to overwrite it.`);
+  }
+  if (live !== expected) throw new Error(`The live config changed ${when}; refusing to overwrite a concurrent edit.`);
 }
 
-async function restoreConfigFrom(configPath, backupPath, stamp, renameOptions = {}) {
+async function replaceConfigAtomically(configPath, text, stamp, expected) {
+  const stagedPath = `${configPath}.activating-${stamp}`;
+  try {
+    await writeFile(stagedPath, text, "utf8");
+    await assertLiveConfigIs(configPath, expected, "since this run read it");
+    await renameWithRetry(stagedPath, configPath);
+  } finally {
+    await rm(stagedPath, { force: true }).catch(() => {});
+  }
+}
+
+// expected: the text this run wrote, i.e. what the live config must still hold to be rolled back.
+async function restoreConfigFrom(configPath, backupPath, stamp, expected, renameOptions = {}) {
   const stagedPath = `${configPath}.restoring-${stamp}`;
-  await copyFile(backupPath, stagedPath);
-  await renameWithRetry(stagedPath, configPath, renameOptions);
+  try {
+    await copyFile(backupPath, stagedPath);
+    await assertLiveConfigIs(configPath, expected, "after this run wrote it");
+    await renameWithRetry(stagedPath, configPath, renameOptions);
+  } finally {
+    await rm(stagedPath, { force: true }).catch(() => {});
+  }
 }
 
 // The server.js hash --sync-clients may pin. A working tree may move, so its current hash
@@ -410,11 +445,11 @@ async function refreshIntegrityPins(configPath, entry, { smoke = runHealthSmoke 
   const stamp = timestamp();
   const backupPath = `${configPath}.rollback-${stamp}`;
   await copyFile(configPath, backupPath);
-  await replaceConfigAtomically(configPath, text, stamp);
+  await replaceConfigAtomically(configPath, text, stamp, original);
   const health = smoke(configPath);
   if (!health.ok) {
     try {
-      await restoreConfigFrom(configPath, backupPath, stamp);
+      await restoreConfigFrom(configPath, backupPath, stamp, text);
     } catch (error) {
       throw new Error(`Re-pinning failed the health check AND restoring the previous config failed (${error?.code || error?.message || error}); copy ${backupPath} over ${configPath} by hand.\n${health.output}`);
     }
@@ -469,6 +504,21 @@ function assertCleanSourceTree(repoDir, allowDirty = false) {
     ].join("\n"));
   }
   return [`WARNING (--allow-dirty): the release includes ${status.lines.length} uncommitted bridge file(s):`, ...listStatusLines(status.lines)];
+}
+
+// R-163: the clean-tree check runs again once the release files are staged, so the published
+// files are the ones checked (npm test or an editor may have changed the tree since the first
+// check) and a tree that became dirty fails before anything is published. node_modules is
+// git-ignored, so no status check can vouch for it: the release installs it fresh from
+// package-lock.json instead of copying the working tree's.
+async function buildCheckedRelease({ destination, sourceRoot = SOURCE_ROOT, allowDirty = false, ...buildOptions }) {
+  return buildRelease({
+    sourceRoot,
+    destination,
+    installDependencies: true,
+    afterStagingHook: async () => { assertCleanSourceTree(sourceRoot, allowDirty); },
+    ...buildOptions,
+  });
 }
 
 // true: the live config names the directory; false: a re-read proves it does not;
@@ -584,8 +634,22 @@ function sameClaudeEntry(left, right) {
 
 // { ok, updated, message }. ok is false for every outcome that leaves Claude Code out of
 // line with the Codex entry; an entry that already matches is left alone (ok, not updated).
-// The replacement is remove-then-add, so the previous entry is saved first and re-added
-// when the add fails.
+// `claude mcp add-json` refuses a name that exists, so the replacement is remove-then-add.
+// Between the two calls Claude Code has no entry, and a crash there used to leave it that way
+// (the next run then refused to proceed for lack of an entry). The previous entry is therefore
+// written to a recovery file before the remove and deleted only once an entry exists again; a
+// run that finds the entry missing next to a recovery file re-adds it before anything else.
+// The file is meaningful only while the entry is missing, so a run that finds the entry
+// present deletes it.
+async function readSavedClaudeEntry(recoveryPath) {
+  try {
+    const saved = JSON.parse(await readFile(recoveryPath, "utf8"));
+    return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
 async function syncClaudeCodeEntry(configPath, {
   claude = claudeCodeCommand(),
   claudeConfigPath = defaultClaudeConfigPath(),
@@ -595,34 +659,63 @@ async function syncClaudeCodeEntry(configPath, {
   if (!claude) {
     return fail("Claude Code executable not found (probed ~/.local/bin, npm prefixes and PATH); its MCP entry was NOT updated. Pass --skip-claude-code if Claude Code does not use this bridge.");
   }
-  const current = await readClaudeUserEntry(claudeConfigPath);
+  let current = await readClaudeUserEntry(claudeConfigPath);
   if (!current.ok) return fail(`Could not read ${claudeConfigPath}: ${current.error}; the Claude Code entry was NOT updated.`);
-  if (!current.entry) {
-    return fail(`${claudeConfigPath} has no user-scope "${SERVER_NAME}" MCP entry; nothing was updated. Register it once with claude mcp add-json -s user ${SERVER_NAME} '<json>', or pass --skip-claude-code.`);
-  }
-  const desired = claudeEntryFor(await loadMcpEntry(configPath, SERVER_NAME));
-  if (sameClaudeEntry(current.entry, desired)) {
-    return { ok: true, updated: false, message: `Claude Code entry already matches the Codex entry (${desired.args[0]}); nothing to update.` };
-  }
+  const recoveryPath = `${claudeConfigPath}.${SERVER_NAME}-entry-recovery.json`;
   const run = (args) => spawnSync(claude.command, [...claude.args, ...args], { encoding: "utf8", windowsHide: true, env });
   const output = (result) => String(result.error?.message || result.stderr || result.stdout || `exit ${result.status}`).trim();
+  const addEntry = (entry) => run(["mcp", "add-json", "-s", "user", SERVER_NAME, JSON.stringify(entry)]);
+  let recovered = "";
+  if (!current.entry) {
+    const saved = await readSavedClaudeEntry(recoveryPath);
+    if (!saved) {
+      return fail(`${claudeConfigPath} has no user-scope "${SERVER_NAME}" MCP entry; nothing was updated. Register it once with claude mcp add-json -s user ${SERVER_NAME} '<json>', or pass --skip-claude-code.`);
+    }
+    const restored = addEntry(saved);
+    if (restored.status !== 0) {
+      return fail(`Claude Code has no "${SERVER_NAME}" entry (an earlier update was interrupted) and re-adding the saved one failed (${output(restored)}); saved entry: ${recoveryPath}.`);
+    }
+    current = await readClaudeUserEntry(claudeConfigPath);
+    if (!current.ok || !current.entry || !sameClaudeEntry(current.entry, saved)) {
+      return fail(`Re-adding the saved Claude Code entry did not restore it in ${claudeConfigPath}; saved entry: ${recoveryPath}.`);
+    }
+    recovered = " (an interrupted earlier update had left it missing; the saved entry was restored first)";
+  }
+  await rm(recoveryPath, { force: true });
+  const desired = claudeEntryFor(await loadMcpEntry(configPath, SERVER_NAME));
+  if (sameClaudeEntry(current.entry, desired)) {
+    return { ok: true, updated: false, message: `Claude Code entry already matches the Codex entry (${desired.args[0]}); nothing to update${recovered}.` };
+  }
+  try {
+    const staged = `${recoveryPath}.staging-${process.pid}`;
+    await writeFile(staged, `${JSON.stringify(current.entry, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await renameWithRetry(staged, recoveryPath);
+  } catch (error) {
+    return fail(`Could not save a recovery copy of the Claude Code entry (${error?.message || error}); the entry was NOT changed.`);
+  }
   const removed = run(["mcp", "remove", "-s", "user", SERVER_NAME]);
-  if (removed.status !== 0) return fail(`Could not replace the Claude Code entry (remove failed: ${output(removed)}); the previous entry is unchanged.`);
-  const added = run(["mcp", "add-json", "-s", "user", SERVER_NAME, JSON.stringify(desired)]);
+  if (removed.status !== 0) {
+    if ((await readClaudeUserEntry(claudeConfigPath)).entry) {
+      await rm(recoveryPath, { force: true });
+      return fail(`Could not replace the Claude Code entry (remove failed: ${output(removed)}); the previous entry is unchanged.`);
+    }
+    return fail(`Could not replace the Claude Code entry (remove failed: ${output(removed)}) and it is now missing; re-run this command to restore it from ${recoveryPath}.`);
+  }
+  const added = addEntry(desired);
   if (added.status !== 0) {
-    const restored = run(["mcp", "add-json", "-s", "user", SERVER_NAME, JSON.stringify(current.entry)]);
+    const restored = addEntry(current.entry);
     if (restored.status === 0) {
+      await rm(recoveryPath, { force: true });
       return fail(`Re-adding the Claude Code entry failed (${output(added)}); the previous entry was restored, so Claude Code still runs ${current.entry.args?.[0] || "its old server"}.`);
     }
-    const savedPath = `${claudeConfigPath}.${SERVER_NAME}-entry-${timestamp()}.json`;
-    await writeFile(savedPath, `${JSON.stringify(current.entry, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }).catch(() => {});
-    return fail(`Re-adding the Claude Code entry failed (${output(added)}) and restoring the previous one failed too (${output(restored)}). Claude Code now has NO ${SERVER_NAME} entry; re-add it with claude mcp add-json -s user ${SERVER_NAME} using the JSON saved in ${savedPath}.`);
+    return fail(`Re-adding the Claude Code entry failed (${output(added)}) and restoring the previous one failed too (${output(restored)}). Claude Code now has NO ${SERVER_NAME} entry; re-run this command to restore it from ${recoveryPath}.`);
   }
   const after = await readClaudeUserEntry(claudeConfigPath);
+  if (after.entry) await rm(recoveryPath, { force: true });
   if (!after.ok || !after.entry || !sameClaudeEntry(after.entry, desired)) {
     return fail(`claude mcp add-json reported success, but ${claudeConfigPath} does not hold the new entry; check it with claude mcp get ${SERVER_NAME}.`);
   }
-  return { ok: true, updated: true, message: `Claude Code entry updated to ${desired.args[0]}` };
+  return { ok: true, updated: true, message: `Claude Code entry updated to ${desired.args[0]}${recovered}` };
 }
 
 async function syncClaudeCodeForOptions(options) {
@@ -895,11 +988,11 @@ async function selfTestRestoreAndCleanup(fixture) {
   const backupPath = `${configPath}.rollback-test`;
   await writeFile(configPath, "candidate\n", "utf8");
   await writeFile(backupPath, "previous\n", "utf8");
-  await restoreConfigFrom(configPath, backupPath, "t1", { renameFile: flakyRename, delays: [1, 1, 1] });
+  await restoreConfigFrom(configPath, backupPath, "t1", "candidate\n", { renameFile: flakyRename, delays: [1, 1, 1] });
   assert.equal(calls, 3, "EBUSY is retried");
   assert.equal(await readFile(configPath, "utf8"), "previous\n");
   await assert.rejects(
-    restoreConfigFrom(configPath, backupPath, "t2", { renameFile: async () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); }, delays: [1, 1] }),
+    restoreConfigFrom(configPath, backupPath, "t2", "previous\n", { renameFile: async () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); }, delays: [1, 1] }),
     /denied/,
   );
 
@@ -915,6 +1008,53 @@ async function selfTestRestoreAndCleanup(fixture) {
   await writeCodexConfig(liveConfig, { serverPath: path.join(fixture, "previous", "server.js"), env: { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "0".repeat(64) } });
   assert.match(await cleanupUnactivatedRelease({ configPath: liveConfig, destination }), /Removed unactivated release/);
   assert.equal(existsSync(destination), false);
+}
+
+// R-160: a config edited between the read and the rename, or between the activation and the
+// rollback, is refused instead of overwritten.
+async function selfTestConcurrentConfigEdits(fixture) {
+  const configPath = path.join(fixture, "concurrent-config.toml");
+  const staged = (stamp) => [`${configPath}.activating-${stamp}`, `${configPath}.restoring-${stamp}`];
+  await writeFile(configPath, "edited by someone else\n", "utf8");
+  await assert.rejects(replaceConfigAtomically(configPath, "new\n", "c1", "what this run read\n"), /changed since this run read it.*concurrent edit/);
+  assert.equal(await readFile(configPath, "utf8"), "edited by someone else\n", "an edit made after the read survives");
+  assert.deepEqual(staged("c1").filter(existsSync), [], "the refused replace leaves no staged file");
+  await replaceConfigAtomically(configPath, "new\n", "c2", "edited by someone else\n");
+  assert.equal(await readFile(configPath, "utf8"), "new\n");
+  assert.deepEqual(staged("c2").filter(existsSync), []);
+
+  const backupPath = `${configPath}.rollback-c3`;
+  await writeFile(backupPath, "previous\n", "utf8");
+  await writeFile(configPath, "edited after activation\n", "utf8");
+  await assert.rejects(restoreConfigFrom(configPath, backupPath, "c3", "the activated text\n"), /changed after this run wrote it.*concurrent edit/);
+  assert.equal(await readFile(configPath, "utf8"), "edited after activation\n", "a rollback never clobbers a later edit");
+  assert.equal(await readFile(backupPath, "utf8"), "previous\n");
+  assert.deepEqual(staged("c3").filter(existsSync), []);
+  await rm(configPath);
+  await assert.rejects(restoreConfigFrom(configPath, backupPath, "c4", "the activated text\n"), /could not be re-read after this run wrote it/);
+  assert.equal(existsSync(configPath), false);
+
+  // End to end through --sync-clients' re-pin: the health check fails while someone edits the
+  // live config. The rollback must keep that edit; without an edit it restores the backup.
+  const workingTree = path.join(fixture, "concurrent-working-tree");
+  await mkdir(workingTree, { recursive: true });
+  const serverPath = path.join(workingTree, "server.js");
+  await writeFile(serverPath, "moving\n", "utf8");
+  const pinConfig = path.join(fixture, "concurrent-pin.toml");
+  await writeCodexConfig(pinConfig, { serverPath, env: { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "0".repeat(64) } });
+  const original = await readFile(pinConfig, "utf8");
+  const entry = await loadMcpEntry(pinConfig, SERVER_NAME);
+  await assert.rejects(
+    refreshIntegrityPins(pinConfig, entry, { smoke: () => ({ ok: false, output: "health failed" }) }),
+    /previous config was restored/,
+  );
+  assert.equal(await readFile(pinConfig, "utf8"), original, "without a concurrent edit the failed re-pin is rolled back");
+  const concurrentEdit = `${original}# added while the health check ran\n`;
+  await assert.rejects(
+    refreshIntegrityPins(pinConfig, entry, { smoke: (live) => { writeFileSync(live, concurrentEdit, "utf8"); return { ok: false, output: "health failed" }; } }),
+    /restoring the previous config failed.*changed after this run wrote it/s,
+  );
+  assert.equal(await readFile(pinConfig, "utf8"), concurrentEdit, "the concurrent edit is kept");
 }
 
 async function selfTestCleanTree(fixture) {
@@ -941,6 +1081,74 @@ async function selfTestCleanTree(fixture) {
   assert.throws(() => assertCleanSourceTree(notARepo, false), /Could not read the git status/);
 }
 
+// R-163 end to end on a committed fixture repo whose node_modules is git-ignored and edited.
+async function selfTestCheckedBuild(fixture) {
+  const repo = path.join(fixture, "checked-repo");
+  const releases = path.join(fixture, "checked-releases");
+  const write = async (relative, content) => {
+    const file = path.join(repo, ...relative.split("/"));
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, content, "utf8");
+    return file;
+  };
+  await write("server.js", "committed\n");
+  await write("package.json", "{}\n");
+  await write("package-lock.json", "{}\n");
+  await write("bin/tool.js", "committed\n");
+  await write("opencode/agents/a.md", "agent\n");
+  await write("opencode/skills/s/SKILL.md", "skill\n");
+  await write("opencode/.gitignore", "log/\n");
+  const configFile = await write("opencode/opencode.jsonc", "{}\n");
+  const settingFile = await write("opencode/antigravity.json", "{}\n");
+  await write("opencode/plugin-integrity-manifest.json", `${JSON.stringify({
+    version: 1,
+    plugins: [],
+    configs: [{ path: configFile, sha256: await sha256File(configFile), scope: "global", plugins: [] }],
+    settings: [{ path: settingFile, sha256: await sha256File(settingFile), requiredValues: {} }],
+  })}\n`);
+  await write(".gitignore", "node_modules/\n");
+  await write("node_modules/dep/index.js", "edited by hand, invisible to git\n");
+  const git = (...args) => {
+    const result = spawnSync("git", ["-C", repo, "-c", "user.name=release", "-c", "user.email=release@example.com", ...args], { encoding: "utf8", windowsHide: true });
+    assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  };
+  git("init", "--quiet");
+  git("add", ".");
+  git("commit", "--quiet", "-m", "init");
+  const publishEntries = ["server.js", "package.json", "package-lock.json", "bin", "opencode/agents", "opencode/skills", "opencode/.gitignore", "opencode/plugin-integrity-manifest.json", "node_modules"];
+  const installFromLockfile = async (staging) => {
+    assert.equal(existsSync(path.join(staging, "node_modules")), false, "the working tree's node_modules is not copied into the release");
+    await mkdir(path.join(staging, "node_modules", "dep"), { recursive: true });
+    await writeFile(path.join(staging, "node_modules", "dep", "index.js"), "installed from the lockfile\n", "utf8");
+  };
+
+  const clean = path.join(releases, "clean");
+  await buildCheckedRelease({ destination: clean, sourceRoot: repo, publishEntries, dependencyInstaller: installFromLockfile });
+  assert.equal(await readFile(path.join(clean, "node_modules", "dep", "index.js"), "utf8"), "installed from the lockfile\n", "the hand-edited, git-ignored node_modules is not published");
+
+  // The tree becomes dirty after the first check (npm test wrote a file, an editor saved one):
+  // nothing is published and no staging folder is left behind.
+  const dirtied = path.join(releases, "dirtied");
+  await assert.rejects(
+    buildCheckedRelease({
+      destination: dirtied,
+      sourceRoot: repo,
+      publishEntries,
+      dependencyInstaller: async (staging) => {
+        await installFromLockfile(staging);
+        await writeFile(path.join(repo, "bin", "tool.js"), "edited while the release was building\n", "utf8");
+      },
+    }),
+    /1 uncommitted bridge file.*bin\/tool\.js/s,
+  );
+  assert.equal(existsSync(dirtied), false);
+  assert.deepEqual((await readdir(releases)).filter((name) => name.includes(".staging-")), []);
+  // --allow-dirty (and --check-only) still build from a dirty tree.
+  const allowed = path.join(releases, "allowed");
+  await buildCheckedRelease({ destination: allowed, sourceRoot: repo, allowDirty: true, publishEntries, dependencyInstaller: installFromLockfile });
+  assert.equal(await readFile(path.join(allowed, "bin", "tool.js"), "utf8"), "edited while the release was building\n");
+}
+
 const FAKE_CLAUDE = `
 const fs = require("node:fs");
 const args = process.argv.slice(2);
@@ -949,11 +1157,20 @@ const configPath = process.env.FAKE_CLAUDE_CONFIG;
 const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 config.mcpServers = config.mcpServers || {};
 if (args[0] === "mcp" && args[1] === "remove" && args[2] === "-s" && args[3] === "user") {
+  if (process.env.FAKE_CLAUDE_FAIL_REMOVE) {
+    process.stderr.write("simulated remove failure\\n");
+    process.exit(1);
+  }
   if (!config.mcpServers[args[4]]) process.exit(1);
   delete config.mcpServers[args[4]];
 } else if (args[0] === "mcp" && args[1] === "add-json" && args[2] === "-s" && args[3] === "user") {
   if (process.env.FAKE_CLAUDE_FAIL_ADD && args[5].includes(process.env.FAKE_CLAUDE_FAIL_ADD)) {
     process.stderr.write("simulated add failure\\n");
+    process.exit(1);
+  }
+  if (process.env.FAKE_CLAUDE_KILL_PARENT_ON_ADD) {
+    // A crash between the remove and the add: the calling process dies with no chance to restore.
+    process.kill(process.ppid, "SIGKILL");
     process.exit(1);
   }
   if (config.mcpServers[args[4]]) process.exit(1);
@@ -1005,6 +1222,65 @@ async function selfTestClaudeSync(fixture) {
   const noClaude = await syncClaudeCodeEntry(codexConfig, { claude: null, claudeConfigPath, env: env() });
   assert.equal(noClaude.ok, false);
 
+  // R-159: `claude mcp add-json` refuses an existing name, so replacing the entry is remove
+  // then add. A crash in between left Claude Code with no entry, and the next run refused to
+  // proceed ("register it once ..."). The previous entry is now saved first and the next run
+  // restores it.
+  const desiredEntry = { type: "stdio", command: process.execPath, args: [newServer], env: codexEnv };
+  const sync = (extra) => syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env(extra) });
+  const recoveryPath = `${claudeConfigPath}.opencode-entry-recovery.json`;
+  await writeClaudeConfig(oldEntry);
+  assert.equal((await sync()).updated, true);
+  assert.equal(existsSync(recoveryPath), false, "a completed replacement leaves no recovery file");
+
+  await writeClaudeConfig(oldEntry);
+  const crashScript = [
+    `import { syncClaudeCodeEntry } from ${JSON.stringify(pathToFileURL(fileURLToPath(import.meta.url)).href)};`,
+    `await syncClaudeCodeEntry(${JSON.stringify(codexConfig)}, { claude: ${JSON.stringify(claude)}, claudeConfigPath: ${JSON.stringify(claudeConfigPath)}, env: process.env });`,
+  ].join("\n");
+  const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", crashScript], { encoding: "utf8", windowsHide: true, env: env({ FAKE_CLAUDE_KILL_PARENT_ON_ADD: "1" }) });
+  assert.notEqual(crashed.status, 0, `the simulated crash kills the process between the remove and the add: ${crashed.stderr}`);
+  assert.equal(await readEntry(), undefined, "the crash left Claude Code without an entry");
+  assert.deepEqual(JSON.parse(await readFile(recoveryPath, "utf8")), oldEntry, "the previous entry was saved before the remove");
+  const afterCrash = await sync();
+  assert.deepEqual([afterCrash.ok, afterCrash.updated], [true, true], afterCrash.message);
+  assert.match(afterCrash.message, /interrupted earlier update/);
+  assert.deepEqual(await readEntry(), desiredEntry, "the next run restores the entry and brings it up to date");
+  assert.equal(existsSync(recoveryPath), false);
+
+  // The add and the restore both fail: no entry, but the recovery file survives and a later
+  // run (first still failing, then working) restores it.
+  await writeClaudeConfig(oldEntry);
+  const bothFail = await sync({ FAKE_CLAUDE_FAIL_ADD: "server.js" });
+  assert.equal(bothFail.ok, false);
+  assert.match(bothFail.message, /NO opencode entry.*re-run this command/s);
+  assert.equal(await readEntry(), undefined);
+  const stillBroken = await sync({ FAKE_CLAUDE_FAIL_ADD: "server.js" });
+  assert.equal(stillBroken.ok, false);
+  assert.match(stillBroken.message, /earlier update was interrupted/);
+  assert.equal(existsSync(recoveryPath), true);
+  const healed = await sync();
+  assert.deepEqual([healed.ok, healed.updated], [true, true], healed.message);
+  assert.deepEqual(await readEntry(), desiredEntry);
+
+  // A remove that fails leaves the entry alone and no recovery file behind.
+  await writeClaudeConfig(oldEntry);
+  const removeFails = await sync({ FAKE_CLAUDE_FAIL_REMOVE: "1" });
+  assert.equal(removeFails.ok, false);
+  assert.match(removeFails.message, /previous entry is unchanged/);
+  assert.deepEqual(await readEntry(), oldEntry);
+  assert.equal(existsSync(recoveryPath), false);
+
+  // A recovery file is only meaningful while the entry is missing: next to a present entry it is
+  // deleted, so it can never resurrect an old entry someone removed on purpose.
+  await writeClaudeConfig(desiredEntry);
+  await writeFile(recoveryPath, `${JSON.stringify(oldEntry)}\n`, "utf8");
+  assert.equal((await sync()).updated, false);
+  assert.equal(existsSync(recoveryPath), false);
+  await writeClaudeConfig(null);
+  assert.match((await sync()).message, /no user-scope "opencode" MCP entry/);
+  assert.equal(await readEntry(), undefined);
+
   const home = path.join(fixture, "claude-home");
   if (process.platform === "win32") {
     const native = path.join(home, ".local", "bin", "claude.exe");
@@ -1029,7 +1305,9 @@ async function selfTest() {
     await selfTestReleasesRoot(fixture);
     await selfTestRepin(fixture);
     await selfTestRestoreAndCleanup(fixture);
+    await selfTestConcurrentConfigEdits(fixture);
     await selfTestCleanTree(fixture);
+    await selfTestCheckedBuild(fixture);
     await selfTestClaudeSync(fixture);
   } finally {
     await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -1086,7 +1364,7 @@ async function main() {
 
   const destination = await nextReleaseDirectory(releasesRoot);
   step(`Building release ${destination}`);
-  const built = await buildRelease({ destination });
+  const built = await buildCheckedRelease({ destination, allowDirty: options.allowDirty || options.checkOnly });
   const serverPath = path.join(destination, "server.js");
   const serverSha256 = await sha256File(serverPath);
   process.stdout.write(`Files: ${built.fileCount}\nserver.js SHA-256: ${serverSha256}\n`);
@@ -1126,7 +1404,7 @@ async function main() {
     if (await readFile(options.configPath, "utf8") !== originalConfig) {
       throw new Error("The live config changed while the release was being built; nothing was activated. Re-run the command.");
     }
-    await replaceConfigAtomically(options.configPath, candidateText, stamp);
+    await replaceConfigAtomically(options.configPath, candidateText, stamp, originalConfig);
     liveConfigWritten = true;
     process.stdout.write(`Config backup: ${backupPath}\n`);
 
@@ -1135,7 +1413,7 @@ async function main() {
     process.stdout.write(`${smoke.output}\n`);
     if (!smoke.ok) {
       try {
-        await restoreConfigFrom(options.configPath, backupPath, stamp);
+        await restoreConfigFrom(options.configPath, backupPath, stamp, candidateText);
       } catch (error) {
         throw new Error(`Post-activation health failed AND restoring ${options.configPath} from ${backupPath} failed (${error?.code || error?.message || error}). The live config still points at ${destination}, which is kept; copy the backup over the config by hand.`);
       }
