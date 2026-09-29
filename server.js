@@ -1166,6 +1166,64 @@ function trustedGitArgs(args = []) {
   return trusted;
 }
 
+// The directory that holds the repository's shared control files (config, hooks, info/,
+// objects/): `.git` itself, or the common dir a linked worktree's `.git` pointer file leads
+// to. Found by walking up from `startDir` as Git does, without spawning a process. "" when
+// no repository is found.
+async function resolveGitCommonDirectory(startDir) {
+  let directory = path.resolve(startDir || process.cwd());
+  for (;;) {
+    const dotGit = path.join(directory, ".git");
+    let details = null;
+    try {
+      details = await stat(dotGit);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    if (details?.isDirectory()) return dotGit;
+    if (details?.isFile()) {
+      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(dotGit, "utf8"));
+      if (!pointer) return "";
+      const gitDir = path.resolve(directory, pointer[1]);
+      try {
+        return path.resolve(gitDir, (await readFile(path.join(gitDir, "commondir"), "utf8")).trim());
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        return gitDir;
+      }
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) return "";
+    directory = parent;
+  }
+}
+
+// Files under the common .git/ directory that Git honours but that no patch ever shows:
+// info/attributes sets filter, diff, merge, eol and text attributes for every path (the file
+// counterpart of the core.attributesfile key refused below), and objects/info/alternates adds
+// another directory to the object store. A line that is neither blank nor a comment makes
+// the file effective. Reported next to the config keys, under these labels.
+const GIT_CONTROL_FILES_WITH_EFFECT = [
+  ["info/attributes", ["info", "attributes"]],
+  ["objects/info/alternates", ["objects", "info", "alternates"]],
+];
+
+async function inspectGitControlFilesWithEffect(cwd) {
+  const effective = [];
+  const commonDir = await resolveGitCommonDirectory(cwd);
+  if (!commonDir) return effective;
+  for (const [label, segments] of GIT_CONTROL_FILES_WITH_EFFECT) {
+    let text = "";
+    try {
+      text = await readFile(path.join(commonDir, ...segments), "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    if (text.split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith("#"))) effective.push(label);
+  }
+  return effective;
+}
+
 async function inspectRepositoryGitControlSurface(cwd) {
   const listed = await runCommand("git", ["config", "--local", "--name-only", "--list"], cwd, 1000 * 15);
   if (listed.exitCode !== 0) {
@@ -1190,15 +1248,42 @@ async function inspectRepositoryGitControlSurface(cwd) {
       unsafeKeys.add("core.fsmonitor");
     }
   }
+  try {
+    for (const label of await inspectGitControlFilesWithEffect(cwd)) unsafeKeys.add(label);
+  } catch (error) {
+    return {
+      ok: false,
+      errorType: "git_repository_config_unreadable",
+      error: `Could not inspect the repository's .git/info/attributes and .git/objects/info/alternates: ${error?.message || String(error)}`,
+      unsafeKeys: [],
+    };
+  }
   const sortedUnsafeKeys = [...unsafeKeys].sort();
   return sortedUnsafeKeys.length
     ? {
         ok: false,
         errorType: "git_repository_config_unsafe",
-        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${sortedUnsafeKeys.join(", ")}.`,
+        error: `Repository-local Git configuration contains executable, credential-bearing or content-altering controls: ${sortedUnsafeKeys.join(", ")}.`,
         unsafeKeys: sortedUnsafeKeys,
       }
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
+}
+
+// Body of a key block whose END line is missing (a truncated answer): base64 runs of 16+
+// characters, at any wrap width, separated by blank space or by real or escaped line breaks
+// (a key inside a JSON string carries the two characters \n, or \\n one level deeper, instead
+// of a newline). Every scan is sticky and bounded, so it stays linear.
+const PEM_BODY_GAP = /(?:[ \t\r\n]|\\{1,8}[rn])*/y;
+const PEM_BODY_RUN = /[A-Za-z0-9+\/=]{16,}/y;
+function pemBodyEnd(text, from) {
+  let end = from;
+  for (;;) {
+    PEM_BODY_GAP.lastIndex = end;
+    PEM_BODY_GAP.exec(text);
+    PEM_BODY_RUN.lastIndex = PEM_BODY_GAP.lastIndex;
+    if (!PEM_BODY_RUN.exec(text)) return end;
+    end = PEM_BODY_RUN.lastIndex;
+  }
 }
 
 // Private key blocks are cut in one forward pass: a lazy BEGIN...END regex rescanned the
@@ -1207,7 +1292,6 @@ async function inspectRepositoryGitControlSurface(cwd) {
 function redactPrivateKeyBlocks(text) {
   const begin = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/gi;
   const endMarker = /-----END [A-Z ]{0,40}PRIVATE KEY-----/gi;
-  const bodyLines = /(?:\r?\n[A-Za-z0-9+\/=]{16,128})+/y;
   let output = "";
   let cursor = 0;
   let endSearchExhausted = false;
@@ -1219,11 +1303,7 @@ function redactPrivateKeyBlocks(text) {
       if (end) blockEnd = endMarker.lastIndex;
       else endSearchExhausted = true;
     }
-    if (blockEnd < 0) {
-      bodyLines.lastIndex = begin.lastIndex;
-      const body = bodyLines.exec(text);
-      blockEnd = begin.lastIndex + (body ? body[0].length : 0);
-    }
+    if (blockEnd < 0) blockEnd = pemBodyEnd(text, begin.lastIndex);
     output += `${text.slice(cursor, match.index)}[private key redacted]`;
     cursor = blockEnd;
     begin.lastIndex = cursor;
@@ -1302,8 +1382,9 @@ function redactLikelySecrets(value) {
 // Git never reports edits under .git/ as changes, so a writer that rewrote .git/config
 // (core.hooksPath, an alias, a filter driver) or dropped a hook would pass every
 // changed-file check. This fingerprint covers the control files a job could use to run
-// code later: the repository config (and a linked worktree's config.worktree), every hook,
-// and a linked worktree's `.git` pointer file. Compare it before and after a write job.
+// code later or change what Git shows: the repository config (and a linked worktree's
+// config.worktree), every hook, info/attributes, objects/info/alternates, and a linked
+// worktree's `.git` pointer file. Compare it before and after a write job.
 async function gitControlSurfaceFingerprint(cwd) {
   const root = path.resolve(cwd || process.cwd());
   const entries = {};
@@ -1340,6 +1421,10 @@ async function gitControlSurfaceFingerprint(cwd) {
       await record("gitdir/config.worktree", path.join(gitDir, "config.worktree"));
     }
     await record("common/config", path.join(commonDir, "config"));
+    // Git reads both from the common dir: info/attributes can select filter/diff/merge drivers
+    // and rewrite what a diff shows; objects/info/alternates adds another object directory.
+    await record("common/info/attributes", path.join(commonDir, "info", "attributes"));
+    await record("common/objects/info/alternates", path.join(commonDir, "objects", "info", "alternates"));
     let hookNames = [];
     try {
       hookNames = (await readdir(path.join(commonDir, "hooks"))).sort();
@@ -1361,9 +1446,10 @@ function gitControlSurfaceChanges(before, after) {
   return labels.filter((label) => (before?.entries || {})[label] !== (after?.entries || {})[label]);
 }
 
-// Marks a write job failed when its .git/ control files (config, hooks, a worktree's .git
-// pointer) changed while it ran. A fingerprint that could not be taken before proves nothing
-// either way (logged, not failed); one that fails only afterwards fails closed.
+// Marks a write job failed when its .git/ control files (config, hooks, info/attributes,
+// objects/info/alternates, a worktree's .git pointer) changed while it ran. A fingerprint
+// that could not be taken before proves nothing either way (logged, not failed); one that
+// fails only afterwards fails closed.
 function applyGitControlSurfaceCheck(result, before, after, phase = "agent execution") {
   if (!before) return;
   if (!before.ok) {
@@ -1376,7 +1462,7 @@ function applyGitControlSurfaceCheck(result, before, after, phase = "agent execu
   result.errorType ||= "git_control_surface_modified";
   result.stderr = [
     result.stderr,
-    `Git control files changed during ${phase}: ${changed.join(", ")}${after?.ok ? "" : ` (${after?.error || "unreadable"})`}. Git never lists .git/ as a change, so this is checked separately; the output was retained. Inspect .git/config and .git/hooks before running git in this checkout.`,
+    `Git control files changed during ${phase}: ${changed.join(", ")}${after?.ok ? "" : ` (${after?.error || "unreadable"})`}. Git never lists .git/ as a change, so this is checked separately; the output was retained. Inspect .git/config, .git/hooks, .git/info/attributes and .git/objects/info/alternates before running git in this checkout.`,
   ].filter(Boolean).join("\n");
 }
 
@@ -1402,6 +1488,45 @@ function binaryTextFilesInPatch(patchText) {
   return files;
 }
 
+// A key marker in an added line is a key when 40+ base64 characters of body follow it,
+// however the file wraps them (OpenSSL wraps at 64, other tools at 32, 76 or not at all;
+// the first version of this gate needed one 40-character line, so a 32-column PKCS#8 key
+// passed). The body is read from the rest of the marker line (a JSON string holds the whole
+// key with escaped \n) and from the added lines below it, which may be indented, quoted or
+// followed by a comma; blank lines and RFC 1421 header fields (Proc-Type, DEK-Info) between
+// the marker and the body are skipped. Each line is scanned by at most one marker.
+const KEY_BODY_MIN_CHARS = 40;
+const KEY_BODY_LOOKAHEAD_LINES = 64;
+const KEY_BODY_LINE = /^\+[ \t]*["'`]?([A-Za-z0-9+\/=]+)(?:\\{1,8}[rn])*["'`]?[ \t]*[,;+]?[ \t]*$/;
+const KEY_BODY_SKIPPED_LINE = /^\+[ \t]*(?:(?:Proc-Type|DEK-Info):.*)?$/;
+const KEY_BODY_RUN = /[A-Za-z0-9+\/=]+/y;
+const KEY_BODY_ESCAPED_BREAKS = /(?:\\{1,8}[rn])+/y;
+function inlineKeyBodyChars(line, from) {
+  let position = from;
+  let chars = 0;
+  for (;;) {
+    KEY_BODY_ESCAPED_BREAKS.lastIndex = position;
+    if (KEY_BODY_ESCAPED_BREAKS.exec(line)) position = KEY_BODY_ESCAPED_BREAKS.lastIndex;
+    KEY_BODY_RUN.lastIndex = position;
+    const run = KEY_BODY_RUN.exec(line);
+    if (!run) return chars;
+    chars += run[0].length;
+    position = KEY_BODY_RUN.lastIndex;
+  }
+}
+function patchKeyBodyChars(lines, index) {
+  const header = PRIVATE_KEY_HEADER.exec(lines[index]);
+  let chars = inlineKeyBodyChars(lines[index], header.index + header[0].length);
+  const last = Math.min(lines.length - 1, index + KEY_BODY_LOOKAHEAD_LINES);
+  for (let next = index + 1; chars < KEY_BODY_MIN_CHARS && next <= last; next += 1) {
+    if (KEY_BODY_SKIPPED_LINE.test(lines[next])) continue;
+    const body = KEY_BODY_LINE.exec(lines[next]);
+    if (!body) break;
+    chars += body[1].length;
+  }
+  return chars;
+}
+
 function patchLikelySecretLines(patchText) {
   const hits = [];
   const lines = String(patchText || "").split(/\r?\n/);
@@ -1412,8 +1537,8 @@ function patchLikelySecretLines(patchText) {
     if (!line.startsWith("+") || /^\+\+\+ (?:b\/|\/dev\/null)/.test(line)) continue;
     const keyHeader = PRIVATE_KEY_HEADER.test(line);
     if (keyHeader) {
-      // A test comment naming the header is not a key; a following base64 body line is.
-      if (/^\+[A-Za-z0-9+\/=]{40,}\s*$/.test(lines[index + 1] || "")) hits.push(index + 1);
+      // A test comment naming the header is not a key; a key body after it is.
+      if (patchKeyBodyChars(lines, index) >= KEY_BODY_MIN_CHARS) hits.push(index + 1);
       continue;
     }
     if (LIKELY_SECRET_PATTERNS.some((pattern) => pattern.test(line))) hits.push(index + 1);
