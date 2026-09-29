@@ -6720,7 +6720,10 @@ function makeQueueJobId(agent = "agent") {
 
 function queueRequestFingerprint(request) {
   const comparable = structuredClone(request);
+  // Both are minted per enqueue (the job id is random), so an idempotent retry of the same
+  // contractor request must not see them as different content.
   delete comparable.internalQueueContractorProof;
+  delete comparable.internalQueueJobId;
   return createHash("sha256").update(JSON.stringify(comparable)).digest("hex");
 }
 
@@ -15590,10 +15593,17 @@ function commandFingerprintFields(value, prefix = "validationCommand") {
 
 function scopeContractDurableSummary(contract) {
   if (!contract) return null;
+  // An already-summarized contract carries an empty command and its original fingerprint;
+  // re-summarizing it must keep that fingerprint instead of replacing it with sha256("").
+  const alreadySummarized = !contract.validationCommand
+    && Object.prototype.hasOwnProperty.call(contract, "validationCommandSha256")
+    && Object.prototype.hasOwnProperty.call(contract, "validationCommandChars");
   return sanitizePersistedValue({
     ...contract,
     validationCommand: "",
-    ...commandFingerprintFields(contract.validationCommand),
+    ...(alreadySummarized
+      ? { validationCommandChars: contract.validationCommandChars, validationCommandSha256: contract.validationCommandSha256 }
+      : commandFingerprintFields(contract.validationCommand)),
   });
 }
 
@@ -16696,6 +16706,12 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   return { ok: true, record };
 }
 
+// node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
+// code in errcode (2067 = SQLITE_CONSTRAINT_UNIQUE); there is no "SQLITE_CONSTRAINT_UNIQUE" code.
+function sqliteUniqueConstraintError(error) {
+  return error?.errcode === 2067 || /UNIQUE constraint failed/i.test(error?.message || "");
+}
+
 async function activatePipelineBatch(record, preparedRecords) {
   if (effectiveQueueMode() !== "sqlite") {
     return { ok: false, errorType: "pipeline_requires_sqlite_queue", error: "Atomic pipeline activation requires the SQLite queue." };
@@ -16883,7 +16899,7 @@ async function activatePipelineBatch(record, preparedRecords) {
       }
       return {
         ok: false,
-        errorType: error?.code === "SQLITE_CONSTRAINT_UNIQUE" ? "pipeline_batch_idempotency_conflict" : "pipeline_batch_persistence_failed",
+        errorType: sqliteUniqueConstraintError(error) ? "pipeline_batch_idempotency_conflict" : "pipeline_batch_persistence_failed",
         error: error?.message || "Pipeline batch activation failed and was rolled back.",
       };
     } finally {
