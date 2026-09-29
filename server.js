@@ -7973,12 +7973,15 @@ async function reconcileWorktreeArtifactRegistry(cwd) {
   const knownDb = await openLockDb(canonicalCwd);
   let knownPaths;
   try {
+    // Any active row counts as known, whichever cwd registered it: a directory another
+    // checkout owns was re-walked on every reservation because the insert below never
+    // replaces an active row.
     knownPaths = new Set(
       knownDb.prepare(`
         SELECT worktree_path FROM worktree_artifacts
-        WHERE cwd = ? AND status IN ('creating', 'retained', 'cleanup_failed')
+        WHERE status IN ('creating', 'retained', 'cleanup_failed')
       `)
-        .all(canonicalCwd)
+        .all()
         .map((row) => path.resolve(row.worktree_path))
     );
   } finally {
@@ -7992,14 +7995,26 @@ async function reconcileWorktreeArtifactRegistry(cwd) {
         const absolute = path.resolve(root, entry.name);
         if (!isPathInside(root, absolute)) continue;
         if (knownPaths.has(absolute)) continue;
-        const details = await lstat(absolute);
-        if (details.isDirectory() && !details.isSymbolicLink()) {
-          discovered.push({
-            path: absolute,
-            status: "retained",
-            measuredBytes: await measureRetainedWorktreeBytes(absolute),
-          });
-        } else if (details.isSymbolicLink()) {
+        try {
+          const details = await lstat(absolute);
+          if (details.isDirectory() && !details.isSymbolicLink()) {
+            discovered.push({
+              path: absolute,
+              status: "retained",
+              measuredBytes: await measureRetainedWorktreeBytes(absolute),
+            });
+          } else if (details.isSymbolicLink()) {
+            discovered.push({
+              path: absolute,
+              status: "cleanup_failed",
+              measuredBytes: CONFIG.retainedWorktreeMaxBytes + 1,
+            });
+          }
+        } catch (error) {
+          if (error?.code === "ENOENT") continue;
+          // An entry that cannot be measured (EPERM/EBUSY on Windows) is recorded as a
+          // capacity-full cleanup failure instead of failing this job's reservation.
+          logEvent("warn", "worktree.registry_measure_failed", { path: absolute, error: error?.message || String(error) });
           discovered.push({
             path: absolute,
             status: "cleanup_failed",
@@ -8344,16 +8359,21 @@ function diffStatFromPatch(patchText) {
   for (const line of String(patchText || "").split("\n")) {
     const header = line.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/);
     if (header) {
-      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false };
+      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false, inHunk: false };
       files.push(current);
       continue;
     }
     if (!current) continue;
-    if (line.startsWith("new file mode")) current.created = true;
-    else if (line.startsWith("deleted file mode")) current.deleted = true;
-    else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
-    else if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
-    else if (line.startsWith("+")) current.added += 1;
+    // The ---/+++ file header lines exist only before a file's first hunk; inside a hunk a
+    // removed "-- x" or an added "++ y" line is content and was skipped as a header.
+    if (!current.inHunk) {
+      if (line.startsWith("new file mode")) current.created = true;
+      else if (line.startsWith("deleted file mode")) current.deleted = true;
+      else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
+      else if (line.startsWith("@@")) current.inHunk = true;
+      continue;
+    }
+    if (line.startsWith("+")) current.added += 1;
     else if (line.startsWith("-")) current.removed += 1;
   }
   if (!files.length) return "";
@@ -8445,6 +8465,20 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
       branchCleanup: "skipped",
       reason: "worktree had no removable local branch",
     };
+  }
+
+  if (!expectedBranchOid) {
+    // show-ref failed: either the branch is already gone (nothing to clean) or its identity
+    // really could not be read (keep reporting that as retained).
+    const listed = await runCommand("git", ["for-each-ref", "--format=%(refname)", branchRef], worktree.repoRoot, 1000 * 15);
+    if (listed.exitCode === 0 && !listed.stdout.split(/\r?\n/).map((line) => line.trim()).includes(branchRef)) {
+      await markWorktreeArtifactState(worktree, "cleaned");
+      return {
+        cleanup: "success",
+        branchCleanup: "already_absent",
+        reason: "the worktree's local branch no longer existed",
+      };
+    }
   }
 
   if (typeof worktreeCleanupTestHook === "function") {
@@ -8810,22 +8844,33 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       };
     }
 
+    // The branch tip is taken from refs/heads/ (a same-named tag must not win), and the patch
+    // is the branch's own change since its merge base with HEAD: diffing HEAD..branch reverted
+    // every target commit made after the fork on the paths both sides touched.
+    const branchOid = verified.stdout.trim().split(/\s+/)[0] || "";
+    const mergeBase = requestedSourceBaseCommit
+      ? null
+      : await runCommand("git", ["merge-base", "HEAD", branchOid], repoRoot, 1000 * 15);
+    if (mergeBase && (mergeBase.exitCode !== 0 || !mergeBase.stdout.trim())) {
+      return { ok: false, errorType: "integration_source_invalid", error: mergeBase.stderr || "The branch has no merge base with the target HEAD." };
+    }
     const base = await runCommand(
       "git",
-      ["rev-parse", "--verify", "--end-of-options", `${requestedSourceBaseCommit || "HEAD"}^{commit}`],
+      ["rev-parse", "--verify", "--end-of-options", `${requestedSourceBaseCommit || mergeBase.stdout.trim()}^{commit}`],
       repoRoot,
       1000 * 15
     );
-    if (base.exitCode !== 0) {
+    if (base.exitCode !== 0 || !branchOid) {
       return { ok: false, errorType: "integration_source_invalid", error: base.stderr || "Could not resolve the reviewed branch base commit." };
     }
-    const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 15);
-    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30);
-    if (diff.exitCode !== 0) {
+    const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branchOid}`, "--"], repoRoot, 1000 * 15);
+    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branchOid}`, "--"], repoRoot, 1000 * 30);
+    if (diff.exitCode !== 0 || changed.exitCode !== 0) {
+      // Without the file list, scope validation would pass vacuously: fail closed.
       return {
         ok: false,
         errorType: "integration_patch_create_failed",
-        error: diff.stderr || diff.stdout || "Could not create patch from branch.",
+        error: diff.stderr || changed.stderr || diff.stdout || "Could not create patch from branch.",
       };
     }
 
@@ -8833,7 +8878,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       ok: true,
       sourceType: "branch",
       source: branch,
-      changedFiles: changed.exitCode === 0 ? normalizeLockPathList(changed.stdout.split("\0")) : [],
+      changedFiles: normalizeLockPathList(changed.stdout.split("\0")),
       patch: diff.stdout || "",
       patchSha256: createHash("sha256").update(diff.stdout || "").digest("hex"),
       sourceStateSha256: createHash("sha256").update([branch, verified.stdout || "", diff.stdout || ""].join("\0")).digest("hex"),
@@ -9588,6 +9633,7 @@ async function integratePatchWithoutSerialLock({
   pipelineJobId = "",
   signal = null,
   integrationLock = null,
+  previewMode = "full",
 }) {
   const requestedCwd = path.resolve(cwd || process.cwd());
   const targetRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
@@ -9721,6 +9767,16 @@ async function integratePatchWithoutSerialLock({
       validationGate: { status: "skipped", command: "", exitCode: "not_run", durationMs: 0 },
     };
   }
+  if (!normalizeLockPathList(patch.changedFiles || []).length) {
+    // A non-empty patch with no known file list would pass scope validation vacuously and
+    // journal zero files, which recovery then closes as recovered_noop while the patch stays.
+    return {
+      ok: false,
+      errorType: "integration_patch_paths_unknown",
+      error: "The integration patch is not empty but its changed-file list is; the bridge refuses to validate or apply a patch whose paths it cannot list.",
+      changedFiles: [],
+    };
+  }
 
   const lockPlan = {
     agent: "merge_manager",
@@ -9807,7 +9863,8 @@ async function integratePatchWithoutSerialLock({
           previewReceipt: null,
         };
       }
-      if (patch.patch.length > CONFIG.integrationPreviewMaxChars) {
+      // The character cap protects the printed full preview; stat mode prints line counts.
+      if (previewMode !== "stat" && patch.patch.length > CONFIG.integrationPreviewMaxChars) {
         return {
           ok: false,
           status: "preview_rejected",
@@ -9867,7 +9924,7 @@ async function integratePatchWithoutSerialLock({
         targetTree: targetState.targetTree,
         targetStateSha256: targetState.targetStateSha256,
         contractSha256,
-        patchPreview: patch.patch,
+        patchPreview: previewMode === "stat" ? "" : patch.patch,
         patchStat: diffStatFromPatch(patch.patch),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
@@ -14064,6 +14121,7 @@ server.tool(
       previewReceipt,
       allowDirtyTarget,
       acceptFlaggedSecretLines,
+      previewMode,
       cleanupAfterSuccess: effectiveCleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
       pipelineId,
@@ -21400,6 +21458,24 @@ export const __selfTest = {
     GLOBALLY_REQUIRED_MANAGED_AGENTS,
     INTEGRATION_PREVIEWS,
     INTEGRATION_PREVIEW_TTL_MS,
+    INTEGRATION_RECOVERY_BLOCKED_ROOTS,
+    MAX_LOCK_TTL_MS,
+    createPatchFromWorkingTree,
+    expandIgnoredDirectoryEntries,
+    formatAgentLockList,
+    formatLockExpiry,
+    generatedWorktreeRootForCwd,
+    gitChangedFileSnapshotParts,
+    gitIndexPathSnapshot,
+    ignoredIntegrationSourceFiles,
+    integrationJournalDiagnosis,
+    integrationRecoveryBaseline,
+    quarantineHardLock,
+    realPathBoundaryReason,
+    reconcileWorktreeArtifactRegistry,
+    recoverIntegrationRepositorySerially,
+    recoverSingleIntegrationOperationWhileLocked,
+    reservedLockAgentError,
     MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
     MCP_ORCHESTRATOR_AGENT,
     MCP_SANITIZED_READER_AGENT,
