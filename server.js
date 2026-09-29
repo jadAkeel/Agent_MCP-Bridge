@@ -143,6 +143,7 @@ const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
 // Agent timeouts are handed to the supervisor's setTimeout, which cannot represent more
 // than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
 const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
+const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -372,6 +373,7 @@ let selfTestModelOverrideAllowlist = null;
 let pipelinePersistenceTestHook = null;
 let queueCancellationTestHook = null;
 let worktreeCleanupTestHook = null;
+let integrationScratchCleanupTestHook = null;
 let pipelineGateExecutorTestHook = null;
 
 const server = new McpServer({
@@ -5100,7 +5102,7 @@ function realPathBoundaryReason(rawPath, cwd) {
     const realRoot = realpathSync(root);
     const realNearest = realpathSync(nearest);
     const relativeReal = path.relative(realRoot, realNearest);
-    if (relativeReal.startsWith("..") || path.isAbsolute(relativeReal)) {
+    if (pathRelativeEscapes(relativeReal) || path.isAbsolute(relativeReal)) {
       return `Path ${JSON.stringify(rawPath)} resolves through a symlink or junction outside the allowed root ${realRoot}.`;
     }
 
@@ -5149,7 +5151,7 @@ function unsafePathReason(paths, cwd = "") {
     if (isAbsolutePathLike(normalized) && root) {
       const resolved = path.resolve(normalized);
       const relative = path.relative(root, resolved);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      if (!relative || pathRelativeEscapes(relative) || path.isAbsolute(relative)) {
         return `Unsafe path ${label} resolves outside the allowed root ${root}.`;
       }
     }
@@ -6722,21 +6724,84 @@ async function runGitReadOnlyCommand(args, cwd, timeoutMs = 1000 * 15, commandRu
   return result;
 }
 
+// Ignored entries, listed with --directory so a wholly ignored node_modules/ or .venv/ is one
+// "dir/" entry: listing every file in them exceeded the 30 MB capture budget in large
+// checkouts and every snapshot then failed closed. A wholly ignored directory that is not a
+// regenerable build/cache directory (.idea/, logs/, secrets/) is walked so its files keep
+// their own entries; regenerable directories inside it stay one entry, by name.
+function ignoredEntryIsRegenerable(entry) {
+  const segments = String(entry || "").split("/");
+  const directories = entry.endsWith("/") ? segments.filter(Boolean) : segments.slice(0, -1);
+  return directories.some((segment) => REGENERABLE_IGNORED_DIRECTORY.test(segment));
+}
+
+async function expandIgnoredDirectoryEntries(cwd, entries, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
+  const base = path.resolve(cwd || process.cwd());
+  const expanded = [];
+  const limitError = () => {
+    const error = new Error(`Ignored-file snapshot limit exceeded: more than ${limit} ignored entries outside build/cache directories exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${limit}.`);
+    error.errorType = "snapshot_safety_limit_exceeded";
+    return error;
+  };
+  for (const entry of entries) {
+    if (!entry.endsWith("/") || ignoredEntryIsRegenerable(entry)) {
+      expanded.push(entry);
+      continue;
+    }
+    const stack = [entry.replace(/\/+$/, "")];
+    while (stack.length) {
+      const directory = stack.pop();
+      let children;
+      try {
+        children = await readdir(path.join(base, ...directory.split("/")), { withFileTypes: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") expanded.push(`${directory}/`);
+        continue;
+      }
+      if (children.some((child) => child.name === ".git")) {
+        expanded.push(`${directory}/`);
+        continue;
+      }
+      for (const child of children) {
+        const childPath = `${directory}/${child.name}`;
+        if (child.isDirectory()) {
+          if (REGENERABLE_IGNORED_DIRECTORY.test(child.name)) expanded.push(`${childPath}/`);
+          else stack.push(childPath);
+        } else {
+          expanded.push(childPath);
+        }
+      }
+      if (expanded.length > limit + entries.length) throw limitError();
+    }
+  }
+  return expanded;
+}
+
+function splitNulSeparated(stdout) {
+  return String(stdout || "").split("\0").filter(Boolean);
+}
+
 async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
+  // --no-renames: a staged `git mv forbidden/x allowed/x` otherwise lists only the destination
+  // and the forbidden deletion passed scope validation. -z: exact paths, no quoting.
   const commands = [
-    runGitReadOnlyCommand(["diff", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["diff", "--cached", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["diff", "--name-only", "--no-renames", "-z"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["diff", "--cached", "--name-only", "--no-renames", "-z"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard", "-z"], cwd, 1000 * 15),
   ];
   if (includeIgnored) {
-    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard"], cwd, 1000 * 30));
+    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"], cwd, 1000 * 30));
+    // Forbidden-looking ignored files (.env, *.pem, *.key, secrets/) keep their own entry even
+    // inside a directory --directory collapsed; the pathspec keeps this listing small.
+    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...FORBIDDEN_LOOKING_PATHSPECS], cwd, 1000 * 30));
   }
-  const [workingTreeDiff, stagedDiff, untracked, ignored] = await Promise.all(commands);
+  const [workingTreeDiff, stagedDiff, untracked, ignored, forbiddenIgnored] = await Promise.all(commands);
   const failedChecks = [
     ["working tree", workingTreeDiff],
     ["staged files", stagedDiff],
     ["untracked files", untracked],
     ...(ignored ? [["ignored files", ignored]] : []),
+    ...(forbiddenIgnored ? [["ignored protected files", forbiddenIgnored]] : []),
   ].filter(([, result]) => result.exitCode !== 0);
   if (failedChecks.length) {
     const details = failedChecks
@@ -6745,14 +6810,15 @@ async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
     throw new Error(`Git changed-file inspection failed closed (${details}).`);
   }
 
+  const ignoredEntries = ignored ? await expandIgnoredDirectoryEntries(cwd, splitNulSeparated(ignored.stdout)) : [];
   return [
-    ...new Set(
-      [workingTreeDiff.stdout, stagedDiff.stdout, untracked.stdout, ignored?.stdout || ""]
-        .join("\n")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-    ),
+    ...new Set([
+      ...splitNulSeparated(workingTreeDiff.stdout),
+      ...splitNulSeparated(stagedDiff.stdout),
+      ...splitNulSeparated(untracked.stdout),
+      ...ignoredEntries,
+      ...(forbiddenIgnored ? splitNulSeparated(forbiddenIgnored.stdout).filter((file) => FORBIDDEN_LOOKING_PATH.test(file)) : []),
+    ]),
   ].sort();
 }
 
@@ -7005,7 +7071,15 @@ async function shouldAvoidSnapshotContent(cwd, file) {
   }
 }
 
-async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
+async function gitChangedFileSnapshot(cwd, options = {}) {
+  const { ordinary, ignored } = await gitChangedFileSnapshotParts(cwd, options);
+  return new Map([...ordinary, ...ignored]);
+}
+
+// Ordinary (tracked-dirty and untracked) entries and ignored entries apart: git apply never
+// writes ignored files, so integration decides on the ordinary part, and ignored metadata
+// only feeds the preview-receipt identity.
+async function gitChangedFileSnapshotParts(cwd, { includeIgnored = true } = {}) {
   const ordinaryFiles = await gitChangedFiles(cwd, { includeIgnored: false });
   const allFiles = includeIgnored ? await gitChangedFiles(cwd, { includeIgnored: true }) : ordinaryFiles;
   const ordinarySet = new Set(ordinaryFiles);
@@ -7018,22 +7092,24 @@ async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
     throw error;
   }
   const ignoredGroups = groupIgnoredFiles(ignoredFiles);
-  const snapshot = new Map();
+  const ordinary = new Map();
+  const ignored = new Map();
   for (const file of ordinaryFiles) {
-    snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
+    ordinary.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
   }
   for (const [entry, files] of ignoredGroups) {
-    if (files.length === 1 && files[0] === entry) {
-      snapshot.set(entry, await fileFingerprint(cwd, entry, { metadataOnly: true }));
+    if (files.length === 1 && files[0] === entry && !entry.endsWith("/")) {
+      ignored.set(entry, await fileFingerprint(cwd, entry, { metadataOnly: true }));
       continue;
     }
-    // Names only: git already listed every member, so files added to or removed from a
-    // cache directory still change the snapshot without an lstat per file.
+    // Names only: git already listed every member (a wholly ignored directory is one "dir/"
+    // member), so files added to or removed from a cache directory still change the snapshot
+    // without an lstat per file.
     const hash = createHash("sha256");
     for (const file of files) hash.update(`${file}\0`);
-    snapshot.set(entry, `group:${files.length}:${hash.digest("hex")}`);
+    ignored.set(entry, `group:${files.length}:${hash.digest("hex")}`);
   }
-  return snapshot;
+  return { ordinary, ignored };
 }
 
 // Ignored files inside regenerable directories (build outputs, virtualenvs, caches) are
@@ -7046,6 +7122,13 @@ const REGENERABLE_IGNORED_DIRECTORY = /^(?:node_modules|\.venv|venv|__pycache__|
 // Same set as DEFAULT_FORBIDDEN_EDIT_PATHS, as one regex: isWithinAnyPath per ignored file
 // cost about 6 s per snapshot on 30000 build files, several times per integration.
 const FORBIDDEN_LOOKING_PATH = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.pem|[^/]*\.key)$|(?:^|\/)secrets\//i;
+const FORBIDDEN_LOOKING_PATHSPECS = [
+  ":(glob,icase)**/.env",
+  ":(glob,icase)**/.env.*",
+  ":(glob,icase)**/*.pem",
+  ":(glob,icase)**/*.key",
+  ":(glob,icase)**/secrets/**",
+];
 
 function groupIgnoredFiles(ignoredFiles, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
   const groups = new Map();
@@ -7790,12 +7873,20 @@ async function prepareIntegrationOperation({
   const operationId = `integration-${Date.now()}-${randomBytes(8).toString("hex")}`;
   const ownerGeneration = randomBytes(16).toString("hex");
   const affectedPaths = normalizeLockPathList(patch.changedFiles || []);
+  if (!affectedPaths.length) {
+    // An operation without file rows has nothing for recovery to verify: it would be closed
+    // recovered_noop while a non-empty patch stayed applied.
+    const error = new Error("Integration journal refused an operation with no affected paths; the patch file list is unknown.");
+    error.errorType = "integration_journal_paths_missing";
+    throw error;
+  }
   const evidence = await captureIntegrationJournalEvidence({
     cwd,
     files: affectedPaths,
     expectedPostSnapshot,
     operationId,
   });
+  const preIndexEntries = await gitIndexPathSnapshot(cwd, affectedPaths);
   const createdAt = new Date().toISOString();
   const db = await openLockDb(cwd);
   let transactionOpen = false;
@@ -7847,8 +7938,8 @@ async function prepareIntegrationOperation({
     );
     const insertFile = db.prepare(`
       INSERT INTO integration_operation_files
-        (operation_id, ordinal, path, pre_kind, pre_mode, pre_sha256, pre_encrypted, post_sha256, post_encrypted)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (operation_id, ordinal, path, pre_kind, pre_mode, pre_sha256, pre_encrypted, post_sha256, post_encrypted, pre_index_entry_sha256)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const item of evidence) {
       insertFile.run(
@@ -7860,7 +7951,8 @@ async function prepareIntegrationOperation({
         item.preSha256,
         item.preEncrypted,
         item.postSha256,
-        item.postEncrypted
+        item.postEncrypted,
+        integrationJournalFingerprintSha256(preIndexEntries.get(item.path) ?? "")
       );
     }
     db.exec("COMMIT");
@@ -8014,17 +8106,109 @@ async function restoreIntegrationJournalFile(cwd, evidence) {
   if (!restored) throw new Error("Integration journal could not restore an exact preimage.");
 }
 
-async function quarantineIntegrationOperation(cwd, operationId, expectedStatuses, reason, authority = null) {
+async function quarantineIntegrationOperation(cwd, operationId, expectedStatuses, reason, authority = null, details = {}) {
   try {
     await transitionIntegrationOperation(cwd, operationId, expectedStatuses, "quarantined", {
+      ...details,
       outcome: "quarantined",
       reason: String(reason || "integration_recovery_ambiguous"),
     }, authority);
+    return true;
   } catch (error) {
     logEvent("error", "integration.journal_quarantine_failed", {
       operationId,
       errorType: error?.errorType || "integration_journal_persistence_failed",
     });
+    return false;
+  }
+}
+
+// Errors that say the evidence could not be read right now (a file held open by an editor or a
+// virus scanner, a busy state database, a git timeout), not that the repository drifted. Recovery
+// leaves the operation nonterminal for these and the next recovery pass retries it; quarantining
+// them turned a momentary EBUSY into a permanent block on every writer.
+const TRANSIENT_INTEGRATION_RECOVERY_CODES = new Set(["EBUSY", "EACCES", "EPERM", "EAGAIN", "EMFILE", "ENFILE", "ETIMEDOUT"]);
+
+function integrationRecoveryErrorIsTransient(error) {
+  if (TRANSIENT_INTEGRATION_RECOVERY_CODES.has(error?.code)) return true;
+  if (["integration_journal_cas_rejected", "integration_lock_ownership_lost", "integration_index_snapshot_failed", "integration_target_state_failed"].includes(error?.errorType)) return true;
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|timed out|timeout/i.test(String(error?.message || error || ""));
+}
+
+function integrationRecoveryErrorText(error) {
+  return truncateText(redactSensitiveText(String(error?.message || error || "unknown error")), 500);
+}
+
+function integrationPathspecs(paths) {
+  return normalizeLockPathList(paths).map((file) => `:(literal)${file}`);
+}
+
+// Decides whether HEAD and the real Git index still hold the state the operation was prepared
+// on. With per-path index evidence in the journal only the affected paths count: their index
+// entries must be unchanged, and a HEAD that moved is accepted when no commit since the
+// recorded HEAD touched them (Codex committing or staging unrelated work while an operation is
+// unresolved used to quarantine the repository permanently). Rows written by older bridges have
+// only the whole-index identity and keep the whole-index rule; this never fails open.
+// Returns { ok: true } | { ok: false, proven: true, details } | { ok: false, proven: false, errorType, error }.
+async function integrationRecoveryBaseline(cwd, operation, fileRows, affectedPaths) {
+  const unavailable = (errorType, error) => ({
+    ok: false,
+    proven: false,
+    errorType: errorType || "integration_recovery_evidence_unavailable",
+    error: integrationRecoveryErrorText(error),
+  });
+  try {
+    const perPath = fileRows.length > 0
+      && fileRows.every((row) => /^[a-f0-9]{64}$/.test(String(row.pre_index_entry_sha256 || "")));
+    if (!perPath) {
+      const state = await captureIntegrationTargetState(cwd);
+      if (!state.ok) return unavailable(state.errorType || "integration_target_state_failed", state.error);
+      const headMoved = state.targetHead !== operation.target_head;
+      const indexChanged = state.indexSha256 !== operation.pre_index_sha256;
+      if (headMoved || indexChanged) {
+        return { ok: false, proven: true, details: { evidence: "whole_index", headMoved, indexChanged } };
+      }
+      return {
+        ok: true,
+        evidence: "whole_index",
+        headMoved: false,
+        externalDriftOutsidePatch: state.targetStateSha256 !== operation.target_state_sha256,
+      };
+    }
+    const head = await runGitReadOnlyCommand(["rev-parse", "--verify", "HEAD^{commit}"], cwd, 1000 * 15);
+    if (head.exitCode !== 0 || !head.stdout.trim()) {
+      return unavailable("integration_target_state_failed", head.stderr || head.stdout || "Could not resolve the target HEAD.");
+    }
+    const currentHead = head.stdout.trim();
+    const index = await gitIndexPathSnapshot(cwd, affectedPaths);
+    const indexMismatches = fileRows
+      .filter((row) => integrationJournalFingerprintSha256(index.get(row.path) ?? "") !== row.pre_index_entry_sha256)
+      .map((row) => row.path);
+    const headMoved = currentHead !== operation.target_head;
+    let committedChanges = [];
+    if (headMoved) {
+      const diff = await runGitReadOnlyCommand(
+        ["diff", "--name-only", "--no-renames", "-z", operation.target_head, currentHead, "--", ...integrationPathspecs(affectedPaths)],
+        cwd,
+        1000 * 30
+      );
+      if (diff.exitCode !== 0) {
+        const recorded = await runGitReadOnlyCommand(["cat-file", "-e", `${operation.target_head}^{commit}`], cwd, 1000 * 15);
+        if (typeof recorded.exitCode === "number" && recorded.exitCode !== 0) {
+          // The recorded HEAD is gone from the repository, so nothing can show the affected
+          // paths' committed content is unchanged.
+          return { ok: false, proven: true, details: { evidence: "affected_paths", headMoved, recordedHeadMissing: true, indexMismatches } };
+        }
+        return unavailable("integration_target_state_failed", diff.stderr || diff.stdout || "Could not compare the recorded and current HEAD.");
+      }
+      committedChanges = normalizeLockPathList(diff.stdout.split("\0"));
+    }
+    if (indexMismatches.length || committedChanges.length) {
+      return { ok: false, proven: true, details: { evidence: "affected_paths", headMoved, indexMismatches, committedChanges } };
+    }
+    return { ok: true, evidence: "affected_paths", headMoved, currentHead };
+  } catch (error) {
+    return unavailable(error?.errorType || "integration_recovery_evidence_unavailable", error);
   }
 }
 
@@ -8038,36 +8222,86 @@ async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, file
     "rolling_back",
     "recovering",
   ];
-  try {
-    if (!recoverableStatuses.includes(operation.status)) {
-      throw new Error("Integration journal contains an unknown nonterminal status.");
+  const operationId = operation.operation_id;
+  let currentStatus = operation.status;
+  // Quarantine only on proven mismatch or corrupt evidence; the reason and the error text go to
+  // result_json so diagnose_opencode_bridge can show why the repository is blocked.
+  const quarantine = async (reason, details = {}) => {
+    const persisted = await quarantineIntegrationOperation(
+      cwd,
+      operationId,
+      [currentStatus, "recovering", "rolling_back"],
+      reason,
+      authority,
+      details
+    );
+    if (!persisted) {
+      return {
+        ok: false,
+        retryable: true,
+        operationId,
+        status: currentStatus,
+        errorType: "integration_journal_persistence_failed",
+        error: `The quarantine (${reason}) could not be recorded; the operation stays ${currentStatus} and recovery retries it.`,
+        pendingReason: reason,
+      };
     }
-    if (operation.status !== "recovering") {
-      await transitionIntegrationOperation(cwd, operation.operation_id, operation.status, "recovering", {
+    return { ok: false, operationId, status: "quarantined", reason };
+  };
+  // Evidence unavailable: leave the operation nonterminal (recovering, or rolling_back after a
+  // partial restore; both are starting states here) so the next recovery pass retries it.
+  const retry = (errorType, error) => {
+    const message = integrationRecoveryErrorText(error);
+    logEvent("warn", "integration.recovery_retryable", { operationId, status: currentStatus, errorType, error: message });
+    return { ok: false, retryable: true, operationId, status: currentStatus, errorType, error: message };
+  };
+
+  if (!recoverableStatuses.includes(operation.status)) {
+    return await quarantine("journal_status_unknown", { status: String(operation.status || "") });
+  }
+  if (operation.status !== "recovering") {
+    try {
+      await transitionIntegrationOperation(cwd, operationId, operation.status, "recovering", {
         outcome: "recovery_started",
       }, authority);
+      currentStatus = "recovering";
+    } catch (error) {
+      return retry(error?.errorType || "integration_journal_persistence_failed", error);
     }
+  }
+
+  let normalizedPaths;
+  try {
     const expectedPaths = JSON.parse(operation.affected_paths_json || "[]");
-    const normalizedPaths = normalizeLockPathList(expectedPaths);
+    normalizedPaths = normalizeLockPathList(expectedPaths);
     if (!Array.isArray(expectedPaths)
+      || !normalizedPaths.length
       || normalizedPaths.length !== expectedPaths.length
       || fileRows.length !== normalizedPaths.length
       || fileRows.some((row, ordinal) => row.ordinal !== ordinal || row.path !== normalizedPaths[ordinal])) {
       throw new Error("Integration journal path cardinality is inconsistent.");
     }
-    const evidence = [];
+  } catch (error) {
+    return await quarantine("journal_evidence_inconsistent", { error: integrationRecoveryErrorText(error) });
+  }
+  const evidence = [];
+  try {
     for (const row of fileRows) evidence.push(await readIntegrationJournalFileEvidence(operation, row));
+  } catch (error) {
+    if (integrationRecoveryErrorIsTransient(error)) return retry("integration_journal_evidence_unavailable", error);
+    return await quarantine("journal_evidence_unreadable", { error: integrationRecoveryErrorText(error) });
+  }
 
-    const currentTargetState = await captureIntegrationTargetState(cwd);
-    if (!currentTargetState.ok
-      || currentTargetState.targetHead !== operation.target_head
-      || currentTargetState.indexSha256 !== operation.pre_index_sha256) {
-      await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "target_head_or_index_drift", authority);
-      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
-    }
+  const baseline = await integrationRecoveryBaseline(cwd, operation, fileRows, normalizedPaths);
+  if (!baseline.ok) {
+    return baseline.proven
+      ? await quarantine("target_head_or_index_drift", baseline.details)
+      : retry(baseline.errorType, baseline.error);
+  }
 
+  const classifications = new Map();
+  try {
     const currentSnapshot = await exactIntegrationFileSnapshot(cwd, normalizedPaths);
-    const classifications = new Map();
     for (const item of evidence) {
       const current = currentSnapshot.get(item.path);
       if (current === item.preFingerprint) {
@@ -8082,63 +8316,98 @@ async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, file
       );
       classifications.set(item.path, postMismatches.length ? "third" : "post");
     }
-    if ([...classifications.values()].includes("third")) {
-      await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "affected_path_drift", authority);
-      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+  } catch (error) {
+    // A directory or an over-limit file at an affected path is neither the preimage nor the
+    // bridge's post-image (both were captured within the limits).
+    if (error?.errorType === "snapshot_safety_limit_exceeded") {
+      return await quarantine("affected_path_drift", { error: integrationRecoveryErrorText(error) });
     }
+    return retry("integration_recovery_evidence_unavailable", error);
+  }
+  const thirdPaths = [...classifications].filter(([, value]) => value === "third").map(([file]) => file);
+  if (thirdPaths.length) {
+    return await quarantine("affected_path_drift", { paths: thirdPaths.slice(0, 20) });
+  }
 
-    if ([...classifications.values()].every((value) => value === "pre")) {
-      // HEAD, the index and every affected path are at their preimage, so the patch left no
-      // trace. Other drift (an ignored file another process rewrote, an edit outside the patch)
-      // is not the bridge's and used to quarantine the repository, blocking every writer.
-      await transitionIntegrationOperation(cwd, operation.operation_id, "recovering", "recovered_noop", {
+  if ([...classifications.values()].every((value) => value === "pre")) {
+    // HEAD, the index and every affected path are at their preimage, so the patch left no
+    // trace. Other drift (an ignored file another process rewrote, an edit outside the patch)
+    // is not the bridge's and used to quarantine the repository, blocking every writer.
+    try {
+      await transitionIntegrationOperation(cwd, operationId, "recovering", "recovered_noop", {
         outcome: "pre_state_verified",
-        externalDriftOutsidePatch: currentTargetState.targetStateSha256 !== operation.target_state_sha256,
+        evidence: baseline.evidence,
+        headMoved: Boolean(baseline.headMoved),
+        ...(baseline.evidence === "whole_index" ? { externalDriftOutsidePatch: baseline.externalDriftOutsidePatch } : {}),
       }, authority);
-      return { ok: true, operationId: operation.operation_id, status: "recovered_noop" };
+    } catch (error) {
+      return retry(error?.errorType || "integration_journal_persistence_failed", error);
     }
+    return { ok: true, operationId, status: "recovered_noop" };
+  }
 
-    await transitionIntegrationOperation(cwd, operation.operation_id, "recovering", "rolling_back", {
+  try {
+    await transitionIntegrationOperation(cwd, operationId, "recovering", "rolling_back", {
       outcome: "exact_preimage_rollback_started",
     }, authority);
-    for (const item of evidence) {
-      if (classifications.get(item.path) === "post") await restoreIntegrationJournalFile(cwd, item);
-    }
-    const restoredSnapshot = await exactIntegrationFileSnapshot(cwd, normalizedPaths);
-    const restoreMismatches = evidence.filter((item) => restoredSnapshot.get(item.path) !== item.preFingerprint);
-    const restoredTargetState = await captureIntegrationTargetState(cwd);
-    if (restoreMismatches.length
-      || !restoredTargetState.ok
-      || restoredTargetState.targetHead !== operation.target_head
-      || restoredTargetState.indexSha256 !== operation.pre_index_sha256) {
-      await quarantineIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rollback_verification_failed", authority);
-      return { ok: false, operationId: operation.operation_id, status: "quarantined" };
-    }
-    await transitionIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rolled_back", {
-      outcome: "exact_pre_state_restored",
-      externalDriftOutsidePatch: restoredTargetState.targetStateSha256 !== operation.target_state_sha256,
-    }, authority);
-    return { ok: true, operationId: operation.operation_id, status: "rolled_back" };
-  } catch {
-    await quarantineIntegrationOperation(
-      cwd,
-      operation.operation_id,
-      [operation.status, "recovering", "rolling_back"],
-      "journal_evidence_unreadable",
-      authority
-    );
-    return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+    currentStatus = "rolling_back";
+  } catch (error) {
+    return retry(error?.errorType || "integration_journal_persistence_failed", error);
   }
+  for (const item of evidence) {
+    if (classifications.get(item.path) !== "post") continue;
+    try {
+      await restoreIntegrationJournalFile(cwd, item);
+    } catch (error) {
+      // Restored paths are at their preimage and the rest still at the post-image, so a retry
+      // classifies and restores again; only a restore that cannot succeed is quarantined.
+      if (integrationRecoveryErrorIsTransient(error)) return retry("integration_recovery_restore_failed", error);
+      return await quarantine("rollback_restore_failed", { path: item.path, error: integrationRecoveryErrorText(error) });
+    }
+  }
+  let restoreMismatches;
+  try {
+    const restoredSnapshot = await exactIntegrationFileSnapshot(cwd, normalizedPaths);
+    restoreMismatches = evidence.filter((item) => restoredSnapshot.get(item.path) !== item.preFingerprint).map((item) => item.path);
+  } catch (error) {
+    if (error?.errorType === "snapshot_safety_limit_exceeded") {
+      return await quarantine("rollback_verification_failed", { error: integrationRecoveryErrorText(error) });
+    }
+    return retry("integration_recovery_evidence_unavailable", error);
+  }
+  if (restoreMismatches.length) {
+    return await quarantine("rollback_verification_failed", { paths: restoreMismatches.slice(0, 20) });
+  }
+  const restoredBaseline = await integrationRecoveryBaseline(cwd, operation, fileRows, normalizedPaths);
+  if (!restoredBaseline.ok) {
+    return restoredBaseline.proven
+      ? await quarantine("target_head_or_index_drift", { ...restoredBaseline.details, phase: "after_rollback" })
+      : retry(restoredBaseline.errorType, restoredBaseline.error);
+  }
+  try {
+    await transitionIntegrationOperation(cwd, operationId, "rolling_back", "rolled_back", {
+      outcome: "exact_pre_state_restored",
+      evidence: restoredBaseline.evidence,
+      headMoved: Boolean(restoredBaseline.headMoved),
+      ...(restoredBaseline.evidence === "whole_index" ? { externalDriftOutsidePatch: restoredBaseline.externalDriftOutsidePatch } : {}),
+    }, authority);
+  } catch (error) {
+    return retry(error?.errorType || "integration_journal_persistence_failed", error);
+  }
+  return { ok: true, operationId, status: "rolled_back" };
 }
 
-// Earlier bridges quarantined an operation for repository_state_drift even when HEAD, the index
-// and every affected path were back at their preimage (only files outside the patch had
-// changed). Such an operation is re-checked under the integration lock and closed as
-// recovered_noop when that still holds; anything else stays quarantined.
+// Quarantines left by the older whole-repository rules (repository_state_drift, and
+// target_head_or_index_drift for a HEAD or index change on paths outside the patch) are
+// re-checked under the integration lock with the per-path rule and closed as recovered_noop
+// when HEAD, the index entries and every affected path prove the preimage; anything else stays
+// quarantined.
+const REQUALIFIABLE_INTEGRATION_QUARANTINES = new Set(["repository_state_drift", "target_head_or_index_drift"]);
+
 async function requalifyStateDriftQuarantine(cwd, operation, fileRows, authority) {
   let reason = "";
   try { reason = JSON.parse(operation.result_json || "{}").reason || ""; } catch {}
-  if (reason !== "repository_state_drift") return false;
+  if (!REQUALIFIABLE_INTEGRATION_QUARANTINES.has(reason)) return false;
   try {
     const expectedPaths = normalizeLockPathList(JSON.parse(operation.affected_paths_json || "[]"));
     if (!expectedPaths.length
@@ -8146,12 +8415,8 @@ async function requalifyStateDriftQuarantine(cwd, operation, fileRows, authority
       || fileRows.some((row, ordinal) => row.ordinal !== ordinal || row.path !== expectedPaths[ordinal])) {
       return false;
     }
-    const currentTargetState = await captureIntegrationTargetState(cwd);
-    if (!currentTargetState.ok
-      || currentTargetState.targetHead !== operation.target_head
-      || currentTargetState.indexSha256 !== operation.pre_index_sha256) {
-      return false;
-    }
+    const baseline = await integrationRecoveryBaseline(cwd, operation, fileRows, expectedPaths);
+    if (!baseline.ok) return false;
     const currentSnapshot = await exactIntegrationFileSnapshot(cwd, expectedPaths);
     for (const row of fileRows) {
       const evidence = await readIntegrationJournalFileEvidence(operation, row);
@@ -8159,10 +8424,12 @@ async function requalifyStateDriftQuarantine(cwd, operation, fileRows, authority
     }
     await transitionIntegrationOperation(cwd, operation.operation_id, "quarantined", "recovered_noop", {
       outcome: "pre_state_verified",
-      requalifiedFrom: "repository_state_drift",
+      requalifiedFrom: reason,
+      evidence: baseline.evidence,
+      headMoved: Boolean(baseline.headMoved),
       externalDriftOutsidePatch: true,
     }, authority);
-    logEvent("info", "integration.quarantine_requalified", { operationId: operation.operation_id });
+    logEvent("info", "integration.quarantine_requalified", { operationId: operation.operation_id, reason });
     return true;
   } catch {
     return false;
@@ -8229,12 +8496,25 @@ async function recoverIntegrationOperationsWhileLocked(cwd, { operationId = "", 
     );
     recovered.push(result);
     if (!result.ok) {
-      return {
-        ok: false,
-        errorType: "integration_recovery_quarantined",
-        operationIds: [result.operationId],
-        recovered,
-      };
+      // A retryable result left the operation nonterminal (evidence was unavailable, nothing
+      // was proven); the deferred recovery pass or the next integration retries it.
+      return result.retryable
+        ? {
+            ok: false,
+            retryable: true,
+            errorType: "integration_recovery_retryable",
+            causeErrorType: result.errorType || "",
+            error: result.error || "",
+            operationIds: [result.operationId],
+            recovered,
+          }
+        : {
+            ok: false,
+            errorType: "integration_recovery_quarantined",
+            operationIds: [result.operationId],
+            reason: result.reason || "",
+            recovered,
+          };
     }
   }
   return { ok: true, recovered };
@@ -8246,7 +8526,7 @@ async function readIntegrationOperationSummary(cwd, operationId) {
   try {
     const row = db.prepare(`
       SELECT operation_id, pipeline_id, pipeline_job_id, status, patch_sha256,
-             source_state_sha256, contract_sha256, created_at, updated_at, finished_at
+             source_state_sha256, contract_sha256, result_json, created_at, updated_at, finished_at
       FROM integration_operations
       WHERE operation_id = ? AND cwd = ?
     `).get(operationId, path.resolve(cwd || process.cwd()));
@@ -8255,6 +8535,7 @@ async function readIntegrationOperationSummary(cwd, operationId) {
       pipelineId: row.pipeline_id || "",
       pipelineJobId: row.pipeline_job_id || "",
       status: row.status,
+      reason: integrationOperationResult(row).reason || "",
       patchSha256: row.patch_sha256,
       sourceStateSha256: row.source_state_sha256,
       contractSha256: row.contract_sha256,
@@ -8267,9 +8548,76 @@ async function readIntegrationOperationSummary(cwd, operationId) {
   }
 }
 
+function integrationOperationResult(row) {
+  try {
+    const parsed = JSON.parse(row?.result_json || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function integrationOperationDiagnosisView(row) {
+  const result = integrationOperationResult(row);
+  let affectedPaths = [];
+  try { affectedPaths = normalizeLockPathList(JSON.parse(row.affected_paths_json || "[]")); } catch { /* Shown as empty. */ }
+  return {
+    operationId: row.operation_id,
+    status: row.status,
+    reason: result.reason || "",
+    outcome: result.outcome || "",
+    error: result.error || "",
+    affectedPaths: affectedPaths.slice(0, 20),
+    affectedPathCount: affectedPaths.length,
+    cwd: row.cwd,
+    pipelineId: row.pipeline_id || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// The integration journal as diagnose_opencode_bridge shows it: every unresolved operation
+// (these block writers; quarantined ones until inspected) up to the limit, the most recent
+// finished ones, and the roots the in-memory recovery pass currently blocks.
+async function integrationJournalDiagnosis(cwd, { limit = 20 } = {}) {
+  const canonicalCwd = path.resolve(cwd || process.cwd());
+  const db = await openLockDb(canonicalCwd);
+  try {
+    const columns = "operation_id, cwd, pipeline_id, status, affected_paths_json, result_json, created_at, updated_at";
+    const unresolvedCount = Number(db.prepare(`
+      SELECT COUNT(*) AS count FROM integration_operations
+      WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+    `).get(canonicalCwd)?.count || 0);
+    const unresolved = db.prepare(`
+      SELECT ${columns} FROM integration_operations
+      WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      ORDER BY updated_at DESC, operation_id LIMIT ?
+    `).all(canonicalCwd, limit);
+    const recent = db.prepare(`
+      SELECT ${columns} FROM integration_operations
+      WHERE cwd = ? AND status IN ('committed', 'rolled_back', 'recovered_noop')
+      ORDER BY updated_at DESC, operation_id LIMIT ?
+    `).all(canonicalCwd, limit);
+    return {
+      unresolvedCount,
+      writersBlocked: unresolvedCount > 0 || INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(canonicalCwd),
+      unresolved: unresolved.map(integrationOperationDiagnosisView),
+      recentTerminal: recent.map(integrationOperationDiagnosisView),
+      blockedRoots: [...INTEGRATION_RECOVERY_BLOCKED_ROOTS].slice(0, limit),
+      blockedRootCount: INTEGRATION_RECOVERY_BLOCKED_ROOTS.size,
+    };
+  } finally {
+    closeDb(db);
+  }
+}
+
+function pathRelativeEscapes(relative) {
+  return relative === ".." || relative.startsWith(`..${path.sep}`) || relative.startsWith("../");
+}
+
 function isPathInside(parent, candidate) {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+  return Boolean(relative) && !pathRelativeEscapes(relative) && !path.isAbsolute(relative);
 }
 
 const BRIDGE_PROCESS_STARTED_AT = new Date().toISOString();
@@ -8479,12 +8827,15 @@ async function reconcileWorktreeArtifactRegistry(cwd) {
   const knownDb = await openLockDb(canonicalCwd);
   let knownPaths;
   try {
+    // Any active row counts as known, whichever cwd registered it: a directory another
+    // checkout owns was re-walked on every reservation because the insert below never
+    // replaces an active row.
     knownPaths = new Set(
       knownDb.prepare(`
         SELECT worktree_path FROM worktree_artifacts
-        WHERE cwd = ? AND status IN ('creating', 'retained', 'cleanup_failed')
+        WHERE status IN ('creating', 'retained', 'cleanup_failed')
       `)
-        .all(canonicalCwd)
+        .all()
         .map((row) => path.resolve(row.worktree_path))
     );
   } finally {
@@ -8498,14 +8849,26 @@ async function reconcileWorktreeArtifactRegistry(cwd) {
         const absolute = path.resolve(root, entry.name);
         if (!isPathInside(root, absolute)) continue;
         if (knownPaths.has(absolute)) continue;
-        const details = await lstat(absolute);
-        if (details.isDirectory() && !details.isSymbolicLink()) {
-          discovered.push({
-            path: absolute,
-            status: "retained",
-            measuredBytes: await measureRetainedWorktreeBytes(absolute),
-          });
-        } else if (details.isSymbolicLink()) {
+        try {
+          const details = await lstat(absolute);
+          if (details.isDirectory() && !details.isSymbolicLink()) {
+            discovered.push({
+              path: absolute,
+              status: "retained",
+              measuredBytes: await measureRetainedWorktreeBytes(absolute),
+            });
+          } else if (details.isSymbolicLink()) {
+            discovered.push({
+              path: absolute,
+              status: "cleanup_failed",
+              measuredBytes: CONFIG.retainedWorktreeMaxBytes + 1,
+            });
+          }
+        } catch (error) {
+          if (error?.code === "ENOENT") continue;
+          // An entry that cannot be measured (EPERM/EBUSY on Windows) is recorded as a
+          // capacity-full cleanup failure instead of failing this job's reservation.
+          logEvent("warn", "worktree.registry_measure_failed", { path: absolute, error: error?.message || String(error) });
           discovered.push({
             path: absolute,
             status: "cleanup_failed",
@@ -8850,16 +9213,21 @@ function diffStatFromPatch(patchText) {
   for (const line of String(patchText || "").split("\n")) {
     const header = line.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/);
     if (header) {
-      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false };
+      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false, inHunk: false };
       files.push(current);
       continue;
     }
     if (!current) continue;
-    if (line.startsWith("new file mode")) current.created = true;
-    else if (line.startsWith("deleted file mode")) current.deleted = true;
-    else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
-    else if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
-    else if (line.startsWith("+")) current.added += 1;
+    // The ---/+++ file header lines exist only before a file's first hunk; inside a hunk a
+    // removed "-- x" or an added "++ y" line is content and was skipped as a header.
+    if (!current.inHunk) {
+      if (line.startsWith("new file mode")) current.created = true;
+      else if (line.startsWith("deleted file mode")) current.deleted = true;
+      else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
+      else if (line.startsWith("@@")) current.inHunk = true;
+      continue;
+    }
+    if (line.startsWith("+")) current.added += 1;
     else if (line.startsWith("-")) current.removed += 1;
   }
   if (!files.length) return "";
@@ -8953,6 +9321,20 @@ async function cleanupWorktree(worktree, cleanupMode, success) {
     };
   }
 
+  if (!expectedBranchOid) {
+    // show-ref failed: either the branch is already gone (nothing to clean) or its identity
+    // really could not be read (keep reporting that as retained).
+    const listed = await runCommand("git", ["for-each-ref", "--format=%(refname)", branchRef], worktree.repoRoot, 1000 * 15);
+    if (listed.exitCode === 0 && !listed.stdout.split(/\r?\n/).map((line) => line.trim()).includes(branchRef)) {
+      await markWorktreeArtifactState(worktree, "cleaned");
+      return {
+        cleanup: "success",
+        branchCleanup: "already_absent",
+        reason: "the worktree's local branch no longer existed",
+      };
+    }
+  }
+
   if (typeof worktreeCleanupTestHook === "function") {
     await worktreeCleanupTestHook({ worktree, branchRef, expectedBranchOid });
   }
@@ -9012,7 +9394,7 @@ async function markUntrackedFilesForDiff(cwd) {
 async function ignoredIntegrationSourceFiles(cwd) {
   const result = await runCommand(
     "git",
-    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"],
     cwd,
     1000 * 30,
     buildValidationEnv()
@@ -9025,45 +9407,106 @@ async function ignoredIntegrationSourceFiles(cwd) {
       files: [],
     };
   }
-  const files = normalizeLockPathList(result.stdout.split("\0"));
+  let entries;
+  try {
+    entries = await expandIgnoredDirectoryEntries(cwd, splitNulSeparated(result.stdout));
+  } catch (error) {
+    return {
+      ok: false,
+      errorType: error?.errorType || "integration_patch_create_failed",
+      error: error?.message || "Could not inspect ignored source paths.",
+      files: [],
+    };
+  }
+  // Regenerable caches a builder's test run leaves behind (node_modules/, __pycache__/,
+  // .pytest_cache/, build/ ...) are not integrated by design; only other ignored files are
+  // unique output the reviewable patch would silently drop.
+  const files = normalizeLockPathList(entries.filter((entry) => !ignoredEntryIsRegenerable(entry)));
   if (files.length > CONFIG.maxIgnoredSnapshotFiles) {
     return {
       ok: false,
       errorType: "snapshot_safety_limit_exceeded",
       error: `Ignored integration source path limit exceeded: ${files.length} files exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${CONFIG.maxIgnoredSnapshotFiles}.`,
-      files,
+      files: files.slice(0, 20),
     };
   }
-  return { ok: true, files };
+  return { ok: true, files, toleratedRegenerableEntries: entries.length - files.length };
 }
 
+// Hashes a read-only git command's stdout as it streams. The whole-index listing is only ever
+// hashed, and buffering it capped the repository size the bridge could integrate.
+async function streamGitReadOnlyOutputSha256(args, cwd, timeoutMs = 1000 * 60) {
+  const runOnce = () => new Promise((resolve) => {
+    const hash = createHash("sha256");
+    let bytes = 0;
+    let entries = 0;
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn("git", trustedGitArgs(args), {
+        cwd: cwd || process.cwd(),
+        shell: false,
+        windowsHide: true,
+        env: buildTrustedGitEnv(buildValidationEnv({ GIT_OPTIONAL_LOCKS: "0" })),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      finish({ exitCode: 1, stderr: error?.message || String(error) });
+      return;
+    }
+    timer = setTimeout(() => {
+      try { child.kill(); } catch { /* The timeout result stands. */ }
+      finish({ exitCode: "timeout", stderr: `git ${args[0] || ""} timed out after ${timeoutMs} ms.` });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      hash.update(chunk);
+      bytes += chunk.length;
+      for (let index = chunk.indexOf(0); index !== -1; index = chunk.indexOf(0, index + 1)) entries += 1;
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 8192) stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => finish({ exitCode: error?.code || 1, stderr: error?.message || String(error) }));
+    child.on("close", (code) => finish({ exitCode: code ?? 1, stderr, sha256: hash.digest("hex"), bytes, entries }));
+  });
+  let result = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    result = await runOnce();
+    if (result.exitCode === 0 || !transientGitIndexReadError(result) || attempt === 3) return result;
+    await new Promise((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
+  }
+  return result;
+}
+
+// The index identity is a streamed hash with no entry cap: capping it at
+// CODEX_OPENCODE_MAX_SNAPSHOT_FILES (a changed-file limit) meant a repository with more than
+// 25000 tracked files could never integrate.
 async function captureGitIndexIdentity(cwd) {
-  const result = await runGitReadOnlyCommand(
+  const result = await streamGitReadOnlyOutputSha256(
     ["ls-files", "--stage", "-z", "--"],
     cwd || process.cwd(),
-    1000 * 30
+    1000 * 60
   );
   if (result.exitCode !== 0) {
     return {
       ok: false,
       errorType: "integration_index_snapshot_failed",
-      error: result.stderr || result.stdout || "Could not capture the exact Git index identity.",
-    };
-  }
-  const entries = result.stdout.split("\0").filter(Boolean);
-  const bytes = Buffer.byteLength(result.stdout || "", "utf8");
-  if (entries.length > CONFIG.maxSnapshotFiles || bytes > CONFIG.maxSnapshotTotalBytes) {
-    return {
-      ok: false,
-      errorType: "snapshot_safety_limit_exceeded",
-      error: `Git index identity exceeds the configured snapshot limits (${entries.length} entries, ${bytes} bytes).`,
+      error: result.stderr || "Could not capture the exact Git index identity.",
     };
   }
   return {
     ok: true,
-    entryCount: entries.length,
-    bytes,
-    indexSha256: createHash("sha256").update(result.stdout || "").digest("hex"),
+    entryCount: result.entries,
+    bytes: result.bytes,
+    indexSha256: result.sha256,
   };
 }
 
@@ -9100,12 +9543,15 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       const ignored = await ignoredIntegrationSourceFiles(sourcePath);
       if (!ignored.ok) return ignored;
       if (ignored.files.length) {
+        const listed = ignored.files.slice(0, 20);
+        const more = ignored.files.length - listed.length;
         return {
           ok: false,
           errorType: "integration_source_unrepresentable",
-          error: `The source contains ignored paths that are absent from the reviewable Git patch: ${ignored.files.join(", ")}. The bridge retained the source and will not report or clean it as successfully integrated.`,
-          ignoredFiles: ignored.files,
-          unresolvedFiles: ignored.files,
+          error: `The source contains ${ignored.files.length} ignored path(s) that are absent from the reviewable Git patch: ${listed.join(", ")}${more ? ` and ${more} more` : ""}. The bridge retained the source and will not report or clean it as successfully integrated.`,
+          ignoredFiles: listed,
+          ignoredFileCount: ignored.files.length,
+          unresolvedFiles: listed,
         };
       }
     }
@@ -9257,22 +9703,33 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       };
     }
 
+    // The branch tip is taken from refs/heads/ (a same-named tag must not win), and the patch
+    // is the branch's own change since its merge base with HEAD: diffing HEAD..branch reverted
+    // every target commit made after the fork on the paths both sides touched.
+    const branchOid = verified.stdout.trim().split(/\s+/)[0] || "";
+    const mergeBase = requestedSourceBaseCommit
+      ? null
+      : await runCommand("git", ["merge-base", "HEAD", branchOid], repoRoot, 1000 * 15);
+    if (mergeBase && (mergeBase.exitCode !== 0 || !mergeBase.stdout.trim())) {
+      return { ok: false, errorType: "integration_source_invalid", error: mergeBase.stderr || "The branch has no merge base with the target HEAD." };
+    }
     const base = await runCommand(
       "git",
-      ["rev-parse", "--verify", "--end-of-options", `${requestedSourceBaseCommit || "HEAD"}^{commit}`],
+      ["rev-parse", "--verify", "--end-of-options", `${requestedSourceBaseCommit || mergeBase.stdout.trim()}^{commit}`],
       repoRoot,
       1000 * 15
     );
-    if (base.exitCode !== 0) {
+    if (base.exitCode !== 0 || !branchOid) {
       return { ok: false, errorType: "integration_source_invalid", error: base.stderr || "Could not resolve the reviewed branch base commit." };
     }
-    const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 15);
-    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30, null, { encoding: "buffer" });
-    if (diff.exitCode !== 0) {
+    const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branchOid}`, "--"], repoRoot, 1000 * 15);
+    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branchOid}`, "--"], repoRoot, 1000 * 30, null, { encoding: "buffer" });
+    if (diff.exitCode !== 0 || changed.exitCode !== 0) {
+      // Without the file list, scope validation would pass vacuously: fail closed.
       return {
         ok: false,
         errorType: "integration_patch_create_failed",
-        error: diff.stderr || diff.stdout.toString("utf8") || "Could not create patch from branch.",
+        error: diff.stderr || changed.stderr || diff.stdout.toString("utf8") || "Could not create patch from branch.",
       };
     }
 
@@ -9281,7 +9738,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       ok: true,
       sourceType: "branch",
       source: branch,
-      changedFiles: changed.exitCode === 0 ? normalizeLockPathList(changed.stdout.split("\0")) : [],
+      changedFiles: normalizeLockPathList(changed.stdout.split("\0")),
       patch: patchBytes.toString("utf8"),
       patchBytes,
       patchSha256: createHash("sha256").update(patchBytes).digest("hex"),
@@ -9594,11 +10051,14 @@ async function captureIntegrationTargetState(cwd) {
     return { ok: false, errorType: "integration_target_state_failed", error: workingPatch.error || "Could not hash integration target working content." };
   }
   let workingState;
+  let trackedWorkingState;
   try {
     // Git status and patches intentionally omit ignored files. A bounded metadata-only
     // identity for ignored/protected content makes preview receipts stale when those
     // files change without persisting their contents.
-    workingState = await gitChangedFileSnapshot(cwd, { includeIgnored: true });
+    const parts = await gitChangedFileSnapshotParts(cwd, { includeIgnored: true });
+    trackedWorkingState = parts.ordinary;
+    workingState = new Map([...parts.ordinary, ...parts.ignored]);
   } catch (error) {
     return {
       ok: false,
@@ -9607,6 +10067,7 @@ async function captureIntegrationTargetState(cwd) {
     };
   }
   const workingStateSha256 = snapshotIdentitySha256(workingState);
+  const trackedWorkingStateSha256 = snapshotIdentitySha256(trackedWorkingState);
   return {
     ok: true,
     targetHead,
@@ -9616,30 +10077,41 @@ async function captureIntegrationTargetState(cwd) {
     indexSha256: workingPatch.indexSha256,
     workingStateSha256,
     targetStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, workingStateSha256].join("\0")).digest("hex"),
+    // The same identity without ignored-file metadata. git apply never writes ignored files, so
+    // once the receipt matched (targetStateSha256, ignored files included) the integration
+    // decides on this one: an IDE rewriting .idea/workspace.xml or a dev server appending to an
+    // ignored log during the apply is not drift the bridge caused.
+    trackedStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, trackedWorkingStateSha256].join("\0")).digest("hex"),
   };
 }
 
-// A read-only agent cannot commit (its bash is limited to read-only git and is attested before
-// spawn), so a HEAD that moved forward during its run was moved by another client. Returns the
-// move so the caller keeps the result and reports it; null when the move cannot be shown to be
-// a plain fast-forward, which keeps the job failing.
+// A read-only agent cannot move HEAD (its bash is limited to read-only git and is attested
+// before spawn), so any HEAD move during its run was made by another client: a new commit, or a
+// `commit --amend` / `pull --rebase` that rewrote history. Returns the move so the caller keeps
+// the result and reports it, listing the commits and changed paths when git can show them;
+// writers get null and keep failing.
 async function readOnlyHeadMove(lockPlan, cwd, before, after) {
   if (lockPlan?.lockType !== "read" || !before || !after || before === after) return null;
   const env = buildValidationEnv();
   const ancestor = await runCommand("git", ["merge-base", "--is-ancestor", before, after], cwd, 1000 * 15, env);
-  if (ancestor.exitCode !== 0) return null;
   const log = await runCommand("git", ["log", "--format=%h %s", `${before}..${after}`], cwd, 1000 * 15, env);
-  const diff = await runCommand("git", ["diff", "--name-only", before, after], cwd, 1000 * 15, env);
-  if (log.exitCode !== 0 || diff.exitCode !== 0) return null;
-  const changedPaths = diff.stdout.split(/\r?\n/).filter(Boolean);
+  const diff = await runCommand("git", ["diff", "--name-only", "--no-renames", "-z", before, after], cwd, 1000 * 15, env);
   const readScope = lockPlan.scopeContract?.scope?.read || [];
-  const readScopeTouched = readScope.length
-    ? changedPaths.filter((changed) => overlaps([changed], readScope, cwd))
-    : changedPaths;
+  const pathsKnown = diff.exitCode === 0;
+  const changedPaths = pathsKnown ? splitNulSeparated(diff.stdout) : [];
+  // Without the changed-path list nothing shows the read scope was untouched.
+  const readScopeTouched = !pathsKnown
+    ? (readScope.length ? normalizeLockPathList(readScope) : ["(repository)"])
+    : readScope.length
+      ? changedPaths.filter((changed) => overlaps([changed], readScope, cwd))
+      : changedPaths;
   return {
     before,
     after,
-    commits: log.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20),
+    fastForward: ancestor.exitCode === 0,
+    nonFastForward: ancestor.exitCode !== 0,
+    pathsKnown,
+    commits: log.exitCode === 0 ? log.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20) : [],
     changedPaths: changedPaths.slice(0, 50),
     readScopeTouched: readScopeTouched.slice(0, 50),
   };
@@ -9648,9 +10120,12 @@ async function readOnlyHeadMove(lockPlan, cwd, before, after) {
 function formatReadOnlyHeadMove(move) {
   if (!move) return null;
   const touched = move.readScopeTouched.length
-    ? `yes (${move.readScopeTouched.join(", ")}); the review may describe the older version of these files`
+    ? `${move.pathsKnown === false ? "unknown, assumed yes" : "yes"} (${move.readScopeTouched.join(", ")}); the review may describe the older version of these files`
     : "no";
-  return `Repository HEAD moved during this read-only run (another client committed; result kept): ${move.before.slice(0, 12)}..${move.after.slice(0, 12)}, ${move.commits.length} commit(s): ${move.commits.join("; ")}. Read scope touched: ${touched}`;
+  const kind = move.nonFastForward
+    ? "non-fast-forward: history was rewritten, e.g. commit --amend or pull --rebase; result kept"
+    : "another client committed; result kept";
+  return `Repository HEAD moved during this read-only run (${kind}): ${move.before.slice(0, 12)}..${move.after.slice(0, 12)}, ${move.commits.length} new commit(s)${move.commits.length ? `: ${move.commits.join("; ")}` : ""}. Read scope touched: ${touched}`;
 }
 
 async function captureGitHead(cwd) {
@@ -9855,7 +10330,7 @@ async function integratePatchSerially(options) {
     return integratePatchWithoutSerialLock({ ...options, cwd: targetCwd });
   }
 
-  const lockResult = await acquireHardLock({
+  const acquireIntegrationLock = () => acquireHardLock({
     owner: "codex",
     agent: "merge_manager",
     task: "Serial worktree/branch integration",
@@ -9864,7 +10339,43 @@ async function integratePatchSerially(options) {
     paths: normalizedAllowed,
     ttlMs: Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10),
   });
+  let lockResult = await acquireIntegrationLock();
+  let pendingRecovery = null;
+  if (!lockResult.ok && lockResult.errorType === "integration_recovery_pending") {
+    // The lock refuses every writer while a journal operation is unresolved, so the recovery
+    // this integration would run under its own lock is unreachable; run it once under the
+    // repository-wide recovery lock and retry.
+    pendingRecovery = await recoverIntegrationRepositorySerially(targetCwd);
+    lockResult = await acquireIntegrationLock();
+  }
   if (!lockResult.ok) {
+    if (lockResult.errorType === "integration_recovery_pending") {
+      const blocking = lockResult.operationId
+        ? await readIntegrationOperationSummary(targetCwd, lockResult.operationId).catch(() => null)
+        : (await integrationJournalDiagnosis(targetCwd, { limit: 1 }).catch(() => null))?.unresolved?.[0] || null;
+      const operationId = lockResult.operationId || blocking?.operationId || "";
+      const operationStatus = lockResult.operationStatus || blocking?.status || "";
+      const reason = blocking?.reason || pendingRecovery?.reason || pendingRecovery?.causeErrorType || "";
+      return {
+        ok: false,
+        errorType: "integration_recovery_pending",
+        error: `Serial integration is blocked by an unresolved integration journal operation${operationId ? ` ${operationId}` : ""}${operationStatus ? ` (status ${operationStatus}${reason ? `, reason ${reason}` : ""})` : ""}. ${pendingRecovery?.errorType === "integration_recovery_lock_conflict"
+          ? "Recovery could not start because other jobs hold locks on this checkout; it runs once they finish."
+          : pendingRecovery?.retryable
+            ? "Recovery ran but its evidence was temporarily unavailable; the operation stays unresolved and is retried."
+            : "Recovery ran and could not prove the pre-integration state, so the operation stays quarantined."}`,
+        operationId,
+        operationStatus,
+        reason,
+        recovery: pendingRecovery
+          ? { ok: Boolean(pendingRecovery.ok), errorType: pendingRecovery.errorType || "", retryable: Boolean(pendingRecovery.retryable) }
+          : null,
+        conflictingPaths: [],
+        suggestedFix: operationStatus === "quarantined"
+          ? "Run diagnose_opencode_bridge for this repository: its integrationOperations section shows the quarantined operation, its reason and affected paths. A target_head_or_index_drift quarantine is re-checked and closed automatically once those paths and their index entries are back at their pre-integration state; any other reason needs the recorded operation inspected."
+          : "Run diagnose_opencode_bridge for this repository and read its integrationOperations section; the deferred recovery pass retries operations whose evidence was temporarily unavailable. Waiting for other jobs does not clear this.",
+      };
+    }
     return {
       ok: false,
       errorType: "integration_lock_conflict",
@@ -9886,12 +10397,22 @@ async function integratePatchSerially(options) {
           signal: stopIntegrationHeartbeat.signal,
           integrationLock: lockResult.lock,
         })
-      : {
-          ok: false,
-          errorType: recovery.errorType || "integration_recovery_quarantined",
-          error: "A prior integration has ambiguous durable recovery evidence. The repository is quarantined from further bridge mutation until the recorded operation is inspected.",
-          operationIds: recovery.operationIds || [],
-        };
+      : recovery.retryable
+        ? {
+            ok: false,
+            errorType: "integration_recovery_pending",
+            error: `A prior integration operation could not be recovered yet because its evidence was temporarily unavailable (${recovery.causeErrorType || "unknown"}: ${recovery.error || "no detail"}). It stays unresolved and is retried; the patch was not applied.`,
+            operationIds: recovery.operationIds || [],
+            operationId: recovery.operationIds?.[0] || "",
+            suggestedFix: "Retry the integration shortly, or run diagnose_opencode_bridge to see the unresolved operation.",
+          }
+        : {
+            ok: false,
+            errorType: recovery.errorType || "integration_recovery_quarantined",
+            error: "A prior integration has ambiguous durable recovery evidence. The repository is quarantined from further bridge mutation until the recorded operation is inspected.",
+            operationIds: recovery.operationIds || [],
+            suggestedFix: "Run diagnose_opencode_bridge for this repository and read its integrationOperations section for the quarantined operation and its reason.",
+          };
     if (recovery.recovered?.length) result.recoveredIntegrationOperations = recovery.recovered;
     if (stopIntegrationHeartbeat.signal.aborted && result.ok && result.journalStatus !== "committed") {
       result = {
@@ -9918,17 +10439,26 @@ async function integratePatchSerially(options) {
     };
     return result;
   } finally {
-    stopIntegrationHeartbeat();
-    const released = await releaseHardLock(
-      lockResult.lock.id,
-      lockResult.lock.token,
-      lockResult.lock.paths,
-      lockResult.lock.cwd
-    );
-    if (!released.ok) {
+    // Cleanup never replaces the integration result (which may already be committed) with an
+    // exception; an unreleased lease expires on its own.
+    try {
+      await stopIntegrationHeartbeat();
+      const released = await releaseHardLock(
+        lockResult.lock.id,
+        lockResult.lock.token,
+        lockResult.lock.paths,
+        lockResult.lock.cwd
+      );
+      if (!released.ok) {
+        logEvent("warn", "integration.lock_release_failed", {
+          lockId: lockResult.lock.id,
+          error: released.error,
+        });
+      }
+    } catch (error) {
       logEvent("warn", "integration.lock_release_failed", {
         lockId: lockResult.lock.id,
-        error: released.error,
+        error: error?.message || String(error),
       });
     }
   }
@@ -9944,6 +10474,7 @@ async function recoverIntegrationRepositorySerially(cwd) {
     lockType: "serial_integration",
     paths: [REPOSITORY_SCOPE_LOCK_PATH],
     repositoryScope: true,
+    integrationRecoveryAuthority: true,
     ttlMs: Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10),
   });
   if (!lockResult.ok) {
@@ -9958,19 +10489,32 @@ async function recoverIntegrationRepositorySerially(cwd) {
     Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10)
   );
   try {
-    return await recoverIntegrationOperationsWhileLocked(targetCwd, { integrationLock: lockResult.lock });
+    const recovery = await recoverIntegrationOperationsWhileLocked(targetCwd, { integrationLock: lockResult.lock });
+    // Keep the in-memory writer block in step with what this recovery proved, as the deferred
+    // recovery pass does.
+    if (recovery.ok) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(targetCwd);
+    else INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(targetCwd);
+    return recovery;
   } finally {
-    stopHeartbeat();
-    const released = await releaseHardLock(
-      lockResult.lock.id,
-      lockResult.lock.token,
-      lockResult.lock.paths,
-      lockResult.lock.cwd
-    );
-    if (!released.ok) {
+    try {
+      await stopHeartbeat();
+      const released = await releaseHardLock(
+        lockResult.lock.id,
+        lockResult.lock.token,
+        lockResult.lock.paths,
+        lockResult.lock.cwd
+      );
+      if (!released.ok) {
+        logEvent("warn", "integration.recovery_lock_release_failed", {
+          lockId: lockResult.lock.id,
+          errorType: "integration_recovery_lock_release_failed",
+        });
+      }
+    } catch (error) {
       logEvent("warn", "integration.recovery_lock_release_failed", {
         lockId: lockResult.lock.id,
         errorType: "integration_recovery_lock_release_failed",
+        error: error?.message || String(error),
       });
     }
   }
@@ -10001,6 +10545,7 @@ async function integratePatchWithoutSerialLock({
   pipelineJobId = "",
   signal = null,
   integrationLock = null,
+  previewMode = "full",
 }) {
   const requestedCwd = path.resolve(cwd || process.cwd());
   const targetRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
@@ -10134,6 +10679,16 @@ async function integratePatchWithoutSerialLock({
       validationGate: { status: "skipped", command: "", exitCode: "not_run", durationMs: 0 },
     };
   }
+  if (!normalizeLockPathList(patch.changedFiles || []).length) {
+    // A non-empty patch with no known file list would pass scope validation vacuously and
+    // journal zero files, which recovery then closes as recovered_noop while the patch stays.
+    return {
+      ok: false,
+      errorType: "integration_patch_paths_unknown",
+      error: "The integration patch is not empty but its changed-file list is; the bridge refuses to validate or apply a patch whose paths it cannot list.",
+      changedFiles: [],
+    };
+  }
 
   const lockPlan = {
     agent: "merge_manager",
@@ -10220,7 +10775,8 @@ async function integratePatchWithoutSerialLock({
           previewReceipt: null,
         };
       }
-      if (patch.patch.length > CONFIG.integrationPreviewMaxChars) {
+      // The character cap protects the printed full preview; stat mode prints line counts.
+      if (previewMode !== "stat" && patch.patch.length > CONFIG.integrationPreviewMaxChars) {
         return {
           ok: false,
           status: "preview_rejected",
@@ -10280,7 +10836,7 @@ async function integratePatchWithoutSerialLock({
         targetTree: targetState.targetTree,
         targetStateSha256: targetState.targetStateSha256,
         contractSha256,
-        patchPreview: patch.patch,
+        patchPreview: previewMode === "stat" ? "" : patch.patch,
         patchStat: diffStatFromPatch(patch.patch),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
@@ -10315,8 +10871,10 @@ async function integratePatchWithoutSerialLock({
       };
     }
 
+    // The receipt check above matched targetState in full (ignored-file metadata included);
+    // from here on only non-ignored drift fails the integration.
     const immediateTargetState = await captureIntegrationTargetState(targetCwd);
-    if (!immediateTargetState.ok || immediateTargetState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+    if (!immediateTargetState.ok || immediateTargetState.trackedStateSha256 !== targetState.trackedStateSha256) {
       return {
         ok: false,
         errorType: "integration_preview_stale",
@@ -10343,11 +10901,11 @@ async function integratePatchWithoutSerialLock({
     preApplyExactSnapshot = await exactIntegrationFileSnapshot(targetCwd, patch.changedFiles);
     preApplyIndexSnapshot = await gitIndexPathSnapshot(targetCwd, patch.changedFiles);
     rollbackBaseline = await captureRollbackBaseline(targetCwd, { files: patch.changedFiles });
-    before = await gitChangedFileSnapshot(targetCwd);
+    before = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const finalPreApplyState = await captureIntegrationTargetState(targetCwd);
     if (!finalPreApplyState.ok
       || rollbackBaseline.baseCommit !== previewReceipt.targetHead
-      || finalPreApplyState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+      || finalPreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       return {
         ok: false,
         errorType: "integration_preview_stale",
@@ -10362,10 +10920,10 @@ async function integratePatchWithoutSerialLock({
       await beforeApplyHook({ targetCwd, patch, targetState: finalPreApplyState });
     }
     const immediatePreApplyState = await captureIntegrationTargetState(targetCwd);
-    if (!immediatePreApplyState.ok || immediatePreApplyState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+    if (!immediatePreApplyState.ok || immediatePreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       let unresolvedFiles = [];
       try {
-        unresolvedFiles = changedFilesBetween(before, await gitChangedFileSnapshot(targetCwd));
+        unresolvedFiles = changedFilesBetween(before, await gitChangedFileSnapshot(targetCwd, { includeIgnored: false }));
       } catch {
         unresolvedFiles = patch.changedFiles;
       }
@@ -10525,7 +11083,9 @@ async function integratePatchWithoutSerialLock({
       outcome: "exact_post_state_verified",
     }, integrationAuthority);
 
-    const after = await gitChangedFileSnapshot(targetCwd);
+    // Ignored entries are left out: git apply never writes them, so an ignored file another
+    // process rewrote is not an unexpected path of this patch.
+    const after = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const appliedFiles = changedFilesBetween(before, after);
     const appliedPathEvidence = changedPathSetEvidence(patch.changedFiles, appliedFiles);
     const appliedValidation = validateChangedFilesForPlan({ changedFiles: appliedFiles, lockPlan, parallel: false });
@@ -10594,7 +11154,7 @@ async function integratePatchWithoutSerialLock({
     }
     let validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec, signal });
     if (signal?.aborted) return ownershipLostResult("during validation");
-    const afterValidation = await gitChangedFileSnapshot(targetCwd);
+    const afterValidation = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const postValidationIndex = await captureGitIndexIdentity(targetCwd);
     const validationIndexChanged = !postValidationIndex.ok || postValidationIndex.indexSha256 !== preApplyFullIndexSha256;
     const postValidationFiles = changedFilesBetween(before, afterValidation);
@@ -10763,6 +11323,7 @@ async function integratePatchWithoutSerialLock({
       sourceStateSha256: patch.sourceStateSha256,
       targetPreviewStateSha256: targetState.targetStateSha256,
       integratedTargetStateSha256: integratedTargetState.targetStateSha256,
+      integratedTrackedStateSha256: integratedTargetState.trackedStateSha256,
       contractSha256,
       previewId: previewReceipt.previewId,
       preExistingTargetChanges: targetChanges,
@@ -10816,30 +11377,45 @@ async function integratePatchWithoutSerialLock({
           });
         }
       } catch (error) {
-        await quarantineIntegrationOperation(
-          targetCwd,
-          integrationOperationId,
-          ["prepared", "applying", "applied_unvalidated", "validating", "validated", "rolling_back", "recovering"],
-          "recovery_finalizer_failed",
-          integrationAuthority
-        );
+        // A busy state database or a locked file leaves the operation nonterminal for the
+        // deferred recovery pass; only other failures are quarantined.
+        if (!integrationRecoveryErrorIsTransient(error)) {
+          await quarantineIntegrationOperation(
+            targetCwd,
+            integrationOperationId,
+            ["prepared", "applying", "applied_unvalidated", "validating", "validated", "rolling_back", "recovering"],
+            "recovery_finalizer_failed",
+            integrationAuthority,
+            { error: integrationRecoveryErrorText(error) }
+          );
+        }
         logEvent("error", "integration.journal_recovery_failed", {
           operationId: integrationOperationId,
           errorType: error?.errorType || "integration_journal_recovery_failed",
         });
       }
     }
-    await rm(dir, { recursive: true, force: true });
+    // The patch scratch directory is temporary; a Windows EBUSY/EPERM on it must not replace an
+    // already committed integration result with an exception.
+    try {
+      if (typeof integrationScratchCleanupTestHook === "function") await integrationScratchCleanupTestHook(dir);
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch (error) {
+      logEvent("warn", "integration.patch_scratch_cleanup_failed", { error: error?.message || String(error) });
+    }
   }
 }
 
-async function integrationCleanupTargetStateError(cwd, expectedTargetStateSha256) {
+async function integrationCleanupTargetStateError(cwd, expectedTargetStateSha256, expectedTrackedStateSha256 = "") {
   if (!/^[a-f0-9]{64}$/i.test(String(expectedTargetStateSha256 || ""))) {
     return "The integrated target state was not attested; the recovery source was retained.";
   }
   const current = await captureIntegrationTargetState(cwd);
   if (!current.ok) return current.error || "The target state could not be reverified immediately before source cleanup.";
-  return current.targetStateSha256 === expectedTargetStateSha256
+  // With the ignored-free identity recorded, an IDE or dev server touching an ignored file
+  // after the integration no longer retains the source worktree forever.
+  const tracked = /^[a-f0-9]{64}$/i.test(String(expectedTrackedStateSha256 || ""));
+  return (tracked ? current.trackedStateSha256 === expectedTrackedStateSha256 : current.targetStateSha256 === expectedTargetStateSha256)
     ? ""
     : "The target changed after reviewed integration; the recovery source was retained.";
 }
@@ -10883,7 +11459,7 @@ async function cleanupIntegratedWorktreeWhileLocked({
     return;
   }
 
-  const preliminaryTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256);
+  const preliminaryTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
   if (preliminaryTargetError) {
     result.sourceCleanup = { cleanup: "retained_for_review", reason: "integration_target_changed_before_cleanup", error: preliminaryTargetError };
     result.cleanupWarning = preliminaryTargetError;
@@ -10894,7 +11470,7 @@ async function cleanupIntegratedWorktreeWhileLocked({
   }
 
   const sourceBranch = await runCommand("git", ["branch", "--show-current"], worktreePath, 1000 * 15);
-  const finalTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256);
+  const finalTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
   const finalSourceMatches = await sourceMatches();
   if (finalTargetError || !finalSourceMatches || sourceBranch.exitCode !== 0 || !sourceBranch.stdout.trim()) {
     result.sourceCleanup = {
@@ -10970,10 +11546,16 @@ function conflictsWithActiveLock(request, activeLock, worktreeMode = CONFIG.work
   // reviewed patch could not land while any other builder (from either client) still ran.
   // Manual acquire_agent_lock writers, legacy rows, and CODEX_OPENCODE_WORKTREE_MODE=off
   // writers edit the checkout itself, so they still serialize with integration.
+  // Whether a writer edits the checkout is recorded on its lock row by the process that took
+  // it (editsCheckout); deciding from this process's CONFIG.worktreeMode was wrong whenever the
+  // two bridges (Codex, Claude) ran with different worktree modes. Rows without the flag are
+  // legacy and count as editing the checkout; in-memory requests without it keep the mode rule.
+  const editsCheckout = (lock) => typeof lock.editsCheckout === "boolean"
+    ? lock.editsCheckout
+    : !(worktreeMode !== "off" && (lock.origin || "internal") === "internal");
   const involvesIntegration = requestType === "serial_integration" || activeType === "serial_integration";
-  const worktreeJobWriter = (lock) => lock.lockType === "write" && (lock.origin || "internal") === "internal";
+  const worktreeJobWriter = (lock) => lock.lockType === "write" && !editsCheckout(lock);
   const writerAndIntegration = involvesIntegration
-    && worktreeMode !== "off"
     && (worktreeJobWriter(request) || worktreeJobWriter(activeLock));
   const requiresRepositorySerialization = involvesIntegration && !writerAndIntegration;
   const overlap = requiresRepositorySerialization
@@ -11676,10 +12258,13 @@ function lockTableHasCompositePrimaryKey(db) {
 }
 
 function ensureLockTableSchema(db) {
-  if (lockTableHasCompositePrimaryKey(db)) {
-    return;
-  }
+  if (!lockTableHasCompositePrimaryKey(db)) migrateLegacyLockTable(db);
+  // 1 when the lock holder edits the checkout itself, 0 for a writer in its own worktree;
+  // NULL rows come from older bridges and are treated as editing the checkout.
+  ensureTableColumn(db, "locks", "edits_checkout", "INTEGER");
+}
 
+function migrateLegacyLockTable(db) {
   db.exec("BEGIN IMMEDIATE");
   try {
     if (!lockTableHasCompositePrimaryKey(db)) {
@@ -11841,6 +12426,9 @@ function ensureIntegrationJournalSchema(db) {
     CREATE INDEX IF NOT EXISTS integration_operation_files_operation_idx
       ON integration_operation_files (operation_id, ordinal);
   `);
+  // SHA-256 of the path's `git ls-files --stage` entry at prepare time. Recovery compares the
+  // affected paths' entries only; NULL (rows from older bridges) keeps the whole-index rule.
+  ensureTableColumn(db, "integration_operation_files", "pre_index_entry_sha256", "TEXT");
 }
 
 function ensureIntegrationPreviewReceiptSchema(db) {
@@ -12131,6 +12719,7 @@ function rowsToLocks(rows) {
       taskSha256: String(row.task || "").replace(/^sha256:/i, ""),
       createdAt: row.created_at,
       expiresAt: row.expires_at,
+      editsCheckout: row.edits_checkout === null || row.edits_checkout === undefined ? true : Number(row.edits_checkout) !== 0,
     };
     lock.paths.push(row.normalized_path);
     grouped.set(key, lock);
@@ -12191,9 +12780,20 @@ async function acquireHardLock({
   paths = [],
   repositoryScope = false,
   ttlMs = DEFAULT_LOCK_TTL_MS,
+  editsCheckout = undefined,
+  // Internal-only: set by recoverIntegrationRepositorySerially so journal recovery can take its
+  // lock while the journal blocks writers. The tool never passes it (the exemption used to key
+  // on the caller-controlled agent name).
+  integrationRecoveryAuthority = false,
 }) {
   const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
   const normalizedOrigin = origin === "manual" ? "manual" : "internal";
+  const recoveryAuthority = integrationRecoveryAuthority === true && normalizedOrigin === "internal";
+  // A writer edits the checkout unless it is an internal job writer while this process runs
+  // writers in worktrees; the flag is persisted so other bridge processes decide from it.
+  const lockEditsCheckout = typeof editsCheckout === "boolean"
+    ? editsCheckout
+    : !(normalizedOrigin === "internal" && normalizedLockType === "write" && CONFIG.worktreeMode !== "off");
   const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
   const requestedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : paths;
   const unsafeReason = repositoryScope ? "" : unsafePathReason(requestedPaths, projectRoot);
@@ -12202,7 +12802,7 @@ async function acquireHardLock({
 
   if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(projectRoot))
     && normalizedLockType !== "read"
-    && agent !== "integration_recovery") {
+    && !recoveryAuthority) {
     return {
       ok: false,
       errorType: "integration_recovery_pending",
@@ -12251,12 +12851,13 @@ async function acquireHardLock({
   const token = makeLockToken();
   const tokenSha256 = `sha256:${createHash("sha256").update(token).digest("hex")}`;
   const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
-  const expiresAt = now + Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
-  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin };
+  const expiresAt = now + Math.min(MAX_LOCK_TTL_MS, Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS));
+  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin, editsCheckout: lockEditsCheckout };
 
+  let committed = false;
   try {
     db.exec("BEGIN IMMEDIATE");
-    if (normalizedLockType !== "read" && agent !== "integration_recovery") {
+    if (normalizedLockType !== "read" && !recoveryAuthority) {
       const unresolvedIntegration = db.prepare(`
         SELECT operation_id, status
         FROM integration_operations
@@ -12292,12 +12893,17 @@ async function acquireHardLock({
       "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
     ).run(runId, agent, "running", normalizedLockType, now);
     const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`);
+      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`, lockEditsCheckout ? 1 : 0);
     }
+    // Read inside the transaction: after COMMIT a SQLITE_BUSY in this listing (it expires
+    // rows) reported the acquire as rejected while the lock rows stayed committed with a
+    // token nobody had, orphaning the lock for its whole TTL.
+    const activeLocks = listLocksFromDb(db, now);
     db.exec("COMMIT");
+    committed = true;
 
     const lock = {
       id: runId,
@@ -12313,14 +12919,17 @@ async function acquireHardLock({
       paths: lockPathsRequested,
       createdAt: now,
       expiresAt,
+      editsCheckout: lockEditsCheckout,
       pid: process.pid,
     };
-    return { ok: true, lock, activeLocks: listLocksFromDb(db) };
+    return { ok: true, lock, activeLocks };
   } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after failed begin/commit.
+      }
     }
     return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
   } finally {
@@ -12337,7 +12946,15 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
     return { ok: false, released: false, error: "Lock release token is required." };
   }
 
-  const db = await openLockDb(cwd);
+  let db;
+  try {
+    db = await openLockDb(cwd);
+  } catch (error) {
+    // Callers release in finally blocks; an unopenable state database must not replace their
+    // result with an exception. The lease expires on its own.
+    return { ok: false, released: false, error: error.message || String(error) };
+  }
+  let committed = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     const requestedPaths = normalizeLockPathList(paths);
@@ -12359,13 +12976,17 @@ async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
     if (!remaining) {
       db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
     }
+    const activeLocks = listLocksFromDb(db);
     db.exec("COMMIT");
-    return { ok: true, released: true, activeLocks: listLocksFromDb(db) };
+    committed = true;
+    return { ok: true, released: true, activeLocks };
   } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback errors after failed begin/commit.
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after failed begin/commit.
+      }
     }
     return { ok: false, released: false, error: error.message || String(error) };
   } finally {
@@ -12402,6 +13023,45 @@ async function quarantineHardLock(lock, containment = "") {
   } finally {
     closeDb(db);
   }
+}
+
+// A containment quarantine sets expires_at to Number.MAX_SAFE_INTEGER, beyond the largest
+// Date, so new Date(...).toISOString() threw RangeError and list_agent_locks failed.
+function formatLockExpiry(expiresAt) {
+  const value = Number(expiresAt);
+  if (value >= Number.MAX_SAFE_INTEGER) return "quarantined (no expiry)";
+  const date = new Date(value);
+  return Number.isFinite(value) && !Number.isNaN(date.getTime()) ? date.toISOString() : "unknown";
+}
+
+function formatAgentLockList(locks = []) {
+  return locks.length
+    ? [
+        "Active temporary locks:",
+        "",
+        ...locks.map((lock) =>
+          [
+            `- ${lock.id}`,
+            `  owner: ${lock.owner}`,
+            `  agent: ${lock.agent}`,
+            `  type: ${lock.lockType}`,
+            `  paths: ${lock.paths.join(", ")}`,
+            `  expires: ${formatLockExpiry(lock.expiresAt)}`,
+          ].join("\n")
+        ),
+      ].join("\n")
+    : "No active temporary locks.";
+}
+
+// Agent names the bridge's own internal locks use. The recovery bypass used to key on the
+// agent name, which acquire_agent_lock takes from the caller.
+const RESERVED_LOCK_AGENT_NAMES = new Set(["integration_recovery", "merge_manager", "pipeline_finalizer"]);
+
+function reservedLockAgentError(name) {
+  const normalized = String(name || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  return RESERVED_LOCK_AGENT_NAMES.has(normalized)
+    ? `Lock rejected: "${name}" is reserved for the bridge's internal locks.`
+    : "";
 }
 
 function hardLockPathsForPlan(lockPlan) {
@@ -12492,9 +13152,25 @@ function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs =
           renewed = (await refreshLease({ lock, expiresAt })) !== false;
         } else {
           db = await openLockDb(lock.cwd);
+          if (stopped || controller.signal.aborted) return false;
           const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ?").run(expiresAt, lock.id, tokenSha256, now);
+          // expires_at = MAX_SAFE_INTEGER is a containment quarantine; a pulse that was already
+          // running when quarantineHardLock ran must not renew it back into an expiring lease.
+          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ? AND expires_at <> ?")
+            .run(expiresAt, lock.id, tokenSha256, now, Number.MAX_SAFE_INTEGER);
           renewed = Number(updated.changes || 0) === Math.max(1, lock.paths?.length || 0);
+          if (!renewed && Number(updated.changes || 0) === 0) {
+            const quarantined = db.prepare("SELECT COUNT(*) AS count FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
+              .get(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER);
+            if (Number(quarantined?.count || 0) > 0) {
+              // Held without expiry until containment is resolved; nothing left to renew.
+              if (fenceTimer) clearTimeout(fenceTimer);
+              fenceTimer = null;
+              clearInterval(timer);
+              lastConfirmedExpiresAt = Number.MAX_SAFE_INTEGER;
+              return true;
+            }
+          }
         }
         if (!renewed) {
           loseOwnership("The durable lock row or fencing token no longer belongs to this execution.");
@@ -12521,10 +13197,14 @@ function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs =
   scheduleFence();
   const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
+  // stop() returns a promise that settles once an in-flight pulse finished, so a caller that
+  // awaits it (before releasing or quarantining the lock) never races a renewal; callers that
+  // do not await it keep working.
   const stop = Object.assign(() => {
     stopped = true;
     clearInterval(timer);
     if (fenceTimer) clearTimeout(fenceTimer);
+    return refreshPromise ? refreshPromise.then(() => undefined, () => undefined) : Promise.resolve();
   }, {
     signal: controller.signal,
     pulse,
@@ -12657,10 +13337,13 @@ server.tool(
     cwd: z.string().min(1).describe("Canonical repository path."),
     lockType: z.enum(["read", "write", "serial_integration"]).optional(),
     paths: z.array(z.string()).min(1).describe("Concrete files or directories to lock."),
-    ttlMs: z.number().int().positive().optional().describe("Lease duration in milliseconds. Defaults to 30 minutes."),
+    ttlMs: z.number().int().positive().max(MAX_LOCK_TTL_MS).optional().describe("Lease duration in milliseconds. Defaults to 30 minutes; at most 24 hours."),
   },
   async ({ owner = "codex", agent = "opencode", task = "", cwd = "", lockType = "write", paths, ttlMs = DEFAULT_LOCK_TTL_MS }) => {
-    const result = await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
+    const reservedAgentError = reservedLockAgentError(agent) || reservedLockAgentError(owner);
+    const result = reservedAgentError
+      ? { ok: false, error: reservedAgentError }
+      : await acquireHardLock({ owner, agent, origin: "manual", task, cwd, lockType, paths, ttlMs });
     return {
       content: [
         {
@@ -12675,7 +13358,7 @@ server.tool(
                 `Agent: ${result.lock.agent}`,
                 `Type: ${result.lock.lockType}`,
                 `Paths: ${result.lock.paths.join(", ")}`,
-                `Expires at: ${new Date(result.lock.expiresAt).toISOString()}`,
+                `Expires at: ${formatLockExpiry(result.lock.expiresAt)}`,
               ].join("\n")
             : [
                 "Temporary lock rejected.",
@@ -12730,22 +13413,7 @@ server.tool(
       content: [
         {
           type: "text",
-          text: locks.length
-            ? [
-                "Active temporary locks:",
-                "",
-                ...locks.map((lock) =>
-                  [
-                    `- ${lock.id}`,
-                    `  owner: ${lock.owner}`,
-                    `  agent: ${lock.agent}`,
-                    `  type: ${lock.lockType}`,
-                    `  paths: ${lock.paths.join(", ")}`,
-                    `  expires: ${new Date(lock.expiresAt).toISOString()}`,
-                  ].join("\n")
-                ),
-              ].join("\n")
-            : "No active temporary locks.",
+          text: formatAgentLockList(locks),
         },
       ],
     };
@@ -12938,12 +13606,14 @@ server.tool(
   },
   async ({ cwd }) => {
     const projectRoot = await resolveProjectStateRoot(cwd);
-    const [jobs, pipelines, locks, provider, directRunAudit] = await Promise.all([
+    const [jobs, pipelines, locks, provider, directRunAudit, integrationOperations] = await Promise.all([
       listPersistedQueueRecords(projectRoot),
       listPersistedPipelineRecords(projectRoot),
       listLocks(projectRoot),
       providerCapacitySnapshot(),
       directRunAuditStore().snapshot(projectRoot),
+      // Queue records blocked on integration_recovery_pending point here; show the journal.
+      integrationJournalDiagnosis(projectRoot, { limit: 20 }).catch((error) => ({ error: error?.message || String(error) })),
     ]);
     const nonterminal = jobs.filter((job) => !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
     const failed = jobs.filter((job) => ["failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
@@ -12971,6 +13641,7 @@ server.tool(
         pipelines: pipelines.length,
         nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,
         locks: locks.length,
+        unresolvedIntegrationOperations: integrationOperations.unresolvedCount ?? "unavailable",
         providerCapacity: provider.capacity,
         providerActiveLeases: provider.leases.length,
       },
@@ -12990,7 +13661,8 @@ server.tool(
         pendingIntegrations: (pipeline.integrationQueue || []).filter((item) => item.status === "pending").length,
         errors: pipeline.errors || [],
       })),
-      locks,
+      locks: locks.map((lock) => ({ ...lock, expires: formatLockExpiry(lock.expiresAt) })),
+      integrationOperations,
       provider,
     };
     return { content: [{ type: "text", text: JSON.stringify(sanitizePersistedValue(report), null, 2) }] };
@@ -14427,6 +15099,7 @@ server.tool(
       allowDirtyTarget,
       acceptFlaggedSecretLines,
       acceptBinaryHunks,
+      previewMode,
       cleanupAfterSuccess: effectiveCleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
       pipelineId,
@@ -22215,6 +22888,24 @@ export const __selfTest = {
     GLOBALLY_REQUIRED_MANAGED_AGENTS,
     INTEGRATION_PREVIEWS,
     INTEGRATION_PREVIEW_TTL_MS,
+    INTEGRATION_RECOVERY_BLOCKED_ROOTS,
+    MAX_LOCK_TTL_MS,
+    createPatchFromWorkingTree,
+    expandIgnoredDirectoryEntries,
+    formatAgentLockList,
+    formatLockExpiry,
+    generatedWorktreeRootForCwd,
+    gitChangedFileSnapshotParts,
+    gitIndexPathSnapshot,
+    ignoredIntegrationSourceFiles,
+    integrationJournalDiagnosis,
+    integrationRecoveryBaseline,
+    quarantineHardLock,
+    realPathBoundaryReason,
+    reconcileWorktreeArtifactRegistry,
+    recoverIntegrationRepositorySerially,
+    recoverSingleIntegrationOperationWhileLocked,
+    reservedLockAgentError,
     MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
     MCP_ORCHESTRATOR_AGENT,
     MCP_SANITIZED_READER_AGENT,
@@ -22487,6 +23178,8 @@ export const __selfTest = {
     set stateDirectoryOverride(value) { stateDirectoryOverride = value; },
     get worktreeCleanupTestHook() { return worktreeCleanupTestHook; },
     set worktreeCleanupTestHook(value) { worktreeCleanupTestHook = value; },
+    get integrationScratchCleanupTestHook() { return integrationScratchCleanupTestHook; },
+    set integrationScratchCleanupTestHook(value) { integrationScratchCleanupTestHook = value; },
     get pipelineGateExecutorTestHook() { return pipelineGateExecutorTestHook; },
     set pipelineGateExecutorTestHook(value) { pipelineGateExecutorTestHook = value; },
     get queueJobExecutorTestHook() { return queueJobExecutorTestHook; },
