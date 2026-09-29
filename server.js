@@ -9,7 +9,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -1061,36 +1061,53 @@ async function readUserLineEndingGitConfig() {
   return values;
 }
 
-async function writeUserLineEndingGitConfigFile(values) {
+// Written lazily, on the first Git process of a state directory, never at module import:
+// tests (and embedders) import this file first and only afterwards point
+// hooks.stateDirectoryOverride at a scratch directory, so an import-time write landed in the
+// operator's real state directory. Synchronous because buildTrustedGitEnv is; the file is a
+// few bytes and is written once per state directory.
+function writeUserLineEndingGitConfigFile(values, directory) {
   if (!values.size) return NULL_GIT_CONFIG_PATH;
   const content = `[core]\n${[...values].sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `\t${key.slice("core.".length)} = ${value}\n`).join("")}`;
   // Content-addressed in the operator-private state directory, so concurrent bridge
   // processes write identical bytes and a shared temporary directory is never trusted.
-  const file = path.join(GLOBAL_BRIDGE_STATE_DIR, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
-  const current = async () => {
-    try { return await readFile(file, "utf8"); } catch { return null; }
+  const file = path.join(directory, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
+  const current = () => {
+    try { return readFileSync(file, "utf8"); } catch { return null; }
   };
   try {
-    if (await current() === content) return file;
-    await mkdir(GLOBAL_BRIDGE_STATE_DIR, { recursive: true });
+    if (current() === content) return file;
+    mkdirSync(directory, { recursive: true });
     const temporary = `${file}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
     try {
-      await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
-      await rename(temporary, file);
+      writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, file);
     } finally {
-      await rm(temporary, { force: true }).catch(() => {});
+      try { rmSync(temporary, { force: true }); } catch { /* best effort */ }
     }
   } catch {
     // Another bridge process may have renamed the same content-addressed file first.
   }
-  if (await current() === content) return file;
+  if (current() === content) return file;
   console.error(JSON.stringify({ ts: new Date().toISOString(), level: "warn", event: "git.line_ending_config_unavailable" }));
   return NULL_GIT_CONFIG_PATH;
 }
 
 const USER_LINE_ENDING_GIT_CONFIG = await readUserLineEndingGitConfig();
-const BRIDGE_GIT_GLOBAL_CONFIG_PATH = await writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG);
+// state directory -> gitconfig path (or the null config when it could not be written)
+const BRIDGE_GIT_GLOBAL_CONFIG_PATHS = new Map();
+
+function bridgeGitGlobalConfigPath() {
+  const directory = effectiveBridgeStateDirectory();
+  const known = BRIDGE_GIT_GLOBAL_CONFIG_PATHS.get(directory);
+  // A state directory that was wiped since (a scratch directory a test removed and
+  // recreated) gets the file again; Git would silently read a missing file as empty.
+  if (known !== undefined && (known === NULL_GIT_CONFIG_PATH || existsSync(known))) return known;
+  const file = writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG, directory);
+  BRIDGE_GIT_GLOBAL_CONFIG_PATHS.set(directory, file);
+  return file;
+}
 
 // Enforced on every bridge Git process, as GIT_CONFIG_COUNT entries and as `-c` options.
 // log.showSignature/gpg.* keep a repository-local gpg.program from running inside bridge
@@ -1117,7 +1134,7 @@ function buildTrustedGitEnv(extra = null) {
     if (extra && extra[key] !== undefined) env[key] = extra[key];
   }
   env.GIT_CONFIG_NOSYSTEM = "1";
-  env.GIT_CONFIG_GLOBAL = BRIDGE_GIT_GLOBAL_CONFIG_PATH;
+  env.GIT_CONFIG_GLOBAL = bridgeGitGlobalConfigPath();
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
   // Paths the bridge passes to git are file names (app/[slug]/page.tsx), never patterns; as
