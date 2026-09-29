@@ -186,6 +186,16 @@ async function validateCandidateReleaseEntry(entry) {
 
   const expectedReleaseManifestSha256 = optionalSha256(env, "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256");
   if (!expectedReleaseManifestSha256) {
+    // A server-pinned entry still pins the plugin manifest it names; a stale pin makes the
+    // bridge refuse external plugins at startup, so it is not "healthy" either.
+    const pluginManifestPath = String(env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || "").trim();
+    const pinnedPluginManifestSha256 = optionalSha256(env, "CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256");
+    if (pluginManifestPath && pinnedPluginManifestSha256) {
+      const actualPluginManifestSha256 = await sha256File(pluginManifestPath);
+      if (actualPluginManifestSha256 !== pinnedPluginManifestSha256) {
+        throw new Error(`CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 (${pinnedPluginManifestSha256.slice(0, 12)}...) does not match ${pluginManifestPath} (${actualPluginManifestSha256.slice(0, 12)}...); run npm run release:activate -- --sync-clients.`);
+      }
+    }
     return { releaseRoot, serverPath, integrityMode: "server-pinned" };
   }
 
@@ -467,6 +477,12 @@ async function runSelfTest() {
     const serverPinned = await runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 });
     assert.equal(serverPinned.healthy, true);
     assert.equal(serverPinned.integrityMode, "server-pinned");
+    await writeCandidateConfig({ ...serverPinnedEnv, CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256: "0".repeat(64) });
+    await assert.rejects(
+      runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 }),
+      /CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 .* does not match/,
+      "a stale plugin manifest pin is not healthy in server-pinned mode"
+    );
     await writeCandidateConfig(candidateEnv);
     await writeCandidateConfig({ ...candidateEnv, CODEX_OPENCODE_AGENT_DIR: path.join(fixture, "mutable-agents") });
     await assert.rejects(
