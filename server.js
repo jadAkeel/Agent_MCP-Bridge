@@ -5600,6 +5600,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     cancellationErrorType: result.cancellationErrorType || "",
     providerTerminated: Boolean(result.providerTerminated),
     treeTerminationConfirmed: result.treeTerminationConfirmed !== false,
+    containmentGuarantee: result.containmentGuarantee || "",
+    terminationBestEffortSucceeded: result.terminationBestEffortSucceeded === true,
     terminationErrorType: result.terminationErrorType || "",
     openCodeFallbackDetected,
     openCodeApiErrorDetected: inspection.apiErrorDetected,
