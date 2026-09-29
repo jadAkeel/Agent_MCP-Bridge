@@ -21,6 +21,7 @@ const ACTIVE_QUEUE_STATUSES = new Set(["held", "pending", "planned", "blocked", 
 const ACTIVE_PIPELINE_STATUSES = new Set(["running", "cleanup_pending", "cleanup_failed", "awaiting_integration", "integrating"]);
 const LIVE_REGISTRY_STATUSES = new Set(["creating", "retained", "cleanup_failed"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 
 function usage() {
   return [
@@ -33,10 +34,13 @@ function usage() {
     "  --state-dir <absolute-path>   Bridge state directory (default: CODEX_OPENCODE_STATE_DIR or ~/.codex/codex-opencode-mcp)",
     "  --apply                       Perform the deletions that the inventory marks as safe",
     "  --include-retained            Also remove worktrees retained for review whose source repository still exists",
-    "  --older-than <days>           Minimum age for --include-retained removals (default: 7)",
+    "  --older-than <days>           Minimum age for retained, orphan and database removals (default: 7)",
     "  --delete-branches             Delete the agent/* branch after removing a retained worktree (default: keep)",
-    "  --force-dirty                 Also remove retained worktrees that still hold uncommitted changes (default: keep them)",
-    "  --prune-databases             Remove project databases whose repositories no longer exist and have no live rows",
+    "  --force-dirty                 Also remove retained worktrees that still hold uncommitted changes, and orphan",
+    "                                worktrees whose source repository is missing (default: keep both)",
+    "  --prune-databases             Remove project databases whose repositories no longer exist, have no live rows",
+    "                                (jobs, pipelines, locks, bridge leases, unresolved integrations) and are older",
+    "                                than --older-than",
     "  --json                        Machine-readable report",
     "  --self-test                   Run the built-in fixture test",
     "",
@@ -91,6 +95,19 @@ function defaultStateDirectory() {
 function isPathInside(parent, child) {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+// "missing" only when the path's root (drive, UNC share, mount root) is reachable and the
+// repository itself is not. An unplugged or unmapped drive (mapped drives are invisible to
+// an elevated shell) or an unreachable share is "unknown": its worktrees may hold
+// unintegrated work for a repository that is merely out of sight.
+function sourceRepositoryState(sourceRepo) {
+  if (!sourceRepo) return "unknown";
+  const resolved = path.resolve(sourceRepo);
+  if (existsSync(resolved)) return "present";
+  const root = path.parse(resolved).root;
+  if (!root || !existsSync(root)) return "unknown";
+  return "missing";
 }
 
 async function runGit(args, cwd, timeoutMs = 1000 * 60) {
@@ -166,8 +183,8 @@ function tableColumns(db, table) {
   return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
 }
 
-function inspectProjectDatabase(dbPath) {
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+function inspectProjectDatabase(dbPath, { busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS } = {}) {
+  const db = new DatabaseSync(dbPath, { readOnly: true, timeout: busyTimeoutMs });
   try {
     const nowIso = new Date().toISOString();
     const nowMs = Date.now();
@@ -221,9 +238,11 @@ function inspectProjectDatabase(dbPath) {
   }
 }
 
-function markRegistryCleaned(dbPath, worktreePath) {
+// A live bridge may hold the database's write lock for a moment; wait for it instead of
+// failing on the first SQLITE_BUSY.
+function markRegistryCleaned(dbPath, worktreePath, { busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS } = {}) {
   if (!existsSync(dbPath)) return false;
-  const db = new DatabaseSync(dbPath);
+  const db = new DatabaseSync(dbPath, { timeout: busyTimeoutMs });
   try {
     if (!hasTable(db, "worktree_artifacts")) return false;
     const now = new Date().toISOString();
@@ -236,6 +255,19 @@ function markRegistryCleaned(dbPath, worktreePath) {
   } finally {
     db.close();
   }
+}
+
+// Days since the database (or its WAL) was last written.
+async function databaseAgeDays(dbPath, now = Date.now()) {
+  let newest = 0;
+  for (const suffix of ["", "-wal"]) {
+    try {
+      newest = Math.max(newest, (await stat(`${dbPath}${suffix}`)).mtimeMs);
+    } catch {
+      // A missing WAL is normal.
+    }
+  }
+  return newest ? Math.max(0, Math.floor((now - newest) / DAY_MS)) : 0;
 }
 
 async function inventory(stateDir, options) {
@@ -261,7 +293,7 @@ async function inventory(stateDir, options) {
   for (const name of projectDbFiles) {
     const dbPath = path.join(projectsRoot, name);
     try {
-      databaseInfo.set(name.replace(/\.sqlite$/, ""), { path: dbPath, ...inspectProjectDatabase(dbPath) });
+      databaseInfo.set(name.replace(/\.sqlite$/, ""), { path: dbPath, ...inspectProjectDatabase(dbPath, options) });
     } catch (error) {
       databaseInfo.set(name.replace(/\.sqlite$/, ""), { path: dbPath, cwds: [], activeReasons: [`unreadable: ${error?.message || error}`], registry: new Map(), unreadable: true });
     }
@@ -294,7 +326,8 @@ async function inventory(stateDir, options) {
       const link = entry.isDirectory() ? await readWorktreeGitLink(worktreePath) : { kind: "not_a_directory", sourceRepo: "", gitDir: "" };
       const registryRow = info?.registry.get(path.resolve(worktreePath)) || null;
       const sourceRepo = link.sourceRepo || registryRow?.cwd || "";
-      const sourceExists = Boolean(sourceRepo) && existsSync(sourceRepo);
+      const sourceState = sourceRepo ? sourceRepositoryState(sourceRepo) : "unknown";
+      const sourceExists = sourceState === "present";
       const projectActive = Boolean(info && info.activeReasons.length);
       const item = {
         projectHash,
@@ -304,6 +337,7 @@ async function inventory(stateDir, options) {
         ageDays,
         sourceRepo,
         sourceExists,
+        sourceState,
         branch: registryRow?.branch || "",
         registryStatus: registryRow?.status || "unregistered",
         jobId: registryRow?.jobId || "",
@@ -314,15 +348,26 @@ async function inventory(stateDir, options) {
       if (!entry.isDirectory()) {
         item.classification = "foreign_entry";
         item.reason = "Not a directory; the bridge never creates this shape here.";
-      } else if (sourceRepo && !sourceExists) {
-        item.classification = "orphan_source_missing";
-        item.action = "remove_directory";
-        item.reason = projectActive
-          ? `Source repository no longer exists (stuck records: ${info.activeReasons.join("; ")}); nothing can still be using this directory.`
-          : "Source repository no longer exists; the directory is unrecoverable evidence with no owner.";
       } else if (projectActive) {
+        // Checked before anything that removes: a bridge may be using this project even when
+        // its repository is out of sight right now.
         item.classification = "project_active";
-        item.reason = `Project state is active (${info.activeReasons.join("; ")}); nothing is removed while a bridge may be using it.`;
+        item.reason = `Project state is active (${info.activeReasons.join("; ")}); nothing is removed while a bridge may be using it.${sourceRepo && !sourceExists ? ` (Source repository ${sourceState}.)` : ""}`;
+      } else if (sourceRepo && sourceState === "unknown") {
+        item.classification = "source_unreachable";
+        item.reason = `The source repository's drive or share (${path.parse(path.resolve(sourceRepo)).root}) is not reachable; it may be unplugged, unmapped in this shell, or offline, so the worktree is kept.`;
+      } else if (sourceRepo && !sourceExists) {
+        // A missing repository may have been renamed or moved, and the worktree directory is
+        // then the only copy of unintegrated work. Removal needs --force-dirty and age.
+        item.classification = "orphan_source_missing";
+        if (options.forceDirty && ageDays >= options.olderThanDays) {
+          item.action = "remove_directory";
+          item.reason = `Source repository no longer exists and the directory is ${ageDays} day(s) old; removed on request (--force-dirty).`;
+        } else {
+          item.reason = options.forceDirty
+            ? `Source repository no longer exists, but the directory is only ${ageDays} day(s) old; below --older-than ${options.olderThanDays}.`
+            : "Source repository no longer exists at its recorded path (moved or renamed?); the worktree may hold the only copy of its work. Pass --force-dirty (with --older-than) to discard it.";
+        }
       } else if (link.kind === "repository") {
         item.classification = "nested_repository";
         item.reason = "Contains a full .git directory instead of a worktree link; inspect manually.";
@@ -375,19 +420,25 @@ async function inventory(stateDir, options) {
       action: "keep",
       reason: "",
     };
-    const anyCwdExists = info.cwds.some((cwd) => existsSync(cwd));
+    const cwdStates = info.cwds.map((cwd) => sourceRepositoryState(cwd));
+    const allCwdsMissing = info.cwds.length > 0 && cwdStates.every((state) => state === "missing");
+    dbItem.ageDays = await databaseAgeDays(info.path, now);
     if (info.unreadable) {
       dbItem.classification = "unreadable";
       dbItem.reason = info.activeReasons[0];
-    } else if (info.cwds.length > 0 && !anyCwdExists) {
-      dbItem.classification = "repository_missing";
-      dbItem.reason = info.activeReasons.length
-        ? `Every recorded repository path is gone; stuck records (${info.activeReasons.join("; ")}) can never resume.`
-        : "Every recorded repository path is gone.";
-      if (options.pruneDatabases) dbItem.action = "remove_database";
     } else if (info.activeReasons.length) {
+      // Live leases, locks, active jobs and unresolved integrations keep a database even when
+      // its repository is gone: a bridge may still be writing to it.
       dbItem.classification = "active";
-      dbItem.reason = info.activeReasons.join("; ");
+      dbItem.reason = `${info.activeReasons.join("; ")}${allCwdsMissing ? " (every recorded repository path is gone)" : ""}`;
+    } else if (info.cwds.length > 0 && cwdStates.includes("unknown")) {
+      dbItem.classification = "repository_unreachable";
+      dbItem.reason = "A recorded repository is on a drive or share that is not reachable; kept.";
+    } else if (allCwdsMissing) {
+      dbItem.classification = "repository_missing";
+      dbItem.reason = "Every recorded repository path is gone.";
+      if (options.pruneDatabases && dbItem.ageDays >= options.olderThanDays) dbItem.action = "remove_database";
+      else if (options.pruneDatabases) dbItem.reason += ` Last written ${dbItem.ageDays} day(s) ago; below --older-than ${options.olderThanDays}.`;
     } else if (info.cwds.length === 0) {
       dbItem.classification = "no_repository_evidence";
       dbItem.reason = "No recorded repository path; likely a temporary fixture or an empty project.";
@@ -435,26 +486,45 @@ async function applyReport(report, options) {
         }
       }
       if (existsSync(item.path)) await rm(item.path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-      markRegistryCleaned(path.join(projectsRoot, `${item.projectHash}.sqlite`), item.path);
       outcome.ok = !existsSync(item.path);
       if (!outcome.ok) outcome.detail = `${outcome.detail} directory still present`.trim();
     } catch (error) {
       outcome.detail = String(error?.message || error);
     }
+    // The directory is gone either way; a registry row that cannot be updated now (a bridge
+    // holding the write lock) is reported with it and repaired by a later run.
+    if (outcome.ok) {
+      try {
+        markRegistryCleaned(path.join(projectsRoot, `${item.projectHash}.sqlite`), item.path, options);
+      } catch (error) {
+        outcome.detail = `${outcome.detail} (directory removed; registry row not updated: ${error?.message || error})`.trim();
+      }
+    }
     results.push(outcome);
   }
   for (const dbItem of report.databases) {
     for (const stalePath of dbItem.staleRegistryRows) {
-      const changed = markRegistryCleaned(dbItem.path, stalePath);
-      results.push({ path: stalePath, action: "mark_registry_cleaned", ok: changed, detail: changed ? "" : "row not updated" });
+      try {
+        const changed = markRegistryCleaned(dbItem.path, stalePath, options);
+        results.push({ path: stalePath, action: "mark_registry_cleaned", ok: changed, detail: changed ? "" : "row not updated" });
+      } catch (error) {
+        results.push({ path: stalePath, action: "mark_registry_cleaned", ok: false, detail: String(error?.message || error) });
+      }
     }
     if (dbItem.action === "remove_database") {
       const outcome = { path: dbItem.path, action: dbItem.action, ok: false, detail: "" };
       try {
-        for (const suffix of ["", "-wal", "-shm"]) {
-          await rm(`${dbItem.path}${suffix}`, { force: true, maxRetries: 5, retryDelay: 200 });
+        // Re-inspect right before deleting: a bridge may have started using the project
+        // since the inventory was taken.
+        const current = inspectProjectDatabase(dbItem.path, options);
+        if (current.activeReasons.length) {
+          outcome.detail = `kept: the database became active (${current.activeReasons.join("; ")})`;
+        } else {
+          for (const suffix of ["", "-wal", "-shm"]) {
+            await rm(`${dbItem.path}${suffix}`, { force: true, maxRetries: 5, retryDelay: 200 });
+          }
+          outcome.ok = !existsSync(dbItem.path);
         }
-        outcome.ok = !existsSync(dbItem.path);
       } catch (error) {
         outcome.detail = String(error?.message || error);
       }
@@ -496,7 +566,7 @@ function formatReport(report, applied) {
     lines.push(`[${classification}] ${items.length} worktree(s), ${formatBytes(items.reduce((sum, item) => sum + item.bytes, 0))}`);
     for (const item of items) {
       lines.push(`  ${item.action === "keep" ? "keep  " : "REMOVE"} ${item.projectHash}/${item.name} (${formatBytes(item.bytes)}, ${item.ageDays}d, registry=${item.registryStatus}${item.branch ? `, branch=${item.branch}` : ""})`);
-      lines.push(`         source: ${item.sourceRepo || "unknown"}${item.sourceRepo ? (item.sourceExists ? "" : " [missing]") : ""}`);
+      lines.push(`         source: ${item.sourceRepo || "unknown"}${item.sourceRepo && !item.sourceExists ? ` [${item.sourceState === "unknown" ? "unreachable" : "missing"}]` : ""}`);
     }
     lines.push(`  why: ${items[0].reason}`);
   }
@@ -597,27 +667,37 @@ async function selfTest() {
     assert.equal(byName("builder-builder-1-retained").action, "keep");
     assert.equal(byName("builder-builder-2-cleaned").classification, "stale_cleaned_directory");
     assert.equal(byName("builder-builder-2-cleaned").action, "remove_worktree");
+    // A missing repository may only have been moved or renamed: its orphan is kept by default.
     assert.equal(byName("builder-builder-3-orphan").classification, "orphan_source_missing");
-    assert.equal(byName("builder-builder-3-orphan").action, "remove_directory");
+    assert.equal(byName("builder-builder-3-orphan").action, "keep");
+    assert.match(byName("builder-builder-3-orphan").reason, /--force-dirty/);
     assert.equal(dry.report.emptyProjectDirectories.length, 1);
     const liveDbReport = dry.report.databases.find((item) => item.projectHash === liveHash);
     assert.equal(liveDbReport.classification, "live_repository");
     assert.equal(liveDbReport.staleRegistryRows.length, 1);
-    assert.equal(dry.report.databases.find((item) => item.projectHash === orphanHash).action, "remove_database");
+    assert.equal(dry.report.databases.find((item) => item.projectHash === orphanHash).classification, "repository_missing");
+    assert.equal(dry.report.databases.find((item) => item.projectHash === orphanHash).action, "keep", "younger than --older-than");
     assert.equal(dry.report.databases.find((item) => item.projectHash === "4444444444444444dddddddd").classification, "active");
     assert.equal(dry.report.databases.find((item) => item.projectHash === "4444444444444444dddddddd").action, "keep");
     assert.equal(existsSync(orphanPath), true);
     assert.equal(existsSync(cleanedPath), true);
     assert.match(formatReport(dry.report, null), /Dry run only/);
 
-    // 2. Apply without --include-retained: orphan + stale removed, retained kept, orphan DB pruned, registry repaired.
+    // 2. Apply without --include-retained: stale removed, retained and orphan kept, young orphan DB kept, registry repaired.
     const applied = await runGc({ stateDir, apply: true, includeRetained: false, olderThanDays: 7, deleteBranches: false, pruneDatabases: true });
     assert.equal(applied.applied.every((outcome) => outcome.ok), true, JSON.stringify(applied.applied, null, 2));
-    assert.equal(existsSync(orphanPath), false);
+    assert.equal(existsSync(orphanPath), true);
     assert.equal(existsSync(cleanedPath), false);
     assert.equal(existsSync(retainedPath), true);
-    assert.equal(existsSync(path.join(stateDir, "projects", `${orphanHash}.sqlite`)), false);
+    assert.equal(existsSync(path.join(stateDir, "projects", `${orphanHash}.sqlite`)), true);
     assert.equal(existsSync(path.join(stateDir, "worktrees", emptyHash)), false);
+
+    // 2b. --force-dirty past the age threshold removes the orphan; the old enough orphan DB goes too.
+    const orphanForced = await runGc({ stateDir, apply: true, includeRetained: false, olderThanDays: 0, deleteBranches: false, forceDirty: true, pruneDatabases: true });
+    assert.equal(orphanForced.applied.every((outcome) => outcome.ok), true, JSON.stringify(orphanForced.applied, null, 2));
+    assert.equal(existsSync(orphanPath), false);
+    assert.equal(existsSync(path.join(stateDir, "projects", `${orphanHash}.sqlite`)), false);
+    assert.equal(existsSync(retainedPath), true, "--force-dirty alone does not remove retained worktrees");
     const worktreeList = await git(sourceRepo, "worktree", "list", "--porcelain");
     assert.equal(worktreeList.includes("builder-builder-2-cleaned"), false);
     assert.equal(worktreeList.includes("builder-builder-1-retained"), true);
@@ -660,6 +740,117 @@ async function selfTest() {
     const final = await runGc({ stateDir, apply: false, includeRetained: true, olderThanDays: 0, deleteBranches: false, pruneDatabases: true });
     assert.equal(final.report.summary.removableWorktrees, 0);
     assert.equal(final.report.summary.staleRegistryRows, 0);
+
+    const vanishedRepo = path.join(fixtureRoot, "vanished-repo");
+    const fakeWorktree = async (hash, name, repo) => {
+      const directory = path.join(stateDir, "worktrees", hash, name);
+      await mkdir(directory, { recursive: true });
+      await writeFile(path.join(directory, ".git"), `gitdir: ${path.join(repo, ".git", "worktrees", name)}\n`, "utf8");
+      await writeFile(path.join(directory, "work.txt"), "unintegrated\n", "utf8");
+      return directory;
+    };
+    const projectDb = (hash, extraSql = "") => {
+      const db = new DatabaseSync(path.join(stateDir, "projects", `${hash}.sqlite`));
+      db.exec(`CREATE TABLE opencode_jobs (job_id TEXT PRIMARY KEY, cwd TEXT, status TEXT NOT NULL, agent TEXT NOT NULL, mode TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, record_json TEXT NOT NULL); ${extraSql}`);
+      return db;
+    };
+    const addJob = (db, id, cwd, status) => db.prepare("INSERT INTO opencode_jobs VALUES (?, ?, ?, 'builder', 'write', ?, ?, NULL, '{}')").run(id, cwd, status, now, now);
+    const forceEverything = { stateDir, apply: true, includeRetained: true, olderThanDays: 0, deleteBranches: false, forceDirty: true, pruneDatabases: true };
+
+    // 5. Active project state wins over a missing repository: the orphan of a project with a
+    //    running job, and databases with a live bridge lease or an unresolved integration, are
+    //    kept even with --force-dirty --older-than 0 --prune-databases.
+    const activeOrphanHash = "5555555555555555eeeeeeee";
+    const activeOrphan = await fakeWorktree(activeOrphanHash, "builder-builder-5-active", vanishedRepo);
+    const activeOrphanDb = projectDb(activeOrphanHash);
+    addJob(activeOrphanDb, "job-5", vanishedRepo, "running");
+    activeOrphanDb.close();
+    const leasedHash = "6666666666666666eeeeeeee";
+    const leasedDb = projectDb(leasedHash, "CREATE TABLE bridge_instances (instance_id TEXT PRIMARY KEY, lease_expires_at TEXT NOT NULL);");
+    addJob(leasedDb, "job-6", vanishedRepo, "completed");
+    leasedDb.prepare("INSERT INTO bridge_instances VALUES ('live-bridge', ?)").run(new Date(Date.now() + 60_000).toISOString());
+    leasedDb.close();
+    const integratingHash = "7777777777777777eeeeeeee";
+    const integratingDb = projectDb(integratingHash, "CREATE TABLE integration_operations (operation_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, status TEXT NOT NULL);");
+    addJob(integratingDb, "job-7", vanishedRepo, "completed");
+    integratingDb.prepare("INSERT INTO integration_operations VALUES ('op-7', ?, 'applying')").run(vanishedRepo);
+    integratingDb.close();
+    const guarded = await runGc(forceEverything);
+    const guardedItem = guarded.report.worktrees.find((item) => item.name === "builder-builder-5-active");
+    assert.equal(guardedItem.classification, "project_active");
+    assert.equal(guardedItem.action, "keep");
+    assert.equal(existsSync(path.join(activeOrphan, "work.txt")), true);
+    for (const hash of [activeOrphanHash, leasedHash, integratingHash]) {
+      const dbItem = guarded.report.databases.find((item) => item.projectHash === hash);
+      assert.deepEqual([dbItem.classification, dbItem.action], ["active", "keep"], `${hash}: ${dbItem.reason}`);
+      assert.equal(existsSync(path.join(stateDir, "projects", `${hash}.sqlite`)), true);
+    }
+    assert.match(guarded.report.databases.find((item) => item.projectHash === leasedHash).reason, /live bridge instance lease/);
+    assert.match(guarded.report.databases.find((item) => item.projectHash === integratingHash).reason, /unresolved integration/);
+
+    // 5b. A repository on a drive that is not mounted (unplugged, unmapped in an elevated
+    //     shell) is unreachable, not missing: nothing is removed.
+    if (process.platform === "win32") {
+      const freeDrive = [..."ZYXWVUTSRQPONMLKJIHG"].find((letter) => !existsSync(`${letter}:\\`));
+      if (freeDrive) {
+        const offlineRepo = `${freeDrive}:\\repos\\offline`;
+        const offlineHash = "8888888888888888eeeeeeee";
+        const offline = await fakeWorktree(offlineHash, "builder-builder-8-offline", offlineRepo);
+        const offlineDb = projectDb(offlineHash);
+        addJob(offlineDb, "job-8", offlineRepo, "completed");
+        offlineDb.close();
+        const offlineRun = await runGc(forceEverything);
+        const offlineItem = offlineRun.report.worktrees.find((item) => item.name === "builder-builder-8-offline");
+        assert.deepEqual([offlineItem.classification, offlineItem.action], ["source_unreachable", "keep"]);
+        assert.equal(existsSync(path.join(offline, "work.txt")), true);
+        const offlineDbItem = offlineRun.report.databases.find((item) => item.projectHash === offlineHash);
+        assert.deepEqual([offlineDbItem.classification, offlineDbItem.action], ["repository_unreachable", "keep"]);
+      }
+    }
+
+    // 6. A database that becomes active between the inventory and --apply is kept.
+    const lateHash = "9999999999999999eeeeeeee";
+    const lateDbPath = path.join(stateDir, "projects", `${lateHash}.sqlite`);
+    const lateDb = projectDb(lateHash);
+    addJob(lateDb, "job-9a", vanishedRepo, "completed");
+    lateDb.close();
+    const lateReport = await inventory(stateDir, forceEverything);
+    assert.equal(lateReport.databases.find((item) => item.projectHash === lateHash).action, "remove_database");
+    const lateWriter = new DatabaseSync(lateDbPath);
+    addJob(lateWriter, "job-9b", vanishedRepo, "running");
+    lateWriter.close();
+    const lateApplied = await applyReport(lateReport, forceEverything);
+    const lateOutcome = lateApplied.find((outcome) => outcome.path === lateDbPath);
+    assert.equal(lateOutcome.ok, false);
+    assert.match(lateOutcome.detail, /became active/);
+    assert.equal(existsSync(lateDbPath), true);
+
+    // 7. A registry repair that meets a locked database is recorded as a failed outcome; the
+    //    run neither aborts nor loses the outcomes of the steps after it.
+    const liveDbPath = path.join(stateDir, "projects", `${liveHash}.sqlite`);
+    const staleRowPath = path.join(stateDir, "worktrees", liveHash, "builder-builder-10-vanished");
+    const registryDb = new DatabaseSync(liveDbPath);
+    registryDb.prepare("INSERT INTO worktree_artifacts VALUES (?, ?, ?, ?, 'retained', 0, ?, ?, NULL)").run(staleRowPath, sourceRepo, "agent/builder/vanished-2", "job-10", now, now);
+    registryDb.close();
+    const laterEmptyDirectory = path.join(stateDir, "worktrees", "aaaaaaaaaaaaaaaaeeeeeeee");
+    await mkdir(laterEmptyDirectory, { recursive: true });
+    const busyOptions = { stateDir, apply: true, includeRetained: false, olderThanDays: 7, deleteBranches: false, pruneDatabases: false, busyTimeoutMs: 200 };
+    const busyReport = await inventory(stateDir, busyOptions);
+    assert.ok(busyReport.databases.find((item) => item.projectHash === liveHash).staleRegistryRows.includes(staleRowPath));
+    const locker = new DatabaseSync(liveDbPath);
+    locker.exec("BEGIN EXCLUSIVE");
+    let busyApplied;
+    try {
+      busyApplied = await applyReport(busyReport, busyOptions);
+    } finally {
+      locker.exec("ROLLBACK");
+      locker.close();
+    }
+    const busyRepair = busyApplied.find((outcome) => outcome.action === "mark_registry_cleaned" && outcome.path === staleRowPath);
+    assert.equal(busyRepair.ok, false);
+    assert.match(busyRepair.detail, /locked|busy/i);
+    assert.equal(busyApplied.some((outcome) => outcome.action === "remove_empty_directory" && outcome.path === laterEmptyDirectory && outcome.ok), true,
+      "steps after the failed repair still run and are recorded");
     process.stdout.write("Bridge GC self-test passed.\n");
     selfTestPassed("bridge-gc");
   } finally {
