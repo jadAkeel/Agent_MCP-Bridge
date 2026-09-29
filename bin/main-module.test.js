@@ -80,3 +80,41 @@ test("a script started with --self-test fails when no self-test ran", () => {
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+// R-136: `node bin/state-audit --self-test` resolves to state-audit.js, but argv[1] keeps the
+// spelling the caller typed, so the script was not recognised as main and exited 0 silently.
+test("isMainModule resolves an extensionless script path the way Node does", () => {
+  const self = fileURLToPath(import.meta.url);
+  const extensionless = self.replace(/\.js$/, "");
+  assert.notEqual(extensionless, self);
+  assert.equal(isMainModule(import.meta.url, ["node", extensionless]), true);
+  if (process.platform === "win32") assert.equal(isMainModule(import.meta.url, ["node", extensionless.toUpperCase()]), true);
+  // Another script, or a name that resolves to nothing, is still not this module.
+  assert.equal(isMainModule(import.meta.url, ["node", path.join(BIN, "state-audit")]), false);
+  assert.equal(isMainModule(import.meta.url, ["node", path.join(BIN, "no-such-script")]), false);
+});
+
+test("--self-test runs and prints its ok line when the script path has no .js extension", () => {
+  withLinkedBin((linked, cwd) => {
+    // The plain directory and a junction, each with a different script to keep the run short.
+    for (const [directory, script] of [[BIN, "state-audit"], [linked, "bridge-gc"]]) {
+      const result = runNode([path.join(directory, script), "--self-test"], cwd);
+      assert.equal(result.status, 0, `${script}: ${result.stdout}\n${result.stderr}`);
+      assert.match(result.stdout, new RegExp(`^${script} self-test: ok$`, "m"), `${script} printed: ${result.stdout}`);
+    }
+  });
+});
+
+test("a script started with --self-test and no .js extension fails when no self-test ran", () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), "main-module-test-"));
+  try {
+    writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ type: "module" }));
+    const skipped = path.join(fixture, "skipped-no-extension.js");
+    writeFileSync(skipped, `import { requireSelfTestRun } from ${JSON.stringify(MAIN_MODULE_URL)};\nrequireSelfTestRun(import.meta.url);\n`);
+    const result = runNode([skipped.replace(/\.js$/, ""), "--self-test"], fixture);
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /--self-test did not run/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
