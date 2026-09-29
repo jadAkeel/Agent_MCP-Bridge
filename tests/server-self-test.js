@@ -136,6 +136,7 @@ const {
   queueRunStage,
   staleBridgeProcessHint,
   truncateResultText,
+  diffStatFromPatch,
   noteQueueLeaseRenewalFailure,
   open,
   openCodeRunArgs,
@@ -1921,6 +1922,42 @@ async function runSelfTests() {
   assert.equal(nonOverlappingParallel.error, null);
   assert.deepEqual(nonOverlappingParallel.lockPlans[0].allowedEdits, ["apps/web"]);
   assert.equal(nonOverlappingParallel.lockPlans[0].lockMode, "strict");
+  assert.equal(nonOverlappingParallel.lockPlans[0].requestedLockMode, undefined, "No lockMode was requested, so nothing was overridden.");
+  const simpleParallel = validateParallelWritePlan(["apps/web/**", "apps/api/**"].map((scope) => ({
+    agent: "builder",
+    task: `Edit ${scope}.`,
+    write: true,
+    lockMode: "simple",
+    lockType: "write",
+    lockedPaths: [scope],
+    allowedEdits: [scope],
+    scopeContract: writeScope([scope]),
+  })));
+  assert.equal(simpleParallel.error, null);
+  assert.equal(simpleParallel.lockPlans[1].lockMode, "strict");
+  assert.equal(simpleParallel.lockPlans[1].requestedLockMode, "simple", "The override from simple to strict is recorded so the output can say so.");
+  // The stat comes from the review patch, so files the agent created are counted too.
+  const statText = diffStatFromPatch([
+    "diff --git a/src/mod.py b/src/mod.py",
+    "index 1111111..2222222 100644",
+    "--- a/src/mod.py",
+    "+++ b/src/mod.py",
+    "@@ -1,2 +1,2 @@",
+    "-old",
+    "+new",
+    " same",
+    "diff --git a/tests/test_mod.py b/tests/test_mod.py",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/tests/test_mod.py",
+    "@@ -0,0 +1,2 @@",
+    "+def test_x():",
+    "+    assert True",
+  ].join("\n"));
+  assert.match(statText, /src\/mod\.py\s+\| \+1 -1/);
+  assert.match(statText, /tests\/test_mod\.py \| \+2 -0 \(new\)/);
+  assert.match(statText, /2 files changed \(1 new\), 3 insertions\(\+\), 1 deletion\(-\)/);
+  assert.equal(diffStatFromPatch(""), "");
   // A reviewed integration may land while a worktree builder runs on other paths; readers of
   // the checkout, manual/legacy writers, and in-place writers (worktree mode off) still block it.
   const integrationLock = { lockType: "serial_integration", paths: ["docs"], origin: "internal" };
@@ -5207,6 +5244,7 @@ async function runSelfTests() {
       dryRun: true,
     });
     assert.equal(contractPreview.ok, true, JSON.stringify(contractPreview, null, 2));
+    assert.match(contractPreview.patchStat, /src\/allowed\.txt \| \+1 -1/, "A dry run carries a stat for previewMode stat.");
     const contractApply = await integratePatchSerially({
       cwd: tempDir,
       worktreePath: contractWorktree.path,

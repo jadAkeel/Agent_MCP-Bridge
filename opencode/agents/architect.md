@@ -71,7 +71,7 @@ Before starting:
 - Explain tradeoffs clearly.
 - Prefer consistency with the existing codebase.
 
-Output format:
+Output format (only when the task prompt gives no Return format):
 # Architecture Analysis
 ## Current Design
 ## Impacted Areas
@@ -83,7 +83,7 @@ Output format:
 
 ## Final Report
 
-After completing the task, report:
+When the task prompt gives a Return format, write only that report and fold these items into it; do not add this list as a second report. Otherwise, after completing the task, report:
 
 - **Agent**: architect
 - **Task suitability**: Suitable / Not Suitable
@@ -93,8 +93,8 @@ After completing the task, report:
 - **Why each skill was used**: <reason per skill>
 - **Files inspected**: <paths>
 - **Files changed**: none
-- **Commands run**: <commands>
-- **Tests/build results**: <results>
+- **Commands run**: <only commands you ran in this run>
+- **Tests/build results**: <results of commands you ran in this run; "not run" if you ran none. Never repeat results stated in the task>
 - **Path-safety check**: N/A (read-only)
 - **Problems found**: <list>
 - **Assumptions made**: <list>

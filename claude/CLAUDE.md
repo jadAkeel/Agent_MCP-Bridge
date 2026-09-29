@@ -6,7 +6,7 @@ The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded
 1. Tiny or obvious change: do it yourself.
 2. Second opinion, exploration, review, or a plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester).
 3. One bounded fix or feature: one `builder` or `debugger` via `run_opencode_agent` with a write Scope Contract.
-4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most 2 real (non-dry-run) jobs per call, the provider slot limit; queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
+4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most 2 real (non-dry-run) jobs per call, the provider slot limit (parallel writers always lock in `strict` mode; each job prints a `Run id` for your notes, not a queue id); queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
 Do not call the OpenCode orchestrator unless the user names it. Do not call `acquire_agent_lock`/`release_agent_lock`; the bridge manages locks.
 
 ## Job shape
@@ -21,7 +21,7 @@ Write:
 
 ## Review and integrate
 1. Read the agent report, the changed-file list, and the diff. Reject scope violations or unrelated edits.
-2. Preview with `integrate_opencode_worktree` (`dryRun: true`, `validationCommand: "git diff --check"`), show the user the patch, then apply with the same arguments plus `reviewed: true` and the exact `previewReceipt`. The receipt is bound to the arguments: an apply that adds or changes one fails with `integration_preview_contract_mismatch`, naming the argument. A passing validation lets the bridge delete the used worktree and branch; without it every worktree is kept and they pile up.
+2. Preview with `integrate_opencode_worktree` (`dryRun: true`, `validationCommand: "git diff --check"`), show the user the patch, then apply with the same arguments plus `reviewed: true` and the exact `previewReceipt`. The receipt is bound to the arguments: an apply that adds or changes one fails with `integration_preview_contract_mismatch`, naming the argument. If you already read the diff in the worktree, dry-run with `previewMode: "stat"` to get line counts instead of the whole patch again. A passing validation lets the bridge delete the used worktree and branch; without it every worktree is kept and they pile up.
 3. After integration, run the project's checks in the real checkout.
 4. `DEPENDENCY_REQUIRED` in a report means: add the dependency yourself, commit, retry the job.
 Never report success based only on an agent's own claim.

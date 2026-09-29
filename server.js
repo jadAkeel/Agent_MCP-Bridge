@@ -301,7 +301,7 @@ const DEFAULT_RETURN_FORMAT = [
   "7. NEEDS_INTEGRATION, if required",
   "8. Dependencies: the DEPENDENCY_REQUIRED marker line only when a package manifest change is required; otherwise write \"Dependencies: none\"",
   "9. Risks",
-  "10. Validation performed",
+  "10. Validation performed: only commands you ran in this run, each with its result (\"none run\" otherwise); never repeat test results stated in this task",
   "11. Validation still recommended",
 ].join("\n");
 const QUEUE_JOBS = new Map();
@@ -5844,7 +5844,7 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Read-only unavailable: ${result?.readOnlyUnavailable ? "yes" : "no"}`,
     `Retry attempts used: ${result?.retryAttempt ?? 0}`,
     `Max retries: ${result?.maxRetries ?? 0}`,
-    `Lock mode: ${lockPlan?.lockMode || "not specified"}`,
+    `Lock mode: ${lockPlan?.lockMode || "not specified"}${lockPlan?.requestedLockMode ? ` (requested ${lockPlan.requestedLockMode}; parallel writers always use ${lockPlan.lockMode})` : ""}`,
     `Lock type: ${lockPlan?.lockType || "not specified"}`,
     lockPlan?.orchestratorMode ? `Orchestrator mode: ${lockPlan.orchestratorMode}` : null,
     lockPlan?.orchestratorMode === "contractor" ? `User-authorized contractor: ${lockPlan.userAuthorizedOrchestrator ? "yes" : "no"}` : null,
@@ -7934,6 +7934,41 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
   };
 }
 
+// `git diff --stat <base>` left out files the agent created (untracked in the worktree), so a
+// builder that wrote a new test file showed "1 file changed". The review patch already carries
+// every file, new ones included; count its lines instead.
+function diffStatFromPatch(patchText) {
+  const files = [];
+  let current = null;
+  for (const line of String(patchText || "").split("\n")) {
+    const header = line.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/);
+    if (header) {
+      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false };
+      files.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith("new file mode")) current.created = true;
+    else if (line.startsWith("deleted file mode")) current.deleted = true;
+    else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
+    else if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
+    else if (line.startsWith("+")) current.added += 1;
+    else if (line.startsWith("-")) current.removed += 1;
+  }
+  if (!files.length) return "";
+  const width = Math.max(...files.map((file) => file.path.length));
+  const rows = files.map((file) => {
+    const note = file.created ? " (new)" : file.deleted ? " (deleted)" : "";
+    const counts = file.binary ? "binary" : `+${file.added} -${file.removed}`;
+    return ` ${file.path.padEnd(width)} | ${counts}${note}`;
+  });
+  const added = files.reduce((sum, file) => sum + file.added, 0);
+  const removed = files.reduce((sum, file) => sum + file.removed, 0);
+  const created = files.filter((file) => file.created).length;
+  rows.push(` ${files.length} file${files.length === 1 ? "" : "s"} changed${created ? ` (${created} new)` : ""}, ${added} insertion${added === 1 ? "" : "s"}(+), ${removed} deletion${removed === 1 ? "" : "s"}(-)`);
+  return rows.join("\n");
+}
+
 async function collectWorktreeDiff(worktree) {
   if (!worktree?.path) {
     return null;
@@ -7949,10 +7984,9 @@ async function collectWorktreeDiff(worktree) {
       error: patch.error,
     };
   }
-  const diffStat = await runCommand("git", ["diff", "--stat", worktree.baseCommit || "HEAD", "--"], worktree.path, 1000 * 15);
   return {
     changedFiles: patch.changedFiles,
-    diffStat: diffStat.exitCode === 0 ? diffStat.stdout.trim() : "",
+    diffStat: diffStatFromPatch(patch.patch),
     patchPreview: truncateText(redactSensitiveText(patch.patch)),
     patchSha256: patch.patchSha256,
     sourceStateSha256: patch.sourceStateSha256,
@@ -9248,6 +9282,7 @@ async function integratePatchWithoutSerialLock({
         targetStateSha256: targetState.targetStateSha256,
         contractSha256,
         patchPreview: patch.patch,
+        patchStat: diffStatFromPatch(patch.patch),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
         allowDirtyTarget: Boolean(allowDirtyTarget),
@@ -11534,7 +11569,7 @@ function formatDelegationPlanJob({ index, job, lockPlan, resolution }) {
     `Effective external-directory permission denied: ${resolution?.agentMetadata?.externalDirectoryDenied ? "yes" : "no/unattested"}`,
     `Would run: ${resolution?.actualAgent ? commandShape(resolution.actualAgent, effectiveMetadata) : "no"}`,
     "Would acquire consistency lock: yes (shared for reads, exclusive for writes/integration)",
-    `Lock mode: ${lockPlan.lockMode}`,
+    `Lock mode: ${lockPlan.lockMode}${lockPlan.requestedLockMode ? ` (requested ${lockPlan.requestedLockMode}; parallel writers always use ${lockPlan.lockMode})` : ""}`,
     `Lock type: ${lockPlan.lockType}`,
     lockPlan.orchestratorMode ? `Orchestrator mode: ${lockPlan.orchestratorMode}` : null,
     lockPlan.orchestratorMode === "contractor" ? `User-authorized contractor: ${lockPlan.userAuthorizedOrchestrator ? "yes" : "no"}` : null,
@@ -13161,6 +13196,7 @@ server.tool(
     cleanupAfterSuccess: z.boolean().optional().describe("Remove the source worktree and its local branch only after reviewed integration and a passing validationCommand. Defaults to true for worktrees the bridge created; pass false to keep the source."),
     allowDirtyTarget: z.boolean().optional().describe("Allow integration into a target repo that already has changes. Defaults to false."),
     acceptFlaggedSecretLines: z.boolean().optional().describe("Dry run only: issue the receipt even though the secret gate flagged patch lines, after you inspected those lines in the worktree and found no real credential. Defaults to false."),
+    previewMode: z.enum(["full", "stat"]).optional().describe("Dry run output: full (default) prints the whole patch; stat prints per-file line counts and the patch SHA-256, for callers that already read the diff in the worktree. The receipt is the same."),
   },
   async ({
     cwd = "",
@@ -13178,6 +13214,7 @@ server.tool(
     cleanupAfterSuccess = undefined,
     allowDirtyTarget = false,
     acceptFlaggedSecretLines = false,
+    previewMode = "full",
   }) => {
     const started = nowMs();
     let pipeline = null;
@@ -13417,8 +13454,11 @@ server.tool(
             result.targetStateSha256 ? `Target state SHA-256: ${result.targetStateSha256}` : null,
             result.contractSha256 ? `Integration contract SHA-256: ${result.contractSha256}` : null,
             result.previewReceipt ? `Preview receipt: ${JSON.stringify(result.previewReceipt)}` : null,
-            result.patchPreview ? `Patch preview:\n${result.patchPreview}` : null,
-            result.patchPreviewTruncated ? "Patch preview truncated: yes (apply remains blocked on the full patch SHA-256)" : null,
+            // A dry run printed the whole patch every time (6-13k characters per job) even when
+            // the caller had read the diff in the worktree already; stat mode prints line counts.
+            previewMode === "stat" && result.patchStat ? `Patch stat (previewMode stat; the receipt covers the full patch):\n${result.patchStat}` : null,
+            previewMode !== "stat" && result.patchPreview ? `Patch preview:\n${result.patchPreview}` : null,
+            previewMode !== "stat" && result.patchPreviewTruncated ? "Patch preview truncated: yes (apply remains blocked on the full patch SHA-256)" : null,
             `Allowed edits: ${normalizeLockPathList(allowedEdits).join(", ")}`,
             `Forbidden edits: ${normalizeLockPathList(forbiddenEdits).length ? normalizeLockPathList(forbiddenEdits).join(", ") : "none specified"}`,
             `Shared files frozen: ${normalizeLockPathList(sharedFiles).length ? normalizeLockPathList(sharedFiles).join(", ") : "none specified"}`,
@@ -14026,6 +14066,10 @@ function validateParallelWritePlan(jobs) {
   const writePlans = lockPlans.filter((plan) => plan.lockType === "write");
   if (writePlans.length > 1) {
     for (const plan of writePlans) {
+      // Parallel writers always lock strictly; record what the caller asked for so the output
+      // can say the mode was changed instead of silently printing "strict".
+      const requested = String(jobs[plan.index]?.lockMode || "").trim().toLowerCase();
+      if (requested && requested !== CONFIG.defaultParallelWriteLockMode) plan.requestedLockMode = requested;
       plan.lockMode = CONFIG.defaultParallelWriteLockMode;
     }
   }
@@ -19138,6 +19182,10 @@ server.tool(
     }
 
     const parallelWorktrees = [];
+    // Each job gets a run id up front (writers already used one for their worktree name), so the
+    // coordinator's ledger can name reviewer runs too. It is not a queue id: get_opencode_job
+    // cannot look it up; use the queue for durable status.
+    const parallelRunIds = lockPlans.map((plan) => makeQueueJobId(plan.agent));
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
       const lockPlan = lockPlans[index];
@@ -19149,7 +19197,7 @@ server.tool(
       const worktreeResult = await createWorktreeForJob({
         cwd: job.cwd || process.cwd(),
         agent: lockPlan.agent,
-        jobId: makeQueueJobId(lockPlan.agent),
+        jobId: parallelRunIds[index],
         lockedPaths: lockPlan.lockedPaths,
         allowedEdits: lockPlan.allowedEdits,
         scopeContract: lockPlan.scopeContract,
@@ -19651,7 +19699,10 @@ server.tool(
             verification,
             rollbackVerification,
             worktreeCleanupVerification,
-            ...results.map((result) => result.text),
+            ...results.map((result, position) => {
+              const runId = parallelRunIds[Number.isInteger(result.index) ? result.index : position];
+              return runId ? String(result.text || "").replace(/^JOB (\d+)/, (label) => `${label}\nRun id: ${runId} (not a queue id)`) : result.text;
+            }),
           ].join("\n\n====================\n\n"),
         },
       ],
@@ -20561,6 +20612,7 @@ export const __selfTest = {
     queueRunStage,
     staleBridgeProcessHint,
     truncateResultText,
+    diffStatFromPatch,
     noteQueueLeaseRenewalFailure,
     open,
     openCodeRunArgs,

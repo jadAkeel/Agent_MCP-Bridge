@@ -110,7 +110,7 @@ Before starting:
 
 ## Final Report
 
-After completing the task, report:
+When the task prompt gives a Return format, write only that report and fold these items into it; do not add this list as a second report. Otherwise, after completing the task, report:
 
 - **Agent**: debugger
 - **Task suitability**: suitable / not suitable
@@ -124,8 +124,8 @@ After completing the task, report:
 - **Reproduction steps**: <how to reproduce>
 - **Files inspected**: <paths>
 - **Files changed**: <paths>
-- **Commands run**: <commands>
-- **Test/build results**: <results>
+- **Commands run**: <only commands you ran in this run>
+- **Test/build results**: <results of commands you ran in this run; "not run" if you ran none. Never repeat results stated in the task>
 - **Root cause**: <what caused the bug>
 - **Evidence**: <evidence supporting root cause>
 - **Proposed fix**: <description of fix>
