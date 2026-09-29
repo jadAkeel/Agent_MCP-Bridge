@@ -10452,6 +10452,13 @@ function heartbeatKnownQueueState() {
           AND owner_lease_expires_at > ?
           AND status NOT IN ('completed', 'failed', 'cancelled')
       `);
+      const reclaimPipeline = db.prepare(`
+        UPDATE opencode_pipelines
+        SET owner_heartbeat_at = ?, owner_lease_expires_at = ?
+        WHERE pipeline_id = ? AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+      `);
+      const pipelineOwner = db.prepare("SELECT owner_instance_id, owner_generation FROM opencode_pipelines WHERE pipeline_id = ?");
       for (const record of localPipelines) {
         const renewed = renewPipeline.run(
           heartbeatAt,
@@ -10461,11 +10468,28 @@ function heartbeatKnownQueueState() {
           record.ownerGeneration,
           heartbeatAt
         );
-        if (Number(renewed.changes || 0) === 1) {
+        // A lapsed lease under this instance's generation is still ours (every takeover writes
+        // a new generation), so it is re-taken instead of being reported lost. Only a row that
+        // another generation took is lost; dropping it from PIPELINE_RUNS stops this
+        // instance's heartbeat from covering it so recovery can resume it.
+        if (Number(renewed.changes || 0) === 1
+          || Number(reclaimPipeline.run(
+            heartbeatAt,
+            leaseExpiresAt,
+            record.pipelineId,
+            BRIDGE_INSTANCE_ID,
+            record.ownerGeneration
+          ).changes || 0) === 1) {
           record.ownerHeartbeatAt = heartbeatAt;
           record.ownerLeaseExpiresAt = leaseExpiresAt;
         } else {
           record.pipelineOwnershipLost = true;
+          const owner = pipelineOwner.get(record.pipelineId);
+          if ((!owner || owner.owner_instance_id !== BRIDGE_INSTANCE_ID
+            || String(owner.owner_generation || "") !== String(record.ownerGeneration || ""))
+            && PIPELINE_RUNS.get(record.pipelineId) === record) {
+            PIPELINE_RUNS.delete(record.pipelineId);
+          }
           logEvent("warn", "pipeline.ownership_lost", {
             pipelineId: record.pipelineId,
             ownerGeneration: record.ownerGeneration,
@@ -17931,9 +17955,10 @@ async function claimPersistedPipeline(record) {
       ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(authoritative.ownerInstanceId)
       : null;
     const ownerExpiresAt = Date.parse(owner?.lease_expires_at || "");
-    const sameLiveOwner = authoritative.ownerInstanceId === BRIDGE_INSTANCE_ID
+    const sameOwnerGeneration = authoritative.ownerInstanceId === BRIDGE_INSTANCE_ID
       && authoritative.ownerGeneration
-      && authoritative.ownerGeneration === record.ownerGeneration
+      && authoritative.ownerGeneration === record.ownerGeneration;
+    const sameLiveOwner = sameOwnerGeneration
       && Number.isFinite(expiresAt)
       && expiresAt > now;
     if (sameLiveOwner) {
@@ -17941,7 +17966,37 @@ async function claimPersistedPipeline(record) {
       transactionOpen = false;
       Object.assign(record, authoritative);
       PIPELINE_RUNS.set(record.pipelineId, record);
-      return { ok: true, record };
+      return { ok: true, record, alreadyOwnedLive: true };
+    }
+    if (sameOwnerGeneration) {
+      // This instance's own generation with a lapsed lease: nobody took it (a takeover writes
+      // a new generation), so renew it in place. Treating it as a foreign live owner left the
+      // pipeline unclaimable and every update failing until the bridge exited.
+      const renewedAt = new Date().toISOString();
+      const renewedLeaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
+      const renewed = db.prepare(`
+        UPDATE opencode_pipelines
+        SET owner_heartbeat_at = ?, owner_lease_expires_at = ?
+        WHERE pipeline_id = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
+      `).run(
+        renewedAt,
+        renewedLeaseExpiresAt,
+        record.pipelineId,
+        Number(authoritative.revision || 0),
+        BRIDGE_INSTANCE_ID,
+        authoritative.ownerGeneration
+      );
+      if (Number(renewed.changes || 0) !== 1) {
+        db.exec("ROLLBACK");
+        transactionOpen = false;
+        return { ok: false, reason: "concurrent_update" };
+      }
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative, { ownerHeartbeatAt: renewedAt, ownerLeaseExpiresAt: renewedLeaseExpiresAt });
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      logEvent("warn", "pipeline.lease_reacquired", { pipelineId: record.pipelineId, ownerGeneration: record.ownerGeneration });
+      return { ok: true, record, reacquired: true };
     }
     if ((Number.isFinite(expiresAt) && expiresAt > now) || (Number.isFinite(ownerExpiresAt) && ownerExpiresAt > now)) {
       db.exec("COMMIT");
@@ -18102,7 +18157,7 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
           owner_instance_id = ?, owner_generation = ?, owner_heartbeat_at = ?, owner_lease_expires_at = ?,
           expected_child_count = ?, batch_state = ?, cleanup_state = ?, queue_mode = ?
       WHERE pipeline_id = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
-        AND owner_lease_expires_at > ?
+        AND owner_generation <> ''
         AND EXISTS (
           SELECT 1 FROM bridge_instances
           WHERE instance_id = opencode_pipelines.owner_instance_id AND lease_expires_at > ?
@@ -18128,15 +18183,25 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
       expected,
       committedSnapshot.ownerInstanceId || "",
       committedSnapshot.ownerGeneration || "",
-      commitAt,
       commitAt
     );
     if (updated.changes !== 1) {
-      const row = db.prepare("SELECT status, revision, record_json FROM opencode_pipelines WHERE pipeline_id = ?").get(snapshot.pipelineId);
+      const row = db.prepare(`
+        SELECT status, revision, record_json, owner_instance_id, owner_generation, owner_heartbeat_at,
+               owner_lease_expires_at, expected_child_count, batch_state, cleanup_state
+        FROM opencode_pipelines WHERE pipeline_id = ?
+      `).get(snapshot.pipelineId);
       const authoritative = row?.record_json ? {
         ...JSON.parse(row.record_json),
         status: row.status,
         revision: Number(row.revision || 0),
+        ownerInstanceId: row.owner_instance_id || "",
+        ownerGeneration: row.owner_generation || "",
+        ownerHeartbeatAt: row.owner_heartbeat_at || "",
+        ownerLeaseExpiresAt: row.owner_lease_expires_at || "",
+        expectedChildCount: Number(row.expected_child_count || 0),
+        batchState: row.batch_state || "unstarted",
+        cleanupState: row.cleanup_state || "none",
       } : null;
       throw pipelineConcurrentUpdateError(snapshot, authoritative);
     }
@@ -18201,7 +18266,14 @@ async function updatePipelineRecord(record, patch = {}) {
       return record;
     });
   } catch (error) {
-    if (error?.authoritative) Object.assign(record, error.authoritative);
+    // The authoritative row is the redacted durable summary (no final validation spec, no
+    // events, items without validation specs). Copy only the ownership and state fields;
+    // assigning all of it let the next write persist the stripped fields as the record.
+    if (error?.authoritative) {
+      for (const key of ["status", "revision", "ownerInstanceId", "ownerGeneration", "ownerHeartbeatAt", "ownerLeaseExpiresAt", "batchState", "cleanupState"]) {
+        if (Object.prototype.hasOwnProperty.call(error.authoritative, key)) record[key] = error.authoritative[key];
+      }
+    }
     logEvent("warn", "pipeline.persist_failed", {
       pipelineId: record.pipelineId,
       error: error.message || String(error),
