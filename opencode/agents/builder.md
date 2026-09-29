@@ -18,6 +18,10 @@ permission:
     "**/*.key": deny
     "secrets/**": deny
     "**/secrets/**": deny
+    ".git": deny
+    ".git/**": deny
+    "**/.git": deny
+    "**/.git/**": deny
   webfetch: deny
   websearch: deny
   external_directory: deny

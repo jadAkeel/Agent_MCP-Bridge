@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,6 +140,9 @@ const DISABLED_GIT_HOOKS_PATH = path.join(
 );
 const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
 const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
+// Agent timeouts are handed to the supervisor's setTimeout, which cannot represent more
+// than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
+const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -208,6 +212,9 @@ const CONFIG = Object.freeze({
   providerConcurrencyLimit: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2),
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
+  // How long a job may wait for a provider slot. The wait is not part of the agent's run
+  // timeout: the run clock starts when the slot is granted.
+  providerWaitMaxMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS", 1000 * 60 * 20),
   providerLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_MS", 1000 * 60 * 4),
   providerHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS", 1000 * 20),
   providerConcurrencyKey: String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "opencode-default-account").trim() || "opencode-default-account",
@@ -259,6 +266,13 @@ const DEFAULT_FORBIDDEN_EDIT_PATHS = Object.freeze([
   "**/*.key",
   "secrets/**",
   "**/secrets/**",
+  // Git's control surface: config, hooks, refs and a worktree's .git pointer file. Git never
+  // lists these as changes, so a deny rule is the only guard. The managed writer profiles
+  // (opencode/agents/builder.md, debugger.md) must list exactly this set.
+  ".git",
+  ".git/**",
+  "**/.git",
+  "**/.git/**",
 ]);
 const DEFAULT_SHARED_FILE_PATHS = Object.freeze([
   "package.json",
@@ -460,16 +474,21 @@ const scopeValidationSchema = z
 
 const scopeTimeoutPolicySchema = z
   .object({
-    timeoutMs: z.number().int().positive().optional(),
-    readOnlyTimeoutMs: z.number().int().positive().optional(),
-    writeTimeoutMs: z.number().int().positive().optional(),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
+    readOnlyTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
+    writeTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
   })
   .strict();
 
+// These values become `opencode run` arguments. A value starting with "-" (variant
+// "--attach=http://host:4096") was parsed by the CLI as an extra option.
+// Model IDs may contain "/" (openrouter/anthropic/...); they still may not start with "-".
+const MODEL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const modelRequirementSchema = z.object({
-  provider: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
-  model: z.string().trim().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/),
-  variant: z.string().trim().min(1).max(128).regex(/^[^\s\x00-\x1f\x7f]+$/).optional(),
+  provider: z.string().trim().min(1).max(256).regex(MODEL_IDENTIFIER_PATTERN),
+  model: z.string().trim().min(1).max(256).regex(MODEL_NAME_PATTERN),
+  variant: z.string().trim().min(1).max(128).regex(MODEL_IDENTIFIER_PATTERN).optional(),
   requireRuntimeEvidence: z.boolean().optional(),
 }).strict();
 
@@ -488,7 +507,7 @@ const scopeContractSchema = z
     scope: scopePathSetSchema.optional(),
     actions: z.array(z.string()).optional(),
     validation: scopeValidationSchema.optional(),
-    timeoutMs: z.number().int().positive().optional(),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
     modelRequirement: modelRequirementSchema.optional().describe("Pin provider/model[@variant] for this job. It must be in CODEX_OPENCODE_MODEL_ALLOWLIST or match the managed profile."),
   })
@@ -522,11 +541,11 @@ const jobInputShape = {
   sharedFiles: z.array(z.string()).optional(),
   serialOnly: z.array(z.string()).optional(),
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
-  timeoutMs: z.number().int().positive().optional(),
+  timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
   allowFallbackToBuild: z.boolean().optional(),
-  subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
+  subagentStrategy: z.enum(["proxy", "reject"]).optional(),
   proxyAgent: z.string().optional(),
   orchestratorMode: z.enum(["planning-only", "contractor", "bounded-writer"]).optional().describe("Only when the user named the OpenCode Orchestrator."),
   userAuthorizedOrchestrator: z.boolean().optional(),
@@ -572,7 +591,11 @@ function readPositiveIntEnv(name, fallback) {
 }
 
 function readNonNegativeIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
+  // Blank is unset: Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS="" silently
+  // disabled progress heartbeats instead of keeping the default.
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
+  const value = Number(raw);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
@@ -607,9 +630,19 @@ function readCsvEnv(name, fallback = []) {
   return [...new Set(String(raw).split(",").map((item) => item.trim()).filter(Boolean))];
 }
 
+// Windows editors (Notepad, PowerShell 5 Out-File) write UTF-8 with a byte-order mark, which
+// JSON.parse rejects. Callers hash the raw bytes first; only the parse ignores the BOM.
+function parseJsonText(text) {
+  return JSON.parse(String(text).replace(/^\uFEFF/, ""));
+}
+
 function readChoiceEnv(name, allowedValues, fallback) {
+  // An unknown value used to fall back silently (WORKTREE_MODE=writes ran writers in the
+  // checkout with worktrees off). Unset or blank keeps the default; anything else must be listed.
   const value = String(process.env[name] || "").trim().toLowerCase();
-  return allowedValues.includes(value) ? value : fallback;
+  if (!value) return fallback;
+  if (allowedValues.includes(value)) return value;
+  throw new Error(`${name} must be one of ${allowedValues.join(", ")} (or unset for ${fallback}); got ${JSON.stringify(String(process.env[name]).trim())}.`);
 }
 
 async function runSingleFlight(flights, key, operation) {
@@ -1257,10 +1290,75 @@ function redactLikelySecrets(value) {
   return text;
 }
 
-// A NUL byte or a .gitattributes "binary" entry turns a source file into a base85
-// "GIT binary patch" hunk the reviewer cannot read, so the preview would approve content
-// nobody saw. Source and text extensions must arrive as readable text hunks.
-const REVIEWABLE_TEXT_EXTENSION = /\.(?:py|pyi|pyx|c|cc|cpp|cxx|h|hh|hpp|hxx|inl|ipp|cmake|txt|md|rst|json|toml|yaml|yml|ini|cfg|js|mjs|cjs|ts|tsx|jsx|sh|ps1|bat|cmd|html|css|xml|csv|sql|gitattributes|gitignore)$/i;
+// Git never reports edits under .git/ as changes, so a writer that rewrote .git/config
+// (core.hooksPath, an alias, a filter driver) or dropped a hook would pass every
+// changed-file check. This fingerprint covers the control files a job could use to run
+// code later: the repository config (and a linked worktree's config.worktree), every hook,
+// and a linked worktree's `.git` pointer file. Compare it before and after a write job.
+async function gitControlSurfaceFingerprint(cwd) {
+  const root = path.resolve(cwd || process.cwd());
+  const entries = {};
+  const record = async (label, filePath) => {
+    try {
+      const details = await lstat(filePath);
+      if (details.isSymbolicLink()) {
+        entries[label] = `symlink:${await readlink(filePath)}`;
+      } else if (details.isFile()) {
+        entries[label] = `file:${details.mode & 0o777}:${createHash("sha256").update(await readFile(filePath)).digest("hex")}`;
+      } else {
+        entries[label] = `other:${details.isDirectory() ? "directory" : "special"}`;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      entries[label] = "missing";
+    }
+  };
+  try {
+    const dotGit = path.join(root, ".git");
+    await record(".git", dotGit);
+    let gitDir = dotGit;
+    let commonDir = dotGit;
+    if (entries[".git"].startsWith("file:")) {
+      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(dotGit, "utf8"));
+      if (!pointer) return { ok: false, sha256: "", entries, error: "The .git file does not name a gitdir." };
+      gitDir = path.resolve(root, pointer[1]);
+      commonDir = gitDir;
+      try {
+        commonDir = path.resolve(gitDir, (await readFile(path.join(gitDir, "commondir"), "utf8")).trim());
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await record("gitdir/config.worktree", path.join(gitDir, "config.worktree"));
+    }
+    await record("common/config", path.join(commonDir, "config"));
+    let hookNames = [];
+    try {
+      hookNames = (await readdir(path.join(commonDir, "hooks"))).sort();
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    entries["common/hooks"] = hookNames.join("\0");
+    for (const name of hookNames) await record(`common/hooks/${name}`, path.join(commonDir, "hooks", name));
+    const sha256 = createHash("sha256").update(JSON.stringify(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)))).digest("hex");
+    return { ok: true, sha256, entries, error: "" };
+  } catch (error) {
+    return { ok: false, sha256: "", entries, error: error.message || String(error) };
+  }
+}
+
+// Paths whose .git/ control files differ between two gitControlSurfaceFingerprint() results.
+function gitControlSurfaceChanges(before, after) {
+  const labels = [...new Set([...Object.keys(before?.entries || {}), ...Object.keys(after?.entries || {})])].sort();
+  return labels.filter((label) => (before?.entries || {})[label] !== (after?.entries || {})[label]);
+}
+
+// A NUL byte or a .gitattributes "binary" entry turns a file into a base85 "GIT binary
+// patch" hunk the reviewer cannot read, and the secret scan only sees "+" text lines, so the
+// preview would approve content nobody saw. Every binary hunk is rejected unless its path
+// has a known binary media/font/archive extension or the caller acknowledges binary hunks.
+// (An allowlist of text extensions left every other extension, and extensionless files,
+// free to arrive as unreviewed binary.) Executables and libraries are deliberately absent.
+const KNOWN_BINARY_EXTENSION = /\.(?:png|jpe?g|gif|bmp|ico|icns|webp|avif|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|7z|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|ogg|flac|webm|mov|wasm)$/i;
 function binaryTextFilesInPatch(patchText) {
   const files = [];
   let current = "";
@@ -1268,7 +1366,7 @@ function binaryTextFilesInPatch(patchText) {
     const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
     if (header) { current = header[2]; continue; }
     if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
-      && (REVIEWABLE_TEXT_EXTENSION.test(current) || /(?:^|\/)(?:CMakeLists\.txt|Makefile|\.gitattributes)$/i.test(current))) {
+      && !KNOWN_BINARY_EXTENSION.test(current)) {
       files.push(current);
       current = "";
     }
@@ -1420,11 +1518,16 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
   }
 }
 
+// After the control channel reports "exit", stdout/stderr may still hold the payload's last
+// bytes; the result waits for the supervisor's "close" (all pipes drained) this long at most.
+const SUPERVISOR_EXIT_CLOSE_GRACE_MS = 5_000;
+
 async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, {
   signal = null,
   terminateOnProviderError = false,
   onSpawn = null,
   beforeHeartbeat = null,
+  supervisorScriptForTest = "",
 } = {}) {
   return new Promise((resolve) => {
     let stdout = "";
@@ -1434,7 +1537,13 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let stdoutChars = 0;
     let stderrChars = 0;
     let stdoutLineBuffer = "";
+    let stderrLineBuffer = "";
     let controlLineBuffer = "";
+    // One decoder per stream: a multi-byte UTF-8 character split across two pipe reads
+    // decoded chunk by chunk became two U+FFFD (Arabic text, emoji). Hashes stay on raw bytes.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let exitCloseFallbackTimer = null;
     const stdoutHash = createHash("sha256");
     const stderrHash = createHash("sha256");
     let stdoutTruncated = false;
@@ -1468,7 +1577,10 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     );
     const supervisorHeartbeatMs = Math.max(50, Math.min(5_000, Math.floor(supervisorWatchdogMs / 3)));
 
-    const supervisor = spawn(process.execPath, [PROCESS_SUPERVISOR_PATH, "--identity", supervisorIdentity], {
+    const supervisorScript = supervisorScriptForTest && process.argv.includes("--self-test")
+      ? supervisorScriptForTest
+      : PROCESS_SUPERVISOR_PATH;
+    const supervisor = spawn(process.execPath, [supervisorScript, "--identity", supervisorIdentity], {
       cwd: BRIDGE_RUNTIME_DIR,
       shell: false,
       windowsHide: true,
@@ -1481,9 +1593,11 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       if (startupTimer) clearTimeout(startupTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (terminationFallbackTimer) clearTimeout(terminationFallbackTimer);
+      if (exitCloseFallbackTimer) clearTimeout(exitCloseFallbackTimer);
       startupTimer = null;
       heartbeatTimer = null;
       terminationFallbackTimer = null;
+      exitCloseFallbackTimer = null;
     };
 
     const finish = (result) => {
@@ -1638,11 +1752,16 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       timedOut ||= reason === "timeout";
       const watchdogExpired = reason === "watchdog_expired";
       const terminationUnconfirmed = controlTerminationUnconfirmed || event.errorType === "termination_unconfirmed";
+      // The supervisor could not start the payload (ENOENT, E2BIG, a Windows command line
+      // over 32,767 characters). That used to surface as a bare nonzero exit.
+      const spawnFailed = event.errorType === "spawn_failed" || reason === "spawn_failed";
       const terminationErrorType = terminationUnconfirmed
         ? "process_tree_termination_unconfirmed"
         : watchdogExpired
           ? "process_supervisor_watchdog_expired"
-          : "";
+          : spawnFailed
+            ? "spawn_failed"
+            : "";
       const verifiedTermination = Boolean(event.treeTerminationConfirmed);
       const exitCode = cancelled
         ? 130
@@ -1668,6 +1787,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         terminationErrorType,
         containmentGuarantee: event.containmentGuarantee || "process_supervisor",
         terminationBestEffortSucceeded: Boolean(event.terminationBestEffortSucceeded),
+        spawnErrorCode: spawnFailed ? String(event.spawnErrorCode || event.errorCode || "spawn_failed") : "",
         stdoutTruncated,
         stderrTruncated,
       });
@@ -1701,7 +1821,20 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         if (!gateFailureType) gateFailureType = "process_supervisor_protocol_error";
         return;
       }
-      if (event.type === "exit") finishFromControlExit(event);
+      if (event.type === "exit") {
+        // Output the payload wrote before exiting may still be in the stdout/stderr pipes;
+        // finishing here dropped it (every later chunk hit `if (settled) return`). The
+        // supervisor's "close" fires once every pipe has drained; the timer bounds the wait.
+        controlExitEvent = event;
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+        if (!exitCloseFallbackTimer) {
+          exitCloseFallbackTimer = setTimeout(() => {
+            if (!settled) finishFromControlExit(controlExitEvent);
+          }, SUPERVISOR_EXIT_CLOSE_GRACE_MS);
+          exitCloseFallbackTimer.unref?.();
+        }
+      }
     };
 
     supervisor.stdio[3].setEncoding("utf8");
@@ -1728,11 +1861,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
     });
 
-    supervisor.stdout.on("data", (chunk) => {
-      if (settled) return;
-      const text = chunk.toString();
+    const consumeStdout = (text) => {
+      if (!text) return;
       stdoutChars += text.length;
-      stdoutHash.update(chunk);
       stdoutTail = `${stdoutTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stdout.length);
       if (remaining) stdout += text.slice(0, remaining);
@@ -1759,25 +1890,47 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
           }
         }
       }
-    });
+    };
 
-    supervisor.stderr.on("data", (chunk) => {
-      if (settled) return;
-      const text = chunk.toString();
+    const consumeStderr = (text) => {
+      if (!text) return;
       stderrChars += text.length;
-      stderrHash.update(chunk);
       stderrTail = `${stderrTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
       const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stderr.length);
       if (remaining) stderr += text.slice(0, remaining);
       stderrTruncated ||= text.length > remaining;
-      const recentErrorLines = text.split(/\r?\n/)
+      // Classify whole lines only: a diagnostic split across two reads was judged as two
+      // fragments, each of which could miss or mis-match the classifier.
+      stderrLineBuffer += text;
+      const lines = stderrLineBuffer.split(/\r?\n/);
+      stderrLineBuffer = (lines.pop() || "").slice(-64 * 1024);
+      const recentErrorLines = lines
         .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
         .filter((line) => /level\s*=\s*ERROR|\berror\b\s*[:=.]|APIError|CreditsError|HTTP\s+[45]\d\d/i.test(line))
         .slice(-20)
         .join("\n");
-      if (terminateOnProviderError && !providerTerminated && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
+      if (terminateOnProviderError && !providerTerminated && recentErrorLines && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
         requestTermination("provider_error");
       }
+    };
+
+    supervisor.stdout.on("data", (chunk) => {
+      if (settled) return;
+      stdoutHash.update(chunk);
+      consumeStdout(stdoutDecoder.write(chunk));
+    });
+    supervisor.stdout.on("end", () => {
+      if (!settled) consumeStdout(stdoutDecoder.end());
+    });
+
+    supervisor.stderr.on("data", (chunk) => {
+      if (settled) return;
+      stderrHash.update(chunk);
+      consumeStderr(stderrDecoder.write(chunk));
+    });
+    supervisor.stderr.on("end", () => {
+      if (settled) return;
+      consumeStderr(stderrDecoder.end());
     });
 
     supervisor.once("error", () => {
@@ -1811,6 +1964,14 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         processRole: "supervisor",
         containmentIdentity: supervisorIdentity,
       })).then((authority) => {
+        // An explicit refusal from the launch gate is a failure like a thrown error; it used
+        // to be ignored and the payload launched anyway.
+        if (authority?.ok === false) {
+          gateFailureType = "child_identity_persistence_failed";
+          logEvent("warn", "opencode.supervisor_launch_gate_rejected", { errorType: String(authority?.errorType || "") });
+          requestTermination("launch_gate_rejected");
+          return;
+        }
         launchAuthorityDeadlineAt = Number(authority?.deadlineAt || Date.now() + supervisorWatchdogMs);
         identityPersisted = true;
         maybeLaunch();
@@ -1968,16 +2129,42 @@ function validationCommandTrustError(parsed, { strictProjectPolicy = false } = {
   if (!allowed.has(executable)) {
     return `Validation executable is not operator-allowlisted: ${parsed[0]}`;
   }
-  if (["cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx"].includes(executable)) {
+  if (["cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx", "pnpx", "bunx"].includes(executable)) {
     return `Shell, interpreter, and package-executor validation commands are forbidden: ${parsed[0]}`;
   }
-  if (["node", "python", "python3", "bun", "deno"].includes(executable)
-    && parsed.some((argument) => ["-e", "-c", "--eval", "--print"].includes(String(argument).toLowerCase()))) {
-    return `Inline evaluation is forbidden in validation commands: ${parsed[0]}`;
+  // Interpreter options that run inline code or preload modules: -e/-p/-c and bundles such as
+  // -pe or -Ic, -r (node --require), and the long forms. Python stops reading interpreter
+  // options at "-m <module>", so the module's own arguments (pytest -p ...) are not checked.
+  const interpreterCodeOption = /^-(?:[a-z]*[ecpr][a-z]*|-(?:eval|print|import|require|loader|experimental-loader|experimental-default-type|env-file|inspect[a-z-]*))(?:=|$)/i;
+  if (["node", "python", "python3", "py", "bun", "deno"].includes(executable)) {
+    const pythonLike = ["python", "python3", "py"].includes(executable);
+    for (const argument of parsed.slice(1).map(String)) {
+      if (pythonLike && argument === "-m") break;
+      if (interpreterCodeOption.test(argument)) {
+        return `Inline evaluation and module preloading are forbidden in validation commands: ${parsed[0]} ${argument}`;
+      }
+    }
+    if (executable === "deno" && ["eval", "repl"].includes(String(parsed.find((argument, index) => index > 0 && !String(argument).startsWith("-")) || "").toLowerCase())) {
+      return `Inline evaluation is forbidden in validation commands: ${parsed.join(" ")}`;
+    }
   }
-  if (["npm", "pnpm", "yarn", "bun"].includes(executable)
-    && parsed.some((argument) => ["exec", "x", "dlx"].includes(String(argument).toLowerCase()))) {
-    return `Package-executor validation subcommands are forbidden: ${parsed.join(" ")}`;
+  // Package managers: only the subcommand position selects an executor. Any other argument
+  // equal to "x" or "exec" ("pnpm test --filter x") used to be rejected. When options come
+  // before the subcommand their values cannot be told apart from it, so every bare word up
+  // to "--" is checked then.
+  if (["npm", "pnpm", "yarn", "bun"].includes(executable)) {
+    const executorSubcommands = new Set(["exec", "x", "dlx", "create", "init", "explore", "node"]);
+    const rest = parsed.slice(1).map(String);
+    const separator = rest.indexOf("--");
+    const beforeSeparator = separator === -1 ? rest : rest.slice(0, separator);
+    const subcommandIndex = beforeSeparator.findIndex((argument) => !argument.startsWith("-"));
+    const candidates = subcommandIndex <= 0
+      ? beforeSeparator.slice(subcommandIndex === -1 ? 0 : subcommandIndex, subcommandIndex === -1 ? 0 : subcommandIndex + 1)
+      : beforeSeparator.filter((argument) => !argument.startsWith("-"));
+    const executor = candidates.find((argument) => executorSubcommands.has(argument.toLowerCase()));
+    if (executor) {
+      return `Package-executor validation subcommands are forbidden: ${parsed.join(" ")}`;
+    }
   }
   if (strictProjectPolicy && executable !== "git") {
     return "Untrusted project policy may execute only a hash-pinned Git read/check vector. Package scripts and repository interpreters require an external sandbox.";
@@ -2060,15 +2247,22 @@ async function resolveValidationExecutable(command) {
   }
   for (const candidate of candidates) {
     try {
+      // Package managers install binaries as symlinks (/usr/bin/python3, Homebrew, nvm):
+      // resolve the link and require the target to be a regular file. The allowlist and hash
+      // checks compare this canonical target.
       const details = await lstat(candidate);
-      if (details.isSymbolicLink() || !details.isFile()) continue;
-      const canonicalPath = realpathSync(candidate);
+      const canonicalPath = details.isSymbolicLink() ? await realpath(candidate) : candidate;
+      const targetDetails = details.isSymbolicLink() ? await stat(canonicalPath) : details;
+      if (!targetDetails.isFile()) continue;
+      const resolvedPath = realpathSync(canonicalPath);
       return {
-        path: canonicalPath,
-        sha256: await sha256File(canonicalPath),
+        path: resolvedPath,
+        sha256: await sha256File(resolvedPath),
       };
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      // A PATH entry that is a file (ENOTDIR), unreadable (EACCES/EPERM) or a dangling link
+      // is skipped like a missing one instead of failing every validation command.
+      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP"].includes(error?.code)) throw error;
     }
   }
   throw new Error(`Validation executable could not be resolved through the trusted process PATH: ${raw}`);
@@ -2402,6 +2596,8 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
   const deadlineAt = started + waitBudgetMs;
+  let observedHolders = 0;
+  let observedCapacity = CONFIG.providerConcurrencyLimit;
   while (Date.now() < deadlineAt) {
     await reclaimProvenGoneProviderQuarantines();
     if (signal?.aborted) {
@@ -2432,6 +2628,8 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
           db.prepare("UPDATE provider_capacities SET capacity = ?, updated_at = ? WHERE provider_key = ?").run(configuredCapacity, now, providerKey);
         }
       }
+      observedHolders = active;
+      observedCapacity = effectiveCapacity;
       if (active < effectiveCapacity) {
         const lease = {
           id: `${BRIDGE_INSTANCE_ID}-${randomBytes(6).toString("hex")}`,
@@ -2450,7 +2648,7 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
         return { ok: false, errorType: "agent_cancelled", error: error.message || String(error) };
       }
       if (error?.code === "PROVIDER_CONCURRENCY_TIMEOUT") {
-        return { ok: false, errorType: "provider_concurrency_timeout", error: error.message || String(error) };
+        return { ok: false, errorType: "provider_slot_wait_timeout", error: error.message || String(error), waitedMs: Date.now() - started, holders: observedHolders, capacity: observedCapacity };
       }
       if (!/database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(error.message || String(error))) {
         return { ok: false, errorType: "provider_concurrency_failed", error: error.message || String(error) };
@@ -2467,7 +2665,14 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       return { ok: false, errorType: "agent_cancelled", error: "Cancelled while waiting for provider capacity." };
     }
   }
-  return { ok: false, errorType: "provider_concurrency_timeout", error: "Timed out waiting for the operator-configured provider/account concurrency limit." };
+  return {
+    ok: false,
+    errorType: "provider_slot_wait_timeout",
+    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs}). The agent was not started.`,
+    waitedMs: Date.now() - started,
+    holders: observedHolders,
+    capacity: observedCapacity,
+  };
 }
 
 function providerLeaseOwnershipLossError(detail = "Durable provider-capacity ownership could not be renewed before expiry.") {
@@ -2533,10 +2738,19 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
         lease.expiresAt = expiresAt;
         lastConfirmedExpiresAt = expiresAt;
         scheduleFence();
-        return true;
+        return { ok: true, deadlineAt: lastConfirmedExpiresAt - expiryGuardMs };
       } catch (error) {
+        // A thrown error (SQLITE_BUSY, a transient open failure) proves nothing about
+        // ownership; the last confirmed expiry still holds. Returning false here killed the
+        // running agent on one busy database read. Fail only once that deadline has passed
+        // (the fence timer enforces it too) or when the renewal changed no row.
         logEvent("warn", "provider.lease_heartbeat_failed", { leaseId: lease.id, error: error.message || String(error) });
-        return false;
+        const deadlineAt = lastConfirmedExpiresAt - expiryGuardMs;
+        if (deadlineAt <= Date.now()) {
+          loseOwnership("The provider-capacity lease could not be renewed before its confirmed expiry.");
+          return false;
+        }
+        return { ok: true, deadlineAt, renewalFailed: true };
       } finally {
         if (db) closeDb(db);
       }
@@ -2601,16 +2815,41 @@ async function sweepStaleIndexScratchDirs(maxAgeMs = 1000 * 60 * 60 * 24) {
   return removed;
 }
 
-async function processDescendants(rootPids) {
+// One process-table read: pid, parent pid and creation time. The creation time tells a
+// recorded process from a later one that reused its PID (Windows reuses PIDs quickly), which
+// otherwise held a containment quarantine indefinitely or attributed a stranger's process.
+async function processTable() {
   const listed = process.platform === "win32"
     ? await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
-    : await runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20);
-  if (listed.exitCode !== 0) return { ok: false, pids: [] };
-  const children = new Map();
+      "Get-CimInstance Win32_Process | ForEach-Object { $c = if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { '' }; \"$($_.ProcessId),$($_.ParentProcessId),$c\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
+    : await runCommand("ps", ["-A", "-o", "pid=,ppid=,lstart="], BRIDGE_RUNTIME_DIR, 1000 * 20, { ...process.env, LC_ALL: "C" })
+      .then((result) => (result.exitCode === 0
+        ? result
+        // A ps without lstart (BusyBox) still yields PID-only evidence.
+        : runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20)));
+  if (listed.exitCode !== 0) return { ok: false, at: Date.now(), rows: [] };
+  const rows = [];
   for (const line of String(listed.stdout || "").split(/\r?\n/)) {
-    const [pid, ppid] = line.trim().split(/[\s,]+/).map(Number);
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0 || pid === ppid) continue;
+    const match = process.platform === "win32"
+      ? /^\s*(\d+),(\d+),(\d*)\s*$/.exec(line)
+      : /^\s*(\d+)\s+(\d+)(?:\s+(.+?))?\s*$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0) continue;
+    rows.push({ pid, ppid, createdAt: String(match[3] || "").trim() });
+  }
+  return { ok: true, at: Date.now(), rows };
+}
+
+async function processDescendants(rootPids) {
+  const table = await processTable();
+  if (!table.ok) return { ok: false, pids: [], processes: [] };
+  const children = new Map();
+  const createdAt = new Map();
+  for (const { pid, ppid, createdAt: created } of table.rows) {
+    createdAt.set(pid, created);
+    if (pid === ppid) continue;
     if (!children.has(ppid)) children.set(ppid, []);
     children.get(ppid).push(pid);
   }
@@ -2623,19 +2862,51 @@ async function processDescendants(rootPids) {
       queue.push(child);
     }
   }
-  return { ok: true, pids: [...found] };
+  const pids = [...found];
+  return {
+    ok: true,
+    pids,
+    processes: [...rootPids, ...pids].map((pid) => ({ pid, createdAt: createdAt.get(pid) || "" })),
+  };
 }
 
 async function containmentRecord(result = {}) {
   const payloadPid = Number(result?.payloadProcessId || 0);
   const supervisorPid = Number(result?.supervisorProcessId || 0);
   const roots = [supervisorPid, payloadPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0);
-  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [] })) : { ok: false, pids: [] };
+  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [], processes: [] })) : { ok: false, pids: [], processes: [] };
+  const processes = (descendants.processes || []).filter((item) => item.createdAt);
+  const pids = [...roots, ...descendants.pids];
   return JSON.stringify({
-    pids: [...roots, ...descendants.pids],
+    pids,
+    // Creation time per PID where the process table reported one. PIDs without one are
+    // evidence by PID only, so reclaim stays as conservative as before for them.
+    processes,
+    pidOnly: processes.length < pids.length,
     complete: payloadPid > 0 && descendants.ok,
     recordedAt: Date.now(),
   });
+}
+
+// Process-table reads are cached briefly so a reclaim pass over several quarantines spawns
+// the listing once. A cached table older than a record cannot prove anything about it.
+let processTableProbe = null;
+async function processTableNewerThan(recordedAt) {
+  if (!processTableProbe || processTableProbe.at < recordedAt || Date.now() - processTableProbe.at > 1000 * 30) {
+    processTableProbe = await processTable().catch(() => ({ ok: false, at: Date.now(), rows: [] }));
+  }
+  return processTableProbe;
+}
+
+async function recordedProcessStillRuns(pid, createdAt, recordedAt) {
+  if (!containmentProcessExists(pid)) return false;
+  if (!createdAt) return true;
+  const table = await processTableNewerThan(recordedAt);
+  if (!table.ok || table.at < recordedAt) return true;
+  const row = table.rows.find((item) => item.pid === pid);
+  // Absent from a listing taken after the record: that process is gone and the live PID
+  // belongs to a process started later. A different creation time: the PID was reused.
+  return Boolean(row) && row.createdAt === createdAt;
 }
 
 function containmentProcessExists(pid) {
@@ -2672,8 +2943,13 @@ async function containmentStillPossible(containmentJson, ownerPid = 0) {
   let info = {};
   try { info = JSON.parse(containmentJson || "{}") || {}; } catch { info = {}; }
   const pids = Array.isArray(info.pids) ? info.pids.map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
-  if (pids.some(containmentProcessExists)) return true;
   const recordedAt = Number(info.recordedAt || 0);
+  const createdAtByPid = new Map((Array.isArray(info.processes) ? info.processes : [])
+    .map((item) => [Number(item?.pid), String(item?.createdAt || "")])
+    .filter(([pid, created]) => Number.isSafeInteger(pid) && pid > 0 && created));
+  for (const pid of pids) {
+    if (await recordedProcessStillRuns(pid, createdAtByPid.get(pid) || "", recordedAt)) return true;
+  }
   if (recordedAt > 0 && Date.now() - recordedAt < CONFIG.containmentReleaseGraceMs) return true;
   if (info.complete === true && pids.length) return false;
   if (containmentProcessExists(Number(ownerPid))) return true;
@@ -2745,22 +3021,36 @@ async function reclaimLockQuarantinesForRoot(projectRoot) {
 }
 
 async function quarantineProviderLease(lease, containment = "") {
-  if (!lease?.id) return { ok: false };
+  if (!lease?.id) return { ok: false, error: "No provider lease to quarantine." };
   let db = null;
   try {
     const now = Date.now();
     db = await openProviderLeaseDb({ deadlineAt: now + 1000 * 30 });
+    db.exec("BEGIN IMMEDIATE");
     const quarantined = db.prepare(`
       UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?, containment = ?
       WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
     `).run(now, Number.MAX_SAFE_INTEGER, String(containment || ""), lease.id, BRIDGE_INSTANCE_ID, now);
-    return { ok: Number(quarantined.changes || 0) === 1 };
+    if (Number(quarantined.changes || 0) === 1) {
+      db.exec("COMMIT");
+      return { ok: true, leaseId: lease.id, inserted: false };
+    }
+    // The lease already expired (a long termination outlived it) or was reclaimed. The
+    // process tree may still run, so the slot must still be held: write a new quarantine row.
+    db.prepare("DELETE FROM provider_leases WHERE lease_id = ? AND owner_instance_id = ?").run(lease.id, BRIDGE_INSTANCE_ID);
+    const leaseId = `${BRIDGE_INSTANCE_ID}-quarantine-${randomBytes(6).toString("hex")}`;
+    db.prepare("INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(leaseId, String(lease.providerKey || CONFIG.providerConcurrencyKey), BRIDGE_INSTANCE_ID, process.pid, now, now, Number.MAX_SAFE_INTEGER, String(containment || ""));
+    db.exec("COMMIT");
+    logEvent("warn", "provider.containment_quarantine_reinserted", { leaseId: lease.id, quarantineLeaseId: leaseId });
+    return { ok: true, leaseId, inserted: true };
   } catch (error) {
+    try { db?.exec("ROLLBACK"); } catch { /* keep the original error */ }
     logEvent("error", "provider.containment_quarantine_failed", {
       leaseId: lease.id,
       error: error.message || String(error),
     });
-    return { ok: false };
+    return { ok: false, error: error.message || String(error) };
   } finally {
     if (db) closeDb(db);
   }
@@ -2777,17 +3067,26 @@ function providerKeyForMetadata(metadata = null) {
     : `${CONFIG.providerConcurrencyKey}:${provider}`;
 }
 
+// LIKE pattern for "<key>:<provider>" rows; "_" and "%" in the operator key are literals.
+function providerKeyLikePattern(baseKey) {
+  return `${String(baseKey).replace(/[\\%_]/g, (item) => `\\${item}`)}:%`;
+}
+
 async function providerCapacitySnapshot() {
   let db = null;
   try {
     db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
     const now = Date.now();
     db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
-    const capacity = db.prepare("SELECT capacity, updated_at FROM provider_capacities WHERE provider_key = ?").get(CONFIG.providerConcurrencyKey);
+    const likePattern = providerKeyLikePattern(CONFIG.providerConcurrencyKey);
+    const capacityRows = db.prepare(`
+      SELECT provider_key, capacity FROM provider_capacities WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'
+    `).all(CONFIG.providerConcurrencyKey, likePattern);
+    const capacityByKey = new Map(capacityRows.map((row) => [row.provider_key, Number(row.capacity)]));
     const leases = db.prepare(`
       SELECT lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at
-      FROM provider_leases WHERE provider_key = ? OR provider_key LIKE ? ORDER BY created_at
-    `).all(CONFIG.providerConcurrencyKey, `${CONFIG.providerConcurrencyKey}:%`).map((row) => ({
+      FROM provider_leases WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\' ORDER BY created_at
+    `).all(CONFIG.providerConcurrencyKey, likePattern).map((row) => ({
       leaseId: row.lease_id,
       providerKey: row.provider_key,
       ownerInstanceId: row.owner_instance_id,
@@ -2796,10 +3095,27 @@ async function providerCapacitySnapshot() {
       heartbeatAt: row.heartbeat_at ? new Date(Number(row.heartbeat_at)).toISOString() : "",
       expiresAt: new Date(Number(row.expires_at)).toISOString(),
       remainingMs: Math.max(0, Number(row.expires_at) - now),
+      quarantined: Number(row.expires_at) === Number.MAX_SAFE_INTEGER,
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: Number(capacity?.capacity || CONFIG.providerConcurrencyLimit), leases };
+    // Leases are stored per "<key>:<provider>"; the base key's capacity said nothing about
+    // them ("capacity 4, 6 leases" across two providers). Report each key on its own.
+    const capacityFor = (key) => {
+      const stored = capacityByKey.get(key);
+      return Number.isInteger(stored) && stored > 0 ? stored : CONFIG.providerConcurrencyLimit;
+    };
+    const keyNames = [...new Set([...capacityByKey.keys(), ...leases.map((lease) => lease.providerKey)])].sort();
+    const keys = keyNames.map((key) => {
+      const held = leases.filter((lease) => lease.providerKey === key);
+      return {
+        providerKey: key,
+        capacity: capacityFor(key),
+        leases: held.length,
+        quarantined: held.filter((lease) => lease.quarantined).length,
+      };
+    });
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases };
   } catch (error) {
-    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, leases: [], error: redactSensitiveText(error.message || String(error)) };
+    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
     if (db) closeDb(db);
   }
@@ -3251,7 +3567,11 @@ function parseModelAllowlistEntry(entry) {
   const slash = modelPart.indexOf("/");
   if (slash <= 0 || slash === modelPart.length - 1) return null;
   if (at > 0 && !variant) return null;
-  return { provider: modelPart.slice(0, slash).trim(), model: modelPart.slice(slash + 1).trim(), variant };
+  const provider = modelPart.slice(0, slash).trim();
+  const model = modelPart.slice(slash + 1).trim();
+  // The same identifier rules as modelRequirementSchema: these become CLI arguments.
+  if (!MODEL_IDENTIFIER_PATTERN.test(provider) || !MODEL_NAME_PATTERN.test(model) || (variant && !MODEL_IDENTIFIER_PATTERN.test(variant))) return null;
+  return { provider, model, variant };
 }
 
 function activeModelOverrideAllowlist() {
@@ -3288,7 +3608,9 @@ function applyModelOverrideToMetadata(metadata, override) {
     ...metadata,
     provider: override.provider,
     model: override.model,
-    variant: override.variant || metadata.variant || "",
+    // The managed profile's variant belongs to the managed model; a different overridden
+    // model runs with the override's variant only (none when the allowlist pins none).
+    variant: override.variant || "",
     modelSelection: "operator_allowlist_override",
     profileProvider: metadata.provider,
     profileModel: metadata.model,
@@ -3718,10 +4040,44 @@ function exactPluginPackageName(specifier) {
   return separator > 0 ? value.slice(0, separator) : "";
 }
 
+// OpenCode config files the plugin policy must account for. Every bridge child runs with
+// OPENCODE_DISABLE_PROJECT_CONFIG=true (buildOpenCodeEnv), so OpenCode never loads a
+// repository's opencode.json(c); counting those files rejected every repository that ships
+// its own plugin config. They are skipped (and logged) while that flag is enforced; project
+// plugin directories are still checked, and the `debug config` effective-plugin attestation
+// still fails closed if OpenCode ever loads a plugin the manifest does not pin.
+function pluginConfigCandidatePaths(projectDirectories = [], managedDirectories = [], {
+  projectConfigDisabled = buildOpenCodeEnv().OPENCODE_DISABLE_PROJECT_CONFIG === "true",
+} = {}) {
+  const projectCandidates = projectDirectories.flatMap((directory) => [
+    path.join(directory, "opencode.json"),
+    path.join(directory, "opencode.jsonc"),
+    path.join(directory, ".opencode", "opencode.json"),
+    path.join(directory, ".opencode", "opencode.jsonc"),
+  ]).map((item) => path.resolve(item));
+  if (projectConfigDisabled) {
+    const ignored = projectCandidates.filter((item) => existsSync(item));
+    if (ignored.length) {
+      logEvent("info", "plugin.project_config_ignored", {
+        reason: "OPENCODE_DISABLE_PROJECT_CONFIG=true",
+        files: ignored.slice(0, 8),
+      });
+    }
+  }
+  return [...new Set([
+    path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.json"),
+    path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.jsonc"),
+    ...managedDirectories.flatMap((directory) => [path.join(directory, "opencode.json"), path.join(directory, "opencode.jsonc")]),
+    ...(projectConfigDisabled ? [] : projectCandidates),
+  ].map((item) => path.resolve(item)))];
+}
+
 function expectedOpenCodePluginResolution(specifier) {
   const packageName = exactPluginPackageName(specifier);
   if (!packageName) return null;
-  const root = path.join(USER_HOME_DIR, ".cache", "opencode", "packages", specifier);
+  // OpenCode resolves packages under $XDG_CACHE_HOME/opencode, and buildOpenCodeEnv() sets
+  // XDG_CACHE_HOME to DEFAULT_OPENCODE_CACHE_HOME; a hard-coded ~/.cache checked another tree.
+  const root = path.join(DEFAULT_OPENCODE_CACHE_HOME, "opencode", "packages", specifier);
   return {
     root: path.resolve(root),
     packageRoot: path.resolve(path.join(root, "node_modules", packageName)),
@@ -3749,7 +4105,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     if (actualManifestSha256 !== CONFIG.expectedExternalPluginManifestSha256) {
       throw new Error(`External plugin manifest hash mismatch. Expected ${CONFIG.expectedExternalPluginManifestSha256}, got ${actualManifestSha256}.${await staleBridgeProcessHint(actualManifestSha256)}`);
     }
-    const manifest = JSON.parse(manifestContent.toString("utf8"));
+    const manifest = parseJsonText(manifestContent.toString("utf8"));
     if (manifest?.version !== 1 || !Array.isArray(manifest.plugins) || !manifest.plugins.length
       || !Array.isArray(manifest.configs) || !manifest.configs.length
       || !Array.isArray(manifest.settings) || !manifest.settings.length
@@ -3788,17 +4144,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
 
     const projectDirectories = await openCodeProjectConfigDirectories(cwd);
     const managedDirectories = managedOpenCodeConfigDirectories();
-    const configCandidates = [...new Set([
-      path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.json"),
-      path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.jsonc"),
-      ...managedDirectories.flatMap((directory) => [path.join(directory, "opencode.json"), path.join(directory, "opencode.jsonc")]),
-      ...projectDirectories.flatMap((directory) => [
-        path.join(directory, "opencode.json"),
-        path.join(directory, "opencode.jsonc"),
-        path.join(directory, ".opencode", "opencode.json"),
-        path.join(directory, ".opencode", "opencode.jsonc"),
-      ]),
-    ].map((item) => path.resolve(item)))];
+    const configCandidates = pluginConfigCandidatePaths(projectDirectories, managedDirectories);
     const activeConfigs = (await Promise.all(configCandidates.map(readPluginConfigSource))).filter(Boolean);
     const configuredManifestPaths = new Set(manifest.configs.map((item) => path.resolve(String(item?.path || ""))));
     const pluginBearingConfigPaths = new Set(activeConfigs.filter((item) => item.specs.length).map((item) => item.path));
@@ -3851,7 +4197,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       if (packageDetails.isSymbolicLink() || !packageDetails.isDirectory()) {
         throw new Error(`External plugin package root is not a real directory: ${plugin.specifier}.`);
       }
-      const packageJson = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
+      const packageJson = parseJsonText(await readFile(path.join(packageRoot, "package.json"), "utf8"));
       const expectedName = plugin.specifier.replace(/@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "");
       const expectedVersion = plugin.specifier.slice(expectedName.length + 1);
       if (packageJson.name !== expectedName || packageJson.version !== expectedVersion) {
@@ -3867,7 +4213,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       if (await sha256File(settingPath) !== setting.sha256) {
         throw new Error(`Pinned external plugin settings changed: ${settingPath}`);
       }
-      const parsed = JSON.parse(await readFile(settingPath, "utf8"));
+      const parsed = parseJsonText(await readFile(settingPath, "utf8"));
       for (const [key, expected] of Object.entries(setting.requiredValues || {})) {
         if (parsed[key] !== expected) {
           throw new Error(`External plugin security setting ${key} does not match the pinned value.`);
@@ -4067,7 +4413,7 @@ async function verifySanitizedWorkspace(contract, phase = "manual") {
     if (actualManifestSha256 !== parsedContract.manifestSha256.toLowerCase()) {
       throw new Error(`Sanitized workspace manifest hash mismatch. Expected ${parsedContract.manifestSha256.toLowerCase()}, got ${actualManifestSha256}.`);
     }
-    const manifest = JSON.parse(manifestContent.toString("utf8"));
+    const manifest = parseJsonText(manifestContent.toString("utf8"));
     if (manifest?.version !== 1 || !manifest.files || typeof manifest.files !== "object" || Array.isArray(manifest.files) || !Array.isArray(manifest.directories)) {
       throw new Error("Sanitized workspace manifest must contain version 1, a files object, and an exact directories array.");
     }
@@ -4158,7 +4504,17 @@ function providerErrorTypeFromText(value) {
   if (!text.trim()) {
     return "";
   }
-  if (/CreditsError|No payment method|insufficient.{0,20}(credit|balance)|(?:provider|account|payment|quota).{0,40}billing|billing.{0,40}(?:disabled|failed|required|problem|error|account|quota)/i.test(text)) {
+  // Ordinary 429s carry billing words: Gemini says "You exceeded your current quota, please
+  // check your plan and billing details" and OpenAI links ".../account/billing" to add a
+  // payment method. Checked first, those made every rate limit a non-retryable billing error
+  // that also killed the run. A rate-limit marker wins unless an explicit billing marker is
+  // present (OpenAI's insufficient_quota, CreditsError, 402 Payment Required) or the limit
+  // is a daily/hard quota that retrying cannot clear.
+  const explicitBilling = /insufficient_quota|CreditsError|payment.required|\b402\b/i.test(text);
+  if (/\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|rate.?limit|too many requests/i.test(text) && !explicitBilling) {
+    return /daily.{0,80}(quota|limit)|per.?day\b|hard.{0,40}quota/i.test(text) ? "opencode_quota_exhausted" : "opencode_rate_limited";
+  }
+  if (explicitBilling || /No payment method|insufficient.{0,20}(credit|balance)|(?:provider|account|payment|quota).{0,40}billing|billing.{0,40}(?:disabled|failed|required|problem|error|account|quota)/i.test(text)) {
     return "opencode_billing_error";
   }
   if (/daily.{0,80}(quota|limit)|quota.{0,80}(exhausted|exceeded).{0,80}(daily|billing)|hard.{0,40}quota/i.test(text)) {
@@ -4225,13 +4581,43 @@ function providerErrorTypeFromStructuredEvent(event) {
     event.providerId,
   ].filter((item) => item !== undefined && item !== null && String(item).trim()).join(" ");
   const fieldType = providerErrorTypeFromText(authoritativeFields);
+  // A status code is authoritative over message wording: 429 is a rate limit even when the
+  // message mentions billing, 402 is billing. Message text only refines a status-less error.
+  const statusValues = [
+    errorValue.status,
+    errorValue.statusCode,
+    errorValue.code,
+    errorValue.data?.status,
+    errorValue.data?.statusCode,
+    errorValue.data?.code,
+  ].map((item) => String(item ?? "").trim()).filter(Boolean);
+  const messageText = [errorValue.message, errorValue.detail, errorValue.data?.message, errorValue.data?.detail].filter(Boolean).join(" ");
+  const statusType = statusValues.includes("402")
+    ? "opencode_billing_error"
+    : statusValues.length ? providerErrorTypeFromText(statusValues.join(" ")) : "";
   const hasProviderContext = /(?:^|\s)(?:APIError|CreditsError|Provider[A-Za-z]*(?:Error|Timeout)|OAuth[A-Za-z]*Error|Auth[A-Za-z]*Error|Quota[A-Za-z]*Error|RateLimit[A-Za-z]*Error|Billing[A-Za-z]*Error|Transport[A-Za-z]*Error|Network[A-Za-z]*Error|Fetch[A-Za-z]*Error|Timeout[A-Za-z]*Error)(?:\s|$)/i.test(authoritativeFields)
     || Boolean(errorValue.providerID || errorValue.providerId || errorValue.data?.providerID || errorValue.data?.providerId);
-  if (hasProviderContext) {
-    const contextualType = providerErrorTypeFromText([authoritativeFields, errorValue.message, errorValue.detail, errorValue.data?.message, errorValue.data?.detail].filter(Boolean).join(" "));
-    if (contextualType) return contextualType;
+  const contextualType = hasProviderContext
+    ? providerErrorTypeFromText([authoritativeFields, messageText].filter(Boolean).join(" "))
+    : "";
+  let type = "";
+  if (statusType === "opencode_rate_limited") {
+    // Still a rate limit unless the text adds an explicit billing marker or a daily quota.
+    type = providerErrorTypeFromText([statusValues.join(" "), authoritativeFields, messageText].filter(Boolean).join(" "));
+  } else if (statusType && statusType !== "opencode_api_error") {
+    type = statusType;
+  } else {
+    type = (fieldType && fieldType !== "opencode_api_error" ? fieldType : "") || contextualType || fieldType;
   }
-  return fieldType;
+  // OpenCode marks provider errors it would retry itself (429, 5xx, overloaded) isRetryable.
+  if (errorValue.data?.isRetryable === true || errorValue.isRetryable === true) {
+    if (type === "opencode_billing_error" && !/insufficient_quota|CreditsError|payment.required|\b402\b/i.test(`${authoritativeFields} ${messageText}`)) {
+      type = "opencode_rate_limited";
+    } else if (!type || type === "opencode_api_error") {
+      type = "opencode_transient_provider_error";
+    }
+  }
+  return type;
 }
 
 function modelEvidenceFromEvent(event) {
@@ -4356,8 +4742,10 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     .filter((line) => /permission requested:.*auto-rejecting|permission.{0,30}denied/i.test(line))
     .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line));
   permissionDeniedCount = Math.max(permissionDeniedCount, deniedDiagnostics.length);
+  // OpenCode logs every failed provider attempt to stderr, including ones it retried and
+  // then completed; a generic APIError there must not fail a run that produced its answer.
   const recoveredTransientProviderError = !stdoutErrorDetected
-    && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error"].includes(stderrProviderErrorType)
+    && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error", "opencode_api_error"].includes(stderrProviderErrorType)
     && finalResponseDetected;
   if (recoveredTransientProviderError) {
     providerErrorType = "";
@@ -4469,21 +4857,25 @@ async function resolveAgent(requestedAgent, cwd, allowFallbackToBuild = false, s
         fallbackUsed: false,
         proxyUsed: false,
         subagentStrategy: normalizedStrategy,
-        error: `OpenCode agent "${agent}" is a subagent. This OpenCode CLI version does not run subagents as top-level agents through "opencode run --agent ${agent}". Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}", or "direct" only if you want to test native CLI behavior.`,
+        error: `OpenCode agent "${agent}" is a subagent. This OpenCode CLI version does not run subagents as top-level agents through "opencode run --agent ${agent}". Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}".`,
         availableAgents: availableAgentLabels(agents),
         discoveryExitCode: result.exitCode,
       };
     }
 
+    // "direct" used to return the subagent as the actual agent, which could never succeed:
+    // `opencode run --agent <subagent>` falls back to the default agent, so the attested
+    // profile is not the one that would run, and the pre-spawn attestation requires a
+    // primary/all mode. It is rejected with the reason instead of failing later.
     if (normalizedStrategy === "direct") {
       return {
         requestedAgent: agent,
         requestedAgentMode: mode,
-        actualAgent: routedAgent,
+        actualAgent: null,
         fallbackUsed: false,
         proxyUsed: false,
         subagentStrategy: normalizedStrategy,
-        error: null,
+        error: `OpenCode agent "${agent}" is a subagent, and subagentStrategy "direct" cannot run it: "opencode run --agent ${agent}" falls back to the default agent, which the bridge cannot attest as the requested role. Use subagentStrategy "proxy" to run it through "${DEFAULT_SUBAGENT_PROXY_AGENT}".`,
         availableAgents: availableAgentLabels(agents),
         discoveryExitCode: result.exitCode,
       };
@@ -4622,10 +5014,11 @@ function normalizeLockPath(value) {
     .replace(/^(?:\.\/)+/, "")
     .replace(/\/\.(?=\/|$)/g, "")
     .replace(/\/+/g, "/");
+  // Only "dir/**" means the whole directory. "dir/*" is one level and stays a glob:
+  // stripping it turned allowedEdits ["src/cli/*"] into "src/cli", which allowed src/cli/deep/x.ts.
   const normalized = slashNormalized
     .replace(/\/+$/, "")
     .replace(/\/\*\*$/, "")
-    .replace(/\/\*$/, "")
     .replace(/\/+$/, "");
   return normalized || (slashNormalized.startsWith("/") ? "/" : "");
 }
@@ -4983,7 +5376,7 @@ async function loadProjectAgentPolicy(
         trustedForAuthority = false;
       }
     }
-    const raw = JSON.parse(content);
+    const raw = parseJsonText(content);
     if (raw?.requiresWorktrees === false) {
       return {
         ok: false,
@@ -5155,21 +5548,74 @@ function escapeRegex(value) {
   return String(value).replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
 }
 
-function globToRegex(pattern, matchDescendants = false) {
-  const normalized = normalizeLockPath(pattern);
+// Callers route any pattern containing * ? [ ] { } ! here, so every one of them must mean
+// what it says: `?` one character, `[..]`/`[!..]` a class, `{a,b}` alternatives, `**/` zero
+// or more directories. `?`, `[` and `{` used to be escaped and matched only literally, and
+// `**/x` required a slash, so forbidden globs like "config/{prod,staging}.json" or
+// "**/settings.py" matched nothing and failed open. No wildcard ever matches "/".
+function globSourceToRegex(glob) {
   let regex = "";
-  for (let index = 0; index < normalized.length; index += 1) {
-    const char = normalized[index];
-    const next = normalized[index + 1];
-    if (char === "*" && next === "*") {
-      regex += ".*";
-      index += 1;
-    } else if (char === "*") {
-      regex += "[^/]*";
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index];
+    if (char === "*") {
+      if (glob[index + 1] === "*") {
+        const atSegmentStart = index === 0 || glob[index - 1] === "/";
+        if (atSegmentStart && glob[index + 2] === "/") {
+          regex += "(?:.*/)?";
+          index += 2;
+        } else {
+          regex += ".*";
+          index += 1;
+        }
+      } else {
+        regex += "[^/]*";
+      }
+    } else if (char === "?") {
+      regex += "[^/]";
+    } else if (char === "[") {
+      const close = glob.indexOf("]", index + 2);
+      if (close === -1) {
+        regex += "\\[";
+        continue;
+      }
+      let body = glob.slice(index + 1, close);
+      const negated = body.startsWith("!") || body.startsWith("^");
+      if (negated) body = body.slice(1);
+      body = body.replace(/[\\\]^/]/g, (item) => (item === "/" ? "" : `\\${item}`));
+      regex += negated ? `[^/${body}]` : body ? `[${body}]` : "(?!)";
+      index = close;
+    } else if (char === "{") {
+      let depth = 0;
+      let close = -1;
+      const alternatives = [];
+      let start = index + 1;
+      for (let cursor = index; cursor < glob.length; cursor += 1) {
+        if (glob[cursor] === "{") depth += 1;
+        else if (glob[cursor] === "}") {
+          depth -= 1;
+          if (depth === 0) { close = cursor; break; }
+        } else if (glob[cursor] === "," && depth === 1) {
+          alternatives.push(glob.slice(start, cursor));
+          start = cursor + 1;
+        }
+      }
+      if (close === -1 || !alternatives.length) {
+        regex += "\\{";
+        continue;
+      }
+      alternatives.push(glob.slice(start, close));
+      regex += `(?:${alternatives.map(globSourceToRegex).join("|")})`;
+      index = close;
     } else {
       regex += escapeRegex(char);
     }
   }
+  return regex;
+}
+
+function globToRegex(pattern, matchDescendants = false) {
+  const normalized = normalizeLockPath(pattern);
+  const regex = globSourceToRegex(normalized);
   return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
 }
 
@@ -5237,21 +5683,37 @@ function firstNonEmptyList(...values) {
 // case-sensitive imports once the code leaves Windows.
 function callerPathSpellings(job = {}) {
   const contract = job.scopeContract || {};
-  return [
+  const spellings = [
     job.lockedPaths, job.allowedEdits, job.forbiddenEdits, job.sharedFiles, job.serialOnly,
     contract.read, contract.write, contract.forbidden, contract.allowedEdits, contract.shared, contract.serialOnly,
     contract.scope?.read, contract.scope?.write, contract.scope?.forbidden,
   ].flatMap((value) => normalizeList(value)).filter((value) => typeof value === "string");
+  // Lock-plan values are relative to the job's cwd, so the speller needs that root to key
+  // absolute spellings and to know whether the filesystem folds case.
+  return Object.assign(spellings, { cwd: typeof job.cwd === "string" ? job.cwd : "" });
 }
 
-function pathSpeller(spellings = []) {
-  const byFolded = new Map();
+function pathSpeller(spellings = [], cwd = spellings?.cwd || "") {
+  // Lock plans are repo-relative (and case-folded unless the filesystem is case-sensitive);
+  // a caller's absolute spelling keyed by itself never matched them.
+  const fold = !cwd || filesystemCaseModeForRoot(cwd) !== "sensitive";
+  const repoRelative = (value) => {
+    const normalized = normalizeLockPath(value);
+    if (!cwd || !normalized || !isAbsolutePathLike(normalized)) return normalized;
+    const relative = path.relative(path.resolve(cwd), path.resolve(normalized));
+    const outside = !relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    return outside ? normalized : normalizeLockPath(relative);
+  };
+  const keyFor = (value) => {
+    const relative = repoRelative(value);
+    return fold ? relative.toLowerCase() : relative;
+  };
+  const byKey = new Map();
   for (const raw of spellings) {
-    const normalized = normalizeLockPath(raw);
-    const folded = normalized.toLowerCase();
-    if (normalized && !byFolded.has(folded)) byFolded.set(folded, normalized);
+    const key = keyFor(raw);
+    if (key && !byKey.has(key)) byKey.set(key, repoRelative(raw));
   }
-  const spell = (value) => byFolded.get(normalizeLockPath(value).toLowerCase()) || value;
+  const spell = (value) => byKey.get(keyFor(value)) || value;
   return (values) => normalizeList(values).map(spell);
 }
 
@@ -5331,7 +5793,9 @@ const dependencyRequestPayloadSchema = z.object({
 // still fails, so a real request written as prose ("DEPENDENCY_REQUIRED numpy") is not lost.
 const DEPENDENCY_ABSENT = /^(?:[-\u2013\u2014:]\s*)?(?:none|n\/a|no|not\s+(?:required|needed|applicable)|nothing)\b/i;
 function parseDependencyRequest(text) {
-  const match = String(text || "").match(/^DEPENDENCY_REQUIRED\s+([^\r\n]+)\s*$/m);
+  // Horizontal whitespace only: \s+ crossed the line break, so a bare "DEPENDENCY_REQUIRED"
+  // heading captured the next line of the report as the payload.
+  const match = String(text || "").match(/^DEPENDENCY_REQUIRED[ \t]+([^\r\n]+?)[ \t]*\r?$/m);
   if (!match) return { request: null, error: "" };
   if (DEPENDENCY_ABSENT.test(match[1].trim())) return { request: null, error: "" };
   try {
@@ -5345,31 +5809,66 @@ function parseDependencyRequest(text) {
   }
 }
 
+// `opencode run` (yargs) documents no "--" end-of-options marker, so the prompt positional
+// must never look like an option. buildCompactPrompt starts with "Role:", but a bare task
+// or a proxied prompt could start with "-"; prefix those with a fixed label.
+function openCodePromptArgument(prompt) {
+  const text = String(prompt ?? "");
+  return /^\s*-/.test(text) ? `Task:\n${text}` : text;
+}
+
 function openCodeRunArgs(agent, prompt, metadata = null, { forcePure = false } = {}) {
   const args = ["--print-logs", "--log-level", "ERROR"];
   if (forcePure || !CONFIG.allowExternalPlugins) {
     args.push("--pure");
   }
   args.push("run");
-  args.push("--format", "json", "--title", "Codex MCP bridge task", "--agent", agent);
+  args.push("--format", "json", "--title", "Codex MCP bridge task", `--agent=${agent}`);
+  // Option and value in one token: a value can never be parsed as a separate option.
   if (metadata?.provider && metadata?.model) {
-    args.push("--model", `${metadata.provider}/${metadata.model}`);
+    args.push(`--model=${metadata.provider}/${metadata.model}`);
   }
   if (metadata?.variant) {
-    args.push("--variant", metadata.variant);
+    args.push(`--variant=${metadata.variant}`);
   }
-  args.push(prompt);
+  args.push(openCodePromptArgument(prompt));
   return args;
+}
+
+// Windows CreateProcess caps the whole command line at 32,767 UTF-16 units; Linux caps one
+// argument at 128 KiB (MAX_ARG_STRLEN). A longer prompt failed as an opaque spawn error.
+const OPENCODE_WINDOWS_COMMAND_LINE_LIMIT = 32_767;
+const OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT = 128 * 1024 - 1;
+function openCodeCommandLineLengthError(command, args, platform = process.platform) {
+  if (platform === "win32") {
+    // Upper bound of Node's quoting: each argument may be quoted and every quote or
+    // backslash escaped, plus the separating space.
+    const length = [command, ...args].reduce((total, item) => {
+      const text = String(item);
+      return total + text.length + (text.match(/["\\]/g) || []).length + 3;
+    }, 0);
+    return length > OPENCODE_WINDOWS_COMMAND_LINE_LIMIT
+      ? `The OpenCode command line would be about ${length} characters; Windows allows at most ${OPENCODE_WINDOWS_COMMAND_LINE_LIMIT}. Shorten the task prompt.`
+      : "";
+  }
+  const longest = Math.max(0, ...args.map((item) => Buffer.byteLength(String(item), "utf8")));
+  return longest > OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT
+    ? `The OpenCode prompt argument is ${longest} bytes; the platform allows at most ${OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT} bytes per argument. Shorten the task prompt.`
+    : "";
 }
 
 function commandShape(agent, metadata = null, { forcePure = false } = {}) {
   const pluginMode = forcePure || !CONFIG.allowExternalPlugins ? " --pure" : "";
-  const model = metadata?.provider && metadata?.model ? ` --model ${metadata.provider}/${metadata.model}` : "";
-  const variant = metadata?.variant ? ` --variant ${metadata.variant}` : "";
-  return `${OPENCODE_EXE} --print-logs --log-level ERROR run${pluginMode} --format json --title "Codex MCP bridge task" --agent ${agent}${model}${variant} <prompt>`;
+  const model = metadata?.provider && metadata?.model ? ` --model=${metadata.provider}/${metadata.model}` : "";
+  const variant = metadata?.variant ? ` --variant=${metadata.variant}` : "";
+  return `${OPENCODE_EXE} --print-logs --log-level ERROR run${pluginMode} --format json --title "Codex MCP bridge task" --agent=${agent}${model}${variant} <prompt>`;
 }
 
 function timeoutForAgent(agent, lockPlan, requestedTimeoutMs = null) {
+  return Math.min(MAX_AGENT_TIMEOUT_MS, unboundedTimeoutForAgent(agent, lockPlan, requestedTimeoutMs));
+}
+
+function unboundedTimeoutForAgent(agent, lockPlan, requestedTimeoutMs = null) {
   const explicit = Number(requestedTimeoutMs);
   if (Number.isInteger(explicit) && explicit > 0) {
     return explicit;
@@ -5526,9 +6025,38 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
 
-  const providerKey = providerKeyForMetadata(configuredMetadata);
-  const providerWaitBudgetMs = Math.max(1, timeoutMs - (nowMs() - started));
-  const providerLease = await acquireProviderLease({ providerKey, timeoutMs: providerWaitBudgetMs, signal });
+  // A prompt the platform cannot pass as one argument fails before any slot is taken.
+  const promptLengthError = openCodeCommandLineLengthError(
+    OPENCODE_EXE,
+    openCodeRunArgs(agent, prompt, applyModelOverrideToMetadata(configuredMetadata, modelOverride), { forcePure })
+  );
+  if (promptLengthError) {
+    return {
+      stdout: "",
+      stderr: promptLengthError,
+      exitCode: "prompt_too_long",
+      durationMs: nowMs() - started,
+      commandShape: commandShape(agent, configuredMetadata, { forcePure }),
+      dryRun: false,
+      timeoutMs,
+      errorType: "prompt_too_long",
+      assistantFinalResponseDetected: false,
+      providerErrorType: "",
+      toolOutcomes: [],
+      configuredProvider: configuredMetadata?.provider || "",
+      configuredModel: configuredMetadata?.model || "",
+      configuredVariant: configuredMetadata?.variant || "",
+      modelFallbackAllowed: false,
+    };
+  }
+
+  // The slot belongs to the provider that will actually run: with a model override (or the
+  // builder's Gemini fallback) the managed profile's provider is not the one spawned, and
+  // counting the run against it over-subscribed the real provider.
+  const providerKey = providerKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
+  // The slot wait has its own budget. It used to come out of the run timeout, so a builder
+  // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
+  const providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
   if (!providerLease.ok) {
     return {
       stdout: "",
@@ -5546,8 +6074,14 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       configuredModel: configuredMetadata?.model || "",
       configuredVariant: configuredMetadata?.variant || "",
       modelFallbackAllowed: false,
+      providerConcurrencyKey: providerKey,
+      providerConcurrencyWaitMs: providerLease.waitedMs || 0,
+      providerSlotHolders: Number(providerLease.holders || 0),
+      providerSlotCapacity: Number(providerLease.capacity || 0),
     };
   }
+  // The run budget starts once the slot is granted.
+  const runStarted = nowMs();
   const stopProviderLeaseHeartbeat = startProviderLeaseHeartbeat(providerLease.lease);
   const providerExecutionSignal = combineAbortSignals([signal, stopProviderLeaseHeartbeat.signal]);
   const persistSupervisorAuthority = async (spawnIdentity) => {
@@ -5562,7 +6096,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   };
   const renewSupervisorAuthority = async () => {
     const providerRenewed = await stopProviderLeaseHeartbeat.pulse();
-    if (!providerRenewed) return { ok: false };
+    if (!providerRenewed || providerRenewed.ok === false) return { ok: false };
     const outer = typeof onSupervisorHeartbeat === "function"
       ? await onSupervisorHeartbeat()
       : { ok: true, deadlineAt: Number.POSITIVE_INFINITY };
@@ -5570,12 +6104,13 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       ok: outer?.ok !== false,
       deadlineAt: Math.min(
         Number(providerLease.lease.expiresAt || 0),
+        Number(providerRenewed?.deadlineAt || Number.POSITIVE_INFINITY),
         Number(outer?.deadlineAt || Number.POSITIVE_INFINITY)
       ),
     };
   };
 
-  let remainingRunMs = timeoutMs - (nowMs() - started);
+  let remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
@@ -5684,7 +6219,33 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     };
   }
   configuredMetadata = applyModelOverrideToMetadata(finalPreSpawnMetadata.metadata, modelOverride);
-  remainingRunMs = timeoutMs - (nowMs() - started);
+  const attestedProviderKey = providerKeyForMetadata(configuredMetadata);
+  if (attestedProviderKey !== providerKey) {
+    const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
+    stopProviderLeaseHeartbeat();
+    await releaseProviderLease(providerLease.lease);
+    return {
+      stdout: "",
+      stderr: cleanup.ok
+        ? `The final pre-spawn attestation resolved provider slot ${attestedProviderKey}, but the run holds a slot on ${providerKey}. No agent was spawned.`
+        : `Isolated OpenCode runtime cleanup failed: ${cleanup.error}`,
+      exitCode: cleanup.ok ? "agent_policy_rejected" : "isolated_runtime_cleanup_failed",
+      durationMs: nowMs() - started,
+      commandShape: commandShape(agent, configuredMetadata, { forcePure }),
+      dryRun: false,
+      timeoutMs,
+      errorType: cleanup.ok ? "provider_lease_key_mismatch" : "isolated_runtime_cleanup_failed",
+      assistantFinalResponseDetected: false,
+      providerErrorType: "",
+      toolOutcomes: [],
+      configuredProvider: configuredMetadata?.provider || "",
+      configuredModel: configuredMetadata?.model || "",
+      configuredVariant: configuredMetadata?.variant || "",
+      modelFallbackAllowed: false,
+      providerConcurrencyKey: providerKey,
+    };
+  }
+  remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
     stopProviderLeaseHeartbeat();
@@ -5712,6 +6273,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   let result;
   let isolatedRuntimeCleanup = { ok: true, error: "" };
   let containmentUnconfirmed = false;
+  let providerQuarantine = null;
   try {
     result = await runSpawnCommand(
       OPENCODE_EXE,
@@ -5730,8 +6292,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   } finally {
     stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
-      const quarantined = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
-      if (!quarantined.ok) {
+      providerQuarantine = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
+      if (!providerQuarantine.ok) {
         logEvent("error", "provider.containment_quarantine_unconfirmed", { leaseId: providerLease.lease.id });
       }
     } else {
@@ -5746,6 +6308,12 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       ...result,
       stderr: `${String(result?.stderr || "")}\nIsolated OpenCode runtime cleanup failed: ${isolatedRuntimeCleanup.error}`.trim(),
       exitCode: "isolated_runtime_cleanup_failed",
+    };
+  }
+  if (providerQuarantine && !providerQuarantine.ok) {
+    result = {
+      ...result,
+      stderr: `${String(result?.stderr || "")}\nThe provider slot could not be quarantined for the unconfirmed process tree (${providerQuarantine.error || "no row written"}); another job may start on this provider while it still runs.`.trim(),
     };
   }
 
@@ -5804,6 +6372,10 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     modelFallbackAllowed: false,
     providerConcurrencyKey: providerKey,
     providerConcurrencyWaitMs: providerLease.waitedMs || 0,
+    providerQuarantine: providerQuarantine
+      ? { ok: Boolean(providerQuarantine.ok), leaseId: providerQuarantine.leaseId || "", inserted: Boolean(providerQuarantine.inserted) }
+      : null,
+    spawnErrorCode: result.spawnErrorCode || "",
     childStartedAtMs: result.childStartedAtMs || 0,
     childFinishedAtMs: result.childFinishedAtMs || 0,
     childExecutionIntervals: result.childStartedAtMs && result.childFinishedAtMs
@@ -5894,6 +6466,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   }
 
   let lastResult = null;
+  let attemptsMade = 0;
   const childExecutionIntervals = [];
   const policyStarted = nowMs();
   // The retry budget bounds retries; it must never shorten the first attempt below the
@@ -5911,6 +6484,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
       onSpawn,
       onSupervisorHeartbeat,
     });
+    attemptsMade = attempt + 1;
     childExecutionIntervals.push(...(lastResult.childExecutionIntervals || []));
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
     lastResult.retryAttempt = attempt;
@@ -5932,13 +6506,29 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     }
   }
 
+  return readOnlyRetryBudgetExhaustedResult(lastResult, attemptsMade, maxReadOnlyAgentRetries);
+}
+
+// The loop above leaves early when the retry budget cannot fit another attempt. A single
+// timed-out attempt was then reported as read_only_agent_unavailable "after 3 bounded
+// attempts" with retryAttempt 0; report the attempts actually made, and keep agent_timeout
+// when the last attempt timed out.
+function readOnlyRetryBudgetExhaustedResult(lastResult, attemptsMade, maxRetries = maxReadOnlyAgentRetries) {
+  const attempts = Math.max(1, Number(attemptsMade) || 0);
+  const attemptText = `${attempts} bounded attempt${attempts === 1 ? "" : "s"}`;
+  const timedOut = isTimeoutResult(lastResult);
   return {
     ...lastResult,
     readOnlyUnavailable: true,
-    errorType: "read_only_agent_unavailable",
+    retryAttempt: attempts - 1,
+    maxRetries,
+    attemptsMade: attempts,
+    errorType: timedOut ? "agent_timeout" : "read_only_agent_unavailable",
     stderr: [
       lastResult?.stderr || "",
-      `Read-only agent remained unavailable after ${maxReadOnlyAgentRetries + 1} bounded attempts and was marked unavailable.`,
+      timedOut
+        ? `Read-only agent timed out; the retry budget left no room for another attempt after ${attemptText}.`
+        : `Read-only agent remained unavailable after ${attemptText} and was marked unavailable.`,
     ].filter(Boolean).join("\n"),
   };
 }
@@ -9400,6 +9990,7 @@ async function integratePatchWithoutSerialLock({
   dryRun = false,
   allowDirtyTarget = false,
   acceptFlaggedSecretLines = false,
+  acceptBinaryHunks = false,
   reviewed = false,
   previewReceipt = null,
   expectedSourceIdentity = null,
@@ -9602,12 +10193,12 @@ async function integratePatchWithoutSerialLock({
 
     if (dryRun) {
       const binaryTextFiles = binaryTextFilesInPatch(patch.patch);
-      if (binaryTextFiles.length) {
+      if (binaryTextFiles.length && !acceptBinaryHunks) {
         return {
           ok: false,
           status: "preview_rejected",
           errorType: "integration_preview_unreadable_text_file",
-          error: `The patch carries source/text files as binary hunks the reviewer cannot read: ${binaryTextFiles.slice(0, 10).join(", ")}. Remove NUL bytes or other binary content (or a .gitattributes binary/-diff entry) from those files in the worktree and preview again.`,
+          error: `The patch carries files as binary hunks the reviewer and the secret scan cannot read: ${binaryTextFiles.slice(0, 10).join(", ")}. Only known binary media, font and archive extensions are accepted as binary. Remove NUL bytes or other binary content (or a .gitattributes binary/-diff entry) from those files in the worktree and preview again, or, if you inspected those files in the worktree and they are meant to be binary, preview again with acceptBinaryHunks: true.`,
           changedFiles: patch.changedFiles,
           patchSha256: patch.patchSha256,
           patchPreview: "",
@@ -13705,6 +14296,7 @@ server.tool(
     cleanupAfterSuccess: z.boolean().optional().describe("Remove the source worktree and its local branch only after reviewed integration and a passing validationCommand. Defaults to true for worktrees the bridge created; pass false to keep the source."),
     allowDirtyTarget: z.boolean().optional().describe("Allow integration into a target repo that already has changes. Defaults to false."),
     acceptFlaggedSecretLines: z.boolean().optional().describe("Dry run only: issue the receipt even though the secret gate flagged patch lines, after you inspected those lines in the worktree and found no real credential. Defaults to false."),
+    acceptBinaryHunks: z.boolean().optional().describe("Dry run only: issue the receipt although the patch has binary hunks for files without a known binary extension, after you inspected those files in the worktree. Defaults to false."),
     previewMode: z.enum(["full", "stat"]).optional().describe("Dry run output: full (default) prints the whole patch; stat prints per-file line counts and the patch SHA-256, for callers that already read the diff in the worktree. The receipt is the same."),
   },
   async ({
@@ -13723,6 +14315,7 @@ server.tool(
     cleanupAfterSuccess = undefined,
     allowDirtyTarget = false,
     acceptFlaggedSecretLines = false,
+    acceptBinaryHunks = false,
     previewMode = "full",
   }) => {
     const started = nowMs();
@@ -13833,6 +14426,7 @@ server.tool(
       previewReceipt,
       allowDirtyTarget,
       acceptFlaggedSecretLines,
+      acceptBinaryHunks,
       cleanupAfterSuccess: effectiveCleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
       pipelineId,
@@ -21847,6 +22441,32 @@ export const __selfTest = {
     wipeIsolatedOpenCodeRuntime,
     writeFile,
     z,
+    // tests/review-spawn.js
+    DEFAULT_OPENCODE_CACHE_HOME,
+    MAX_AGENT_TIMEOUT_MS,
+    acquireProviderLease,
+    commandShape,
+    containmentRecord,
+    expectedOpenCodePluginResolution,
+    gitControlSurfaceChanges,
+    gitControlSurfaceFingerprint,
+    globToRegex,
+    jobInputShape,
+    openCodeCommandLineLengthError,
+    openCodePromptArgument,
+    openProviderLeaseDb,
+    parseJsonText,
+    pathSpeller,
+    pluginConfigCandidatePaths,
+    processTable,
+    providerCapacitySnapshot,
+    providerKeyLikePattern,
+    quarantineProviderLease,
+    readChoiceEnv,
+    readNonNegativeIntEnv,
+    readOnlyRetryBudgetExhaustedResult,
+    releaseProviderLease,
+    runOpenCode,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
