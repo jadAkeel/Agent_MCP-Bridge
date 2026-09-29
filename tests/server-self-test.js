@@ -1377,7 +1377,7 @@ async function runSelfTests() {
   assert.equal(normalizeLockPath("apps/api/app/**"), "apps/api/app");
   assert.equal(normalizeLockPath("apps\\api\\app\\**\\"), "apps/api/app");
   assert.equal(normalizeLockPath("apps/web///"), "apps/web");
-  assert.equal(normalizeLockPath("./apps/web/*"), "apps/web");
+  assert.equal(normalizeLockPath("./apps/web/*"), "apps/web/*", "dir/* is one level, not the whole directory");
   assert.equal(normalizeLockPath("src/./file.js"), "src/file.js");
   assert.equal(normalizeLockPath("src/."), "src");
   assert.equal(normalizeLockPath("README.md"), "README.md");

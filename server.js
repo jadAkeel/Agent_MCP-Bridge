@@ -266,6 +266,13 @@ const DEFAULT_FORBIDDEN_EDIT_PATHS = Object.freeze([
   "**/*.key",
   "secrets/**",
   "**/secrets/**",
+  // Git's control surface: config, hooks, refs and a worktree's .git pointer file. Git never
+  // lists these as changes, so a deny rule is the only guard. The managed writer profiles
+  // (opencode/agents/builder.md, debugger.md) must list exactly this set.
+  ".git",
+  ".git/**",
+  "**/.git",
+  "**/.git/**",
 ]);
 const DEFAULT_SHARED_FILE_PATHS = Object.freeze([
   "package.json",
@@ -1113,10 +1120,75 @@ function redactLikelySecrets(value) {
   return text;
 }
 
-// A NUL byte or a .gitattributes "binary" entry turns a source file into a base85
-// "GIT binary patch" hunk the reviewer cannot read, so the preview would approve content
-// nobody saw. Source and text extensions must arrive as readable text hunks.
-const REVIEWABLE_TEXT_EXTENSION = /\.(?:py|pyi|pyx|c|cc|cpp|cxx|h|hh|hpp|hxx|inl|ipp|cmake|txt|md|rst|json|toml|yaml|yml|ini|cfg|js|mjs|cjs|ts|tsx|jsx|sh|ps1|bat|cmd|html|css|xml|csv|sql|gitattributes|gitignore)$/i;
+// Git never reports edits under .git/ as changes, so a writer that rewrote .git/config
+// (core.hooksPath, an alias, a filter driver) or dropped a hook would pass every
+// changed-file check. This fingerprint covers the control files a job could use to run
+// code later: the repository config (and a linked worktree's config.worktree), every hook,
+// and a linked worktree's `.git` pointer file. Compare it before and after a write job.
+async function gitControlSurfaceFingerprint(cwd) {
+  const root = path.resolve(cwd || process.cwd());
+  const entries = {};
+  const record = async (label, filePath) => {
+    try {
+      const details = await lstat(filePath);
+      if (details.isSymbolicLink()) {
+        entries[label] = `symlink:${await readlink(filePath)}`;
+      } else if (details.isFile()) {
+        entries[label] = `file:${details.mode & 0o777}:${createHash("sha256").update(await readFile(filePath)).digest("hex")}`;
+      } else {
+        entries[label] = `other:${details.isDirectory() ? "directory" : "special"}`;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      entries[label] = "missing";
+    }
+  };
+  try {
+    const dotGit = path.join(root, ".git");
+    await record(".git", dotGit);
+    let gitDir = dotGit;
+    let commonDir = dotGit;
+    if (entries[".git"].startsWith("file:")) {
+      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(dotGit, "utf8"));
+      if (!pointer) return { ok: false, sha256: "", entries, error: "The .git file does not name a gitdir." };
+      gitDir = path.resolve(root, pointer[1]);
+      commonDir = gitDir;
+      try {
+        commonDir = path.resolve(gitDir, (await readFile(path.join(gitDir, "commondir"), "utf8")).trim());
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await record("gitdir/config.worktree", path.join(gitDir, "config.worktree"));
+    }
+    await record("common/config", path.join(commonDir, "config"));
+    let hookNames = [];
+    try {
+      hookNames = (await readdir(path.join(commonDir, "hooks"))).sort();
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    entries["common/hooks"] = hookNames.join("\0");
+    for (const name of hookNames) await record(`common/hooks/${name}`, path.join(commonDir, "hooks", name));
+    const sha256 = createHash("sha256").update(JSON.stringify(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)))).digest("hex");
+    return { ok: true, sha256, entries, error: "" };
+  } catch (error) {
+    return { ok: false, sha256: "", entries, error: error.message || String(error) };
+  }
+}
+
+// Paths whose .git/ control files differ between two gitControlSurfaceFingerprint() results.
+function gitControlSurfaceChanges(before, after) {
+  const labels = [...new Set([...Object.keys(before?.entries || {}), ...Object.keys(after?.entries || {})])].sort();
+  return labels.filter((label) => (before?.entries || {})[label] !== (after?.entries || {})[label]);
+}
+
+// A NUL byte or a .gitattributes "binary" entry turns a file into a base85 "GIT binary
+// patch" hunk the reviewer cannot read, and the secret scan only sees "+" text lines, so the
+// preview would approve content nobody saw. Every binary hunk is rejected unless its path
+// has a known binary media/font/archive extension or the caller acknowledges binary hunks.
+// (An allowlist of text extensions left every other extension, and extensionless files,
+// free to arrive as unreviewed binary.) Executables and libraries are deliberately absent.
+const KNOWN_BINARY_EXTENSION = /\.(?:png|jpe?g|gif|bmp|ico|icns|webp|avif|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|7z|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|ogg|flac|webm|mov|wasm)$/i;
 function binaryTextFilesInPatch(patchText) {
   const files = [];
   let current = "";
@@ -1124,7 +1196,7 @@ function binaryTextFilesInPatch(patchText) {
     const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
     if (header) { current = header[2]; continue; }
     if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
-      && (REVIEWABLE_TEXT_EXTENSION.test(current) || /(?:^|\/)(?:CMakeLists\.txt|Makefile|\.gitattributes)$/i.test(current))) {
+      && !KNOWN_BINARY_EXTENSION.test(current)) {
       files.push(current);
       current = "";
     }
@@ -4705,10 +4777,11 @@ function normalizeLockPath(value) {
     .replace(/^(?:\.\/)+/, "")
     .replace(/\/\.(?=\/|$)/g, "")
     .replace(/\/+/g, "/");
+  // Only "dir/**" means the whole directory. "dir/*" is one level and stays a glob:
+  // stripping it turned allowedEdits ["src/cli/*"] into "src/cli", which allowed src/cli/deep/x.ts.
   const normalized = slashNormalized
     .replace(/\/+$/, "")
     .replace(/\/\*\*$/, "")
-    .replace(/\/\*$/, "")
     .replace(/\/+$/, "");
   return normalized || (slashNormalized.startsWith("/") ? "/" : "");
 }
@@ -5238,21 +5311,74 @@ function escapeRegex(value) {
   return String(value).replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
 }
 
-function globToRegex(pattern, matchDescendants = false) {
-  const normalized = normalizeLockPath(pattern);
+// Callers route any pattern containing * ? [ ] { } ! here, so every one of them must mean
+// what it says: `?` one character, `[..]`/`[!..]` a class, `{a,b}` alternatives, `**/` zero
+// or more directories. `?`, `[` and `{` used to be escaped and matched only literally, and
+// `**/x` required a slash, so forbidden globs like "config/{prod,staging}.json" or
+// "**/settings.py" matched nothing and failed open. No wildcard ever matches "/".
+function globSourceToRegex(glob) {
   let regex = "";
-  for (let index = 0; index < normalized.length; index += 1) {
-    const char = normalized[index];
-    const next = normalized[index + 1];
-    if (char === "*" && next === "*") {
-      regex += ".*";
-      index += 1;
-    } else if (char === "*") {
-      regex += "[^/]*";
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index];
+    if (char === "*") {
+      if (glob[index + 1] === "*") {
+        const atSegmentStart = index === 0 || glob[index - 1] === "/";
+        if (atSegmentStart && glob[index + 2] === "/") {
+          regex += "(?:.*/)?";
+          index += 2;
+        } else {
+          regex += ".*";
+          index += 1;
+        }
+      } else {
+        regex += "[^/]*";
+      }
+    } else if (char === "?") {
+      regex += "[^/]";
+    } else if (char === "[") {
+      const close = glob.indexOf("]", index + 2);
+      if (close === -1) {
+        regex += "\\[";
+        continue;
+      }
+      let body = glob.slice(index + 1, close);
+      const negated = body.startsWith("!") || body.startsWith("^");
+      if (negated) body = body.slice(1);
+      body = body.replace(/[\\\]^/]/g, (item) => (item === "/" ? "" : `\\${item}`));
+      regex += negated ? `[^/${body}]` : body ? `[${body}]` : "(?!)";
+      index = close;
+    } else if (char === "{") {
+      let depth = 0;
+      let close = -1;
+      const alternatives = [];
+      let start = index + 1;
+      for (let cursor = index; cursor < glob.length; cursor += 1) {
+        if (glob[cursor] === "{") depth += 1;
+        else if (glob[cursor] === "}") {
+          depth -= 1;
+          if (depth === 0) { close = cursor; break; }
+        } else if (glob[cursor] === "," && depth === 1) {
+          alternatives.push(glob.slice(start, cursor));
+          start = cursor + 1;
+        }
+      }
+      if (close === -1 || !alternatives.length) {
+        regex += "\\{";
+        continue;
+      }
+      alternatives.push(glob.slice(start, close));
+      regex += `(?:${alternatives.map(globSourceToRegex).join("|")})`;
+      index = close;
     } else {
       regex += escapeRegex(char);
     }
   }
+  return regex;
+}
+
+function globToRegex(pattern, matchDescendants = false) {
+  const normalized = normalizeLockPath(pattern);
+  const regex = globSourceToRegex(normalized);
   return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
 }
 
@@ -5320,21 +5446,37 @@ function firstNonEmptyList(...values) {
 // case-sensitive imports once the code leaves Windows.
 function callerPathSpellings(job = {}) {
   const contract = job.scopeContract || {};
-  return [
+  const spellings = [
     job.lockedPaths, job.allowedEdits, job.forbiddenEdits, job.sharedFiles, job.serialOnly,
     contract.read, contract.write, contract.forbidden, contract.allowedEdits, contract.shared, contract.serialOnly,
     contract.scope?.read, contract.scope?.write, contract.scope?.forbidden,
   ].flatMap((value) => normalizeList(value)).filter((value) => typeof value === "string");
+  // Lock-plan values are relative to the job's cwd, so the speller needs that root to key
+  // absolute spellings and to know whether the filesystem folds case.
+  return Object.assign(spellings, { cwd: typeof job.cwd === "string" ? job.cwd : "" });
 }
 
-function pathSpeller(spellings = []) {
-  const byFolded = new Map();
+function pathSpeller(spellings = [], cwd = spellings?.cwd || "") {
+  // Lock plans are repo-relative (and case-folded unless the filesystem is case-sensitive);
+  // a caller's absolute spelling keyed by itself never matched them.
+  const fold = !cwd || filesystemCaseModeForRoot(cwd) !== "sensitive";
+  const repoRelative = (value) => {
+    const normalized = normalizeLockPath(value);
+    if (!cwd || !normalized || !isAbsolutePathLike(normalized)) return normalized;
+    const relative = path.relative(path.resolve(cwd), path.resolve(normalized));
+    const outside = !relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    return outside ? normalized : normalizeLockPath(relative);
+  };
+  const keyFor = (value) => {
+    const relative = repoRelative(value);
+    return fold ? relative.toLowerCase() : relative;
+  };
+  const byKey = new Map();
   for (const raw of spellings) {
-    const normalized = normalizeLockPath(raw);
-    const folded = normalized.toLowerCase();
-    if (normalized && !byFolded.has(folded)) byFolded.set(folded, normalized);
+    const key = keyFor(raw);
+    if (key && !byKey.has(key)) byKey.set(key, repoRelative(raw));
   }
-  const spell = (value) => byFolded.get(normalizeLockPath(value).toLowerCase()) || value;
+  const spell = (value) => byKey.get(keyFor(value)) || value;
   return (values) => normalizeList(values).map(spell);
 }
 
@@ -9436,6 +9578,7 @@ async function integratePatchWithoutSerialLock({
   dryRun = false,
   allowDirtyTarget = false,
   acceptFlaggedSecretLines = false,
+  acceptBinaryHunks = false,
   reviewed = false,
   previewReceipt = null,
   expectedSourceIdentity = null,
@@ -9638,12 +9781,12 @@ async function integratePatchWithoutSerialLock({
 
     if (dryRun) {
       const binaryTextFiles = binaryTextFilesInPatch(patch.patch);
-      if (binaryTextFiles.length) {
+      if (binaryTextFiles.length && !acceptBinaryHunks) {
         return {
           ok: false,
           status: "preview_rejected",
           errorType: "integration_preview_unreadable_text_file",
-          error: `The patch carries source/text files as binary hunks the reviewer cannot read: ${binaryTextFiles.slice(0, 10).join(", ")}. Remove NUL bytes or other binary content (or a .gitattributes binary/-diff entry) from those files in the worktree and preview again.`,
+          error: `The patch carries files as binary hunks the reviewer and the secret scan cannot read: ${binaryTextFiles.slice(0, 10).join(", ")}. Only known binary media, font and archive extensions are accepted as binary. Remove NUL bytes or other binary content (or a .gitattributes binary/-diff entry) from those files in the worktree and preview again, or, if you inspected those files in the worktree and they are meant to be binary, preview again with acceptBinaryHunks: true.`,
           changedFiles: patch.changedFiles,
           patchSha256: patch.patchSha256,
           patchPreview: "",
@@ -13678,6 +13821,7 @@ server.tool(
     cleanupAfterSuccess: z.boolean().optional().describe("Remove the source worktree and its local branch only after reviewed integration and a passing validationCommand. Defaults to true for worktrees the bridge created; pass false to keep the source."),
     allowDirtyTarget: z.boolean().optional().describe("Allow integration into a target repo that already has changes. Defaults to false."),
     acceptFlaggedSecretLines: z.boolean().optional().describe("Dry run only: issue the receipt even though the secret gate flagged patch lines, after you inspected those lines in the worktree and found no real credential. Defaults to false."),
+    acceptBinaryHunks: z.boolean().optional().describe("Dry run only: issue the receipt although the patch has binary hunks for files without a known binary extension, after you inspected those files in the worktree. Defaults to false."),
     previewMode: z.enum(["full", "stat"]).optional().describe("Dry run output: full (default) prints the whole patch; stat prints per-file line counts and the patch SHA-256, for callers that already read the diff in the worktree. The receipt is the same."),
   },
   async ({
@@ -13696,6 +13840,7 @@ server.tool(
     cleanupAfterSuccess = undefined,
     allowDirtyTarget = false,
     acceptFlaggedSecretLines = false,
+    acceptBinaryHunks = false,
     previewMode = "full",
   }) => {
     const started = nowMs();
@@ -13806,6 +13951,7 @@ server.tool(
       previewReceipt,
       allowDirtyTarget,
       acceptFlaggedSecretLines,
+      acceptBinaryHunks,
       cleanupAfterSuccess: effectiveCleanupAfterSuccess,
       deferCleanup: Boolean(pipelineId),
       pipelineId,
