@@ -12153,10 +12153,10 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       WHERE job_id = ? AND status = ? AND revision = ?
         AND (owner_generation = ? OR (owner_generation IS NULL AND ? = ''))
         AND (lease_expires_at IS NULL OR lease_expires_at = '' OR julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?)
-        AND NOT EXISTS (
+        AND (owner_instance_id = ? OR NOT EXISTS (
           SELECT 1 FROM bridge_instances
           WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
-        )
+        ))
     `);
 
     for (const row of rows) {
@@ -12193,7 +12193,13 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
           ? db.prepare("SELECT heartbeat_at, lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
           : null;
         const instanceLease = Date.parse(instance?.lease_expires_at || "");
-        if (Number.isFinite(instanceLease) && instanceLease > now) continue;
+        // A live owner instance covers its jobs, but only another instance is trusted to be
+        // running them: QUEUE_JOBS (checked above) is this process's own worker list. A job
+        // this instance owns and no longer tracks (its worker was abandoned, e.g. every
+        // terminal write failed) was left behind while the instance lease stayed fresh for
+        // other work (a parent pipeline, other jobs), so shielding it would keep it, and
+        // its parent pipeline, running forever.
+        if (Number.isFinite(instanceLease) && instanceLease > now && row.owner_instance_id !== BRIDGE_INSTANCE_ID) continue;
         // Once both durable owner leases have expired, PID liveness cannot prove
         // ownership: operating systems reuse PIDs after crashes. Reconcile the
         // record without killing any process; retain child identity as evidence.
@@ -12226,6 +12232,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
         row.owner_generation || "",
         row.owner_generation || "",
         finishedAt,
+        BRIDGE_INSTANCE_ID,
         finishedAt
       );
       if (Number(changed.changes || 0) > 0) {
@@ -18165,8 +18172,12 @@ async function decryptQueuePrivateDetails(envelope, jobId) {
 function enforceQueueResultEvidence(record) {
   const persistedResultText = redactSensitiveText(record.resultText || "");
   const completedWithoutFinal = record.status === "completed" && !persistedResultText.trim();
+  // A writer whose verified worktree diff was empty (noChanges) legitimately has no changed
+  // files or patch hash: the empty worktree is removed and there is nothing to integrate.
+  // Failing it here made a successful "nothing needed" run fail its pipeline.
   const completedWriteWithoutEvidence = record.status === "completed"
     && record.mode === "write"
+    && !record.noChanges
     && !(record.changedFiles || []).length
     && !record.worktreePatchSha256;
   if (completedWithoutFinal || completedWriteWithoutEvidence) {

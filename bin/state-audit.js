@@ -85,7 +85,7 @@ function expiredRows(db, table, idColumn, leaseColumn, statusColumn, ownerColumn
   const liveBridgePredicate = ownerColumn && columns.has(ownerColumn) && hasTable(db, "bridge_instances")
     ? `AND NOT EXISTS (SELECT 1 FROM bridge_instances WHERE instance_id = ${table}.${ownerColumn} AND lease_expires_at > ?)`
     : "";
-  const statuses = table === "opencode_jobs" ? ACTIVE_QUEUE_STATUSES : ["running", "cleanup_pending", "cleanup_failed", "awaiting_integration", "integrating"];
+  const statuses = table === "opencode_jobs" ? ACTIVE_QUEUE_STATUSES : ["running", "finalizing", "cleanup_pending", "cleanup_failed", "awaiting_integration", "integrating"];
   const placeholders = statuses.map(() => "?").join(", ");
   const now = new Date().toISOString();
   const statement = db.prepare(`
