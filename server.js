@@ -4195,7 +4195,17 @@ function providerErrorTypeFromText(value) {
   if (!text.trim()) {
     return "";
   }
-  if (/CreditsError|No payment method|insufficient.{0,20}(credit|balance)|(?:provider|account|payment|quota).{0,40}billing|billing.{0,40}(?:disabled|failed|required|problem|error|account|quota)/i.test(text)) {
+  // Ordinary 429s carry billing words: Gemini says "You exceeded your current quota, please
+  // check your plan and billing details" and OpenAI links ".../account/billing" to add a
+  // payment method. Checked first, those made every rate limit a non-retryable billing error
+  // that also killed the run. A rate-limit marker wins unless an explicit billing marker is
+  // present (OpenAI's insufficient_quota, CreditsError, 402 Payment Required) or the limit
+  // is a daily/hard quota that retrying cannot clear.
+  const explicitBilling = /insufficient_quota|CreditsError|payment.required|\b402\b/i.test(text);
+  if (/\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|rate.?limit|too many requests/i.test(text) && !explicitBilling) {
+    return /daily.{0,80}(quota|limit)|per.?day\b|hard.{0,40}quota/i.test(text) ? "opencode_quota_exhausted" : "opencode_rate_limited";
+  }
+  if (explicitBilling || /No payment method|insufficient.{0,20}(credit|balance)|(?:provider|account|payment|quota).{0,40}billing|billing.{0,40}(?:disabled|failed|required|problem|error|account|quota)/i.test(text)) {
     return "opencode_billing_error";
   }
   if (/daily.{0,80}(quota|limit)|quota.{0,80}(exhausted|exceeded).{0,80}(daily|billing)|hard.{0,40}quota/i.test(text)) {
@@ -4262,13 +4272,43 @@ function providerErrorTypeFromStructuredEvent(event) {
     event.providerId,
   ].filter((item) => item !== undefined && item !== null && String(item).trim()).join(" ");
   const fieldType = providerErrorTypeFromText(authoritativeFields);
+  // A status code is authoritative over message wording: 429 is a rate limit even when the
+  // message mentions billing, 402 is billing. Message text only refines a status-less error.
+  const statusValues = [
+    errorValue.status,
+    errorValue.statusCode,
+    errorValue.code,
+    errorValue.data?.status,
+    errorValue.data?.statusCode,
+    errorValue.data?.code,
+  ].map((item) => String(item ?? "").trim()).filter(Boolean);
+  const messageText = [errorValue.message, errorValue.detail, errorValue.data?.message, errorValue.data?.detail].filter(Boolean).join(" ");
+  const statusType = statusValues.includes("402")
+    ? "opencode_billing_error"
+    : statusValues.length ? providerErrorTypeFromText(statusValues.join(" ")) : "";
   const hasProviderContext = /(?:^|\s)(?:APIError|CreditsError|Provider[A-Za-z]*(?:Error|Timeout)|OAuth[A-Za-z]*Error|Auth[A-Za-z]*Error|Quota[A-Za-z]*Error|RateLimit[A-Za-z]*Error|Billing[A-Za-z]*Error|Transport[A-Za-z]*Error|Network[A-Za-z]*Error|Fetch[A-Za-z]*Error|Timeout[A-Za-z]*Error)(?:\s|$)/i.test(authoritativeFields)
     || Boolean(errorValue.providerID || errorValue.providerId || errorValue.data?.providerID || errorValue.data?.providerId);
-  if (hasProviderContext) {
-    const contextualType = providerErrorTypeFromText([authoritativeFields, errorValue.message, errorValue.detail, errorValue.data?.message, errorValue.data?.detail].filter(Boolean).join(" "));
-    if (contextualType) return contextualType;
+  const contextualType = hasProviderContext
+    ? providerErrorTypeFromText([authoritativeFields, messageText].filter(Boolean).join(" "))
+    : "";
+  let type = "";
+  if (statusType === "opencode_rate_limited") {
+    // Still a rate limit unless the text adds an explicit billing marker or a daily quota.
+    type = providerErrorTypeFromText([statusValues.join(" "), authoritativeFields, messageText].filter(Boolean).join(" "));
+  } else if (statusType && statusType !== "opencode_api_error") {
+    type = statusType;
+  } else {
+    type = (fieldType && fieldType !== "opencode_api_error" ? fieldType : "") || contextualType || fieldType;
   }
-  return fieldType;
+  // OpenCode marks provider errors it would retry itself (429, 5xx, overloaded) isRetryable.
+  if (errorValue.data?.isRetryable === true || errorValue.isRetryable === true) {
+    if (type === "opencode_billing_error" && !/insufficient_quota|CreditsError|payment.required|\b402\b/i.test(`${authoritativeFields} ${messageText}`)) {
+      type = "opencode_rate_limited";
+    } else if (!type || type === "opencode_api_error") {
+      type = "opencode_transient_provider_error";
+    }
+  }
+  return type;
 }
 
 function modelEvidenceFromEvent(event) {
@@ -4393,8 +4433,10 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     .filter((line) => /permission requested:.*auto-rejecting|permission.{0,30}denied/i.test(line))
     .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line));
   permissionDeniedCount = Math.max(permissionDeniedCount, deniedDiagnostics.length);
+  // OpenCode logs every failed provider attempt to stderr, including ones it retried and
+  // then completed; a generic APIError there must not fail a run that produced its answer.
   const recoveredTransientProviderError = !stdoutErrorDetected
-    && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error"].includes(stderrProviderErrorType)
+    && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error", "opencode_api_error"].includes(stderrProviderErrorType)
     && finalResponseDetected;
   if (recoveredTransientProviderError) {
     providerErrorType = "";
