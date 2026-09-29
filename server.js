@@ -918,6 +918,9 @@ function buildTrustedGitEnv(extra = null) {
   env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
+  // Paths the bridge passes to git are file names (app/[slug]/page.tsx), never patterns; as
+  // glob pathspecs `git add -N -- app/[slug]/page.tsx` would also match app/s/page.tsx.
+  env.GIT_LITERAL_PATHSPECS = "1";
   delete env.GIT_ASKPASS;
   delete env.SSH_ASKPASS;
   env.GIT_CONFIG_COUNT = "5";
@@ -12119,6 +12122,8 @@ server.tool(
 
     const queueAssessment = await assessQueuePlan(lockPlans);
     const plannedJobs = [];
+    const plannedResolutions = [];
+    const plannedMetadata = [];
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
       const lockPlan = lockPlans[index];
@@ -12222,8 +12227,28 @@ server.tool(
         }) }] };
       }
       resolution.agentMetadata = metadata.metadata || null;
+      plannedResolutions[index] = resolution;
+      plannedMetadata[index] = metadata;
 
       plannedJobs.push(formatDelegationPlanJob({ index, job, lockPlan, resolution }));
+    }
+
+    // run_opencode_parallel rejects a batch above the per-provider slot limit; the preflight
+    // must not accept what the run would refuse.
+    const capacityError = executionMode === "parallel"
+      ? parallelBatchCapacityError(jobs, parallelProviderKeys(plannedResolutions, plannedMetadata, lockPlans))
+      : null;
+    if (capacityError) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Delegation plan rejected.",
+        errorType: capacityError.errorType,
+        reason: capacityError.error,
+        requestedAgent: requestedAgents,
+        actualAgent: "none",
+        lockMode,
+        durationMs: nowMs() - toolStarted,
+        suggestedFix: capacityError.suggestedFix,
+      }) }] };
     }
 
     return {
@@ -12290,6 +12315,11 @@ server.tool(
       agent,
       task,
       cwd,
+      // executeOpenCodeJob routes with these; dropping them made its own advice to set
+      // allowFallbackToBuild impossible to follow.
+      allowFallbackToBuild,
+      subagentStrategy,
+      proxyAgent,
       dryRun,
       orchestratorMode,
       userAuthorizedOrchestrator,
@@ -12353,11 +12383,15 @@ server.tool(
       };
     }
 
+    // The read scope keeps a reader from counting as the whole repository, and the job id keeps
+    // a writer the scheduler already claimed from conflicting with itself.
     const queueAssessment = await assessQueuePlan([{
+      jobId: enqueued.record.jobId,
       lockType: enqueued.record.mode === "read" ? "read" : "write",
       cwd: enqueued.record.cwd,
       lockedPaths: enqueued.record.lockedPaths,
       allowedEdits: enqueued.record.allowedEdits,
+      scopeContract: enqueued.record.scopeContract,
     }]);
     return {
       content: [
@@ -12511,8 +12545,12 @@ server.tool(
   async ({ jobId, cwd = "", detail = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const authoritative = await authoritativeQueueRecord(jobId, projectRoot || cwd);
-    const snapshot = authoritative
+    const persisted = authoritative
       ? (effectiveQueueMode() === "sqlite" ? authoritative : queueRecordSnapshot(authoritative))
+      : null;
+    // record_json keeps the stage and timings of its last write; a running job's are derived now.
+    const snapshot = persisted
+      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted) }
       : null;
     if (!snapshot) {
       return {
@@ -12695,13 +12733,36 @@ server.tool(
       heartbeatAt: "",
       leaseExpiresAt: "",
     });
-    await persistQueueRecord(record);
+    const persisted = await persistQueueRecord(record);
     scheduleQueue();
+    if (!persisted?.persisted) {
+      // The durable row moved first (claimed, finished, or owned elsewhere); persistQueueRecord
+      // reloaded it, so report what the job durably is instead of a cancellation that did not land.
+      return {
+        content: [
+          {
+            type: "text",
+            text: `OpenCode queue job ${jobId} was not cancelled: its durable status is ${persisted?.status || record.status || "unknown"}.${persisted?.ownershipLost ? " Another bridge generation owns it now." : ""}`,
+          },
+        ],
+      };
+    }
+    if (record.parentJobId || record.pipelinePropagation?.pipelineId) {
+      try {
+        await reconcileParentPipelineAfterQueueTerminal(record);
+      } catch (error) {
+        logEvent("warn", "pipeline.child_terminal_reconciliation_failed", {
+          pipelineId: record.parentJobId || record.pipelinePropagation?.pipelineId || "",
+          jobId,
+          errorType: error?.errorType || "pipeline_child_terminal_reconciliation_failed",
+        });
+      }
+    }
     return {
       content: [
         {
           type: "text",
-          text: `OpenCode queue job cancelled: ${jobId}`,
+          text: `OpenCode queue job cancelled: ${jobId} (durable status: ${persisted.status || record.status}).`,
         },
       ],
     };
@@ -12787,11 +12848,15 @@ server.tool(
     const targetCwd = sanitizedWorkspace
       ? path.resolve(sanitizedWorkspace.root)
       : await resolveProjectStateRoot(cwd || jobs[0]?.cwd || process.cwd());
+    // A job without its own cwd belongs to the pipeline's repository, not to the bridge's
+    // working directory (which made every such pipeline "multi-repository").
     const pipelineJobs = sanitizedWorkspace
       ? jobs.map((job) => ({ ...job, cwd: targetCwd, sanitizedWorkspace, subagentStrategy: "reject", write: false, lockType: "read", lockMode: "off" }))
-      : jobs;
+      : jobs.map((job) => ({ ...job, cwd: job.cwd || targetCwd }));
     const normalizedJobs = await Promise.all(pipelineJobs.map((job) => normalizeJobCwd(job)));
-    const foreignJob = normalizedJobs.find((job) => path.resolve(job.cwd) !== path.resolve(targetCwd));
+    // Children are inserted into the pipeline's own state database, so a child that resolves to
+    // another project would be run and recorded elsewhere while the parent waits for it forever.
+    const foreignJob = normalizedJobs.find((job) => normalizeFilesystemCase(path.resolve(job.cwd), targetCwd) !== normalizeFilesystemCase(path.resolve(targetCwd), targetCwd));
     if (foreignJob) {
       return {
         content: [
@@ -13686,16 +13751,38 @@ function effectiveContractorAuthorizationSha256() {
     : CONFIG.contractorAuthorizationSha256;
 }
 
-function makeInternalQueueContractorProof(jobId) {
-  return createHmac("sha256", QUEUE_CAPABILITY_KEY).update(`contractor\0${jobId}`).digest("hex");
+// A queued contractor job carries a proof instead of the caller's token. The proof is bound to
+// the configured authorization hash as well as the job: rotating or removing
+// CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 revokes every proof minted under the old one.
+// Its second half is a keyless binding digest that survives a restart, so recovery (which
+// re-mints the process-keyed half) re-authorizes a job only under the hash it was minted with.
+function internalQueueContractorBinding(jobId, authorizationSha256) {
+  return createHash("sha256").update(`contractor-binding\0${authorizationSha256}\0${jobId}`).digest("hex");
+}
+
+function currentContractorAuthorizationSha256() {
+  const configured = String(effectiveContractorAuthorizationSha256() || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(configured) ? configured : "";
+}
+
+function makeInternalQueueContractorProof(jobId, previousProof = "") {
+  const authorizationSha256 = currentContractorAuthorizationSha256();
+  if (!authorizationSha256) return "";
+  const binding = internalQueueContractorBinding(jobId, authorizationSha256);
+  // Re-minting a stored proof (startup recovery) keeps it only when it was minted under the
+  // hash configured now.
+  if (previousProof && String(previousProof).split(":")[1] !== binding) return "";
+  const keyed = createHmac("sha256", QUEUE_CAPABILITY_KEY).update(`contractor\0${authorizationSha256}\0${jobId}`).digest("hex");
+  return `${keyed}:${binding}`;
 }
 
 function internalQueueContractorProofValid(job) {
   const jobId = String(job?.internalQueueJobId || "");
   const proof = String(job?.internalQueueContractorProof || "");
-  if (!jobId || !/^[a-f0-9]{64}$/.test(proof)) return false;
+  if (!jobId || !/^[a-f0-9]{64}:[a-f0-9]{64}$/.test(proof)) return false;
   const expected = makeInternalQueueContractorProof(jobId);
-  return timingSafeEqual(Buffer.from(proof, "hex"), Buffer.from(expected, "hex"));
+  if (!expected) return false;
+  return timingSafeEqual(Buffer.from(proof, "utf8"), Buffer.from(expected, "utf8"));
 }
 
 function contractorAuthorizationValid(job, expectedHash = effectiveContractorAuthorizationSha256()) {
@@ -13844,8 +13931,12 @@ function normalizePathForCompare(value, cwd = "") {
   return normalizeFilesystemCase(normalized, cwd);
 }
 
-function hasAmbiguousPathPattern(paths) {
-  return normalizeList(paths).some((path) => /[*?[\]{}!]/.test(path));
+// A path with glob characters is ambiguous unless it names an existing file or directory
+// literally (Next.js app/[slug]/page.tsx). Bridge git commands run with
+// GIT_LITERAL_PATHSPECS=1 (buildTrustedGitEnv), so such a path is never expanded as a pattern.
+function hasAmbiguousPathPattern(paths, cwd = "") {
+  return normalizeList(paths).some((candidate) => /[*?[\]{}!]/.test(candidate)
+    && !(cwd && !/[*?]/.test(candidate) && existsSync(path.join(cwd, candidate))));
 }
 
 function overlaps(pathsA, pathsB, cwd = "") {
@@ -14169,14 +14260,33 @@ async function verifySanitizedJobsBeforeDiscovery(jobs, phase) {
 // for one (up to their timeout) and then run their full timeout, so the call could take
 // twice the agent timeout and outlive Codex's tool_timeout_sec. Pipelines and queued jobs
 // take a lease per job and are not limited here. Dry runs take no slot.
-function parallelBatchCapacityError(jobs) {
-  const leasedJobCount = jobs.filter((job) => !job.dryRun).length;
-  if (leasedJobCount <= CONFIG.providerConcurrencyLimit) return null;
+// Leases are counted per provider key (providerKeyForMetadata), so once each job's attested
+// metadata is known the limit applies to each provider's jobs; without keys every job counts
+// against one key, which is the conservative reading.
+function parallelBatchCapacityError(jobs, providerKeys = null) {
+  const leasedByKey = new Map();
+  jobs.forEach((job, index) => {
+    if (job.dryRun) return;
+    const key = Array.isArray(providerKeys) && providerKeys[index] ? providerKeys[index] : CONFIG.providerConcurrencyKey;
+    leasedByKey.set(key, (leasedByKey.get(key) || 0) + 1);
+  });
+  const [overKey, leasedJobCount] = [...leasedByKey.entries()].find(([, count]) => count > CONFIG.providerConcurrencyLimit) || [];
+  if (!overKey) return null;
+  const keyed = Array.isArray(providerKeys) && leasedByKey.size > 1;
   return {
-    error: `${leasedJobCount} parallel jobs exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
+    error: `${leasedJobCount} parallel jobs${keyed ? ` for provider key ${overKey}` : ""} exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
     errorType: "parallel_batch_exceeds_provider_capacity",
-    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
+    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per provider per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
   };
+}
+
+function parallelProviderKeys(resolutions = [], metadataResults = [], lockPlans = []) {
+  return resolutions.map((resolution, index) => {
+    const metadata = metadataResults[index]?.metadata || null;
+    if (!metadata) return "";
+    const override = allowlistedModelOverride(lockPlans[index]?.scopeContract?.modelRequirement, resolution?.actualAgent || lockPlans[index]?.agent);
+    return providerKeyForMetadata(applyModelOverrideToMetadata(metadata, override));
+  });
 }
 
 function validateParallelWritePlan(jobs) {
@@ -14305,7 +14415,7 @@ function validateParallelWritePlan(jobs) {
     }
 
     const ambiguousPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.sharedFiles, plan.scopeContract?.scope.write || []);
-    if (hasAmbiguousPathPattern(ambiguousPathInputs)) {
+    if (hasAmbiguousPathPattern(ambiguousPathInputs, plan.cwd)) {
       return {
         error: `Parallel write job for agent "${plan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks, or run serially.`,
         errorType: "parallel_plan_rejected",
@@ -14361,11 +14471,15 @@ function validateParallelWritePlan(jobs) {
 
   }
 
+  // Paths are repository-relative: the same relative path in two repositories is no overlap.
+  const sameProject = (left, right) => !left.cwd || !right.cwd
+    || normalizeFilesystemCase(path.resolve(left.cwd), left.cwd) === normalizeFilesystemCase(path.resolve(right.cwd), left.cwd);
   for (let i = 0; i < lockPlans.length; i += 1) {
     for (let j = i + 1; j < lockPlans.length; j += 1) {
       const left = lockPlans[i];
       const right = lockPlans[j];
       if ((left.lockType === "read") === (right.lockType === "read")) continue;
+      if (!sameProject(left, right)) continue;
       const overlap = overlaps(hardLockPathsForPlan(left), hardLockPathsForPlan(right), left.cwd || right.cwd);
       if (overlap) {
         return {
@@ -14382,9 +14496,11 @@ function validateParallelWritePlan(jobs) {
   if (writePlans.length > 1) {
     for (let i = 0; i < writePlans.length; i += 1) {
       for (let j = i + 1; j < writePlans.length; j += 1) {
+        if (!sameProject(writePlans[i], writePlans[j])) continue;
         const overlap = overlaps(
           writePlans[i].allowedEdits.concat(writePlans[i].lockedPaths),
-          writePlans[j].allowedEdits.concat(writePlans[j].lockedPaths)
+          writePlans[j].allowedEdits.concat(writePlans[j].lockedPaths),
+          writePlans[i].cwd || writePlans[j].cwd
         );
         if (overlap) {
           return {
@@ -14502,7 +14618,7 @@ function validateSingleLockPlan(job) {
   }
 
   const ambiguousPathInputs = lockPlan.lockedPaths.concat(lockPlan.allowedEdits, lockPlan.sharedFiles, lockPlan.scopeContract?.scope.write || []);
-  if (hasAmbiguousPathPattern(ambiguousPathInputs)) {
+  if (hasAmbiguousPathPattern(ambiguousPathInputs, lockPlan.cwd)) {
     return {
       error: `Write job for agent "${lockPlan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks.`,
       errorType: "lock_plan_rejected",
@@ -16395,6 +16511,7 @@ async function assessQueuePlan(lockPlans = []) {
 
   for (const plan of lockPlans) {
     const candidate = {
+      jobId: plan.jobId || "",
       mode: plan.lockType === "read" ? "read" : "write",
       cwd: plan.cwd,
       lockedPaths: plan.lockedPaths,
@@ -19232,10 +19349,9 @@ server.tool(
   async ({ jobs }) => {
     jobs = await Promise.all(jobs.map((job) => normalizeJobCwd(job)));
     const toolStarted = nowMs();
-    const capacityError = parallelBatchCapacityError(jobs);
-    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = capacityError
-      ? { ...capacityError, lockPlans: [] }
-      : validateParallelWritePlan(jobs);
+    // Provider capacity is checked per provider key once every route is attested (below),
+    // before any lock, worktree or agent; each key's leases are limited separately.
+    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = validateParallelWritePlan(jobs);
     if (writePlanError) {
       const requestedAgents = lockPlans?.map((plan) => plan.agent).filter(Boolean).join(", ") || "multiple";
       const lockMode = lockPlans?.map((plan) => plan.lockMode).filter(Boolean).join(", ") || "unknown";
@@ -19367,6 +19483,20 @@ server.tool(
       resolution.agentMetadata = metadata?.metadata || null;
       parallelResolutions[index] = resolution;
       parallelAgentMetadata[index] = metadata;
+    }
+
+    const capacityError = parallelBatchCapacityError(jobs, parallelProviderKeys(parallelResolutions, parallelAgentMetadata, lockPlans));
+    if (capacityError) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Parallel OpenCode execution rejected.",
+        errorType: capacityError.errorType,
+        reason: capacityError.error,
+        requestedAgent: lockPlans.map((plan) => plan.agent).filter(Boolean).join(", ") || "multiple",
+        actualAgent: "none",
+        lockMode: lockPlans.map((plan) => plan.lockMode).filter(Boolean).join(", ") || "unknown",
+        durationMs: nowMs() - toolStarted,
+        suggestedFix: capacityError.suggestedFix,
+      }) }] };
     }
 
     const acquiredLocks = [];
@@ -20609,7 +20739,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         try {
           request = await decryptQueueRequest(row.request_encrypted, row.job_id);
           if (request?.internalQueueContractorProof) {
-            request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id);
+            request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id, request.internalQueueContractorProof);
           }
         } catch (error) {
           logEvent("warn", "queue.request_resume_failed", { jobId: row.job_id, dbPath, error: redactSensitiveText(error.message || String(error)) });
