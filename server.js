@@ -724,6 +724,19 @@ function buildOpenCodeEnv(extra = {}) {
   // cross-process lock races and unnecessary prompt/session persistence.
   env.OPENCODE_DB = ":memory:";
   env.OPENCODE_DISABLE_CHANNEL_DB = "true";
+  // The agent's own git: a repository-local fsmonitor hook, external diff or gpg.program (run
+  // by log.showSignature) must not execute. Appended after any operator entries so they win.
+  const inheritedConfigCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT || "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
+  if (!inheritedConfigCount) {
+    for (const key of Object.keys(env)) {
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
+    }
+  }
+  [["core.fsmonitor", "false"], ["diff.external", ""], ["log.showSignature", "false"]].forEach(([key, value], offset) => {
+    env[`GIT_CONFIG_KEY_${inheritedConfigCount + offset}`] = key;
+    env[`GIT_CONFIG_VALUE_${inheritedConfigCount + offset}`] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(inheritedConfigCount + 3);
   return env;
 }
 
@@ -909,35 +922,124 @@ function isGitExecutable(command) {
   return executable === "git" || executable === "git.exe";
 }
 
+// Bridge-owned Git drops the operator's system and global config (GIT_CONFIG_NOSYSTEM,
+// GIT_CONFIG_GLOBAL=NUL). That also dropped Git for Windows' system core.autocrlf=true: a
+// clean CRLF checkout looked modified to bridge Git after a timestamp-only change, bridge
+// worktrees were checked out with LF, and the integration apply saw every CRLF target file as
+// "needs update". The line-ending keys are read once, with the operator's plain environment,
+// from the system and global levels, and handed to bridge Git as its *global* config file.
+// A repository-local value (the self-test repositories and this repository set
+// core.autocrlf=false) therefore still wins exactly as it does for the operator's Git; a
+// `-c`/GIT_CONFIG_COUNT override would have beaten it. Only these keys with these literal
+// values are carried; any other value counts as unset. core.symlinks is carried for the
+// same reason: Git for Windows sets it in the system config, and it decides whether a
+// 120000 entry is checked out as a symlink or as a plain file.
+const USER_LINE_ENDING_GIT_CONFIG_KEYS = new Map([
+  ["core.autocrlf", /^(?:true|false|input)$/],
+  ["core.eol", /^(?:lf|crlf|native)$/],
+  ["core.safecrlf", /^(?:true|false|warn)$/],
+  ["core.symlinks", /^(?:true|false)$/],
+]);
+const NULL_GIT_CONFIG_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
+
+async function readUserLineEndingGitConfig() {
+  const values = new Map();
+  // Later levels win, as in Git: global overrides system.
+  for (const scope of ["--system", "--global"]) {
+    let stdout = "";
+    try {
+      ({ stdout } = await execFileAsync("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
+        cwd: tmpdir(),
+        shell: false,
+        timeout: 1000 * 15,
+        maxBuffer: 64 * 1024,
+        windowsHide: true,
+        env: process.env,
+      }));
+    } catch (error) {
+      // Exit 1 means no key is set at that level; a missing git leaves Git's defaults.
+      stdout = String(error?.stdout || "");
+    }
+    for (const line of String(stdout || "").split(/\r?\n/)) {
+      const match = /^(\S+)\s+(.+)$/.exec(line.trim());
+      if (!match) continue;
+      const key = match[1].toLowerCase();
+      const value = match[2].trim().toLowerCase();
+      if (USER_LINE_ENDING_GIT_CONFIG_KEYS.get(key)?.test(value)) values.set(key, value);
+    }
+  }
+  return values;
+}
+
+async function writeUserLineEndingGitConfigFile(values) {
+  if (!values.size) return NULL_GIT_CONFIG_PATH;
+  const content = `[core]\n${[...values].sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `\t${key.slice("core.".length)} = ${value}\n`).join("")}`;
+  // Content-addressed in the operator-private state directory, so concurrent bridge
+  // processes write identical bytes and a shared temporary directory is never trusted.
+  const file = path.join(GLOBAL_BRIDGE_STATE_DIR, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
+  const current = async () => {
+    try { return await readFile(file, "utf8"); } catch { return null; }
+  };
+  try {
+    if (await current() === content) return file;
+    await mkdir(GLOBAL_BRIDGE_STATE_DIR, { recursive: true });
+    const temporary = `${file}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+      await rename(temporary, file);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
+  } catch {
+    // Another bridge process may have renamed the same content-addressed file first.
+  }
+  if (await current() === content) return file;
+  console.error(JSON.stringify({ ts: new Date().toISOString(), level: "warn", event: "git.line_ending_config_unavailable" }));
+  return NULL_GIT_CONFIG_PATH;
+}
+
+const USER_LINE_ENDING_GIT_CONFIG = await readUserLineEndingGitConfig();
+const BRIDGE_GIT_GLOBAL_CONFIG_PATH = await writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG);
+
+// Enforced on every bridge Git process, as GIT_CONFIG_COUNT entries and as `-c` options.
+// log.showSignature/gpg.* keep a repository-local gpg.program from running inside bridge
+// `git log` (readOnlyHeadMove ran one); core.pager is never a repository program.
+const TRUSTED_GIT_ENFORCED_CONFIG = [
+  ["core.hooksPath", DISABLED_GIT_HOOKS_PATH],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedCache", "false"],
+  ["credential.helper", ""],
+  ["diff.external", ""],
+  // Bridge-owned Git ignores global config, so opt into long paths explicitly:
+  // generated worktree roots plus repository-relative paths routinely exceed MAX_PATH.
+  ...(process.platform === "win32" ? [["core.longpaths", "true"]] : []),
+  ["log.showSignature", "false"],
+  ["gpg.program", ""],
+  ["gpg.ssh.program", ""],
+  ["gpg.x509.program", ""],
+  ["core.pager", "cat"],
+];
+
 function buildTrustedGitEnv(extra = null) {
   const env = buildValidationEnv();
   for (const key of TRUSTED_GIT_EXTRA_ENV_KEYS) {
     if (extra && extra[key] !== undefined) env[key] = extra[key];
   }
   env.GIT_CONFIG_NOSYSTEM = "1";
-  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+  env.GIT_CONFIG_GLOBAL = BRIDGE_GIT_GLOBAL_CONFIG_PATH;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
   delete env.GIT_ASKPASS;
   delete env.SSH_ASKPASS;
-  env.GIT_CONFIG_COUNT = "5";
-  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
-  env.GIT_CONFIG_VALUE_0 = DISABLED_GIT_HOOKS_PATH;
-  env.GIT_CONFIG_KEY_1 = "core.fsmonitor";
-  env.GIT_CONFIG_VALUE_1 = "false";
-  env.GIT_CONFIG_KEY_2 = "core.untrackedCache";
-  env.GIT_CONFIG_VALUE_2 = "false";
-  env.GIT_CONFIG_KEY_3 = "credential.helper";
-  env.GIT_CONFIG_VALUE_3 = "";
-  env.GIT_CONFIG_KEY_4 = "diff.external";
-  env.GIT_CONFIG_VALUE_4 = "";
-  if (process.platform === "win32") {
-    // Bridge-owned Git ignores global config, so opt into long paths explicitly:
-    // generated worktree roots plus repository-relative paths routinely exceed MAX_PATH.
-    env.GIT_CONFIG_KEY_5 = "core.longpaths";
-    env.GIT_CONFIG_VALUE_5 = "true";
-    env.GIT_CONFIG_COUNT = "6";
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
   }
+  TRUSTED_GIT_ENFORCED_CONFIG.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(TRUSTED_GIT_ENFORCED_CONFIG.length);
   return env;
 }
 
@@ -959,13 +1061,8 @@ function trustedGitArgs(args = []) {
   }
   if (subcommandIndex >= trusted.length) return trusted;
   const enforcedConfig = [
-    "-c", `core.hooksPath=${DISABLED_GIT_HOOKS_PATH}`,
-    "-c", "core.fsmonitor=false",
-    "-c", "core.untrackedCache=false",
+    ...TRUSTED_GIT_ENFORCED_CONFIG.flatMap(([key, value]) => ["-c", `${key}=${value}`]),
     "-c", "core.quotePath=false",
-    "-c", "credential.helper=",
-    "-c", "diff.external=",
-    ...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []),
   ];
   trusted.splice(subcommandIndex, 0, ...enforcedConfig);
   const actualSubcommandIndex = subcommandIndex + enforcedConfig.length;
@@ -986,19 +1083,27 @@ async function inspectRepositoryGitControlSurface(cwd) {
       unsafeKeys: [],
     };
   }
-  const unsafePattern = /^(?:filter\..*|diff\..*\.(?:command|textconv)|merge\..*\.driver|core\.(?:attributesfile|sshcommand)|credential\..*|http\..*\.extraheader|url\..*\.insteadof|include(?:if)?\..*)$/i;
-  const unsafeKeys = [...new Set(
-    String(listed.stdout || "")
-      .split(/\r?\n/)
-      .map((key) => key.trim())
-      .filter((key) => unsafePattern.test(key))
-  )].sort();
-  return unsafeKeys.length
+  // Every key that names a program Git may run (pager, editor, proxy, askpass, gpg, fsmonitor
+  // hook, external diff, upload/receive-pack) or that makes Git run one (log.showSignature).
+  const unsafePattern = /^(?:filter\..*|diff\..*\.(?:command|textconv)|diff\.external|merge\..*\.driver|core\.(?:attributesfile|sshcommand|pager|editor|gitproxy|askpass)|credential\..*|http\..*\.extraheader|url\..*\.insteadof|include(?:if)?\..*|gpg\..*|log\.showsignature|pager\..*|sequence\.editor|uploadpack\..*|remote\..*\.(?:uploadpack|receivepack))$/i;
+  const listedKeys = String(listed.stdout || "").split(/\r?\n/).map((key) => key.trim()).filter(Boolean);
+  const unsafeKeys = new Set(listedKeys.filter((key) => unsafePattern.test(key)));
+  // core.fsmonitor=true/false selects Git's builtin daemon or none; any other value is a hook
+  // program path that every status/diff would execute.
+  if (listedKeys.some((key) => key.toLowerCase() === "core.fsmonitor")) {
+    const monitor = await runCommand("git", ["config", "--local", "--get-all", "core.fsmonitor"], cwd, 1000 * 15);
+    const values = String(monitor.stdout || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (monitor.exitCode !== 0 || values.some((value) => !/^(?:true|false|yes|no|on|off|1|0)$/i.test(value))) {
+      unsafeKeys.add("core.fsmonitor");
+    }
+  }
+  const sortedUnsafeKeys = [...unsafeKeys].sort();
+  return sortedUnsafeKeys.length
     ? {
         ok: false,
         errorType: "git_repository_config_unsafe",
-        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${unsafeKeys.join(", ")}.`,
-        unsafeKeys,
+        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${sortedUnsafeKeys.join(", ")}.`,
+        unsafeKeys: sortedUnsafeKeys,
       }
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
 }
@@ -2053,11 +2158,13 @@ async function runValidationGate({ command, cwd, dryRun = false, timeoutMs = CON
 
   const started = nowMs();
   const executable = path.basename(prepared.executablePath).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-  // Bridge-owned Git ignores the operator's global config, so core.autocrlf is off and
-  // `git diff --check` reports every CRLF line an agent writes on Windows as trailing
-  // whitespace, failing an otherwise clean job. Treat CR at end of line as allowed unless
-  // the repository's own core.whitespace says otherwise; real trailing blanks, space-before-tab
-  // and conflict markers are still caught.
+  // Bridge Git now carries the operator's core.autocrlf (see USER_LINE_ENDING_GIT_CONFIG), so
+  // with autocrlf=true/input the diff never shows a CR. A repository that sets
+  // core.autocrlf=false locally (this one does) still gets CRLF files from agents on Windows,
+  // and `git diff --check` would report every such line as trailing whitespace, failing an
+  // otherwise clean job. Treat CR at end of line as allowed unless the repository's own
+  // core.whitespace says otherwise; real trailing blanks, space-before-tab and conflict
+  // markers are still caught.
   let whitespaceConfig = [];
   if (executable === "git" && prepared.args[0] === "diff" && prepared.args.includes("--check")) {
     const configured = await runCommand(prepared.executablePath, ["config", "--get", "core.whitespace"], cwd || process.cwd(), 1000 * 15, buildValidationEnv(), { signal });
