@@ -429,7 +429,7 @@ async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extra
 }
 
 async function getQueueSnapshot(client, cwd, jobId) {
-  return parseJobSnapshot(await callTool(client, "get_opencode_job", { cwd, jobId }));
+  return parseJobSnapshot(await callTool(client, "get_opencode_job", { cwd, jobId, detail: true }));
 }
 
 async function waitForQueueStatus(client, cwd, jobId, expectedStatuses, timeoutMs = 10_000) {

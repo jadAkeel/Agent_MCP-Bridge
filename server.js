@@ -5838,6 +5838,7 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Command shape: ${result?.commandShape || "not run"}`,
     `Dry run: ${result?.dryRun ? "yes" : "no"}`,
     `Error type: ${result?.errorType || "none"}`,
+    formatReadOnlyHeadMove(result?.readOnlyHeadMove),
     result?.timedOut ? `Agent timeout: ${resolution.actualAgent || resolution.requestedAgent}` : null,
     `Timeout ms: ${result?.timeoutMs ?? "not specified"}`,
     `Timed out: ${result?.timedOut ? "yes" : "no"}`,
@@ -5862,6 +5863,9 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Files changed: ${result?.changedFiles?.length ? result.changedFiles.join(", ") : "none detected"}`,
     `Exit code: ${result?.exitCode ?? "not run"}`,
     `Duration ms: ${result?.durationMs ?? 0}`,
+    result?.childStartedAtMs && result?.childFinishedAtMs
+      ? `Agent run ms: ${Math.max(0, result.childFinishedAtMs - result.childStartedAtMs)} (agent process only; Duration ms adds role attestation and the provider slot wait)`
+      : null,
     "",
     `Tool outcomes: ${result?.toolOutcomes?.length ? result.toolOutcomes.map((item) => `${item.tool}:${item.status}`).join(", ") : "none"}`,
     "",
@@ -8653,6 +8657,40 @@ async function captureIntegrationTargetState(cwd) {
     workingStateSha256,
     targetStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, workingStateSha256].join("\0")).digest("hex"),
   };
+}
+
+// A read-only agent cannot commit (its bash is limited to read-only git and is attested before
+// spawn), so a HEAD that moved forward during its run was moved by another client. Returns the
+// move so the caller keeps the result and reports it; null when the move cannot be shown to be
+// a plain fast-forward, which keeps the job failing.
+async function readOnlyHeadMove(lockPlan, cwd, before, after) {
+  if (lockPlan?.lockType !== "read" || !before || !after || before === after) return null;
+  const env = buildValidationEnv();
+  const ancestor = await runCommand("git", ["merge-base", "--is-ancestor", before, after], cwd, 1000 * 15, env);
+  if (ancestor.exitCode !== 0) return null;
+  const log = await runCommand("git", ["log", "--format=%h %s", `${before}..${after}`], cwd, 1000 * 15, env);
+  const diff = await runCommand("git", ["diff", "--name-only", before, after], cwd, 1000 * 15, env);
+  if (log.exitCode !== 0 || diff.exitCode !== 0) return null;
+  const changedPaths = diff.stdout.split(/\r?\n/).filter(Boolean);
+  const readScope = lockPlan.scopeContract?.scope?.read || [];
+  const readScopeTouched = readScope.length
+    ? changedPaths.filter((changed) => overlaps([changed], readScope, cwd))
+    : changedPaths;
+  return {
+    before,
+    after,
+    commits: log.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20),
+    changedPaths: changedPaths.slice(0, 50),
+    readScopeTouched: readScopeTouched.slice(0, 50),
+  };
+}
+
+function formatReadOnlyHeadMove(move) {
+  if (!move) return null;
+  const touched = move.readScopeTouched.length
+    ? `yes (${move.readScopeTouched.join(", ")}); the review may describe the older version of these files`
+    : "no";
+  return `Repository HEAD moved during this read-only run (another client committed; result kept): ${move.before.slice(0, 12)}..${move.after.slice(0, 12)}, ${move.commits.length} commit(s): ${move.commits.join("; ")}. Read scope touched: ${touched}`;
 }
 
 async function captureGitHead(cwd) {
@@ -11915,35 +11953,7 @@ server.tool(
         directRuns: directRunAudit.coverage,
         detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs and direct runs; counts in summary cover all`,
       },
-      jobs: detailJobs.map((job) => ({
-        jobId: job.jobId,
-        pipelineId: job.parentJobId || "",
-        status: job.status,
-        stage: queueRunStage(job),
-        errorType: job.errorType || "",
-        failureReason: job.errorReason || "",
-        requestedAgent: job.agent || "",
-        actualModel: job.actualModel || job.runtimeObservedModel || "",
-        childProcessId: job.childProcessId || job.orphanChildProcessId || 0,
-        worktreePath: job.worktreePath || "",
-        workPreserved: Boolean(job.worktreePath),
-        retrySafe: job.mode === "read" && !["running", "validating", "reviewing", "testing"].includes(job.status),
-        // Healthy jobs used to get "inspect preserved work before retrying", which reads as if
-        // something had gone wrong; only jobs that stopped short get recovery steps.
-        recoveryAction: ["pending", "planned", "running", "validating", "reviewing", "testing"].includes(job.status)
-          ? `None: the job is ${queueRunStage(job)}.`
-          : job.status === "completed"
-          ? (job.worktreePath && job.mode === "write"
-            ? "None: review the patch and integrate it with integrate_opencode_worktree (dry run first)."
-            : "None: the job completed.")
-          : job.worktreePath
-          ? `Inspect preserved work: git -C "${job.worktreePath}" status --short and git diff --binary before retrying.`
-          : job.status === "not_resumable"
-          ? "Re-enqueue with a stable idempotencyKey; legacy records without encrypted requests cannot be replayed."
-          : job.status === "interrupted"
-          ? "Inspect the target repository and recorded child identity before retrying with the same idempotencyKey."
-          : "No manual SQLite edit is required; follow the stable error type and wait for active leases/locks to expire or complete.",
-      })),
+      jobs: detailJobs.map((job) => diagnoseJobView(job)),
       pipelines: pipelines.map((pipeline) => ({
         pipelineId: pipeline.pipelineId,
         status: pipeline.status,
@@ -12358,6 +12368,62 @@ server.tool(
 
 // Polling four jobs with full records cost ~20k characters of coordinator context per poll.
 // The compact form keeps what a coordinator acts on; detail: true or get_opencode_job has the rest.
+// One diagnose row. A completed writer whose worktree no longer exists was integrated (or removed),
+// so it is not offered for integration again.
+function diagnoseJobView(job) {
+  const worktreePresent = Boolean(job.worktreePath) && existsSync(job.worktreePath);
+  return {
+    jobId: job.jobId,
+    pipelineId: job.parentJobId || "",
+    status: job.status,
+    stage: queueRunStage(job),
+    errorType: job.errorType || "",
+    failureReason: job.errorReason || "",
+    requestedAgent: job.agent || "",
+    actualModel: job.actualModel || job.runtimeObservedModel || "",
+    childProcessId: job.childProcessId || job.orphanChildProcessId || 0,
+    worktreePath: job.worktreePath || "",
+    workPreserved: worktreePresent,
+    retrySafe: job.mode === "read" && !["running", "validating", "reviewing", "testing"].includes(job.status),
+    // Healthy jobs used to get "inspect preserved work before retrying", which reads as if
+    // something had gone wrong; only jobs that stopped short get recovery steps.
+    recoveryAction: ["pending", "planned", "running", "validating", "reviewing", "testing"].includes(job.status)
+      ? `None: the job is ${queueRunStage(job)}.`
+      : job.status === "completed"
+      ? (worktreePresent && job.mode === "write"
+        ? "None: review the patch and integrate it with integrate_opencode_worktree (dry run first)."
+        : job.worktreePath && job.mode === "write"
+        ? "None: the worktree is gone (integrated and cleaned up, or removed)."
+        : "None: the job completed.")
+      : worktreePresent
+      ? `Inspect preserved work: git -C "${job.worktreePath}" status --short and git diff --binary before retrying.`
+      : job.status === "not_resumable"
+      ? "Re-enqueue with a stable idempotencyKey; legacy records without encrypted requests cannot be replayed."
+      : job.status === "interrupted"
+      ? "Inspect the target repository and recorded child identity before retrying with the same idempotencyKey."
+      : "No manual SQLite edit is required; follow the stable error type and wait for active leases/locks to expire or complete.",
+  };
+}
+
+const ESSENTIAL_QUEUE_JOB_FIELDS = [
+  "jobId", "idempotencyKey", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "providerWaitMs",
+  "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
+  "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText",
+];
+
+// The fields a caller polling or reading one job acts on; `detail: true` returns the full record.
+function essentialQueueJobView(snapshot) {
+  const view = {};
+  for (const field of ESSENTIAL_QUEUE_JOB_FIELDS) {
+    const value = snapshot?.[field];
+    if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) continue;
+    view[field] = value;
+  }
+  view.omitted = "Pass detail: true for the scope contract, hashes, lease, owner and containment fields.";
+  return view;
+}
+
 function compactQueueJobLines(records) {
   if (!records.length) return "(no jobs)";
   return records.map((record) => {
@@ -12370,7 +12436,9 @@ function compactQueueJobLines(records) {
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
       timing.agentRunMs ? `agentRunMs=${timing.agentRunMs}` : "",
-      timing.waitBeforeAgentMs ? `waitMs=${timing.waitBeforeAgentMs}` : "",
+      timing.waitBeforeAgentMs ? `startupMs=${timing.waitBeforeAgentMs}` : "",
+      record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
+      record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
       record.errorType ? `error=${record.errorType}` : "",
       record.completionOutcome ? `outcome=${record.completionOutcome}` : "",
@@ -12386,8 +12454,9 @@ server.tool(
   {
     jobId: z.string(),
     cwd: z.string().min(1).describe("Canonical repository path for project-scoped job lookup."),
+    detail: z.boolean().optional().describe("Full record (scope contract, hashes, lease, owner and containment fields). Default: status, timing, changed files, worktree and result text."),
   },
-  async ({ jobId, cwd = "" }) => {
+  async ({ jobId, cwd = "", detail = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const authoritative = await authoritativeQueueRecord(jobId, projectRoot || cwd);
     const snapshot = authoritative
@@ -12408,7 +12477,7 @@ server.tool(
       content: [
         {
           type: "text",
-          text: JSON.stringify(snapshot, null, 2),
+          text: JSON.stringify(detail ? snapshot : essentialQueueJobView(snapshot), null, 2),
         },
       ],
     };
@@ -14951,8 +15020,13 @@ async function executeOpenCodeJob(requestedJob, {
       ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
       : changedFilesBetween(beforeFiles, afterFiles);
     if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
-      result.errorType = "repository_head_changed_during_execution";
-      result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+      const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
+      if (move) {
+        result.readOnlyHeadMove = move;
+      } else {
+        result.errorType = "repository_head_changed_during_execution";
+        result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+      }
     }
     result.executionHeadBefore = executionHeadBefore;
     result.executionHeadAfter = executionHeadAfterAgent;
@@ -14999,8 +15073,15 @@ async function executeOpenCodeJob(requestedJob, {
     const executionHeadAfterValidation = dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
     const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
     if (executionHeadAfterValidation !== executionHeadBefore) {
-      result.errorType ||= "repository_head_changed_during_execution";
-      result.stderr = [result.stderr, "Repository HEAD changed before execution validation completed. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+      const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
+        ? null
+        : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterValidation);
+      if (move) {
+        result.readOnlyHeadMove = move;
+      } else {
+        result.errorType ||= "repository_head_changed_during_execution";
+        result.stderr = [result.stderr, "Repository HEAD changed before execution validation completed. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+      }
       result.executionHeadAfter = executionHeadAfterValidation;
     }
     if (validationMutationFiles.length) {
@@ -15241,7 +15322,9 @@ async function executeOpenCodeJob(requestedJob, {
 // durationMs includes the wait. runStage and agentRunMs separate the two.
 function queueRunStage(record) {
   if (record.status !== "running") return record.status || "";
-  return record.childProcessStartedAt ? "agent_running" : "waiting_for_provider_slot";
+  // Before the agent process starts the bridge re-attests the role (two `opencode debug` calls,
+  // a few seconds each) and waits for a provider slot; providerWaitMs on the record splits the two.
+  return record.childProcessStartedAt ? "agent_running" : "starting_agent";
 }
 
 function queueAgentTiming(record, now = Date.now()) {
@@ -15289,6 +15372,8 @@ function queueRecordSnapshot(record, includeResult = true) {
     finishedAt: record.finishedAt || "",
     durationMs: record.durationMs || 0,
     ...queueAgentTiming(record),
+    providerWaitMs: record.providerWaitMs || 0,
+    readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
     maxRetries: record.maxRetries || 0,
     errorType: record.errorType || "",
@@ -16258,12 +16343,15 @@ async function assessQueuePlan(lockPlans = []) {
       cwd: plan.cwd,
       lockedPaths: plan.lockedPaths,
       allowedEdits: plan.allowedEdits,
+      // The scheduler judges a reader by its read scope; without it a reader with no locked
+      // paths counts as the whole repository and "must wait" for every writer.
+      scopeContract: plan.scopeContract,
     };
     const conflict = await findQueueWriteConflict(candidate);
     if (conflict) {
       return {
         status: effectiveQueueWriteConflictPolicy() === "reject" ? "conflict" : "must_wait",
-        reason: `Queued/running write job ${conflict.jobId} overlaps this plan.`,
+        reason: `Queued/running write job ${conflict.jobId} overlaps this plan on ${(conflict.paths || []).join(", ") || "the repository"}.`,
         conflictingPaths: conflict.paths,
       };
     }
@@ -16972,6 +17060,8 @@ async function startQueueRecord(record) {
         actualModelEvidence: execution.result?.actualModelEvidence || "",
         dependencyRequest: execution.result?.dependencyRequest || null,
         resultText: execution.response?.content?.[0]?.text || "",
+        providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
+        readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
         worktreeBranch: execution.worktree?.branch || "",
         worktreeBaseCommit: execution.worktree?.baseCommit || "",
@@ -19448,8 +19538,13 @@ server.tool(
           : changedFilesBetween(beforeFiles, afterFiles);
         const expectedExecutionHead = parallelHeadBefore.get(path.resolve(executionCwd)) || "";
         if (executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead) {
-          result.errorType ||= "repository_head_changed_during_execution";
-          result.stderr = [result.stderr, "Repository HEAD changed during parallel execution. The change is unattributed and the worktree/output was retained."].filter(Boolean).join("\n");
+          const move = result.changedFiles.length || result.errorType ? null : await readOnlyHeadMove(lockPlan, executionCwd, expectedExecutionHead, executionHeadAfterAgent);
+          if (move) {
+            result.readOnlyHeadMove = move;
+          } else {
+            result.errorType ||= "repository_head_changed_during_execution";
+            result.stderr = [result.stderr, "Repository HEAD changed during parallel execution. The change is unattributed and the worktree/output was retained."].filter(Boolean).join("\n");
+          }
         }
         result.executionHeadBefore = expectedExecutionHead;
         result.executionHeadAfter = executionHeadAfterAgent;
@@ -19491,7 +19586,11 @@ server.tool(
         const executionHeadAfterValidation = job.dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
         const validationMutationFiles = job.dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
         if (executionHeadAfterValidation && executionHeadAfterValidation !== expectedExecutionHead) {
-          result.errorType ||= "repository_head_changed_during_execution";
+          const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
+            ? null
+            : await readOnlyHeadMove(lockPlan, executionCwd, expectedExecutionHead, executionHeadAfterValidation);
+          if (move) result.readOnlyHeadMove = move;
+          else result.errorType ||= "repository_head_changed_during_execution";
           result.executionHeadAfter = executionHeadAfterValidation;
         }
         if (validationMutationFiles.length) {
@@ -19583,15 +19682,21 @@ server.tool(
         const afterHead = await captureGitHead(cwdKey);
         const expectedHead = parallelHeadBefore.get(cwdKey) || "";
         const headChanged = afterHead !== expectedHead;
+        const changedFiles = changedFilesBetween(parallelBefore.get(cwdKey) || new Map(), after);
+        const plansForCwd = lockPlans.filter((_, index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
         if (headChanged) {
-          for (const jobResult of results.filter((_, index) => path.resolve(executionCwdForIndex(index)) === cwdKey)) {
-            jobResult.result.errorType ||= "repository_head_changed_during_execution";
+          const readOnlyCwd = !changedFiles.length && plansForCwd.every((plan) => plan.lockType === "read");
+          for (const [index, jobResult] of results.entries()) {
+            if (path.resolve(executionCwdForIndex(index)) !== cwdKey) continue;
+            const move = readOnlyCwd && !jobResult.result.errorType
+              ? await readOnlyHeadMove(lockPlans[index], cwdKey, expectedHead, afterHead)
+              : null;
+            if (move) jobResult.result.readOnlyHeadMove = move;
+            else jobResult.result.errorType ||= "repository_head_changed_during_execution";
             jobResult.result.executionHeadBefore = expectedHead;
             jobResult.result.executionHeadAfter = afterHead;
           }
         }
-        const changedFiles = changedFilesBetween(parallelBefore.get(cwdKey) || new Map(), after);
-        const plansForCwd = lockPlans.filter((_, index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
         const writePlansForCwd = plansForCwd.filter((plan) => plan.lockType === "write");
         const allowedEditsForCwd = writePlansForCwd.flatMap((plan) => plan.allowedEdits);
         const forbiddenForCwd = plansForCwd.flatMap((plan) => plan.forbiddenEdits.concat(plan.sharedFiles));
@@ -20608,11 +20713,15 @@ export const __selfTest = {
     normalizeProjectAgentPolicy,
     normalizeScopeContract,
     compactQueueJobLines,
+    essentialQueueJobView,
+    diagnoseJobView,
     queueAgentTiming,
     queueRunStage,
     staleBridgeProcessHint,
     truncateResultText,
     diffStatFromPatch,
+    readOnlyHeadMove,
+    formatReadOnlyHeadMove,
     noteQueueLeaseRenewalFailure,
     open,
     openCodeRunArgs,

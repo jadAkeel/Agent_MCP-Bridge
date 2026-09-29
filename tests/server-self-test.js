@@ -132,11 +132,15 @@ const {
   normalizeProjectAgentPolicy,
   normalizeScopeContract,
   compactQueueJobLines,
+  essentialQueueJobView,
+  diagnoseJobView,
   queueAgentTiming,
   queueRunStage,
   staleBridgeProcessHint,
   truncateResultText,
   diffStatFromPatch,
+  readOnlyHeadMove,
+  formatReadOnlyHeadMove,
   noteQueueLeaseRenewalFailure,
   open,
   openCodeRunArgs,
@@ -609,6 +613,44 @@ async function runSelfTests() {
       );
     } finally {
       await rm(quoteFixtureRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+    }
+  }
+  {
+    // Another client committing while a reviewer reads the checkout must not throw the review away.
+    const headMoveRoot = await mkdtemp(path.join(tmpdir(), "codex-opencode-head-move-self-test-"));
+    try {
+      const git = (...args) => runCommand("git", args, headMoveRoot, 1000 * 30);
+      await git("init", "-q");
+      await git("config", "user.email", "bridge-self-test@example.invalid");
+      await git("config", "user.name", "bridge-self-test");
+      await mkdir(path.join(headMoveRoot, "src"), { recursive: true });
+      await writeFile(path.join(headMoveRoot, "src", "a.py"), "a\n", "utf8");
+      await writeFile(path.join(headMoveRoot, "log.md"), "one\n", "utf8");
+      await git("add", "-A");
+      await git("commit", "-qm", "seed");
+      const before = (await git("rev-parse", "HEAD")).stdout.trim();
+      await writeFile(path.join(headMoveRoot, "log.md"), "two\n", "utf8");
+      await git("commit", "-qam", "log: notes");
+      const docsOnly = (await git("rev-parse", "HEAD")).stdout.trim();
+      const readPlan = { lockType: "read", scopeContract: { scope: { read: ["src"] } } };
+      const move = await readOnlyHeadMove(readPlan, headMoveRoot, before, docsOnly);
+      assert.deepEqual(move.commits.map((line) => line.replace(/^\S+ /, "")), ["log: notes"]);
+      assert.deepEqual(move.changedPaths, ["log.md"]);
+      assert.deepEqual(move.readScopeTouched, [], "A docs commit outside the read scope leaves the review valid.");
+      assert.match(formatReadOnlyHeadMove(move), /result kept.*Read scope touched: no/);
+      await writeFile(path.join(headMoveRoot, "src", "a.py"), "b\n", "utf8");
+      await git("commit", "-qam", "change src");
+      const srcMove = await readOnlyHeadMove(readPlan, headMoveRoot, before, (await git("rev-parse", "HEAD")).stdout.trim());
+      assert.deepEqual(srcMove.readScopeTouched, ["src/a.py"]);
+      assert.match(formatReadOnlyHeadMove(srcMove), /Read scope touched: yes \(src\/a\.py\)/);
+      assert.equal(await readOnlyHeadMove({ lockType: "write", scopeContract: readPlan.scopeContract }, headMoveRoot, before, docsOnly), null, "Writers keep failing on a HEAD move.");
+      await git("reset", "-q", "--hard", before);
+      await writeFile(path.join(headMoveRoot, "log.md"), "rewritten\n", "utf8");
+      await git("commit", "-qam", "rewrite");
+      const rewritten = (await git("rev-parse", "HEAD")).stdout.trim();
+      assert.equal(await readOnlyHeadMove(readPlan, headMoveRoot, docsOnly, rewritten), null, "A HEAD that did not move forward is not explained away.");
+    } finally {
+      await rm(headMoveRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     }
   }
   assert.doesNotThrow(() => assertSupportedQueueRetryConfig({ queueReadOnlyRetries: 0, queueWriteRetries: 0 }));
@@ -2386,6 +2428,24 @@ async function runSelfTests() {
       allowedEdits: queuedBlocked.record.allowedEdits,
     }]);
     assert.match(queueAssessment.status, /must_wait|conflict/);
+    // The enqueue answer for a reviewer follows the scheduler: judged by its read scope.
+    const disjointReaderAssessment = await assessQueuePlan([{
+      lockType: "read",
+      cwd: queuedWrite.record.cwd,
+      lockedPaths: [],
+      allowedEdits: [],
+      scopeContract: { scope: { read: ["apps/api"] } },
+    }]);
+    assert.equal(disjointReaderAssessment.status, "can_run_immediately", "A reviewer outside the writer's paths is not told to wait.");
+    const overlappingReaderAssessment = await assessQueuePlan([{
+      lockType: "read",
+      cwd: queuedWrite.record.cwd,
+      lockedPaths: [],
+      allowedEdits: [],
+      scopeContract: { scope: { read: ["apps/web"] } },
+    }]);
+    assert.match(overlappingReaderAssessment.status, /must_wait|conflict/);
+    assert.match(overlappingReaderAssessment.reason, /overlaps this plan on apps\/web/);
     assert.equal(queueRecordSnapshot(queuedReadOnly.record).status, "pending");
     assert.equal((await updateQueueRecordDurable(queuedBlocked.record, { status: "cancelled", finishedAt: new Date().toISOString() })).persisted, true);
     assert.equal(queueRecordSnapshot(queuedBlocked.record).status, "cancelled");
@@ -3505,9 +3565,9 @@ async function runSelfTests() {
     assert.match(cutReport, new RegExp(`${longReport.length} characters in total; the middle was truncated`));
     assert.equal(truncateResultText(cutReport, 4000), cutReport);
     assert.equal(truncateResultText("short", 4000), "short");
-    // A claimed job that has not spawned its agent is waiting for a provider slot, and the
-    // agent's run time excludes that wait.
-    assert.equal(queueRunStage({ status: "running" }), "waiting_for_provider_slot");
+    // A claimed job that has not spawned its agent is still starting it (role attestation and
+    // provider slot), and the agent's run time excludes that startup.
+    assert.equal(queueRunStage({ status: "running" }), "starting_agent");
     assert.equal(queueRunStage({ status: "running", childProcessStartedAt: "2026-01-01T00:00:05.000Z" }), "agent_running");
     assert.equal(queueRunStage({ status: "completed" }), "completed");
     assert.deepEqual(queueAgentTiming({
@@ -3520,11 +3580,22 @@ async function runSelfTests() {
       { jobId: "builder-1", idempotencyKey: "P1-A", agent: "builder", status: "running", scopeContract: { read: ["x".repeat(500)] } },
       { jobId: "builder-2", agent: "builder", status: "completed", durationMs: 1200, changedFiles: ["a.py", "tests/test_a.py"],
         startedAt: "2026-01-01T00:00:00.000Z", agentStartedAt: "2026-01-01T00:00:01.000Z", finishedAt: "2026-01-01T00:00:02.000Z" },
+      { jobId: "reviewer-3", agent: "reviewer", status: "completed", providerWaitMs: 40, readOnlyHeadMove: { readScopeTouched: [] } },
     ]);
     assert.equal(compactLines, [
-      "- builder-1 key=P1-A agent=builder status=running stage=waiting_for_provider_slot",
-      "- builder-2 agent=builder status=completed agentRunMs=1000 waitMs=1000 durationMs=1200 changed=a.py,tests/test_a.py",
+      "- builder-1 key=P1-A agent=builder status=running stage=starting_agent",
+      "- builder-2 agent=builder status=completed agentRunMs=1000 startupMs=1000 durationMs=1200 changed=a.py,tests/test_a.py",
+      "- reviewer-3 agent=reviewer status=completed providerWaitMs=40 headMoved=outside-read-scope",
     ].join("\n"));
+    const essentialView = essentialQueueJobView({
+      jobId: "reviewer-9", agent: "reviewer", status: "running", runStage: "agent_running", changedFiles: [],
+      scopeContract: { scope: { read: ["x".repeat(4000)] } }, requestFingerprint: "f".repeat(64), ownerInstanceId: "1-2-3",
+    });
+    assert.deepEqual(Object.keys(essentialView), ["jobId", "agent", "status", "runStage", "omitted"], "Polling one job returns what the caller acts on, not the scope contract or lease fields.");
+    const integratedRow = diagnoseJobView({ jobId: "builder-7", status: "completed", mode: "write", worktreePath: path.join(tmpdir(), "codex-opencode-missing-worktree-self-test") });
+    assert.equal(integratedRow.workPreserved, false);
+    assert.match(integratedRow.recoveryAction, /worktree is gone/, "An integrated writer is not offered for integration again.");
+    assert.match(diagnoseJobView({ jobId: "builder-8", status: "completed", mode: "write", worktreePath: tmpdir() }).recoveryAction, /integrate it with integrate_opencode_worktree/);
     assert.equal(await staleBridgeProcessHint("0".repeat(64)), "", "An unpinned hash gives no stale-process hint.");
     const truncatedQueueRecord = makeQueuePersistenceRecord("queue-result-truncation-self-test");
     assert.equal((await persistQueueRecord(truncatedQueueRecord)).persisted, true);

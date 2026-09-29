@@ -138,6 +138,7 @@ async function fetchPipeline(client, pipelineId, cwd = "") {
 async function fetchQueueJob(client, jobId, cwd = "") {
   const response = await callToolJson(client, "get_opencode_job", {
     jobId,
+    detail: true,
     ...(cwd ? { cwd } : {}),
   });
   return response.json || null;

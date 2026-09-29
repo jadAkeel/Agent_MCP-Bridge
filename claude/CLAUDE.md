@@ -28,7 +28,8 @@ Never report success based only on an agent's own claim.
 
 ## Troubleshooting
 - Start with `get_opencode_bridge_status`; use `diagnose_opencode_bridge` when something looks stuck.
-- Poll queued jobs with `list_opencode_jobs` (one compact line per job; `detail: true` for full records) or `get_opencode_job`. `stage=waiting_for_provider_slot` means the job is claimed but its agent has not started; `agentRunMs` excludes that wait.
+- Poll queued jobs with `list_opencode_jobs` (one compact line per job; `detail: true` for full records) or `get_opencode_job` (essential fields and result text; `detail: true` for the full record). `stage=starting_agent` means the job is claimed and the bridge is attesting the role (5-10 s is normal) or waiting for a provider slot (`providerWaitMs`); `agentRunMs` excludes that startup.
+- A reviewer whose checkout HEAD moved during its run (you committed meanwhile) now completes and says so: `Repository HEAD moved during this read-only run ... Read scope touched: yes/no`. If the read scope was touched, the review may describe the older files. Prefer not to commit while a review of the same checkout runs.
 - `External plugin manifest hash mismatch ... this bridge process ... is older than the current install`: the bridge was re-pinned after this session started. Start a new session (Codex: restart it).
 - `dirty_worktree_requires_checkpoint`: the job's files have uncommitted changes. If they are yours (a finished integration), commit them and retry. If another client (Codex) owns them, wait for it to commit; never commit or revert another client's work. Use `allowDirtyTarget: true` only for dirt on paths the patch does not touch.
 - Codex may be using the same bridge on the same repo at the same time; a lock conflict message means wait or pick disjoint paths.
