@@ -133,3 +133,33 @@ test("retention bounds terminal history but never removes unfinished records", a
   assert.equal((await audit.snapshot(root)).records.length, 2);
   assert.equal((await audit.snapshot(root)).records.every((record) => record.status === "started"), true);
 });
+
+test("an audit table from before the metric columns is migrated and parallel runs are found by id", async (t) => {
+  const { audit, root, dbPath } = await fixture(t, {
+    openDb: async () => {
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TABLE IF NOT EXISTS opencode_direct_runs (
+        run_id TEXT PRIMARY KEY, project_key TEXT NOT NULL, status TEXT NOT NULL, error_type TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER, agent TEXT NOT NULL,
+        configured_model TEXT NOT NULL DEFAULT '', model_evidence_present INTEGER NOT NULL DEFAULT 0)`);
+      ensureDirectRunAuditSchema(db);
+      return db;
+    },
+  });
+  const handle = await audit.start({ cwd: root, agent: "builder" }, { runId: "builder-1-abcd", kind: "parallel", jobId: "builder-1-abcd" });
+  const finished = await audit.finish(handle, { execution: { result: {
+    childStartedAtMs: 1000, childFinishedAtMs: 4000, providerConcurrencyWaitMs: 12, providerRetryWarningCount: 2,
+    usage: { steps: 1, inputCount: 10, outputCount: 2, reasoningCount: 0, cacheReadCount: 0, cacheWriteCount: 0, cost: 0 },
+  } } });
+  assert.equal(finished.persisted, true);
+  const record = await audit.get(root, "builder-1-abcd");
+  assert.equal(record.kind, "parallel");
+  assert.equal(record.status, "completed");
+  assert.equal(record.agentRunMs, 3000);
+  assert.equal(record.providerWaitMs, 12);
+  assert.equal(record.inputCount, 10);
+  assert.equal(record.providerRetryWarnings, 2);
+  assert.equal(await audit.get(root, "missing"), null);
+  const text = await readFile(dbPath).then((bytes) => bytes.toString("latin1"));
+  assert.doesNotMatch(text, /sk-canary/);
+});

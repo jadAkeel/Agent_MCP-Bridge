@@ -3593,7 +3593,7 @@ async function runSelfTests() {
     ]);
     assert.equal(compactLines, [
       "- builder-1 key=P1-A agent=builder status=running stage=starting_agent",
-      "- builder-2 agent=builder status=completed agentRunMs=1000 startupMs=1000 durationMs=1200 changed=a.py,tests/test_a.py",
+      "- builder-2 agent=builder status=completed waitBeforeAgentMs=1000 agentRunMs=1000 durationMs=1200 changed=a.py,tests/test_a.py",
       "- reviewer-3 agent=reviewer status=completed providerWaitMs=40 headMoved=outside-read-scope",
     ].join("\n"));
     const essentialView = essentialQueueJobView({

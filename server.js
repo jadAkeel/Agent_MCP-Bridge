@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -15,7 +16,7 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDirectRunAudit, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
-import { runBuilderModelFallback } from "./bin/builder-model-fallback.js";
+import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -2364,7 +2365,11 @@ async function validationCommandPreflightError(validationCommand, { dryRun = fal
   return prepared.ok ? null : { errorType: prepared.errorType, error: prepared.error, command };
 }
 
-async function runValidationGate({ command, cwd, dryRun = false, timeoutMs = CONFIG.validationCommandTimeoutMs, trustedSpec = null, signal = null }) {
+function runValidationGate(...args) {
+  return integrationTimed("validation", () => runValidationGateUntimed(...args));
+}
+
+async function runValidationGateUntimed({ command, cwd, dryRun = false, timeoutMs = CONFIG.validationCommandTimeoutMs, trustedSpec = null, signal = null }) {
   const validationCommand = String(command || "").trim();
   if (!validationCommand) {
     return {
@@ -4577,8 +4582,19 @@ function providerErrorTypeFromDiagnosticLine(value) {
     return "";
   }
   const authoritativeMarker = /(?:\bAPIError\b|\bCreditsError\b|\bProvider[A-Za-z]*(?:Error|Timeout)\b|\bOAuth\b|\bHTTP\s+[45]\d\d\b|\b(?:status|statusCode|code)\s*[:=]\s*["']?(?:[45]\d\d|RESOURCE_EXHAUSTED|rateLimitExceeded|invalid_grant)\b|\bRESOURCE_EXHAUSTED\b|\brateLimitExceeded\b|\binvalid_(?:grant|client)\b|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_[A-Z_]+|DEADLINE_EXCEEDED)\b|\b401\s+Unauthorized\b|\b429\s+Too Many Requests\b)/i;
-  return authoritativeMarker.test(line) ? providerErrorTypeFromText(line) : "";
+  if (authoritativeMarker.test(line)) return providerErrorTypeFromText(line);
+  // B-023: OpenCode logs retried provider failures as the AI SDK's AI_APICallError (and
+  // AI_RetryError). Such a line alone only ever counts as a transient failure: a billing/auth
+  // reading of its free text must not stop a live run or fail one that produced its answer,
+  // which is what the line meant before it was recognized at all.
+  if (/\bAI_[A-Za-z]*Error\b/.test(line)) {
+    const type = providerErrorTypeFromText(line);
+    return SDK_ONLY_PROVIDER_ERROR_TYPES.has(type) ? type : "";
+  }
+  return "";
 }
+
+const SDK_ONLY_PROVIDER_ERROR_TYPES = new Set(["opencode_rate_limited", "opencode_transient_provider_error", "opencode_provider_unavailable", "opencode_transport_error"]);
 
 function providerErrorTypeFromStructuredEvent(event) {
   if (!event || typeof event !== "object" || (event.type !== "error" && event.type !== "session.error" && !event.error && !event.data?.error && !event.properties?.error)) {
@@ -4663,18 +4679,49 @@ function modelEvidenceFromEvent(event) {
   return null;
 }
 
-function providerDiagnosticTextFromStderr(stderr) {
+function providerDiagnosticLinesFromStderr(stderr) {
   return String(stderr || "")
     .split(/\r?\n/)
     .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
     .filter((line) => !/^\s*(?:task|prompt|messages|input)\s*[:=]/i.test(line))
-    .filter((line) => Boolean(providerErrorTypeFromDiagnosticLine(line)))
-    .slice(-100)
-    .join("\n");
+    .filter((line) => Boolean(providerErrorTypeFromDiagnosticLine(line)));
+}
+
+function providerDiagnosticTextFromStderr(stderr) {
+  return providerDiagnosticLinesFromStderr(stderr).slice(-100).join("\n");
+}
+
+// Token usage from OpenCode's step_finish events (one per model step, subagent sessions included).
+function emptyOpenCodeUsage() {
+  // Field names avoid "token" and "input": sanitizePersistedValue drops or hashes those keys.
+  return { steps: 0, inputCount: 0, outputCount: 0, reasoningCount: 0, cacheReadCount: 0, cacheWriteCount: 0, cost: 0, rootSteps: 0 };
+}
+
+function addStepFinishUsage(usage, event, rootSessionId) {
+  const tokens = event?.part?.tokens;
+  if (!tokens || typeof tokens !== "object") return false;
+  const count = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
+  usage.steps += 1;
+  if (!rootSessionId || String(event.sessionID || event.part?.sessionID || "") === rootSessionId) usage.rootSteps += 1;
+  usage.inputCount += count(tokens.input);
+  usage.outputCount += count(tokens.output);
+  usage.reasoningCount += count(tokens.reasoning);
+  usage.cacheReadCount += count(tokens.cache?.read);
+  usage.cacheWriteCount += count(tokens.cache?.write);
+  usage.cost += count(event.part.cost);
+  return true;
+}
+
+function formatOpenCodeUsage(usage) {
+  if (!usage || !usage.steps) return "not emitted by OpenCode";
+  const cost = Math.round(Number(usage.cost || 0) * 1e6) / 1e6;
+  return `steps=${usage.steps} input=${usage.inputCount} output=${usage.outputCount} reasoning=${usage.reasoningCount} cache_read=${usage.cacheReadCount} cache_write=${usage.cacheWriteCount} cost=${cost}${cost === 0 ? " (provider reported no price)" : ""}`;
 }
 
 function inspectOpenCodeEventStream(stdout, stderr = "") {
-  const stderrProviderErrorType = providerErrorTypeFromText(providerDiagnosticTextFromStderr(stderr));
+  const stderrDiagnosticLines = providerDiagnosticLinesFromStderr(stderr);
+  const stderrProviderErrorType = providerErrorTypeFromText(stderrDiagnosticLines.slice(-100).join("\n"));
+  const usage = emptyOpenCodeUsage();
   let providerErrorType = stderrProviderErrorType;
   let stdoutErrorDetected = false;
   const toolOutcomes = [];
@@ -4717,6 +4764,8 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
         state.lastEvent = "error";
         continue;
       }
+      // Not a turn boundary: step_finish follows the final text part, so it leaves lastEvent alone.
+      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) continue;
       if (event?.type === "text" && event?.part?.type === "text") {
         state.lastEvent = "incomplete_text";
         if (!event.part.time?.end) continue;
@@ -4784,6 +4833,9 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     providerErrorType: providerErrorType || "",
     recoveredTransientProviderError,
     providerWarningType: recoveredTransientProviderError ? stderrProviderErrorType : "",
+    // Each classified stderr line is one provider attempt that failed (OpenCode retries some itself).
+    providerRetryWarningCount: stderrDiagnosticLines.length,
+    usage,
     retryAfterMs: retryAfterMsFromText(`${stderr}\n${stdout}`),
     runtimeObservedProvider: runtimeModelEvidence?.provider || "",
     runtimeObservedModel: runtimeModelEvidence?.model || "",
@@ -5987,6 +6039,71 @@ function classifyResultError(result) {
   return null;
 }
 
+// B-024/B-025: one clock per job. mark(name) books the time since the previous mark to that
+// phase, so the phases partition the job and add up to totalMs. The wall-clock start relates the
+// job to the agent process timestamps (childStartedAtMs/childFinishedAtMs are epoch ms).
+function createPhaseClock() {
+  const startedWallMs = Date.now();
+  let last = nowMs();
+  const phases = {};
+  return {
+    startedWallMs,
+    mark(name) {
+      const now = nowMs();
+      phases[name] = Math.round((phases[name] || 0) + (now - last));
+      last = now;
+    },
+    summary(result = {}) {
+      const finishedWallMs = Date.now();
+      const childStarted = Number(result?.childStartedAtMs) || 0;
+      const childFinished = Number(result?.childFinishedAtMs) || 0;
+      return {
+        phases: { ...phases },
+        run: result?.runPhaseTimings || null,
+        totalMs: Math.max(0, finishedWallMs - startedWallMs),
+        beforeAgentMs: childStarted ? Math.max(0, childStarted - startedWallMs) : null,
+        agentProcessMs: childStarted && childFinished ? Math.max(0, childFinished - childStarted) : null,
+        afterAgentMs: childFinished ? Math.max(0, finishedWallMs - childFinished) : null,
+      };
+    },
+  };
+}
+
+const PHASE_LABELS = Object.freeze({
+  preflight: "lock plan, validation command, workspace readiness",
+  discovery: "agent routing and role attestation in the checkout",
+  lock: "path lock",
+  worktreeSetup: "git worktree add and checkpoint checks",
+  worktreeAttestation: "role attestation inside the new worktree",
+  preAgentSnapshot: "changed-file snapshot before the agent",
+  openCodeRun: "final attestation, provider slot, agent process",
+  postAgentChecks: "checks after the agent (in a parallel job also validation and patch collection)",
+  validation: "validation command",
+  postValidationChecks: "changed-file snapshot after validation",
+  patchCollect: "worktree patch collection",
+  cleanup: "empty-worktree cleanup",
+  report: "report and lock release",
+});
+
+function formatPhaseTimings(timings) {
+  if (!timings) return null;
+  const orNa = (value) => (value === null || value === undefined ? "n/a" : value);
+  const lines = [
+    `Timing ms: total=${timings.totalMs} before-agent=${orNa(timings.beforeAgentMs)} agent-process=${orNa(timings.agentProcessMs)} after-agent=${orNa(timings.afterAgentMs)}`,
+  ];
+  for (const [name, ms] of Object.entries(timings.phases || {})) {
+    lines.push(`  ${name}=${ms} (${PHASE_LABELS[name] || name})`);
+  }
+  if (timings.sharedSetupMs !== undefined) {
+    lines.push(`  sharedSetup=${timings.sharedSetupMs} (locks, worktrees and attestation for every job in the parallel call, before this job's clock)`);
+  }
+  const run = timings.run;
+  if (run) {
+    lines.push(`  openCodeRun split: pre-slot=${orNa(run.preSlotMs)} provider-slot-wait=${orNa(run.providerWaitMs)} final-attestation=${orNa(run.finalAttestationMs)} spawn-to-agent=${orNa(run.spawnGateMs)} after-exit=${orNa(run.afterExitMs)}`);
+  }
+  return lines.join("\n");
+}
+
 async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defaultWriteAgentTimeoutMs, {
   signal = null,
   agentMetadata = null,
@@ -6017,6 +6134,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       openCodeApiErrorDetected: false,
       recoveredTransientProviderError: false,
       providerWarningType: "",
+      providerRetryWarningCount: 0,
+      usage: emptyOpenCodeUsage(),
       assistantFinalResponseDetected: true,
       providerErrorType: "",
       toolOutcomes: [],
@@ -6083,6 +6202,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const providerKey = providerKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
   // The slot wait has its own budget. It used to come out of the run timeout, so a builder
   // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
+  const preSlotMs = Math.round(nowMs() - started);
   const providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
   if (!providerLease.ok) {
     return {
@@ -6301,6 +6421,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   let isolatedRuntimeCleanup = { ok: true, error: "" };
   let containmentUnconfirmed = false;
   let providerQuarantine = null;
+  const finalAttestationMs = Math.round(nowMs() - runStarted);
+  const spawnCalledWallMs = Date.now();
   try {
     result = await runSpawnCommand(
       OPENCODE_EXE,
@@ -6346,7 +6468,15 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   const openCodeFallbackDetected = detectsOpenCodeFallback(result.stderr);
   const inspection = inspectOpenCodeEventStream(result.stdout, result.stderr);
+  const runPhaseTimings = {
+    preSlotMs,
+    providerWaitMs: providerLease.waitedMs || 0,
+    finalAttestationMs,
+    spawnGateMs: Number(result?.childStartedAtMs) ? Math.max(0, Number(result.childStartedAtMs) - spawnCalledWallMs) : null,
+    afterExitMs: Number(result?.childFinishedAtMs) ? Math.max(0, Date.now() - Number(result.childFinishedAtMs)) : null,
+  };
   const runResult = {
+    runPhaseTimings,
     supervisorProcessId: Number(result?.supervisorProcessId || 0),
     payloadProcessId: Number(result?.payloadProcessId || 0),
     stdout: redactLikelySecrets(inspection.finalText),
@@ -6369,6 +6499,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     providerErrorType: inspection.providerErrorType,
     recoveredTransientProviderError: inspection.recoveredTransientProviderError,
     providerWarningType: inspection.providerWarningType,
+    providerRetryWarningCount: inspection.providerRetryWarningCount || 0,
+    usage: inspection.usage,
     retryAfterMs: inspection.retryAfterMs || 0,
     assistantFinalResponseDetected: inspection.finalResponseDetected,
     assistantResponseTruncated: inspection.finalTextTruncated,
@@ -6495,6 +6627,8 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   let lastResult = null;
   let attemptsMade = 0;
   const childExecutionIntervals = [];
+  let usageTotal = null;
+  let providerRetryWarningTotal = 0;
   const policyStarted = nowMs();
   // The retry budget bounds retries; it must never shorten the first attempt below the
   // configured read-only timeout (an 8 min budget silently capped a 15 min reviewer).
@@ -6514,6 +6648,11 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     attemptsMade = attempt + 1;
     childExecutionIntervals.push(...(lastResult.childExecutionIntervals || []));
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
+    // Every attempt used provider tokens; the last attempt's result reports all of them.
+    usageTotal = sumOpenCodeUsage(usageTotal, lastResult.usage);
+    providerRetryWarningTotal += lastResult.providerRetryWarningCount || 0;
+    lastResult.usage = usageTotal;
+    lastResult.providerRetryWarningCount = providerRetryWarningTotal;
     lastResult.retryAttempt = attempt;
     lastResult.maxRetries = maxReadOnlyAgentRetries;
     logOpenCodeResult(agent, lastResult, lockPlan);
@@ -6591,6 +6730,8 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     `Provider error type: ${result?.providerErrorType || "none"}`,
     `Recovered transient provider error: ${result?.recoveredTransientProviderError ? "yes" : "no"}`,
     `Provider warning type: ${result?.providerWarningType || "none"}`,
+    `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result?.providerRetryWarningCount || 0}`,
+    `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
     `Configured provider: ${result?.configuredProvider || "unknown"}`,
     `Configured model: ${result?.configuredModel || "unknown"}`,
     `Configured variant: ${result?.configuredVariant || "unknown"}`,
@@ -6648,10 +6789,11 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     result?.dependencyRequestError ? `Dependency request error: ${result.dependencyRequestError}` : null,
     `Files changed: ${result?.changedFiles?.length ? result.changedFiles.join(", ") : "none detected"}`,
     `Exit code: ${result?.exitCode ?? "not run"}`,
-    `Duration ms: ${result?.durationMs ?? 0}`,
+    `Duration ms: ${result?.durationMs ?? 0} (OpenCode run only: final role attestation, provider slot wait and the agent process; job setup and post-agent checks are under Timing)`,
     result?.childStartedAtMs && result?.childFinishedAtMs
-      ? `Agent run ms: ${Math.max(0, result.childFinishedAtMs - result.childStartedAtMs)} (agent process only; Duration ms adds role attestation and the provider slot wait)`
+      ? `Agent run ms: ${Math.max(0, result.childFinishedAtMs - result.childStartedAtMs)} (agent process only)`
       : null,
+    formatPhaseTimings(result?.phaseTimings),
     "",
     `Tool outcomes: ${result?.toolOutcomes?.length ? result.toolOutcomes.map((item) => `${item.tool}:${item.status}`).join(", ") : "none"}`,
     "",
@@ -6807,6 +6949,12 @@ function splitNulSeparated(stdout) {
 }
 
 async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
+  return (await gitChangedFileLists(cwd, { includeIgnored })).all;
+}
+
+// ordinary: modified, staged and untracked files; all: those plus ignored entries when asked.
+// Callers that need both used to list the ordinary set twice (three git commands each time).
+async function gitChangedFileLists(cwd, { includeIgnored = false } = {}) {
   // --no-renames: a staged `git mv forbidden/x allowed/x` otherwise lists only the destination
   // and the forbidden deletion passed scope validation. -z: exact paths, no quoting.
   const commands = [
@@ -6840,15 +6988,21 @@ async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
   }
 
   const ignoredEntries = ignored ? await expandIgnoredDirectoryEntries(cwd, splitNulSeparated(ignored.stdout)) : [];
-  return [
+  const ordinary = [
     ...new Set([
       ...splitNulSeparated(workingTreeDiff.stdout),
       ...splitNulSeparated(stagedDiff.stdout),
       ...splitNulSeparated(untracked.stdout),
-      ...ignoredEntries,
-      ...(forbiddenIgnored ? splitNulSeparated(forbiddenIgnored.stdout).filter((file) => FORBIDDEN_LOOKING_PATH.test(file)) : []),
     ]),
   ].sort();
+  const all = includeIgnored
+    ? [...new Set([
+      ...ordinary,
+      ...ignoredEntries,
+      ...(forbiddenIgnored ? splitNulSeparated(forbiddenIgnored.stdout).filter((file) => FORBIDDEN_LOOKING_PATH.test(file)) : []),
+    ])].sort()
+    : ordinary;
+  return { ordinary, all };
 }
 
 async function verifyProtectedGitRoot(cwd) {
@@ -7100,7 +7254,11 @@ async function shouldAvoidSnapshotContent(cwd, file) {
   }
 }
 
-async function gitChangedFileSnapshot(cwd, options = {}) {
+function gitChangedFileSnapshot(...args) {
+  return integrationTimed("changedFileSnapshot", () => gitChangedFileSnapshotUntimed(...args));
+}
+
+async function gitChangedFileSnapshotUntimed(cwd, options = {}) {
   const { ordinary, ignored } = await gitChangedFileSnapshotParts(cwd, options);
   return new Map([...ordinary, ...ignored]);
 }
@@ -7109,8 +7267,7 @@ async function gitChangedFileSnapshot(cwd, options = {}) {
 // writes ignored files, so integration decides on the ordinary part, and ignored metadata
 // only feeds the preview-receipt identity.
 async function gitChangedFileSnapshotParts(cwd, { includeIgnored = true } = {}) {
-  const ordinaryFiles = await gitChangedFiles(cwd, { includeIgnored: false });
-  const allFiles = includeIgnored ? await gitChangedFiles(cwd, { includeIgnored: true }) : ordinaryFiles;
+  const { ordinary: ordinaryFiles, all: allFiles } = await gitChangedFileLists(cwd, { includeIgnored });
   const ordinarySet = new Set(ordinaryFiles);
   const ignoredFiles = allFiles.filter((file) => !ordinarySet.has(file));
   // Ignored files have their own bound (groupIgnoredFiles); counting them here made any
@@ -7254,7 +7411,11 @@ async function readFileIfExists(filePath) {
   }
 }
 
-async function captureRollbackBaseline(cwd, { files = [] } = {}) {
+function captureRollbackBaseline(...args) {
+  return integrationTimed("rollbackBaseline", () => captureRollbackBaselineUntimed(...args));
+}
+
+async function captureRollbackBaselineUntimed(cwd, { files = [] } = {}) {
   const base = cwd || process.cwd();
   const baseCommitResult = await runCommand("git", ["rev-parse", "HEAD"], base, 1000 * 15);
   if (baseCommitResult.exitCode !== 0 || !baseCommitResult.stdout.trim()) {
@@ -7262,8 +7423,7 @@ async function captureRollbackBaseline(cwd, { files = [] } = {}) {
     error.errorType = "snapshot_safety_limit_exceeded";
     throw error;
   }
-  const ordinaryFiles = await gitChangedFiles(base, { includeIgnored: false });
-  const allFiles = await gitChangedFiles(base, { includeIgnored: true });
+  const { ordinary: ordinaryFiles, all: allFiles } = await gitChangedFileLists(base, { includeIgnored: true });
   const ordinarySet = new Set(ordinaryFiles);
   const ignoredFiles = allFiles.filter((file) => !ordinarySet.has(file));
   if (ordinaryFiles.length > CONFIG.maxSnapshotFiles) {
@@ -9171,12 +9331,26 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
   const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, CONFIG.gitHeavyTimeoutMs);
   if (created.exitCode !== 0) {
     await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
+    // B-028: git creates the branch before it creates the worktree, so a failed add ("'$GIT_DIR'
+    // too big" or "Filename too long" on Windows, an unwritable .git/worktrees) left an
+    // agent/... branch behind on every attempt. The branch did not exist before this call
+    // (checked above); it is deleted only while it still points at the base commit, and
+    // git branch -D refuses a branch that some worktree has checked out.
+    let branchCleanup = "not_created";
+    const leftover = await runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot, 1000 * 15);
+    if (leftover.exitCode === 0) {
+      const removed = leftover.stdout.trim() === baseCommit
+        ? await runCommand("git", ["branch", "-D", "--", branch], repoRoot, 1000 * 15)
+        : { exitCode: 1 };
+      branchCleanup = removed.exitCode === 0 ? "deleted" : "retained";
+    }
     return {
       ok: false,
       errorType: "worktree_create_failed",
-      error: created.stderr || created.stdout || "git worktree add failed.",
+      error: `${created.stderr || created.stdout || "git worktree add failed."}${branchCleanup === "retained" ? ` The branch ${branch} that git created was retained; delete it with git branch -D once nothing uses it.` : ""}`,
       repoRoot,
       branch,
+      branchCleanup,
       path: worktreePath,
     };
   }
@@ -9302,7 +9476,11 @@ async function collectWorktreeDiff(worktree) {
   };
 }
 
-async function cleanupWorktree(worktree, cleanupMode, success) {
+function cleanupWorktree(...args) {
+  return integrationTimed("worktreeRemove", () => cleanupWorktreeUntimed(...args));
+}
+
+async function cleanupWorktreeUntimed(worktree, cleanupMode, success) {
   if (!worktree?.path || cleanupMode === "never") {
     return {
       cleanup: "skipped",
@@ -9589,7 +9767,7 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
     if (readTree.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: readTree.stderr || "Could not create an isolated temporary Git index." };
     }
-    const add = await runCommand("git", ["add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv);
+    const add = await integrationTimed("freshIndexHash", () => runCommand("git", ["add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv));
     if (add.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
     }
@@ -9637,7 +9815,11 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
   }
 }
 
-async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", sourceBaseCommit = "" }) {
+function collectIntegrationPatch(...args) {
+  return integrationTimed("sourcePatch", () => collectIntegrationPatchUntimed(...args));
+}
+
+async function collectIntegrationPatchUntimed({ cwd, worktreePath = "", branch = "", sourceBaseCommit = "" }) {
   const repoRoot = path.resolve(cwd || process.cwd());
   const requestedSourceBaseCommit = String(sourceBaseCommit || "").trim();
   if (requestedSourceBaseCommit && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(requestedSourceBaseCommit)) {
@@ -9808,7 +9990,11 @@ async function checkPatchApplies({ cwd, patchFile }) {
 // seen without the operator's core.autocrlf) and wrote conflict markers into the user's file.
 // A conflict now stays in the throwaway index and fails before any working-tree byte is
 // written, and checkout-index applies the same line-ending conversion as a checkout.
-async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal = null }) {
+function applyPatchFile(...args) {
+  return integrationTimed("apply", () => applyPatchFileUntimed(...args));
+}
+
+async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], signal = null }) {
   const base = cwd || process.cwd();
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
@@ -9907,7 +10093,11 @@ async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal =
   }
 }
 
-async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, files }) {
+function simulateIntegrationPatchSnapshot(...args) {
+  return integrationTimed("simulate", () => simulateIntegrationPatchSnapshotUntimed(...args));
+}
+
+async function simulateIntegrationPatchSnapshotUntimed({ cwd, targetHead, patchFile, files }) {
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-integration-sim-"));
   const gitDir = path.join(scratch, "repo.git");
   const workTree = path.join(scratch, "worktree");
@@ -10064,7 +10254,49 @@ async function isolatedIndexPreservationEvidence({ cwd, files, baselineSnapshot 
   };
 }
 
-async function captureIntegrationTargetState(cwd) {
+// B-026: per-phase timing of one integrate_opencode_worktree call. The store is only set inside
+// that tool call, so the same helpers used by jobs record nothing. Phases may overlap (the target
+// and source captures run in parallel), so their ms can sum to more than totalMs.
+const integrationTimingStorage = new AsyncLocalStorage();
+
+async function integrationTimed(name, fn) {
+  const store = integrationTimingStorage.getStore();
+  if (!store) return fn();
+  const started = nowMs();
+  try {
+    return await fn();
+  } finally {
+    const entry = store[name] || (store[name] = { count: 0, ms: 0 });
+    entry.count += 1;
+    entry.ms += Math.round(nowMs() - started);
+  }
+}
+
+const INTEGRATION_PHASE_LABELS = Object.freeze({
+  targetState: "full target identity (status + fresh-index content hash of every file)",
+  sourcePatch: "source worktree patch (fresh-index content hash of every file)",
+  freshIndexHash: "git add -A into a fresh temporary index (inside the two above)",
+  changedFileSnapshot: "changed-file snapshot",
+  rollbackBaseline: "rollback baseline",
+  simulate: "patch simulation in an isolated index",
+  apply: "patch application",
+  validation: "validation command",
+  worktreeRemove: "source worktree removal",
+});
+
+function formatIntegrationTimings(timings) {
+  if (!timings) return null;
+  const phases = Object.entries(timings.phases || {})
+    .sort((left, right) => right[1].ms - left[1].ms)
+    .map(([name, entry]) => `  ${name}: ${entry.ms} ms over ${entry.count} call(s) (${INTEGRATION_PHASE_LABELS[name] || name})`);
+  return [`Integration timing: total ${timings.totalMs} ms`, ...phases].join("\n");
+}
+
+function captureIntegrationTargetState(...args) {
+  return integrationTimed("targetState", () => captureIntegrationTargetStateUntimed(...args));
+}
+
+async function captureIntegrationTargetStateUntimed(cwd) {
   const [head, tree, status] = await Promise.all([
     runGitReadOnlyCommand(["rev-parse", "HEAD"], cwd, 1000 * 15),
     runGitReadOnlyCommand(["rev-parse", "HEAD^{tree}"], cwd, 1000 * 15),
@@ -10595,14 +10827,23 @@ async function integratePatchWithoutSerialLock({
     };
   }
 
-  const targetState = await captureIntegrationTargetState(targetCwd);
+  // B-026: the target identity and the source patch each rehash a whole tree (12-19 s on a
+  // 22,708-file repository). They read different trees and neither writes, so they run together;
+  // the target result still decides first, as when they ran one after the other.
+  const [targetCapture, patchCapture] = await Promise.allSettled([
+    captureIntegrationTargetState(targetCwd),
+    collectIntegrationPatch({
+      cwd: targetCwd,
+      worktreePath,
+      branch,
+      sourceBaseCommit: expectedSourceIdentity?.sourceBaseCommit || previewReceipt?.sourceBaseCommit || "",
+    }),
+  ]);
+  if (targetCapture.status === "rejected") throw targetCapture.reason;
+  const targetState = targetCapture.value;
   if (!targetState.ok) return targetState;
-  const patch = await collectIntegrationPatch({
-    cwd: targetCwd,
-    worktreePath,
-    branch,
-    sourceBaseCommit: expectedSourceIdentity?.sourceBaseCommit || previewReceipt?.sourceBaseCommit || "",
-  });
+  if (patchCapture.status === "rejected") throw patchCapture.reason;
+  const patch = patchCapture.value;
   if (!patch.ok) {
     return patch;
   }
@@ -10902,20 +11143,12 @@ async function integratePatchWithoutSerialLock({
     }
 
     // The receipt check above matched targetState in full (ignored-file metadata included);
-    // from here on only non-ignored drift fails the integration.
-    const immediateTargetState = await captureIntegrationTargetState(targetCwd);
-    if (!immediateTargetState.ok || immediateTargetState.trackedStateSha256 !== targetState.trackedStateSha256) {
-      return {
-        ok: false,
-        errorType: "integration_preview_stale",
-        error: "Integration target changed after preview and before patch application.",
-        changedFiles: patch.changedFiles,
-      };
-    }
-
+    // from here on only non-ignored drift fails the integration. B-026: a second full capture
+    // here repeated finalPreApplyState below (same tracked identity, compared to the same
+    // targetState, with only read-only work between them) and cost one whole-tree rehash.
     const simulation = await simulateIntegrationPatchSnapshot({
       cwd: targetCwd,
-      targetHead: immediateTargetState.targetHead,
+      targetHead: targetState.targetHead,
       patchFile,
       files: patch.changedFiles,
     });
@@ -11476,7 +11709,11 @@ async function cleanupIntegratedWorktreeWhileLocked({
       && current.patchSha256 === result.patchSha256
       && current.sourceStateSha256 === result.sourceStateSha256;
   };
-  if (!await sourceMatches()) {
+  // B-026: without a deferral or a test hook the preliminary source and target checks only
+  // repeated the final ones below (two whole-tree rehashes); the final ones still run right
+  // before the destructive removal.
+  const preliminaryChecks = deferCleanup || typeof beforeCleanupHook === "function";
+  if (preliminaryChecks && !await sourceMatches()) {
     result.sourceCleanup = { cleanup: "retained_for_review", reason: "integration_source_changed_after_review" };
     result.cleanupWarning = "The source worktree changed during or after integration validation; it was retained and not force-removed.";
     return;
@@ -11489,7 +11726,9 @@ async function cleanupIntegratedWorktreeWhileLocked({
     return;
   }
 
-  const preliminaryTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
+  const preliminaryTargetError = preliminaryChecks
+    ? await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256)
+    : "";
   if (preliminaryTargetError) {
     result.sourceCleanup = { cleanup: "retained_for_review", reason: "integration_target_changed_before_cleanup", error: preliminaryTargetError };
     result.cleanupWarning = preliminaryTargetError;
@@ -11499,9 +11738,13 @@ async function cleanupIntegratedWorktreeWhileLocked({
     await beforeCleanupHook({ targetCwd: cwd, worktreePath, result });
   }
 
-  const sourceBranch = await runCommand("git", ["branch", "--show-current"], worktreePath, 1000 * 15);
-  const finalTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
-  const finalSourceMatches = await sourceMatches();
+  // The source check runs last, right before the removal, so a change to the source during the
+  // target check is still seen; the branch read runs alongside the target check.
+  const [sourceBranch, finalTargetError] = await Promise.all([
+    runCommand("git", ["branch", "--show-current"], worktreePath, 1000 * 15),
+    integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256),
+  ]);
+  const finalSourceMatches = !finalTargetError && await sourceMatches();
   if (finalTargetError || !finalSourceMatches || sourceBranch.exitCode !== 0 || !sourceBranch.stdout.trim()) {
     result.sourceCleanup = {
       cleanup: "retained_for_review",
@@ -13641,7 +13884,7 @@ server.tool(
   },
   async ({ cwd }) => {
     const projectRoot = await resolveProjectStateRoot(cwd);
-    const [jobs, pipelines, locks, provider, directRunAudit, integrationOperations] = await Promise.all([
+    const [jobs, pipelines, locks, provider, directRunAudit, integrationOperations, retainedArtifacts] = await Promise.all([
       listPersistedQueueRecords(projectRoot),
       listPersistedPipelineRecords(projectRoot),
       listLocks(projectRoot),
@@ -13649,7 +13892,16 @@ server.tool(
       directRunAuditStore().snapshot(projectRoot),
       // Queue records blocked on integration_recovery_pending point here; show the journal.
       integrationJournalDiagnosis(projectRoot, { limit: 20 }).catch((error) => ({ error: error?.message || String(error) })),
+      listRetainedWorktreeArtifacts(projectRoot).catch((error) => ({ error: error?.message || String(error) })),
     ]);
+    const queueJobByWorktree = new Map(jobs.filter((job) => job.worktreePath).map((job) => [path.resolve(job.worktreePath), job]));
+    const runByJobId = new Map(directRunAudit.records.filter((run) => run.jobId || run.runId).map((run) => [run.jobId || run.runId, run]));
+    const retainedWorktrees = Array.isArray(retainedArtifacts)
+      ? retainedArtifacts.map((artifact) => retainedWorktreeView(artifact, {
+        queueJob: queueJobByWorktree.get(path.resolve(artifact.worktreePath)) || null,
+        run: runByJobId.get(artifact.jobId) || null,
+      }))
+      : retainedArtifacts;
     const nonterminal = jobs.filter((job) => !["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
     const failed = jobs.filter((job) => ["failed", "cancelled", "interrupted", "not_resumable"].includes(job.status));
     // The report goes into the caller's context. After a long run it listed every audit row
@@ -13677,6 +13929,8 @@ server.tool(
         nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,
         locks: locks.length,
         unresolvedIntegrationOperations: integrationOperations.unresolvedCount ?? "unavailable",
+        retainedWorktrees: Array.isArray(retainedWorktrees) ? retainedWorktrees.filter((item) => item.present && !item.inFlight).length : "unavailable",
+        inFlightWorktrees: Array.isArray(retainedWorktrees) ? retainedWorktrees.filter((item) => item.present && item.inFlight).length : "unavailable",
         providerCapacity: provider.capacity,
         providerSlotsByKey: (provider.keys || []).map((item) => `${item.providerKey}=${item.leases}/${item.capacity}`),
         providerActiveLeases: provider.leases.length,
@@ -13685,9 +13939,11 @@ server.tool(
       diagnosticCoverage: {
         jobs: "queued_jobs_only",
         directRuns: directRunAudit.coverage,
+        retainedWorktrees: "every bridge-created worktree still registered (queued, direct and parallel jobs); owner says which",
         detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs and direct runs; counts in summary cover all`,
       },
       jobs: detailJobs.map((job) => diagnoseJobView(job)),
+      retainedWorktrees,
       pipelines: pipelines.map((pipeline) => ({
         pipelineId: pipeline.pipelineId,
         status: pipeline.status,
@@ -14025,9 +14281,10 @@ server.tool(
       validationCommand,
       delegation,
     };
+    const directRunId = makeQueueJobId(agent);
     return directRunAuditStore().run(requestedJob, async ({ onChildSpawn }) =>
-      executeOpenCodeJob(await normalizeJobCwd(requestedJob), { toolStarted, onChildSpawn })
-    );
+      executeOpenCodeJob(await normalizeJobCwd(requestedJob), { toolStarted, onChildSpawn, jobId: directRunId })
+    , { runId: directRunId, kind: "direct", jobId: directRunId });
   }
 );
 
@@ -14136,6 +14393,83 @@ server.tool(
 // The compact form keeps what a coordinator acts on; detail: true or get_opencode_job has the rest.
 // One diagnose row. A completed writer whose worktree no longer exists was integrated (or removed),
 // so it is not offered for integration again.
+// B-020: every bridge-created worktree (queued, direct or parallel) is in worktree_artifacts;
+// diagnose read only queue records, so parallel writers' retained patches were invisible.
+async function listRetainedWorktreeArtifacts(projectRoot, { jobId = "" } = {}) {
+  const db = await openLockDb(projectRoot);
+  try {
+    const placeholders = RETAINED_WORKTREE_STATUSES.map(() => "?").join(", ");
+    const rows = db.prepare(`
+      SELECT worktree_path AS worktreePath, cwd, branch, job_id AS jobId, status,
+        measured_bytes AS measuredBytes, created_at AS createdAt, updated_at AS updatedAt
+      FROM worktree_artifacts
+      WHERE status IN (${placeholders})${jobId ? " AND job_id = ?" : ""}
+      ORDER BY created_at DESC
+    `).all(...RETAINED_WORKTREE_STATUSES, ...(jobId ? [jobId] : []));
+    return rows.map((row) => ({ ...row, present: existsSync(row.worktreePath) }));
+  } finally {
+    closeDb(db);
+  }
+}
+
+const QUEUE_JOB_RUNNING_STATUSES = new Set(["pending", "planned", "running", "validating", "reviewing", "testing", "blocked"]);
+
+function retainedWorktreeView(artifact, { queueJob = null, run = null } = {}) {
+  const owner = queueJob ? "queue" : run ? run.kind || "direct" : "unrecorded";
+  // A worktree is registered "retained" when it is created, so a running agent's worktree looks
+  // retained too; it must not be offered for integration or removal while an agent may write to it.
+  const inFlight = Boolean(queueJob ? QUEUE_JOB_RUNNING_STATUSES.has(queueJob.status) : run?.status === "started");
+  return {
+    worktreePath: artifact.worktreePath,
+    branch: artifact.branch,
+    jobId: artifact.jobId,
+    owner,
+    ownerStatus: queueJob?.status || run?.status || "",
+    registryStatus: artifact.status,
+    present: artifact.present,
+    inFlight,
+    createdAt: artifact.createdAt,
+    measuredBytes: artifact.measuredBytes,
+    recoveryAction: inFlight
+      ? "None yet: its job is still running (or its bridge stopped before recording the outcome; check the owner status). Do not integrate or remove it while an agent may be writing."
+      : !artifact.present
+      ? "None on disk: the directory is gone; the next worktree reservation reconciles the registry row."
+      : artifact.status === "creating"
+      ? "Creation did not finish: inspect it, then remove it with git worktree remove if it holds no work."
+      : `Review: git -C "${artifact.worktreePath}" status --short and git diff; integrate with integrate_opencode_worktree (dry run first) or remove it.`,
+  };
+}
+
+function directRunView(run, artifacts = []) {
+  const usage = run.usageSteps === null || run.usageSteps === undefined ? null : {
+    steps: run.usageSteps,
+    inputCount: run.inputCount,
+    outputCount: run.outputCount,
+    reasoningCount: run.reasoningCount,
+    cacheReadCount: run.cacheReadCount,
+    cacheWriteCount: run.cacheWriteCount,
+    cost: run.cost,
+  };
+  return {
+    kind: run.kind === "parallel" ? "parallel_run" : "direct_run",
+    runId: run.runId,
+    agent: run.agent,
+    status: run.status,
+    errorType: run.errorType || "",
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt || "",
+    durationMs: run.durationMs,
+    waitBeforeAgentMs: run.startupMs,
+    agentRunMs: run.agentRunMs,
+    providerWaitMs: run.providerWaitMs,
+    providerRetryWarningCount: run.providerRetryWarnings,
+    usage,
+    configuredModel: run.configuredModel || "",
+    worktrees: artifacts.map((artifact) => retainedWorktreeView(artifact, { run })),
+    note: `Not a queue job: the result text was returned by the ${run.kind === "parallel" ? "run_opencode_parallel" : "run_opencode_agent"} call and is not stored; this run cannot be cancelled or replayed. A worktree listed here is retained work.`,
+  };
+}
+
 function diagnoseJobView(job) {
   const worktreePresent = Boolean(job.worktreePath) && existsSync(job.worktreePath);
   return {
@@ -14173,7 +14507,8 @@ function diagnoseJobView(job) {
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
   "jobId", "idempotencyKey", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
-  "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "providerWaitMs",
+  "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
+  "providerRetryWarningCount", "usage", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText",
 ];
@@ -14201,9 +14536,12 @@ function compactQueueJobLines(records) {
       `agent=${record.agent || "?"}`,
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
+      timing.waitBeforeAgentMs ? `waitBeforeAgentMs=${timing.waitBeforeAgentMs}` : "",
       timing.agentRunMs ? `agentRunMs=${timing.agentRunMs}` : "",
-      timing.waitBeforeAgentMs ? `startupMs=${timing.waitBeforeAgentMs}` : "",
+      timing.afterAgentMs ? `afterAgentMs=${timing.afterAgentMs}` : "",
       record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
+      record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
+      record.providerRetryWarningCount ? `providerErrorLines=${record.providerRetryWarningCount}` : "",
       record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
       record.errorType ? `error=${record.errorType}` : "",
@@ -14216,7 +14554,7 @@ function compactQueueJobLines(records) {
 
 server.tool(
   "get_opencode_job",
-  "Get one queued OpenCode job, including result text when available.",
+  "Get one OpenCode job by id: a queued job (with result text), or a run_opencode_agent / run_opencode_parallel Run id (status, timing, usage and retained worktree).",
   {
     jobId: z.string(),
     cwd: z.string().min(1).describe("Canonical repository path for project-scoped job lookup."),
@@ -14233,11 +14571,27 @@ server.tool(
       ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted) }
       : null;
     if (!snapshot) {
+      const lookupRoot = projectRoot || await resolveProjectStateRoot(process.cwd());
+      const [run, artifacts] = await Promise.all([
+        directRunAuditStore().get(lookupRoot, jobId),
+        listRetainedWorktreeArtifacts(lookupRoot, { jobId }).catch(() => []),
+      ]);
+      if (run || artifacts.length) {
+        const view = run
+          ? directRunView(run, artifacts)
+          : {
+            kind: "worktree_only",
+            runId: jobId,
+            worktrees: artifacts.map((artifact) => retainedWorktreeView(artifact)),
+            note: "No queue record or run audit record has this id (older than the audit, or pruned); the worktree registry still has its retained worktree.",
+          };
+        return { content: [{ type: "text", text: JSON.stringify(sanitizePersistedValue(view), null, 2) }] };
+      }
       return {
         content: [
           {
             type: "text",
-            text: `OpenCode queue job not found: ${jobId}`,
+            text: `OpenCode job not found: ${jobId}. Neither the queue, the direct/parallel run audit, nor the worktree registry of this repository has that id.`,
           },
         ],
       };
@@ -15178,7 +15532,9 @@ server.tool(
       }
     }
     const effectiveCleanupAfterSuccess = cleanupAfterSuccess ?? isBridgeGeneratedWorktree(cwd || process.cwd(), worktreePath);
-    const result = await integratePatchSerially({
+    const integrationTimings = {};
+    const integrationStarted = nowMs();
+    const result = await integrationTimingStorage.run(integrationTimings, () => integratePatchSerially({
       cwd: cwd || process.cwd(),
       worktreePath,
       branch,
@@ -15219,7 +15575,8 @@ server.tool(
         patchSha256: pipelineItem.patchSha256,
         sourceStateSha256: pipelineItem.sourceStateSha256,
       } : null,
-    });
+    }));
+    result.timings = { totalMs: Math.round(nowMs() - integrationStarted), phases: { ...integrationTimings } };
     if (pipelineId) {
       if (pipeline) {
         // Computed from the record as it stands when the write runs, so a concurrent
@@ -15294,6 +15651,7 @@ server.tool(
                 suggestedFix: result.suggestedFix || "Resolve conflicts, narrow allowedEdits, move shared/global files to a serial contract step, or rerun with a passing validation command.",
               }),
               result.validationGate ? formatValidationGateResult(result.validationGate) : null,
+              formatIntegrationTimings(result.timings),
             ].filter(Boolean).join("\n\n"),
           },
         ],
@@ -15334,6 +15692,7 @@ server.tool(
             result.sourceCleanup?.reason ? `Source worktree cleanup reason: ${result.sourceCleanup.reason}` : null,
             result.cleanupWarning ? `Cleanup warning: ${result.cleanupWarning}` : null,
             formatValidationGateResult(result.validationGate),
+            formatIntegrationTimings(result.timings),
           ].filter(Boolean).join("\n"),
         },
       ],
@@ -16391,6 +16750,7 @@ async function executeOpenCodeJob(requestedJob, {
     delegation,
   } = requestedJob;
   const effectiveJobId = jobId || makeQueueJobId(agent);
+  const phaseClock = createPhaseClock();
   const { error: lockPlanError, errorType: lockPlanErrorType, suggestedFix: lockPlanSuggestedFix, lockPlan, serialOnlyMatches = [] } = validateSingleLockPlan(requestedJob);
 
   if (lockPlanError || (hasWriteIntent(requestedJob) && lockPlan.lockType === "read")) {
@@ -16520,6 +16880,7 @@ async function executeOpenCodeJob(requestedJob, {
     }
   }
 
+  phaseClock.mark("preflight");
   const discoveryContext = sanitizedDiscoveryContext({ ...requestedJob, cwd: cwd || process.cwd() });
   const { forcePure, discoveryCwd } = discoveryContext;
   const resolution = await jobAgentRuntime().resolveAgent(
@@ -16605,6 +16966,7 @@ async function executeOpenCodeJob(requestedJob, {
     ? await attestContractorNestedAgents(discoveryCwd, { forcePure })
     : { ok: true };
   const contractorNestedError = contractorNestedAttestation.ok ? null : contractorNestedAttestation;
+  phaseClock.mark("discovery");
   const sanitizedMetadataError = requestedJob.sanitizedWorkspace ? sanitizedAgentMetadataError(agentMetadata, requestedJob.sanitizedWorkspace.root) : null;
   const sanitizedRoutingError = sanitizedRoutingPolicyError(requestedJob, resolution, discoveryCwd);
   if (metadataPolicyError || contractorNestedError || sanitizedMetadataError || sanitizedRoutingError) {
@@ -16743,6 +17105,7 @@ async function executeOpenCodeJob(requestedJob, {
       stopLockHeartbeat = startHardLockHeartbeat(acquiredLock, hardLockTtlForPlan(lockPlan));
       executionSignal = combineAbortSignals([signal, stopLockHeartbeat.signal]);
     }
+    phaseClock.mark("lock");
 
     if (shouldUseWorktree(requestedJob, lockPlan)) {
       const worktreeResult = await createWorktreeForJob({
@@ -16797,6 +17160,7 @@ async function executeOpenCodeJob(requestedJob, {
       worktree = worktreeResult;
       executionCwd = worktree.path;
       if (typeof onWorktreePrepared === "function") await onWorktreePrepared(worktree);
+      phaseClock.mark("worktreeSetup");
     }
 
     const manifestProtected = Boolean(requestedJob.sanitizedWorkspace);
@@ -16836,6 +17200,7 @@ async function executeOpenCodeJob(requestedJob, {
       ? await attestContractorNestedAgents(executionCwd, { forcePure })
       : { ok: true };
     const finalContractorNestedError = finalContractorNestedAttestation.ok ? null : finalContractorNestedAttestation;
+    phaseClock.mark(worktree ? "worktreeAttestation" : "discovery");
     const finalSanitizedMetadataError = manifestProtected ? sanitizedAgentMetadataError(finalAgentMetadata, requestedJob.sanitizedWorkspace.root) : null;
     const finalSanitizedRoutingError = sanitizedRoutingPolicyError(requestedJob, resolution, executionCwd);
     if (finalMetadataPolicyError || finalContractorNestedError || finalSanitizedMetadataError || finalSanitizedRoutingError) {
@@ -16893,6 +17258,7 @@ async function executeOpenCodeJob(requestedJob, {
     const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
     const gitControlBefore = dryRun || manifestProtected || lockPlan.lockType === "read" ? null : await gitControlSurfaceFingerprint(executionCwd);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
+    phaseClock.mark("preAgentSnapshot");
     const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
       const childAuthority = typeof onChildSpawn === "function"
         ? await onChildSpawn(spawnIdentity)
@@ -16933,6 +17299,7 @@ async function executeOpenCodeJob(requestedJob, {
         onSupervisorHeartbeat: renewExecutionSupervisorAuthority,
       }
     );
+    phaseClock.mark("openCodeRun");
     containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
       || result?.terminationErrorType === "process_tree_termination_unconfirmed";
     if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
@@ -16991,6 +17358,7 @@ async function executeOpenCodeJob(requestedJob, {
       result.errorType ||= "unsafe_path_after_execution";
       result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
     }
+    phaseClock.mark("postAgentChecks");
     const validationGate = manifestProtected
       ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
       : !validation.disallowedFiles.length && !result.errorType
@@ -17007,12 +17375,14 @@ async function executeOpenCodeJob(requestedJob, {
     if (validationGate.errorType && !result.errorType) {
       result.errorType = validationGate.errorType;
     }
+    phaseClock.mark("validation");
 
     const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     if (gitControlBefore && lockPlan.validationCommand) {
       applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd), "validation");
     }
     const executionHeadAfterValidation = dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
+    phaseClock.mark("postValidationChecks");
     const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
     if (executionHeadAfterValidation !== executionHeadBefore) {
       const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
@@ -17062,6 +17432,7 @@ async function executeOpenCodeJob(requestedJob, {
 
     if (worktree) {
       worktreeDiff = await collectWorktreeDiff(worktree);
+      phaseClock.mark("patchCollect");
       if (worktreeDiff?.errorType && !result.errorType) {
         result.errorType = worktreeDiff.errorType;
         result.stderr = [result.stderr, worktreeDiff.error].filter(Boolean).join("\n");
@@ -17182,8 +17553,11 @@ async function executeOpenCodeJob(requestedJob, {
 
     // The job's work is done; the lock is released before the report so the report can say
     // whether it really was.
+    phaseClock.mark("cleanup");
     const lockRelease = await releaseAcquiredLock();
     result.lockRelease = { needed: lockRelease.needed, released: lockRelease.released };
+    phaseClock.mark("report");
+    result.phaseTimings = phaseClock.summary(result);
     return {
       response: {
         content: [
@@ -17278,19 +17652,37 @@ async function executeOpenCodeJob(requestedJob, {
 // durationMs includes the wait. runStage and agentRunMs separate the two.
 function queueRunStage(record) {
   if (record.status !== "running") return record.status || "";
-  // Before the agent process starts the bridge re-attests the role (two `opencode debug` calls,
-  // a few seconds each) and waits for a provider slot; providerWaitMs on the record splits the two.
+  // Before the agent process starts the bridge checks the workspace, creates the worktree,
+  // attests the role (several `opencode` calls), snapshots the tree and waits for a provider slot;
+  // phaseTimings on the finished record splits these, providerWaitMs is the slot wait alone.
   return record.childProcessStartedAt ? "agent_running" : "starting_agent";
 }
 
+// B-024: once the job has finished, agentRunMs is the agent process alone (the same number as
+// "Agent run ms" in the result text) and afterAgentMs is the post-agent work (snapshots,
+// validation, patch collection), so waitBeforeAgentMs + agentRunMs + afterAgentMs ~ durationMs.
+// While the job runs, agentRunMs is the time since the supervisor started.
 function queueAgentTiming(record, now = Date.now()) {
   const agentStartedMs = Date.parse(record.agentStartedAt || "");
   if (!Number.isFinite(agentStartedMs)) return { agentRunMs: 0, waitBeforeAgentMs: 0 };
   const finishedMs = Date.parse(record.finishedAt || "");
   const startedMs = Date.parse(record.startedAt || "");
+  const waitBeforeAgentMs = Number.isFinite(startedMs) ? Math.max(0, agentStartedMs - startedMs) : 0;
+  const processMs = record.phaseTimings?.agentProcessMs;
+  if (Number.isFinite(finishedMs) && Number.isFinite(processMs)) {
+    // afterAgentMs comes from the job clock (last agent exit to the end): with read-only retries
+    // agentStartedAt is the first attempt and agentProcessMs the last, so their difference would
+    // count earlier attempts and backoff as post-agent work. Earlier attempts are in neither.
+    const afterAgentMs = record.phaseTimings?.afterAgentMs;
+    return {
+      agentRunMs: Math.max(0, processMs),
+      waitBeforeAgentMs,
+      afterAgentMs: Number.isFinite(afterAgentMs) ? Math.max(0, afterAgentMs) : Math.max(0, finishedMs - agentStartedMs - processMs),
+    };
+  }
   return {
     agentRunMs: Math.max(0, (Number.isFinite(finishedMs) ? finishedMs : now) - agentStartedMs),
-    waitBeforeAgentMs: Number.isFinite(startedMs) ? Math.max(0, agentStartedMs - startedMs) : 0,
+    waitBeforeAgentMs,
   };
 }
 
@@ -17329,6 +17721,9 @@ function queueRecordSnapshot(record, includeResult = true) {
     durationMs: record.durationMs || 0,
     ...queueAgentTiming(record),
     providerWaitMs: record.providerWaitMs || 0,
+    providerRetryWarningCount: record.providerRetryWarningCount || 0,
+    usage: record.usage || null,
+    phaseTimings: record.phaseTimings || null,
     readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
     maxRetries: record.maxRetries || 0,
@@ -19288,6 +19683,9 @@ async function startQueueRecord(record) {
         dependencyRequest: execution.result?.dependencyRequest || null,
         resultText: execution.response?.content?.[0]?.text || "",
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
+        providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
+        usage: execution.result?.usage || null,
+        phaseTimings: execution.result?.phaseTimings || null,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
         noChanges: Boolean(execution.result?.noChanges),
@@ -21963,8 +22361,8 @@ server.tool(
 
     const parallelWorktrees = [];
     // Each job gets a run id up front (writers already used one for their worktree name), so the
-    // coordinator's ledger can name reviewer runs too. It is not a queue id: get_opencode_job
-    // cannot look it up; use the queue for durable status.
+    // coordinator's ledger can name reviewer runs too. It is not a queue id: get_opencode_job finds
+    // it in the direct-run audit (kind "parallel"); the queue still owns durable cancellation.
     const parallelRunIds = lockPlans.map((plan) => makeQueueJobId(plan.agent));
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
@@ -22095,6 +22493,15 @@ server.tool(
       if (heartbeat.signal?.aborted) abortGroupForLostLock();
       else heartbeat.signal?.addEventListener("abort", abortGroupForLostLock, { once: true });
     }
+    // Locks, worktrees and discovery attestation for all jobs happened before this point. The audit
+    // start records are written before the group deadline is armed (they fail open, never throw).
+    const parallelSharedSetupMs = Math.round(nowMs() - toolStarted);
+    const parallelAudit = directRunAuditStore();
+    const parallelAuditHandles = await Promise.all(jobs.map((job, index) => parallelAudit.start(
+      { agent: lockPlans[index].agent, cwd: job.cwd || process.cwd(), dryRun: Boolean(job.dryRun) },
+      { runId: parallelRunIds[index], kind: "parallel", jobId: parallelRunIds[index] }
+    )));
+    const parallelChildSpawned = jobs.map(() => false);
     const groupDeadlineMs = parallelGroupDeadlineMs(lockPlans);
     let groupDeadlineExpired = false;
     const groupDeadlineTimer = setTimeout(() => {
@@ -22105,6 +22512,7 @@ server.tool(
       const executionPromises = jobs.map(async (job, index) => {
         const lockPlan = lockPlans[index];
         const jobStartedAtMs = nowMs();
+        const phaseClock = createPhaseClock();
         const resolution = parallelResolutions[index];
         if (resolution.error) {
           return {
@@ -22223,6 +22631,7 @@ server.tool(
         if (resolution.proxyUsed) {
           prompt = buildSubagentProxyPrompt(resolution.requestedAgent, await readAgentDefinition(resolution.requestedAgent), prompt);
         }
+        phaseClock.mark("preAgentSnapshot");
         const result = await jobAgentRuntime().runOpenCodeWithPolicy(
           resolution.actualAgent,
           prompt,
@@ -22230,8 +22639,16 @@ server.tool(
           job.dryRun || false,
           lockPlan,
           lockPlan.timeoutMs,
-          { signal: groupController.signal, agentMetadata: parallelAgentMetadata[index] }
+          {
+            signal: groupController.signal,
+            agentMetadata: parallelAgentMetadata[index],
+            onSpawn: () => {
+              parallelChildSpawned[index] = true;
+              return { ok: true };
+            },
+          }
         );
+        phaseClock.mark("openCodeRun");
         const afterFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
         const afterFilesForValidation = job.dryRun || manifestProtected || readerEditsDenied
           ? afterFiles
@@ -22345,6 +22762,8 @@ server.tool(
         const worktreeRemoved = producedNothing && ["success", "partial"].includes(worktreeCleanup.cleanup);
         if (worktreeRemoved) parallelRemovedWorktrees.add(path.resolve(worktree.path));
         if (producedNothing) result.noChanges = true;
+        phaseClock.mark("postAgentChecks");
+        result.phaseTimings = { ...phaseClock.summary(result), sharedSetupMs: parallelSharedSetupMs };
         if (worktree) {
           result.worktree = {
             path: worktreeRemoved ? "" : worktree.path,
@@ -22364,6 +22783,7 @@ server.tool(
           index,
           lockPlan,
           result,
+          unsafeFiles,
           worktreeCleanup,
           startedAtMs: jobStartedAtMs,
           finishedAtMs: nowMs(),
@@ -22406,6 +22826,17 @@ server.tool(
           suggestedFix: "Inspect the retained sibling worktrees and retry through the queue/pipeline if cancellation or durable status is required.",
         })}`,
       }));
+      const parallelAudits = await Promise.all(results.map((entry, position) => {
+        const index = Number.isInteger(entry.index) ? entry.index : position;
+        return parallelAudit.finish(parallelAuditHandles[index], {
+          execution: { result: entry.result || {} },
+          childStarted: parallelChildSpawned[index],
+          errorType: entry.result?.errorType || (entry.unsafeFiles?.length ? "changed_file_validation_error" : ""),
+        });
+      }));
+      results.forEach((entry, position) => {
+        entry.text = [entry.text, parallelAudit.notice(parallelAudits[position])].filter(Boolean).join("\n");
+      });
       for (const cwdKey of cwdKeys) {
         if (!parallelSnapshottedCwds.has(cwdKey)) continue;
         // A writer worktree that produced nothing was removed; there is no group state left there.
@@ -22554,7 +22985,7 @@ server.tool(
             worktreeCleanupVerification,
             ...results.map((result, position) => {
               const runId = parallelRunIds[Number.isInteger(result.index) ? result.index : position];
-              return runId ? String(result.text || "").replace(/^JOB (\d+)/, (label) => `${label}\nRun id: ${runId} (not a queue id)`) : result.text;
+              return runId ? String(result.text || "").replace(/^JOB (\d+)/, (label) => `${label}\nRun id: ${runId} (get_opencode_job finds it; not cancellable like a queue job)`) : result.text;
             }),
           ].join("\n\n====================\n\n"),
         },
@@ -23416,6 +23847,14 @@ async function runProviderLeaseWorker() {
 // variables through the live accessors in __selfTest.hooks.
 export const __selfTest = {
   internals: {
+    createPhaseClock,
+    directRunAuditStore,
+    formatIntegrationTimings,
+    formatOpenCodeUsage,
+    formatPhaseTimings,
+    formatSingleResult,
+    integrationTimingStorage,
+    listRetainedWorktreeArtifacts,
     BRIDGE_INSTANCE_ID,
     BRIDGE_OPENCODE_HOME_DIR,
     BRIDGE_RUNTIME_DIR,

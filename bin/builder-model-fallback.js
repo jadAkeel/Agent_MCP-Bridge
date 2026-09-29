@@ -10,6 +10,16 @@ export function terminationContained(result) {
   return result?.containmentGuarantee === "windows_taskkill_best_effort" && result.terminationBestEffortSucceeded === true;
 }
 
+export function sumOpenCodeUsage(...items) {
+  const present = items.filter((item) => item && typeof item === "object");
+  if (!present.length) return null;
+  const total = { steps: 0, inputCount: 0, outputCount: 0, reasoningCount: 0, cacheReadCount: 0, cacheWriteCount: 0, cost: 0, rootSteps: 0 };
+  for (const item of present) {
+    for (const key of Object.keys(total)) total[key] += Number.isFinite(Number(item[key])) ? Number(item[key]) : 0;
+  }
+  return total;
+}
+
 // An explicit operator policy, bounded to a failure before any tool execution.
 export function builderFallbackEligible(agent, result, { enabled, modelRequirement, forcePure } = {}) {
   return enabled === true && agent === "builder" && !modelRequirement && !forcePure
@@ -39,6 +49,9 @@ export async function runBuilderModelFallback(agent, run, {
   return {
     ...fallback,
     durationMs: (primary.durationMs || 0) + (fallback.durationMs || 0),
+    // Both attempts used provider tokens; the report counts them together.
+    usage: sumOpenCodeUsage(primary.usage, fallback.usage),
+    providerRetryWarningCount: (primary.providerRetryWarningCount || 0) + (fallback.providerRetryWarningCount || 0),
     childExecutionIntervals: [...(primary.childExecutionIntervals || []), ...(fallback.childExecutionIntervals || [])],
     modelFallbackUsed: true,
     modelFallbackReason: primary.errorType,
