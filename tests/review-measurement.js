@@ -299,6 +299,49 @@ test("B-028: a failed git worktree add does not leave its new branch behind", as
   }
 });
 
+// ---------------------------------------------------------------------------- B-027
+test("B-027: a file force-added on an ignored path fails the integration instead of being dropped", async () => {
+  const ignoredRepo = await mkdtemp(path.join(tmpdir(), "review-measure-ignored-"));
+  try {
+    await git(["init", "-q"], ignoredRepo);
+    await git(["config", "core.autocrlf", "false"], ignoredRepo);
+    await writeFile(path.join(ignoredRepo, ".gitignore"), "*.log\n", "utf8");
+    await writeFile(path.join(ignoredRepo, "a.txt"), "a\n", "utf8");
+    // Tracked before the rule applied: an ignored path the base commit already has.
+    await writeFile(path.join(ignoredRepo, "kept.log"), "base\n", "utf8");
+    await git(["add", ".gitignore", "a.txt"], ignoredRepo);
+    await git(["add", "-f", "kept.log"], ignoredRepo);
+    await git([...gitIdentity, "commit", "-q", "-m", "init"], ignoredRepo);
+    const edits = ["a.txt", "kept.log", "x.log"];
+
+    // Control: editing the already-tracked ignored file is in the patch and passes.
+    let worktree = await createWorktreeForJob({ cwd: ignoredRepo, agent: "builder", jobId: "builder-ignored-ok", lockedPaths: edits, allowedEdits: edits });
+    assert.equal(worktree.ok, true, JSON.stringify(worktree));
+    await writeFile(path.join(worktree.path, "kept.log"), "edited\n", "utf8");
+    let preview = await integratePatchSerially({ cwd: ignoredRepo, worktreePath: worktree.path, allowedEdits: edits, validationCommand: "git diff --check", dryRun: true });
+    assert.equal(preview.ok, true, JSON.stringify(preview));
+    assert.deepEqual(preview.changedFiles, ["kept.log"]);
+    await cleanupWorktree(worktree, "always", true);
+
+    // The defect: a new file force-added on an ignored path.
+    worktree = await createWorktreeForJob({ cwd: ignoredRepo, agent: "builder", jobId: "builder-ignored-bad", lockedPaths: edits, allowedEdits: edits });
+    assert.equal(worktree.ok, true, JSON.stringify(worktree));
+    await writeFile(path.join(worktree.path, "a.txt"), "changed\n", "utf8");
+    await writeFile(path.join(worktree.path, "x.log"), "agent output\n", "utf8");
+    await git(["add", "-f", "x.log"], worktree.path);
+    preview = await integratePatchSerially({ cwd: ignoredRepo, worktreePath: worktree.path, allowedEdits: edits, validationCommand: "git diff --check", dryRun: true });
+    assert.equal(preview.ok, false, JSON.stringify(preview));
+    assert.equal(preview.errorType, "integration_source_unrepresentable", JSON.stringify(preview));
+    assert.deepEqual(preview.ignoredFiles, ["x.log"]);
+    assert.match(preview.error, /git add -f/);
+    const { existsSync } = await import("node:fs");
+    assert.equal(existsSync(path.join(worktree.path, "x.log")), true, "the source is retained");
+    await cleanupWorktree(worktree, "always", true);
+  } finally {
+    await rm(ignoredRepo, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  }
+});
+
 // ---------------------------------------------------------------------------- B-026
 test("B-026: integration reports its phases and rehashes each tree fewer times", async () => {
   const worktree = await createWorktreeForJob({ cwd: repo, agent: "builder", jobId: "builder-measure-1", lockedPaths: ["src"], allowedEdits: ["src"] });

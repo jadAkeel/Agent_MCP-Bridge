@@ -9599,6 +9599,32 @@ async function markUntrackedFilesForDiff(cwd) {
   return { ok: errors.length === 0, files, errors };
 }
 
+// B-027: `git add -A` into the fresh index skips ignored paths, and the ignored listing below
+// shows only untracked files. A file the agent force-added (`git add -f`) on an ignored path is
+// tracked in the source's real index, so it fell through both: it was left out of the reviewed
+// patch and deleted with the worktree at cleanup. Files on ignored paths that the base commit
+// already had stay in the fresh index (add -A updates tracked entries), so only new ones remain.
+async function forceAddedIgnoredSourceFiles(cwd, patchIndexEnv) {
+  const trackedIgnored = await runCommand(
+    "git",
+    ["ls-files", "--cached", "--ignored", "--exclude-standard", "-z"],
+    cwd,
+    1000 * 30,
+    buildValidationEnv()
+  );
+  if (trackedIgnored.exitCode !== 0) {
+    return { ok: false, errorType: "integration_patch_create_failed", error: trackedIgnored.stderr || "Could not inspect tracked files on ignored source paths.", files: [] };
+  }
+  const candidates = splitNulSeparated(trackedIgnored.stdout);
+  if (!candidates.length) return { ok: true, files: [] };
+  const patchIndex = await runCommand("git", ["ls-files", "--cached", "-z"], cwd, 1000 * 30, patchIndexEnv);
+  if (patchIndex.exitCode !== 0) {
+    return { ok: false, errorType: "integration_patch_create_failed", error: patchIndex.stderr || "Could not list the isolated temporary Git index.", files: [] };
+  }
+  const inPatch = new Set(splitNulSeparated(patchIndex.stdout));
+  return { ok: true, files: normalizeLockPathList(candidates.filter((file) => !inPatch.has(file))) };
+}
+
 async function ignoredIntegrationSourceFiles(cwd) {
   const result = await runCommand(
     "git",
@@ -9770,6 +9796,22 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
     const add = await integrationTimed("freshIndexHash", () => runCommand("git", ["add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv));
     if (add.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
+    }
+    if (rejectIgnoredSource) {
+      const forceAdded = await forceAddedIgnoredSourceFiles(sourcePath, gitEnv);
+      if (!forceAdded.ok) return forceAdded;
+      if (forceAdded.files.length) {
+        const listed = forceAdded.files.slice(0, 20);
+        const more = forceAdded.files.length - listed.length;
+        return {
+          ok: false,
+          errorType: "integration_source_unrepresentable",
+          error: `The source index tracks ${forceAdded.files.length} file(s) on ignored paths (added with git add -f) that are absent from the reviewable Git patch: ${listed.join(", ")}${more ? ` and ${more} more` : ""}. The bridge retained the source and will not report or clean it as successfully integrated.`,
+          ignoredFiles: listed,
+          ignoredFileCount: forceAdded.files.length,
+          unresolvedFiles: listed,
+        };
+      }
     }
     const [diff, changed, status] = await Promise.all([
       runCommand("git", ["diff", "--cached", "--binary", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 60, gitEnv, { encoding: "buffer" }),
