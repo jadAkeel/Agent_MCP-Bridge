@@ -345,6 +345,9 @@ let pipelinePersistenceTestHook = null;
 let queueCancellationTestHook = null;
 let worktreeCleanupTestHook = null;
 let pipelineGateExecutorTestHook = null;
+// Self-test only: stands in for agent discovery, attestation and the OpenCode run so the job
+// and parallel paths can be exercised against a real Git checkout without a provider.
+let agentRuntimeTestHook = null;
 
 const server = new McpServer({
   name: "codex-opencode-bridge",
@@ -14653,6 +14656,46 @@ function validateSingleLockPlan(job) {
   return { error: null, lockPlan };
 }
 
+function jobAgentRuntime() {
+  const hook = process.argv.includes("--self-test") ? agentRuntimeTestHook : null;
+  return {
+    resolveAgent: hook?.resolveAgent || resolveAgent,
+    readAgentDebugMetadata: hook?.readAgentDebugMetadata || readAgentDebugMetadata,
+    runOpenCodeWithPolicy: hook?.runOpenCodeWithPolicy || runOpenCodeWithPolicy,
+  };
+}
+
+// True only for a reader whose final pre-spawn attestation passed with edits denied; any other
+// reader keeps failing when the checkout changes, because it could have made the change.
+function readOnlyEditsDeniedByAttestation(lockPlan, agentMetadata) {
+  return lockPlan?.lockType === "read"
+    && agentMetadata?.ok !== false
+    && Boolean(agentMetadata?.metadata)
+    && agentMetadata.metadata.canEdit === false;
+}
+
+// Files that changed in the checkout while an edit-denied reader ran. A file that is clean
+// again after HEAD moved matches the new HEAD: it was committed, not edited.
+function readOnlyWorkspaceDrift(changedFiles, afterSnapshot, headMoved) {
+  const committedFiles = headMoved ? changedFiles.filter((file) => !afterSnapshot.has(file)) : [];
+  const committed = new Set(committedFiles);
+  const files = changedFiles.filter((file) => !committed.has(file));
+  return {
+    files: files.slice(0, 50),
+    fileCount: files.length,
+    committedFiles: committedFiles.slice(0, 50),
+  };
+}
+
+function formatReadOnlyWorkspaceDrift(drift) {
+  if (!drift || (!drift.fileCount && !drift.committedFiles?.length)) return null;
+  const changed = drift.fileCount
+    ? `${drift.fileCount} file(s) changed by another client: ${drift.files.join(", ")}${drift.fileCount > drift.files.length ? ", ..." : ""}`
+    : "no uncommitted external changes";
+  const committed = drift.committedFiles?.length ? `; committed during the run: ${drift.committedFiles.join(", ")}` : "";
+  return `Checkout changed during this read-only run (the attested agent cannot edit; result kept): ${changed}${committed}. The review may describe the older version of these files.`;
+}
+
 async function executeOpenCodeJob(requestedJob, {
   toolStarted = nowMs(),
   jobId = null,
@@ -14936,8 +14979,42 @@ async function executeOpenCodeJob(requestedJob, {
   let worktree = null;
   let worktreeDiff = null;
   let worktreeCleanup = null;
+  let emptyWorktreeRemoved = false;
   let containmentQuarantined = false;
   let containmentEvidence = "";
+  // Stopping the heartbeat and releasing (or quarantining) the lock come first and happen once:
+  // a later failure (measuring the retained worktree) must not leave the heartbeat renewing
+  // the path lock until the process exits, and the report states what actually happened.
+  let lockReleaseOutcome = null;
+  const releaseAcquiredLock = async () => {
+    if (lockReleaseOutcome) return lockReleaseOutcome;
+    stopLockHeartbeat();
+    if (!acquiredLock) {
+      lockReleaseOutcome = { needed: false, released: false, text: "not needed" };
+      return lockReleaseOutcome;
+    }
+    try {
+      if (containmentQuarantined) {
+        const quarantined = await quarantineHardLock(acquiredLock, containmentEvidence);
+        if (!quarantined.ok) {
+          logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
+        }
+        lockReleaseOutcome = { needed: true, released: false, quarantined: Boolean(quarantined.ok), text: `no (containment quarantined${quarantined.ok ? "" : "; quarantine unconfirmed"})` };
+      } else {
+        const released = await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+        if (!released?.ok) {
+          logEvent("warn", "lock.release_failed", { lockId: acquiredLock.id, error: released?.error || "" });
+        }
+        lockReleaseOutcome = released?.ok
+          ? { needed: true, released: true, text: "yes" }
+          : { needed: true, released: false, text: `no (${redactSensitiveText(released?.error || "release failed")}; the lock expires with its TTL)` };
+      }
+    } catch (error) {
+      logEvent("error", "lock.release_failed", { lockId: acquiredLock.id, error: error?.message || String(error) });
+      lockReleaseOutcome = { needed: true, released: false, text: `no (${redactSensitiveText(error?.message || String(error))}; the lock expires with its TTL)` };
+    }
+    return lockReleaseOutcome;
+  };
   const shouldAcquireLock = !dryRun;
   let executionCwd = cwd || process.cwd();
   let sanitizedBefore = null;
@@ -15134,7 +15211,12 @@ async function executeOpenCodeJob(requestedJob, {
         };
       }
     }
-    const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+    // A reader whose attested effective policy denies every edit cannot have changed the
+    // checkout, so a difference there is another client's work (a commit, an editor save,
+    // coverage/ from a test run): it is reported, not held against the reader.
+    const readerEditsDenied = !dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, agentMetadata);
+    const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
+    const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
     const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
       const childAuthority = typeof onChildSpawn === "function"
@@ -15183,7 +15265,12 @@ async function executeOpenCodeJob(requestedJob, {
       result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
       result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
     }
-    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+    // Validation is judged on tracked and untracked files only: ignored build/cache output
+    // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
+    const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
+      ? afterFiles
+      : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
     const sanitizedAfter = manifestProtected && !dryRun
       ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
@@ -15191,6 +15278,10 @@ async function executeOpenCodeJob(requestedJob, {
     result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
       ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
       : changedFilesBetween(beforeFiles, afterFiles);
+    if (readerEditsDenied && result.changedFiles.length) {
+      result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
+      result.changedFiles = [];
+    }
     if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
       const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
       if (move) {
@@ -15241,9 +15332,9 @@ async function executeOpenCodeJob(requestedJob, {
       result.errorType = validationGate.errorType;
     }
 
-    const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd);
+    const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     const executionHeadAfterValidation = dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
-    const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
+    const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
     if (executionHeadAfterValidation !== executionHeadBefore) {
       const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
         ? null
@@ -15257,7 +15348,7 @@ async function executeOpenCodeJob(requestedJob, {
       result.executionHeadAfter = executionHeadAfterValidation;
     }
     if (validationMutationFiles.length) {
-      result.changedFiles = changedFilesBetween(beforeFiles, afterValidationFiles);
+      result.changedFiles = normalizeLockPathList(result.changedFiles.concat(validationMutationFiles));
       validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
       result.validationMutationFiles = validationMutationFiles;
       result.errorType ||= "validation_mutated_workspace";
@@ -15331,14 +15422,20 @@ async function executeOpenCodeJob(requestedJob, {
             ? "failed or rejected write output is retained for diagnosis and recovery"
             : "successful write output is retained until reviewed integration and a passing validation gate",
         };
+      // Once the empty worktree is gone its path names nothing: reporting it made the queue
+      // record and the pipeline offer a removed worktree for integration forever.
+      emptyWorktreeRemoved = producedNothing && ["success", "partial"].includes(worktreeCleanup.cleanup);
+      if (producedNothing) result.noChanges = true;
       result.worktree = {
-        path: worktree.path,
-        branch: worktree.branch,
+        path: emptyWorktreeRemoved ? "" : worktree.path,
+        branch: emptyWorktreeRemoved ? "" : worktree.branch,
         baseCommit: worktree.baseCommit,
         baseTree: worktree.baseTree,
         patchSha256: worktreeDiff?.patchSha256 || "",
         sourceStateSha256: worktreeDiff?.sourceStateSha256 || "",
         cleanup: worktreeCleanup.cleanup,
+        removed: emptyWorktreeRemoved,
+        removedPath: emptyWorktreeRemoved ? worktree.path : "",
         changedFiles: worktreeDiff?.changedFiles || [],
         diffStat: worktreeDiff?.diffStat || "",
       };
@@ -15404,6 +15501,10 @@ async function executeOpenCodeJob(requestedJob, {
         ].join("\n")
       : ["", "Worktree review:", "Worktree: not used"].join("\n");
 
+    // The job's work is done; the lock is released before the report so the report can say
+    // whether it really was.
+    const lockRelease = await releaseAcquiredLock();
+    result.lockRelease = { needed: lockRelease.needed, released: lockRelease.released };
     return {
       response: {
         content: [
@@ -15411,15 +15512,16 @@ async function executeOpenCodeJob(requestedJob, {
             type: "text",
             text: [
               `Temporary lock acquired: ${hardLockSummary(acquiredLock)}`,
-              `Temporary lock released: ${acquiredLock ? (containmentQuarantined ? "no (containment quarantined)" : "yes") : "not needed"}`,
+              `Temporary lock released: ${lockRelease.text}`,
               formatSingleResult({ resolution, result, cwd: executionCwd, lockPlan }),
+              formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
               worktreeReview,
               nativeFallbackViolation,
               apiErrorViolation,
               finalResponseViolation,
               formatValidationGateResult(validationGate),
               lockViolation,
-            ].join("\n"),
+            ].filter((line) => line !== null).join("\n"),
           },
         ],
       },
@@ -15427,15 +15529,18 @@ async function executeOpenCodeJob(requestedJob, {
       lockPlan,
       resolution,
       validation,
-      worktree,
+      worktree: emptyWorktreeRemoved ? null : worktree,
       worktreeCleanup,
       sanitizedWorkspace: result.sanitizedWorkspaceVerification || null,
     };
   } catch (error) {
+    // An empty worktree that was already removed is not retained work.
+    if (emptyWorktreeRemoved) worktree = null;
     let retainedDiff = null;
     if (worktree) {
       try { retainedDiff = await collectWorktreeDiff(worktree); } catch { retainedDiff = null; }
     }
+    const lockRelease = await releaseAcquiredLock();
     const worktreeDetails = worktree ? {
       path: worktree.path,
       branch: worktree.branch,
@@ -15459,12 +15564,13 @@ async function executeOpenCodeJob(requestedJob, {
         durationMs: nowMs() - toolStarted,
         unresolvedFiles: worktreeDetails?.changedFiles || [],
         suggestedFix: "Inspect the retained worktree or target checkout before retrying; do not discard recovery evidence.",
-      }) }] },
+      }) + `\nTemporary lock released: ${lockRelease.text}` }] },
       result: {
         errorType: "job_infrastructure_failed",
         error: errorText,
         changedFiles: worktreeDetails?.changedFiles || [],
         worktree: worktreeDetails,
+        lockRelease: { needed: lockRelease.needed, released: lockRelease.released },
       },
       lockPlan,
       resolution,
@@ -15472,18 +15578,17 @@ async function executeOpenCodeJob(requestedJob, {
       worktreeCleanup: worktree ? { cleanup: "retained_for_review", reason: "infrastructure failure" } : null,
     };
   } finally {
+    // Release first (idempotent: the report paths above already did), then measure; a failed
+    // measurement is logged and never replaces the job result.
+    await releaseAcquiredLock();
     if (worktree?.path && existsSync(worktree.path)) {
-      await updateRetainedWorktreeMeasurement(worktree);
-    }
-    stopLockHeartbeat();
-    if (acquiredLock) {
-      if (containmentQuarantined) {
-        const quarantined = await quarantineHardLock(acquiredLock, containmentEvidence);
-        if (!quarantined.ok) {
-          logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
-        }
-      } else {
-        await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+      try {
+        await updateRetainedWorktreeMeasurement(worktree);
+      } catch (error) {
+        logEvent("warn", "worktree.measurement_failed", {
+          worktreePath: worktree.path,
+          error: redactSensitiveText(error?.message || String(error)),
+        });
       }
     }
   }
@@ -17236,6 +17341,7 @@ async function startQueueRecord(record) {
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
+        noChanges: Boolean(execution.result?.noChanges),
         worktreeBranch: execution.worktree?.branch || "",
         worktreeBaseCommit: execution.worktree?.baseCommit || "",
         worktreeBaseTree: execution.worktree?.baseTree || "",
