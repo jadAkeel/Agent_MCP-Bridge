@@ -1257,7 +1257,7 @@ async function runSelfTests() {
     const trustedGitEnvFixture = buildTrustedGitEnv();
     assert.equal(trustedGitEnvFixture.GIT_CONFIG_KEY_5, "core.longpaths");
     assert.equal(trustedGitEnvFixture.GIT_CONFIG_VALUE_5, "true");
-    assert.equal(trustedGitEnvFixture.GIT_CONFIG_COUNT, "6");
+    assert.equal(trustedGitEnvFixture.GIT_CONFIG_COUNT, "11");
     assert.equal(trustedGitArgs(["worktree", "add"]).includes("core.longpaths=true"), true);
     assert.equal(buildValidationEnv().GIT_CONFIG_KEY_2, "core.longpaths");
     assert.equal(buildValidationEnv().GIT_CONFIG_COUNT, "3");
@@ -3790,7 +3790,7 @@ async function runSelfTests() {
     await chmod(rollbackVictim, 0o755);
     const executableOwnedSnapshot = await exactIntegrationFileSnapshot(tempDir, ["src/allowed.txt"]);
     if (process.platform !== "win32") {
-      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:493:"), true);
+      assert.equal(executableOwnedSnapshot.get("src/allowed.txt").startsWith("file:73:"), true);
     }
     const safeModeRollback = await rollbackVerifiedOwnedChanges({
       cwd: tempDir,

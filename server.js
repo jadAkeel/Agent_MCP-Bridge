@@ -7,7 +7,7 @@ import { execFile, spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -724,6 +724,19 @@ function buildOpenCodeEnv(extra = {}) {
   // cross-process lock races and unnecessary prompt/session persistence.
   env.OPENCODE_DB = ":memory:";
   env.OPENCODE_DISABLE_CHANNEL_DB = "true";
+  // The agent's own git: a repository-local fsmonitor hook, external diff or gpg.program (run
+  // by log.showSignature) must not execute. Appended after any operator entries so they win.
+  const inheritedConfigCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT || "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
+  if (!inheritedConfigCount) {
+    for (const key of Object.keys(env)) {
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
+    }
+  }
+  [["core.fsmonitor", "false"], ["diff.external", ""], ["log.showSignature", "false"]].forEach(([key, value], offset) => {
+    env[`GIT_CONFIG_KEY_${inheritedConfigCount + offset}`] = key;
+    env[`GIT_CONFIG_VALUE_${inheritedConfigCount + offset}`] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(inheritedConfigCount + 3);
   return env;
 }
 
@@ -909,35 +922,124 @@ function isGitExecutable(command) {
   return executable === "git" || executable === "git.exe";
 }
 
+// Bridge-owned Git drops the operator's system and global config (GIT_CONFIG_NOSYSTEM,
+// GIT_CONFIG_GLOBAL=NUL). That also dropped Git for Windows' system core.autocrlf=true: a
+// clean CRLF checkout looked modified to bridge Git after a timestamp-only change, bridge
+// worktrees were checked out with LF, and the integration apply saw every CRLF target file as
+// "needs update". The line-ending keys are read once, with the operator's plain environment,
+// from the system and global levels, and handed to bridge Git as its *global* config file.
+// A repository-local value (the self-test repositories and this repository set
+// core.autocrlf=false) therefore still wins exactly as it does for the operator's Git; a
+// `-c`/GIT_CONFIG_COUNT override would have beaten it. Only these keys with these literal
+// values are carried; any other value counts as unset. core.symlinks is carried for the
+// same reason: Git for Windows sets it in the system config, and it decides whether a
+// 120000 entry is checked out as a symlink or as a plain file.
+const USER_LINE_ENDING_GIT_CONFIG_KEYS = new Map([
+  ["core.autocrlf", /^(?:true|false|input)$/],
+  ["core.eol", /^(?:lf|crlf|native)$/],
+  ["core.safecrlf", /^(?:true|false|warn)$/],
+  ["core.symlinks", /^(?:true|false)$/],
+]);
+const NULL_GIT_CONFIG_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
+
+async function readUserLineEndingGitConfig() {
+  const values = new Map();
+  // Later levels win, as in Git: global overrides system.
+  for (const scope of ["--system", "--global"]) {
+    let stdout = "";
+    try {
+      ({ stdout } = await execFileAsync("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
+        cwd: tmpdir(),
+        shell: false,
+        timeout: 1000 * 15,
+        maxBuffer: 64 * 1024,
+        windowsHide: true,
+        env: process.env,
+      }));
+    } catch (error) {
+      // Exit 1 means no key is set at that level; a missing git leaves Git's defaults.
+      stdout = String(error?.stdout || "");
+    }
+    for (const line of String(stdout || "").split(/\r?\n/)) {
+      const match = /^(\S+)\s+(.+)$/.exec(line.trim());
+      if (!match) continue;
+      const key = match[1].toLowerCase();
+      const value = match[2].trim().toLowerCase();
+      if (USER_LINE_ENDING_GIT_CONFIG_KEYS.get(key)?.test(value)) values.set(key, value);
+    }
+  }
+  return values;
+}
+
+async function writeUserLineEndingGitConfigFile(values) {
+  if (!values.size) return NULL_GIT_CONFIG_PATH;
+  const content = `[core]\n${[...values].sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `\t${key.slice("core.".length)} = ${value}\n`).join("")}`;
+  // Content-addressed in the operator-private state directory, so concurrent bridge
+  // processes write identical bytes and a shared temporary directory is never trusted.
+  const file = path.join(GLOBAL_BRIDGE_STATE_DIR, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
+  const current = async () => {
+    try { return await readFile(file, "utf8"); } catch { return null; }
+  };
+  try {
+    if (await current() === content) return file;
+    await mkdir(GLOBAL_BRIDGE_STATE_DIR, { recursive: true });
+    const temporary = `${file}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+      await rename(temporary, file);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
+  } catch {
+    // Another bridge process may have renamed the same content-addressed file first.
+  }
+  if (await current() === content) return file;
+  console.error(JSON.stringify({ ts: new Date().toISOString(), level: "warn", event: "git.line_ending_config_unavailable" }));
+  return NULL_GIT_CONFIG_PATH;
+}
+
+const USER_LINE_ENDING_GIT_CONFIG = await readUserLineEndingGitConfig();
+const BRIDGE_GIT_GLOBAL_CONFIG_PATH = await writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG);
+
+// Enforced on every bridge Git process, as GIT_CONFIG_COUNT entries and as `-c` options.
+// log.showSignature/gpg.* keep a repository-local gpg.program from running inside bridge
+// `git log` (readOnlyHeadMove ran one); core.pager is never a repository program.
+const TRUSTED_GIT_ENFORCED_CONFIG = [
+  ["core.hooksPath", DISABLED_GIT_HOOKS_PATH],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedCache", "false"],
+  ["credential.helper", ""],
+  ["diff.external", ""],
+  // Bridge-owned Git ignores global config, so opt into long paths explicitly:
+  // generated worktree roots plus repository-relative paths routinely exceed MAX_PATH.
+  ...(process.platform === "win32" ? [["core.longpaths", "true"]] : []),
+  ["log.showSignature", "false"],
+  ["gpg.program", ""],
+  ["gpg.ssh.program", ""],
+  ["gpg.x509.program", ""],
+  ["core.pager", "cat"],
+];
+
 function buildTrustedGitEnv(extra = null) {
   const env = buildValidationEnv();
   for (const key of TRUSTED_GIT_EXTRA_ENV_KEYS) {
     if (extra && extra[key] !== undefined) env[key] = extra[key];
   }
   env.GIT_CONFIG_NOSYSTEM = "1";
-  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+  env.GIT_CONFIG_GLOBAL = BRIDGE_GIT_GLOBAL_CONFIG_PATH;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
   delete env.GIT_ASKPASS;
   delete env.SSH_ASKPASS;
-  env.GIT_CONFIG_COUNT = "5";
-  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
-  env.GIT_CONFIG_VALUE_0 = DISABLED_GIT_HOOKS_PATH;
-  env.GIT_CONFIG_KEY_1 = "core.fsmonitor";
-  env.GIT_CONFIG_VALUE_1 = "false";
-  env.GIT_CONFIG_KEY_2 = "core.untrackedCache";
-  env.GIT_CONFIG_VALUE_2 = "false";
-  env.GIT_CONFIG_KEY_3 = "credential.helper";
-  env.GIT_CONFIG_VALUE_3 = "";
-  env.GIT_CONFIG_KEY_4 = "diff.external";
-  env.GIT_CONFIG_VALUE_4 = "";
-  if (process.platform === "win32") {
-    // Bridge-owned Git ignores global config, so opt into long paths explicitly:
-    // generated worktree roots plus repository-relative paths routinely exceed MAX_PATH.
-    env.GIT_CONFIG_KEY_5 = "core.longpaths";
-    env.GIT_CONFIG_VALUE_5 = "true";
-    env.GIT_CONFIG_COUNT = "6";
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
   }
+  TRUSTED_GIT_ENFORCED_CONFIG.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(TRUSTED_GIT_ENFORCED_CONFIG.length);
   return env;
 }
 
@@ -959,13 +1061,8 @@ function trustedGitArgs(args = []) {
   }
   if (subcommandIndex >= trusted.length) return trusted;
   const enforcedConfig = [
-    "-c", `core.hooksPath=${DISABLED_GIT_HOOKS_PATH}`,
-    "-c", "core.fsmonitor=false",
-    "-c", "core.untrackedCache=false",
+    ...TRUSTED_GIT_ENFORCED_CONFIG.flatMap(([key, value]) => ["-c", `${key}=${value}`]),
     "-c", "core.quotePath=false",
-    "-c", "credential.helper=",
-    "-c", "diff.external=",
-    ...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []),
   ];
   trusted.splice(subcommandIndex, 0, ...enforcedConfig);
   const actualSubcommandIndex = subcommandIndex + enforcedConfig.length;
@@ -986,19 +1083,27 @@ async function inspectRepositoryGitControlSurface(cwd) {
       unsafeKeys: [],
     };
   }
-  const unsafePattern = /^(?:filter\..*|diff\..*\.(?:command|textconv)|merge\..*\.driver|core\.(?:attributesfile|sshcommand)|credential\..*|http\..*\.extraheader|url\..*\.insteadof|include(?:if)?\..*)$/i;
-  const unsafeKeys = [...new Set(
-    String(listed.stdout || "")
-      .split(/\r?\n/)
-      .map((key) => key.trim())
-      .filter((key) => unsafePattern.test(key))
-  )].sort();
-  return unsafeKeys.length
+  // Every key that names a program Git may run (pager, editor, proxy, askpass, gpg, fsmonitor
+  // hook, external diff, upload/receive-pack) or that makes Git run one (log.showSignature).
+  const unsafePattern = /^(?:filter\..*|diff\..*\.(?:command|textconv)|diff\.external|merge\..*\.driver|core\.(?:attributesfile|sshcommand|pager|editor|gitproxy|askpass)|credential\..*|http\..*\.extraheader|url\..*\.insteadof|include(?:if)?\..*|gpg\..*|log\.showsignature|pager\..*|sequence\.editor|uploadpack\..*|remote\..*\.(?:uploadpack|receivepack))$/i;
+  const listedKeys = String(listed.stdout || "").split(/\r?\n/).map((key) => key.trim()).filter(Boolean);
+  const unsafeKeys = new Set(listedKeys.filter((key) => unsafePattern.test(key)));
+  // core.fsmonitor=true/false selects Git's builtin daemon or none; any other value is a hook
+  // program path that every status/diff would execute.
+  if (listedKeys.some((key) => key.toLowerCase() === "core.fsmonitor")) {
+    const monitor = await runCommand("git", ["config", "--local", "--get-all", "core.fsmonitor"], cwd, 1000 * 15);
+    const values = String(monitor.stdout || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (monitor.exitCode !== 0 || values.some((value) => !/^(?:true|false|yes|no|on|off|1|0)$/i.test(value))) {
+      unsafeKeys.add("core.fsmonitor");
+    }
+  }
+  const sortedUnsafeKeys = [...unsafeKeys].sort();
+  return sortedUnsafeKeys.length
     ? {
         ok: false,
         errorType: "git_repository_config_unsafe",
-        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${unsafeKeys.join(", ")}.`,
-        unsafeKeys,
+        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${sortedUnsafeKeys.join(", ")}.`,
+        unsafeKeys: sortedUnsafeKeys,
       }
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
 }
@@ -1223,7 +1328,14 @@ function logEvent(level, event, data = {}) {
   }));
 }
 
-async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null } = {}) {
+// encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
+// The default utf8 decoding turned every non-UTF-8 byte of a patch into U+FFFD.
+async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null, encoding = "utf8" } = {}) {
+  const binary = encoding === "buffer";
+  const output = (value) => binary
+    ? (Buffer.isBuffer(value) ? value : Buffer.from(String(value || ""), "utf8"))
+    : (Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""));
+  const text = (value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || "");
   try {
     const gitCommand = isGitExecutable(command);
     const result = await execFileAsync(command, gitCommand ? trustedGitArgs(args) : args, {
@@ -1232,25 +1344,26 @@ async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null,
       timeout: timeoutMs,
       maxBuffer: 1024 * 1024 * 30,
       env: gitCommand ? buildTrustedGitEnv(env) : (env === null ? process.env : env),
+      ...(binary ? { encoding: "buffer" } : {}),
       ...(signal ? { signal } : {}),
     });
 
     return {
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
+      stdout: output(result.stdout),
+      stderr: text(result.stderr),
       exitCode: 0,
     };
   } catch (error) {
     if (/maxBuffer|ENOBUFS/i.test(String(error?.message || error))) {
       return {
-        stdout: String(error?.stdout || ""),
+        stdout: output(error?.stdout),
         stderr: "Process output exceeded the bridge capture budget; the command was terminated by the bridge instead of returning truncated evidence.",
         exitCode: "process_output_limit_exceeded",
       };
     }
     return {
-      stdout: error.stdout || "",
-      stderr: error.stderr || String(error),
+      stdout: output(error.stdout),
+      stderr: text(error.stderr) || String(error),
       exitCode: error.code || (error.killed ? "timeout" : 1),
     };
   }
@@ -2053,11 +2166,13 @@ async function runValidationGate({ command, cwd, dryRun = false, timeoutMs = CON
 
   const started = nowMs();
   const executable = path.basename(prepared.executablePath).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-  // Bridge-owned Git ignores the operator's global config, so core.autocrlf is off and
-  // `git diff --check` reports every CRLF line an agent writes on Windows as trailing
-  // whitespace, failing an otherwise clean job. Treat CR at end of line as allowed unless
-  // the repository's own core.whitespace says otherwise; real trailing blanks, space-before-tab
-  // and conflict markers are still caught.
+  // Bridge Git now carries the operator's core.autocrlf (see USER_LINE_ENDING_GIT_CONFIG), so
+  // with autocrlf=true/input the diff never shows a CR. A repository that sets
+  // core.autocrlf=false locally (this one does) still gets CRLF files from agents on Windows,
+  // and `git diff --check` would report every such line as trailing whitespace, failing an
+  // otherwise clean job. Treat CR at end of line as allowed unless the repository's own
+  // core.whitespace says otherwise; real trailing blanks, space-before-tab and conflict
+  // markers are still caught.
   let whitespaceConfig = [];
   if (executable === "git" && prepared.args[0] === "diff" && prepared.args.includes("--check")) {
     const configured = await runCommand(prepared.executablePath, ["config", "--get", "core.whitespace"], cwd || process.cwd(), 1000 * 15, buildValidationEnv(), { signal });
@@ -6065,13 +6180,50 @@ async function fileFingerprint(cwd, file, { metadataOnly = false } = {}) {
   }
 }
 
+// The permission bits a rollback restores (exact on POSIX; libuv never reports exec bits on
+// Windows). Fingerprints never use them directly: see integrationFingerprintMode.
 function durableFileMode(details) {
   return process.platform === "win32" ? details.mode & 0o111 : details.mode & 0o7777;
+}
+
+// Git tracks one bit of a regular file's mode, executable or not, and only where it can see
+// it: never on Windows, never with core.fileMode=false. Every integration fingerprint
+// (`file:<mode>:<sha256>`) uses this one rule, whether it comes from the disk, from a
+// simulated index entry (100755 -> exec) or from a journal preimage. The simulation used to
+// write 0o111 for 100755 while the disk reported 0 on Windows and 0o644/0o755 on POSIX, so
+// every patch touching an executable (and on POSIX every patch) failed as a content mismatch
+// and recovery quarantined it. Journal pre_mode keeps the raw permission bits (rows written
+// on this machine hold 0) and passes through the same rule when read, so no migration.
+const INTEGRATION_WORKTREE_RULES = new Map();
+async function integrationWorktreeRules(cwd) {
+  const key = path.resolve(cwd || process.cwd());
+  if (!INTEGRATION_WORKTREE_RULES.has(key)) {
+    if (INTEGRATION_WORKTREE_RULES.size >= 256) INTEGRATION_WORKTREE_RULES.clear();
+    INTEGRATION_WORKTREE_RULES.set(key, (async () => {
+      const [fileMode, symlinks] = await Promise.all([
+        runCommand("git", ["config", "--bool", "--get", "core.filemode"], key, 1000 * 15),
+        runCommand("git", ["config", "--bool", "--get", "core.symlinks"], key, 1000 * 15),
+      ]);
+      const value = (result) => (result.exitCode === 0 ? String(result.stdout || "").trim() : "");
+      return {
+        execBit: process.platform !== "win32" && value(fileMode) !== "false",
+        // Git for Windows checks a 120000 entry out as a plain file holding the target unless
+        // core.symlinks is true; elsewhere symlinks are the default.
+        symlinks: value(symlinks) ? value(symlinks) === "true" : process.platform !== "win32",
+      };
+    })());
+  }
+  return INTEGRATION_WORKTREE_RULES.get(key);
+}
+
+function integrationFingerprintMode(permissions, rules) {
+  return rules?.execBit && (Number(permissions) & 0o100) ? 0o111 : 0;
 }
 
 async function exactIntegrationFileSnapshot(cwd, files) {
   const snapshot = new Map();
   let totalBytes = 0;
+  const rules = await integrationWorktreeRules(cwd);
   for (const file of normalizeLockPathList(files)) {
     const absolute = path.resolve(cwd || process.cwd(), file);
     try {
@@ -6097,7 +6249,7 @@ async function exactIntegrationFileSnapshot(cwd, files) {
         throw error;
       }
       const content = await readFile(absolute);
-      snapshot.set(file, `file:${durableFileMode(details)}:${createHash("sha256").update(content).digest("hex")}`);
+      snapshot.set(file, `file:${integrationFingerprintMode(durableFileMode(details), rules)}:${createHash("sha256").update(content).digest("hex")}`);
     } catch (error) {
       if (error?.code === "ENOENT") {
         snapshot.set(file, "missing");
@@ -6162,11 +6314,15 @@ async function integrationContentMismatches(cwd, expected, actual, files, { eolR
       continue;
     }
     let eolRecord = eolRecords instanceof Map ? String(eolRecords.get(file) || "") : "";
+    let untrackedInRealIndex = false;
     if (!(eolRecords instanceof Map)) {
-      const eol = await runGitReadOnlyCommand(["ls-files", "--eol", "-z", "--", file], cwd, 1000 * 15);
+      const eol = await runGitReadOnlyCommand(["--literal-pathspecs", "ls-files", "--eol", "-z", "--", file], cwd, 1000 * 15);
       eolRecord = eol.exitCode === 0 ? (String(eol.stdout || "").split("\0").find(Boolean) || "") : "";
+      // Recovery reads the real index, where a file the patch adds has no entry and so no eol
+      // record, although the checkout conversion wrote it with CRLF like any other text file.
+      untrackedInRealIndex = eol.exitCode === 0 && !eolRecord;
     }
-    if (!/^i\/lf\s+w\/crlf\s+/.test(eolRecord)) {
+    if (!untrackedInRealIndex && !/^i\/(?:lf|none)\s+w\/crlf\s+/.test(eolRecord)) {
       mismatches.push(file);
       continue;
     }
@@ -6348,7 +6504,7 @@ async function readFileIfExists(filePath) {
   }
 }
 
-async function captureRollbackBaseline(cwd) {
+async function captureRollbackBaseline(cwd, { files = [] } = {}) {
   const base = cwd || process.cwd();
   const baseCommitResult = await runCommand("git", ["rev-parse", "HEAD"], base, 1000 * 15);
   if (baseCommitResult.exitCode !== 0 || !baseCommitResult.stdout.trim()) {
@@ -6383,6 +6539,28 @@ async function captureRollbackBaseline(cwd) {
   for (const file of ignoredFiles) {
     preExisting.set(file, { exists: true, content: null, restorable: false, ignored: true });
   }
+  // The exact pre-apply bytes of the clean paths a patch will touch. Rebuilding them from a
+  // Git blob loses the checkout conversion (a CRLF checkout came back LF); symlinks still
+  // restore from the commit, which records them exactly.
+  for (const file of normalizeLockPathList(files)) {
+    if (preExisting.has(file)) continue;
+    const target = path.resolve(base, file);
+    let details = null;
+    try {
+      details = await lstat(target);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (details && (details.isSymbolicLink() || !details.isFile())) continue;
+    const captured = details ? await readFileIfExists(target) : { exists: false, content: null };
+    totalRestorableBytes += captured.content?.length || 0;
+    if (totalRestorableBytes > CONFIG.maxSnapshotTotalBytes) {
+      const error = new Error(`Rollback snapshot byte limit exceeded: ${totalRestorableBytes} bytes exceeds CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES=${CONFIG.maxSnapshotTotalBytes}.`);
+      error.errorType = "snapshot_safety_limit_exceeded";
+      throw error;
+    }
+    preExisting.set(file, captured);
+  }
   return { cwd: base, baseCommit: baseCommitResult.stdout.trim(), totalRestorableBytes, preExisting };
 }
 
@@ -6414,7 +6592,15 @@ async function removeRollbackLeaf(target) {
 
 async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
   const parent = await safeRollbackParent(cwd, target);
-  if (!await removeRollbackLeaf(target)) return false;
+  let existing = null;
+  try {
+    existing = await lstat(target);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (existing?.isDirectory() && !existing.isSymbolicLink()) return false;
+  // The replacement is written completely before the target is touched: removing the target
+  // first left it deleted whenever the temporary write or symlink failed.
   const temporary = path.join(parent, `.codex-rollback-${process.pid}-${randomBytes(8).toString("hex")}`);
   try {
     if (kind === "link") {
@@ -6428,7 +6614,17 @@ async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
       await chmod(temporary, exactMode);
     }
     await assertNoLinkedPath(parent, "Rollback parent");
-    await rename(temporary, target);
+    // rename() replaces a regular file atomically; a symlink or a leaf of the other kind is
+    // removed first so the rename never follows or keeps it.
+    if (existing && (existing.isSymbolicLink() || kind === "link")) await rm(target, { force: true });
+    try {
+      await rename(temporary, target);
+    } catch (error) {
+      // Windows refuses to rename over a read-only or briefly locked file.
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EEXIST"].includes(error?.code)) throw error;
+      await rm(target, { force: true });
+      await rename(temporary, target);
+    }
     return true;
   } catch {
     await rm(temporary, { force: true }).catch(() => {});
@@ -6438,35 +6634,42 @@ async function replaceRollbackLeaf({ cwd, target, kind, content, mode = 0 }) {
 
 async function restoreFromGitHead(cwd, file, baseCommit = "HEAD") {
   try {
+    const base = cwd || process.cwd();
     const normalizedFile = file.replace(/\\/g, "/");
-    const entry = await runCommand("git", ["ls-tree", "-z", baseCommit, "--", normalizedFile], cwd || process.cwd(), 1000 * 15, buildValidationEnv());
+    const entry = await runCommand("git", ["ls-tree", "-z", baseCommit, "--", normalizedFile], base, 1000 * 15, buildValidationEnv());
     const match = /^(100644|100755|120000) blob ([0-9a-f]+)\t/.exec((entry.stdout || "").split("\0")[0] || "");
     if (entry.exitCode !== 0 || !match) return false;
     const [, gitMode, objectId] = match;
-    const result = await execFileAsync("git", ["cat-file", "blob", objectId], {
-      cwd: cwd || process.cwd(),
-      shell: false,
-      timeout: 1000 * 15,
-      maxBuffer: 1024 * 1024 * 30,
-      encoding: "buffer",
-    });
-    const target = path.resolve(cwd || process.cwd(), file);
+    const rules = await integrationWorktreeRules(base);
+    const asLink = gitMode === "120000" && rules.symlinks;
+    // A raw `cat-file blob` skipped the checkout conversion, so rolling back a clean file in a
+    // CRLF checkout wrote LF bytes, and recovery then saw a third state and quarantined.
+    // `--filters` converts exactly as a checkout of that path does (autocrlf, eol, attributes).
+    const result = await runCommand(
+      "git",
+      gitMode === "120000" ? ["cat-file", "blob", objectId] : ["cat-file", "--filters", `${baseCommit}:${normalizedFile}`],
+      base,
+      1000 * 15,
+      null,
+      { encoding: "buffer" }
+    );
+    if (result.exitCode !== 0) return false;
+    const content = result.stdout;
+    const permissions = gitMode === "100755" ? 0o755 : 0o644;
+    const target = path.resolve(base, file);
     await ensureParentDir(target);
     const restored = await replaceRollbackLeaf({
       cwd,
       target,
-      kind: gitMode === "120000" ? "link" : "file",
-      content: gitMode === "120000" ? result.stdout.toString("utf8") : result.stdout,
-      mode: gitMode === "100755" ? 0o755 : 0o644,
+      kind: asLink ? "link" : "file",
+      content: asLink ? content.toString("utf8") : content,
+      mode: permissions,
     });
     if (!restored) return false;
-    const actual = await exactIntegrationFileSnapshot(cwd || process.cwd(), [file]);
-    const restoredMode = process.platform === "win32"
-      ? durableFileMode(await lstat(target))
-      : gitMode === "100755" ? 0o755 : 0o644;
-    const expected = gitMode === "120000"
-      ? `link:${result.stdout.toString("utf8")}`
-      : `file:${restoredMode}:${createHash("sha256").update(result.stdout).digest("hex")}`;
+    const actual = await exactIntegrationFileSnapshot(base, [file]);
+    const expected = asLink
+      ? `link:${content.toString("utf8")}`
+      : `file:${integrationFingerprintMode(permissions, rules)}:${createHash("sha256").update(content).digest("hex")}`;
     return actual.get(normalizeLockPath(file)) === expected;
   } catch {
     return false;
@@ -6543,7 +6746,10 @@ async function rollbackUnsafeChanges({ cwd, baseline, files }) {
   };
 }
 
-async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapshot }) {
+// eolRecords (the isolated index's `ls-files --eol`) is passed when ownedSnapshot is the
+// simulated post-patch snapshot: that records index blobs, so a file the checkout
+// conversion wrote with CRLF is still bridge-owned when it matches under that tolerance.
+async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapshot, eolRecords = null }) {
   const uniqueFiles = normalizeLockPathList(files);
   if (!(ownedSnapshot instanceof Map)) {
     return {
@@ -6559,7 +6765,9 @@ async function rollbackVerifiedOwnedChanges({ cwd, baseline, files, ownedSnapsho
   for (const file of uniqueFiles) {
     try {
       const current = await exactIntegrationFileSnapshot(cwd, [file]);
-      if (current.get(file) === ownedSnapshot.get(file)) {
+      if (current.get(file) === ownedSnapshot.get(file)
+        || (eolRecords instanceof Map
+          && !(await integrationContentMismatches(cwd, ownedSnapshot, current, [file], { eolRecords })).length)) {
         verifiedOwnedFiles.push(file);
       } else {
         ownershipMismatches.push(file);
@@ -7138,7 +7346,7 @@ async function readIntegrationJournalFileEvidence(operation, row) {
     ? "missing"
     : row.pre_kind === "link"
       ? `link:${preContent.toString("utf8")}`
-      : `file:${Number(row.pre_mode || 0)}:${createHash("sha256").update(preContent).digest("hex")}`;
+      : `file:${integrationFingerprintMode(Number(row.pre_mode || 0), await integrationWorktreeRules(operation.cwd))}:${createHash("sha256").update(preContent).digest("hex")}`;
   return { ...row, preContent, preFingerprint, postFingerprint };
 }
 
@@ -8264,15 +8472,18 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
     }
     const [diff, changed, status] = await Promise.all([
-      runCommand("git", ["diff", "--cached", "--binary", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 60, gitEnv),
+      runCommand("git", ["diff", "--cached", "--binary", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 60, gitEnv, { encoding: "buffer" }),
       runCommand("git", ["diff", "--cached", "--name-only", "-z", "--no-renames", base.stdout.trim(), "--"], sourcePath, 1000 * 30, gitEnv),
       runGitReadOnlyCommand(["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], sourcePath, 1000 * 30),
     ]);
     if (diff.exitCode !== 0 || changed.exitCode !== 0 || status.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: diff.stderr || changed.stderr || status.stderr || "Could not create a complete source patch." };
     }
-    const patch = diff.stdout || "";
-    const patchSha256 = createHash("sha256").update(patch).digest("hex");
+    // The exact patch bytes are hashed and applied; the decoded text is only for the
+    // preview, the secret scan and the diffstat.
+    const patchBytes = diff.stdout;
+    const patch = patchBytes.toString("utf8");
+    const patchSha256 = createHash("sha256").update(patchBytes).digest("hex");
     const sourceStateSha256 = createHash("sha256")
       .update([base.stdout.trim(), head.stdout.trim(), status.stdout || "", patchSha256, realIndex.indexSha256].join("\0"))
       .digest("hex");
@@ -8282,6 +8493,7 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       sourceHead: head.stdout.trim(),
       changedFiles: normalizeLockPathList(changed.stdout.split("\0")),
       patch,
+      patchBytes,
       patchSha256,
       indexSha256: realIndex.indexSha256,
       sourceStateSha256,
@@ -8381,6 +8593,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       source: sourcePath,
       changedFiles: createdPatch.changedFiles,
       patch: createdPatch.patch,
+      patchBytes: createdPatch.patchBytes,
       patchSha256: createdPatch.patchSha256,
       sourceStateSha256: createdPatch.sourceStateSha256,
       sourceBaseCommit: createdPatch.baseCommit,
@@ -8408,23 +8621,25 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
       return { ok: false, errorType: "integration_source_invalid", error: base.stderr || "Could not resolve the reviewed branch base commit." };
     }
     const changed = await runCommand("git", ["diff", "--name-only", "-z", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 15);
-    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30);
+    const diff = await runCommand("git", ["diff", "--binary", "--no-renames", `${base.stdout.trim()}..${branch}`, "--"], repoRoot, 1000 * 30, null, { encoding: "buffer" });
     if (diff.exitCode !== 0) {
       return {
         ok: false,
         errorType: "integration_patch_create_failed",
-        error: diff.stderr || diff.stdout || "Could not create patch from branch.",
+        error: diff.stderr || diff.stdout.toString("utf8") || "Could not create patch from branch.",
       };
     }
 
+    const patchBytes = diff.stdout;
     return {
       ok: true,
       sourceType: "branch",
       source: branch,
       changedFiles: changed.exitCode === 0 ? normalizeLockPathList(changed.stdout.split("\0")) : [],
-      patch: diff.stdout || "",
-      patchSha256: createHash("sha256").update(diff.stdout || "").digest("hex"),
-      sourceStateSha256: createHash("sha256").update([branch, verified.stdout || "", diff.stdout || ""].join("\0")).digest("hex"),
+      patch: patchBytes.toString("utf8"),
+      patchBytes,
+      patchSha256: createHash("sha256").update(patchBytes).digest("hex"),
+      sourceStateSha256: createHash("sha256").update(`${branch}\0${verified.stdout || ""}\0`).update(patchBytes).digest("hex"),
       sourceBaseCommit: base.stdout.trim(),
       sourceHead: verified.stdout.trim().split(/\s+/)[0] || "",
     };
@@ -8440,7 +8655,7 @@ async function collectIntegrationPatch({ cwd, worktreePath = "", branch = "", so
 async function writeTemporaryPatchFile(patch) {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-opencode-patch-"));
   const patchFile = path.join(dir, "changes.patch");
-  await writeFile(patchFile, patch, "utf8");
+  await writeFile(patchFile, Buffer.isBuffer(patch) ? patch : Buffer.from(String(patch || ""), "utf8"));
   return { dir, patchFile };
 }
 
@@ -8454,60 +8669,106 @@ async function checkPatchApplies({ cwd, patchFile }) {
   };
 }
 
+// The patch is applied to an isolated index only (`--cached`), then exactly the patch paths
+// are checked out of that index. `git apply --3way` against the working tree fell back to a
+// merge whenever a reviewed path did not match the stat-less seeded index (a CRLF checkout
+// seen without the operator's core.autocrlf) and wrote conflict markers into the user's file.
+// A conflict now stays in the throwaway index and fails before any working-tree byte is
+// written, and checkout-index applies the same line-ending conversion as a checkout.
 async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal = null }) {
+  const base = cwd || process.cwd();
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
+  const patchPaths = normalizeLockPathList(files);
+  const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
+  const isolatedEol = async () => {
+    const eol = patchPaths.length
+      ? await runCommand("git", ["--literal-pathspecs", "ls-files", "--eol", "-z", "--", ...patchPaths], base, 1000 * 30, env, { signal })
+      : { exitCode: 0, stdout: "", stderr: "" };
+    return {
+      isolatedEolRecords: eol.exitCode === 0 ? gitEolRecordsFromOutput(eol.stdout) : new Map(),
+      isolatedEolError: eol.exitCode === 0 ? "" : (eol.stderr || eol.stdout || "Could not capture isolated-index EOL evidence."),
+    };
+  };
   try {
     if (!isPathInside(tmpdir(), scratch) || !isPathInside(scratch, indexFile)) {
       return { exitCode: 1, stdout: "", stderr: "Temporary integration index escaped its bounded root." };
     }
-    const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
-    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), CONFIG.gitHeavyTimeoutMs, env, { signal });
+    const seeded = await runCommand("git", ["read-tree", targetHead], base, CONFIG.gitHeavyTimeoutMs, env, { signal });
     if (seeded.exitCode !== 0) {
       return { exitCode: seeded.exitCode, stdout: seeded.stdout || "", stderr: seeded.stderr || "Could not seed the isolated integration index." };
     }
-    const refreshPaths = normalizeLockPathList(files);
-    if (refreshPaths.length) {
-      const trackedAtTarget = await runCommand(
-        "git",
-        ["ls-tree", "-r", "--name-only", "-z", targetHead, "--", ...refreshPaths],
-        cwd || process.cwd(),
-        1000 * 30,
-        env,
-        { signal }
-      );
-      if (trackedAtTarget.exitCode !== 0) {
+    const applied = await runCommand("git", ["apply", "--cached", "--3way", patchFile], base, 1000 * 60, env, { signal });
+    if (applied.exitCode !== 0) {
+      return { ...applied, stderr: `${applied.stderr || applied.stdout || "Patch did not apply."} The working tree was not modified.`, worktreeWritten: false };
+    }
+    const [unmerged, staged] = await Promise.all([
+      runCommand("git", ["ls-files", "--unmerged", "-z"], base, 1000 * 30, env, { signal }),
+      runCommand("git", ["diff-index", "--cached", "--name-only", "-z", "--no-renames", targetHead, "--"], base, 1000 * 30, env, { signal }),
+    ]);
+    if (unmerged.exitCode !== 0 || String(unmerged.stdout || "").length || staged.exitCode !== 0) {
+      return {
+        exitCode: unmerged.exitCode || staged.exitCode || 1,
+        stdout: "",
+        stderr: unmerged.stderr || staged.stderr || "The patch left conflicted entries in the isolated index; the working tree was not modified.",
+        worktreeWritten: false,
+      };
+    }
+    const stagedPaths = normalizeLockPathList(String(staged.stdout || "").split("\0"));
+    const reviewed = new Set(patchPaths);
+    const unexpected = stagedPaths.filter((file) => !reviewed.has(file));
+    if (unexpected.length) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: `The patch changed paths outside the reviewed file list (${unexpected.slice(0, 10).join(", ")}); the working tree was not modified.`,
+        worktreeWritten: false,
+      };
+    }
+    const present = await runCommand("git", ["--literal-pathspecs", "ls-files", "-z", "--", ...patchPaths], base, 1000 * 30, env, { signal });
+    if (present.exitCode !== 0) {
+      return { exitCode: present.exitCode, stdout: "", stderr: present.stderr || "Could not list the isolated integration index.", worktreeWritten: false };
+    }
+    const presentPaths = new Set(normalizeLockPathList(String(present.stdout || "").split("\0")));
+    // Deletions first, so a patch that turns a file into a directory (or back) can check out.
+    for (const file of patchPaths.filter((candidate) => !presentPaths.has(candidate))) {
+      const target = path.resolve(base, file);
+      try {
+        await safeRollbackParent(base, target);
+        if (!await removeRollbackLeaf(target)) throw new Error(`${file} is a directory.`);
+        for (let parent = path.dirname(target); isPathInside(path.resolve(base), parent); parent = path.dirname(parent)) {
+          try {
+            if ((await readdir(parent)).length) break;
+            await rmdir(parent);
+          } catch {
+            break;
+          }
+        }
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
         return {
-          exitCode: trackedAtTarget.exitCode,
-          stdout: trackedAtTarget.stdout || "",
-          stderr: trackedAtTarget.stderr || "Could not identify target paths in the isolated integration index.",
+          exitCode: 1,
+          stdout: "",
+          stderr: `Could not remove ${file} deleted by the patch: ${error?.message || error}`,
+          worktreeWritten: true,
+          ...await isolatedEol(),
         };
       }
-      const trackedRefreshPaths = normalizeLockPathList(trackedAtTarget.stdout.split("\0"));
-      if (trackedRefreshPaths.length) {
-      const refreshed = await runCommand(
-        "git",
-        ["update-index", "--refresh", "--ignore-submodules", "--", ...trackedRefreshPaths],
-        cwd || process.cwd(),
-        1000 * 30,
-        env,
-        { signal }
-      );
-      // `update-index --refresh` may report an unrelated dirty path even with a
-      // pathspec. The reviewed-path snapshots and target receipt were already
-      // checked; the isolated `git apply --3way` below remains authoritative and
-      // fails closed if any reviewed target path does not match the seeded index.
-      void refreshed;
+    }
+    const checkoutPaths = patchPaths.filter((file) => presentPaths.has(file));
+    if (checkoutPaths.length) {
+      const checkout = await runCommand("git", ["checkout-index", "-f", "--", ...checkoutPaths], base, 1000 * 60, env, { signal });
+      if (checkout.exitCode !== 0) {
+        return {
+          exitCode: checkout.exitCode,
+          stdout: checkout.stdout || "",
+          stderr: checkout.stderr || "Could not write the patched paths from the isolated integration index.",
+          worktreeWritten: true,
+          ...await isolatedEol(),
+        };
       }
     }
-    const applied = await runCommand("git", ["apply", "--3way", patchFile], cwd || process.cwd(), 1000 * 60, env, { signal });
-    if (applied.exitCode !== 0) return applied;
-    const eol = await runCommand("git", ["ls-files", "--eol", "-z", "--", ...normalizeLockPathList(files)], cwd || process.cwd(), 1000 * 30, env, { signal });
-    return {
-      ...applied,
-      isolatedEolRecords: eol.exitCode === 0 ? gitEolRecordsFromOutput(eol.stdout) : new Map(),
-      isolatedEolError: eol.exitCode === 0 ? "" : (eol.stderr || eol.stdout || "Could not capture isolated-index EOL evidence."),
-    };
+    return { ...applied, worktreeWritten: true, ...await isolatedEol() };
   } finally {
     if (isPathInside(tmpdir(), scratch)) await rm(scratch, { recursive: true, force: true });
   }
@@ -8565,6 +8826,7 @@ async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, fi
 
     const snapshot = new Map();
     const indexSnapshot = new Map();
+    const rules = await integrationWorktreeRules(cwd);
     let totalBytes = 0;
     for (const file of normalizeLockPathList(files)) {
       const entry = await runCommand("git", ["ls-files", "--stage", "-z", "--", file], cwd, 1000 * 15, gitEnv);
@@ -8611,10 +8873,13 @@ async function simulateIntegrationPatchSnapshot({ cwd, targetHead, patchFile, fi
       } catch (error) {
         return { ok: false, errorType: "integration_simulation_failed", error: redactSensitiveText(error?.message || `Could not read simulated blob: ${file}`) };
       }
-      if (mode === "120000") {
+      if (mode === "120000" && rules.symlinks) {
         snapshot.set(file, `link:${blob.toString("utf8")}`);
+      } else if (mode === "120000") {
+        // core.symlinks=false: the checkout holds a plain file whose bytes are the target.
+        snapshot.set(file, `file:0:${createHash("sha256").update(blob).digest("hex")}`);
       } else if (mode === "100644" || mode === "100755") {
-        snapshot.set(file, `file:${mode === "100755" ? 0o111 : 0}:${createHash("sha256").update(blob).digest("hex")}`);
+        snapshot.set(file, `file:${integrationFingerprintMode(mode === "100755" ? 0o755 : 0o644, rules)}:${createHash("sha256").update(blob).digest("hex")}`);
       } else {
         return { ok: false, errorType: "snapshot_safety_limit_exceeded", error: `Integration evidence contains unsupported Git mode ${mode}: ${file}` };
       }
@@ -9247,7 +9512,7 @@ async function integratePatchWithoutSerialLock({
     };
   }
 
-  const { dir, patchFile } = await writeTemporaryPatchFile(patch.patch);
+  const { dir, patchFile } = await writeTemporaryPatchFile(patch.patchBytes || patch.patch);
   let rollbackBaseline = null;
   let before = null;
   let patchApplied = false;
@@ -9430,7 +9695,7 @@ async function integratePatchWithoutSerialLock({
     expectedPostApplySnapshot = simulation.snapshot;
     preApplyExactSnapshot = await exactIntegrationFileSnapshot(targetCwd, patch.changedFiles);
     preApplyIndexSnapshot = await gitIndexPathSnapshot(targetCwd, patch.changedFiles);
-    rollbackBaseline = await captureRollbackBaseline(targetCwd);
+    rollbackBaseline = await captureRollbackBaseline(targetCwd, { files: patch.changedFiles });
     before = await gitChangedFileSnapshot(targetCwd);
     const finalPreApplyState = await captureIntegrationTargetState(targetCwd);
     if (!finalPreApplyState.ok
@@ -9546,6 +9811,7 @@ async function integratePatchWithoutSerialLock({
         baseline: rollbackBaseline,
         files: changedSincePreApply,
         ownedSnapshot: expectedPostApplySnapshot,
+        eolRecords: applied.isolatedEolRecords || null,
       });
       return {
         ok: false,
@@ -9593,6 +9859,7 @@ async function integratePatchWithoutSerialLock({
         baseline: rollbackBaseline,
         files: patch.changedFiles,
         ownedSnapshot: expectedPostApplySnapshot,
+        eolRecords: applied.isolatedEolRecords || null,
       });
       return {
         ok: false,
@@ -20803,6 +21070,10 @@ export const __selfTest = {
     activatePipelineBatch,
     allowlistedModelOverride,
     applyModelOverrideToMetadata,
+    applyPatchFile,
+    inspectRepositoryGitControlSurface,
+    replaceRollbackLeaf,
+    writeTemporaryPatchFile,
     assert,
     assertSupportedCallerModel,
     assertSupportedQueueRetryConfig,
