@@ -389,6 +389,42 @@ function startToolProgressHeartbeat(extra) {
   return () => clearInterval(timer);
 }
 
+// Startup recovery runs right after the transport connects, so a slow recovery can no longer
+// exceed the client's MCP startup timeout. Every tool call still waits for it (bounded) and
+// then answers with a clear rejection instead of hanging or acting on unrecovered state.
+let bridgeStartupRecovery = null;
+const STARTUP_RECOVERY_TOOL_WAIT_MS = readPositiveIntEnv("CODEX_OPENCODE_STARTUP_RECOVERY_WAIT_MS", 1000 * 60 * 2);
+
+async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT_MS) {
+  const pending = bridgeStartupRecovery;
+  if (!pending) return { ok: true };
+  let timer = null;
+  try {
+    return await Promise.race([
+      pending.then(() => ({ ok: true }), () => ({ ok: true })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false }), Math.max(0, Number(timeoutMs) || 0));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function startupRecoveryPendingResult() {
+  return {
+    isError: true,
+    content: [{
+      type: "text",
+      text: [
+        "Bridge startup recovery still running.",
+        "errorType: startup_recovery_pending",
+        `The bridge is still recovering durable queue, pipeline and integration state (waited ${Math.round(STARTUP_RECOVERY_TOOL_WAIT_MS / 1000)} s). Retry the call shortly; get_opencode_bridge_status reports the bridge once recovery finishes.`,
+      ].join("\n"),
+    }],
+  };
+}
+
 const registerToolWithoutProgress = server.tool.bind(server);
 server.tool = (...registration) => {
   const handler = registration[registration.length - 1];
@@ -396,6 +432,7 @@ server.tool = (...registration) => {
     registration[registration.length - 1] = async (...handlerArgs) => {
       const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
       try {
+        if (!(await awaitBridgeStartupRecovery()).ok) return startupRecoveryPendingResult();
         return await handler(...handlerArgs);
       } finally {
         stop();
@@ -20572,20 +20609,22 @@ function immutableReleasePluginModeError({
 
 async function verifyReleaseIntegrity() {
   const expected = String(process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 || "").trim().toLowerCase();
-  const serverPath = path.resolve(process.argv[1] || __filename);
+  // The module's own file, never argv[1]: imported (the self-test suite) argv[1] is the
+  // importer, and ESM has no __filename, so an empty argv[1] threw a ReferenceError.
+  const serverPath = BRIDGE_SERVER_PATH;
   if (expected) {
     const actual = await sha256File(serverPath);
     if (actual !== expected) {
       throw new Error(`Bridge release integrity check failed. Expected ${expected}, got ${actual}.`);
     }
   }
-  await verifyReleaseManifest(path.dirname(serverPath));
+  await verifyReleaseManifest(BRIDGE_RUNTIME_DIR);
   if (String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim()) {
     const pluginModeError = immutableReleasePluginModeError();
     if (pluginModeError) {
       throw new Error(`Bridge release integrity check failed. ${pluginModeError}`);
     }
-    const sourcePathError = releaseManagedSourcePathError(path.dirname(serverPath));
+    const sourcePathError = releaseManagedSourcePathError(BRIDGE_RUNTIME_DIR);
     if (sourcePathError) {
       throw new Error(`Bridge release integrity check failed. ${sourcePathError}`);
     }
@@ -21546,7 +21585,22 @@ export const __selfTest = {
 };
 
 // Imported by the self-test suite: register tools only, never connect or recover.
-const BRIDGE_RUN_AS_MAIN = normalizeFilesystemCase(path.resolve(process.argv[1] || "")) === normalizeFilesystemCase(BRIDGE_SERVER_PATH);
+// argv[1] is compared by real path: a launch through a junction or symlink, or as
+// `node server` (Node adds the extension), used to fail the plain path comparison, do
+// nothing and exit 0, which the client only saw as "connection closed".
+function bridgeLaunchedAsMain(argvPath = process.argv[1]) {
+  if (!argvPath) return false;
+  const resolved = path.resolve(String(argvPath));
+  const launched = existsSync(resolved) ? resolved : existsSync(`${resolved}.js`) ? `${resolved}.js` : "";
+  if (!launched) return false;
+  try {
+    return normalizeFilesystemCase(realpathSync(launched)) === normalizeFilesystemCase(realpathSync(BRIDGE_SERVER_PATH));
+  } catch {
+    return false;
+  }
+}
+
+const BRIDGE_RUN_AS_MAIN = bridgeLaunchedAsMain();
 
 if (!BRIDGE_RUN_AS_MAIN) {
   // Module import: the importer drives everything.
@@ -21571,9 +21625,17 @@ if (!BRIDGE_RUN_AS_MAIN) {
   if (!startupPluginPolicy.ok) {
     throw new Error(`OpenCode external plugin policy rejected startup: ${startupPluginPolicy.error}`);
   }
-  await reconcileQueueStateAtStartup();
-  void reclaimProvenGoneProviderQuarantines({ force: true });
-  void sweepStaleIndexScratchDirs();
+  // Connect first so the client's MCP startup timeout never waits on recovery; tool calls
+  // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
+  bridgeStartupRecovery = reconcileQueueStateAtStartup().catch((error) => {
+    logEvent("error", "state.startup_recovery_failed", {
+      errorType: error?.errorType || "startup_recovery_failed",
+      error: redactSensitiveText(error?.message || String(error)),
+    });
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  await bridgeStartupRecovery;
+  void reclaimProvenGoneProviderQuarantines({ force: true });
+  void sweepStaleIndexScratchDirs();
 }
