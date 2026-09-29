@@ -7544,6 +7544,9 @@ function shouldUseWorktree(job, lockPlan, worktreeMode = CONFIG.worktreeMode) {
     return false;
   }
 
+  // Internal only (pipeline gates; tool schemas strip unknown keys): a reader of the checkout.
+  if (job.noWorktree === true && lockPlan.lockType === "read") return false;
+
   if (lockPlan.orchestratorMode === "contractor") {
     return true;
   }
@@ -13427,11 +13430,7 @@ server.tool(
       if (!PIPELINE_RUNS.has(pipelineId)) PIPELINE_RUNS.set(pipelineId, pipeline);
       await refreshPipelineRecord(pipeline);
       await reconcilePipelineIntegrationOperationStates(pipeline);
-      const candidates = (pipeline.integrationQueue || []).filter((item) => {
-        const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-        const sameBranch = branch && item.branch === branch;
-        return sameWorktree || sameBranch;
-      });
+      const candidates = (pipeline.integrationQueue || []).filter((item) => pipelineIntegrationItemMatches(pipeline, item, { worktreePath, branch }));
       if (candidates.length !== 1 || !["pending", "integrating"].includes(candidates[0].status)) {
         return { content: [{ type: "text", text: formatRejectedExecution({
           headline: "Pipeline integration rejected.",
@@ -13522,23 +13521,18 @@ server.tool(
       pipelineId,
       pipelineJobId: pipelineItem?.jobId || "",
       onIntegrationPrepared: pipeline ? async ({ operationId }) => {
-        const integrationQueue = (pipeline.integrationQueue || []).map((item) => {
-          const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-          const sameBranch = branch && item.branch === branch;
-          return sameWorktree || sameBranch
+        await updatePipelineRecord(pipeline, (current) => ({
+          integrationQueue: (current.integrationQueue || []).map((item) => pipelineIntegrationItemMatches(current, item, { worktreePath, branch })
             ? { ...item, status: "integrating", operationId }
-            : item;
-        });
-        await updatePipelineRecord(pipeline, {
-          integrationQueue,
-          events: (pipeline.events || []).concat({
+            : item),
+          events: (current.events || []).concat({
             type: "integration_prepared",
             at: new Date().toISOString(),
             operationId,
             jobId: pipelineItem?.jobId || "",
           }),
-        });
-        pipelineItem = integrationQueue.find((item) => item.operationId === operationId) || pipelineItem;
+        }));
+        pipelineItem = (pipeline.integrationQueue || []).find((item) => item.operationId === operationId) || pipelineItem;
       } : null,
       expectedSourceIdentity: pipelineItem ? {
         sourceBaseCommit: pipelineItem.sourceBaseCommit,
@@ -13548,52 +13542,52 @@ server.tool(
     });
     if (pipelineId) {
       if (pipeline) {
-        const events = (pipeline.events || []).concat({
-          type: "integration",
-          at: new Date().toISOString(),
-          ok: Boolean(result.ok),
-          status: result.status || "rejected",
-          errorType: result.errorType || "",
-          sourceType: result.sourceType || (worktreePath ? "worktree" : branch ? "branch" : "unknown"),
-          source: result.source || worktreePath || branch || "",
-          changedFiles: result.changedFiles || [],
-          appliedFiles: result.appliedFiles || [],
-          operationId: result.operationId || pipelineItem?.operationId || "",
-        });
-        const nextIntegrationQueue = (pipeline.integrationQueue || []).map((item) => {
-          const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-          const sameBranch = branch && item.branch === branch;
-          return sameWorktree || sameBranch
-            ? {
-                ...item,
-                status: result.ok && result.status === "applied"
-                  ? "integrated"
-                  : result.ok
-                    ? (item.status === "integrating" ? "pending" : item.status)
-                    : result.errorType === "integration_recovery_quarantined"
-                      ? "quarantined"
-                      : "rejected",
-                errorType: result.errorType || "",
-                operationId: result.operationId || item.operationId || "",
-                cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && effectiveCleanupAfterSuccess && worktreePath),
-                sourceBaseCommit: result.sourceBaseCommit || "",
-                patchSha256: result.patchSha256 || "",
-                sourceStateSha256: result.sourceStateSha256 || "",
-              }
-            : item;
-        });
-        const applied = Boolean(result.ok && result.status === "applied");
-        const allIntegrated = nextIntegrationQueue.length && nextIntegrationQueue.every((item) => item.status === "integrated");
-        await updatePipelineRecord(pipeline, {
-          status: applied && allIntegrated ? "awaiting_finalization" : pipeline.status,
-          finishedAt: applied && allIntegrated ? "" : pipeline.finishedAt,
-          integrationQueue: nextIntegrationQueue,
-          events,
-          errors: result.ok ? pipeline.errors || [] : (pipeline.errors || []).concat({
-            type: "integration",
-            errorType: result.errorType || "integration_rejected",
-            error: result.error || "",
-          }),
+        // Computed from the record as it stands when the write runs, so a concurrent
+        // integration of another item on this pipeline keeps its own item update.
+        await updatePipelineRecord(pipeline, (current) => {
+          const integrated = !dryRun && Boolean(result.ok && ["applied", "no_changes"].includes(result.status));
+          const integrationQueue = (current.integrationQueue || []).map((item) => {
+            // A dry run changes nothing about the item: its outcome is only an event.
+            if (dryRun || !pipelineIntegrationItemMatches(current, item, { worktreePath, branch })) return item;
+            return {
+              ...item,
+              status: nextPipelineIntegrationItemStatus(item, result),
+              errorType: result.errorType || "",
+              operationId: result.operationId || item.operationId || "",
+              noChanges: result.ok && result.status === "no_changes" ? true : Boolean(item.noChanges),
+              cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && effectiveCleanupAfterSuccess && worktreePath),
+              // A failed attempt returns only part of the source identity; the item keeps the
+              // attested identity a retry is checked against.
+              sourceBaseCommit: result.sourceBaseCommit || item.sourceBaseCommit || "",
+              patchSha256: result.patchSha256 || item.patchSha256 || "",
+              sourceStateSha256: result.sourceStateSha256 || item.sourceStateSha256 || "",
+            };
+          });
+          const allIntegrated = integrationQueue.length && integrationQueue.every((item) => item.status === "integrated");
+          return {
+            status: integrated && allIntegrated ? "awaiting_finalization" : current.status,
+            finishedAt: integrated && allIntegrated ? "" : current.finishedAt,
+            integrationQueue,
+            events: (current.events || []).concat({
+              type: "integration",
+              at: new Date().toISOString(),
+              ok: Boolean(result.ok),
+              dryRun: Boolean(dryRun),
+              status: result.status || "rejected",
+              errorType: result.errorType || "",
+              sourceType: result.sourceType || (worktreePath ? "worktree" : branch ? "branch" : "unknown"),
+              source: result.source || worktreePath || branch || "",
+              changedFiles: result.changedFiles || [],
+              appliedFiles: result.appliedFiles || [],
+              operationId: result.operationId || pipelineItem?.operationId || "",
+            }),
+            errors: result.ok ? current.errors || [] : (current.errors || []).concat({
+              type: "integration",
+              errorType: result.errorType || "integration_rejected",
+              error: result.error || "",
+              dryRun: Boolean(dryRun),
+            }),
+          };
         });
       }
     }
@@ -18053,9 +18047,11 @@ async function updatePipelineRecord(record, patch = {}) {
   try {
     return await enqueuePipelinePersistence(record, async () => {
       const expectedRevision = Number(record.revision || 0);
+      // A function patch is computed from the record as it stands when this write runs, so
+      // two callers that each change one integration item do not overwrite each other.
       const candidate = {
         ...record,
-        ...patch,
+        ...(typeof patch === "function" ? patch(record) : patch),
         revision: expectedRevision + 1,
         updatedAt: new Date().toISOString(),
         ownerHeartbeatAt: new Date().toISOString(),
@@ -18083,15 +18079,13 @@ async function updatePipelineRecord(record, patch = {}) {
   }
 }
 
-async function reconcilePipelineIntegrationOperationStates(record) {
-  let changed = false;
-  const events = [...(record.events || [])];
-  const integrationQueue = [];
+async function reconcilePipelineIntegrationOperationStates(record, { persist = true } = {}) {
+  // The journal is the authority for an item whose operation was prepared: an integrating
+  // item may have committed or rolled back before a crash, and a quarantined item's operation
+  // may since have been requalified (recovered_noop) or recovered by the bridge.
+  const statuses = new Map();
   for (const item of record.integrationQueue || []) {
-    if (item.status !== "integrating" || !item.operationId) {
-      integrationQueue.push(item);
-      continue;
-    }
+    if (!["integrating", "quarantined"].includes(item.status) || !item.operationId) continue;
     const operation = await readIntegrationOperationSummary(record.cwd, item.operationId);
     const operationMatchesItem = Boolean(operation)
       && operation.pipelineId === record.pipelineId
@@ -18103,19 +18097,33 @@ async function reconcilePipelineIntegrationOperationStates(record) {
     else if (operation.status === "committed") status = "integrated";
     else if (["rolled_back", "recovered_noop"].includes(operation.status)) status = "pending";
     else if (operation.status === "quarantined") status = "quarantined";
-    if (status !== item.status) {
-      changed = true;
+    if (status !== item.status) statuses.set(item.operationId, { from: item.status, to: status });
+  }
+  if (!statuses.size) return record;
+  const patch = (current) => {
+    const events = [...(current.events || [])];
+    const integrationQueue = (current.integrationQueue || []).map((item) => {
+      const change = item.operationId ? statuses.get(item.operationId) : null;
+      if (!change || item.status !== change.from) return item;
       events.push({
         type: "integration_journal_reconciled",
         at: new Date().toISOString(),
         operationId: item.operationId,
         jobId: item.jobId || "",
-        status,
+        status: change.to,
       });
-    }
-    integrationQueue.push({ ...item, status });
-  }
-  if (changed) await updatePipelineRecord(record, { integrationQueue, events });
+      return { ...item, status: change.to };
+    });
+    // Same rule as a completed integration: the last item landing makes the pipeline finalizable.
+    const allIntegrated = integrationQueue.length && integrationQueue.every((item) => item.status === "integrated");
+    return {
+      integrationQueue,
+      events,
+      status: allIntegrated && current.status === "awaiting_integration" ? "awaiting_finalization" : current.status,
+    };
+  };
+  if (persist) await updatePipelineRecord(record, patch);
+  else Object.assign(record, patch(record));
   return record;
 }
 
@@ -18259,7 +18267,9 @@ function pipelineJobStatus(jobId, cwd = "") {
 function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) {
   const existing = existingQueue.map((item) => ({ ...item }));
   const used = new Set();
-  const writeSnapshots = queueSnapshots.filter((job) => job.worktreePath);
+  // A writer that changed nothing has its empty worktree removed and nothing to integrate;
+  // an item for it could never become integrated and would block finalization for good.
+  const writeSnapshots = queueSnapshots.filter((job) => job.worktreePath && !job.noChanges && (job.changedFiles || []).length);
   return writeSnapshots.map((job) => {
     let matchIndex = existing.findIndex((item, index) => !used.has(index) && item.jobId && item.jobId === job.jobId);
     if (matchIndex < 0) {
@@ -18292,15 +18302,62 @@ function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) 
   });
 }
 
-async function refreshPipelineRecord(record) {
+// Pipeline items are named by their retained worktree or branch. On a case-insensitive
+// filesystem the caller may spell the same worktree with different case or slashes.
+function pipelineIntegrationItemMatches(record, item, { worktreePath = "", branch = "" } = {}) {
+  const cwd = record?.cwd || "";
+  const sameWorktree = Boolean(worktreePath && item?.worktreePath)
+    && normalizeFilesystemCase(path.resolve(item.worktreePath), cwd) === normalizeFilesystemCase(path.resolve(worktreePath), cwd);
+  const sameBranch = Boolean(branch) && item?.branch === branch;
+  return sameWorktree || sameBranch;
+}
+
+const PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES = new Set([
+  "forbidden_file_changed",
+  "changed_file_validation_error",
+  "shared_file_parallel_write",
+  "serial_only_parallel_write",
+]);
+
+// Only a result that says this exact source can never be integrated rejects its item: the
+// source changed after the writer completed, its patch conflicts with the target, or the
+// patch itself touches paths outside its contract. The same scope types after an apply
+// (appliedFiles present) mean another process wrote the checkout during it, which a retry
+// can clear, as can every lock, dirty-target, stale-preview, review, validation and journal
+// outcome.
+function pipelineIntegrationFailureIsDefinitive(result) {
+  const errorType = String(result?.errorType || "");
+  if (["pipeline_source_identity_changed", "integration_merge_conflict", "empty_allowed_edits"].includes(errorType)) return true;
+  return PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES.has(errorType) && !Array.isArray(result?.appliedFiles);
+}
+
+function nextPipelineIntegrationItemStatus(item, result, { dryRun = false } = {}) {
+  // A dry run never prepares a journal operation, so it cannot change what the item is.
+  if (dryRun) return item.status;
+  if (result?.ok && ["applied", "no_changes"].includes(result.status)) return "integrated";
+  if (result?.ok) return item.status === "integrating" ? "pending" : item.status;
+  if (result?.errorType === "integration_recovery_quarantined") {
+    const quarantinedOperations = [result.operationId, ...(result.operationIds || [])].filter(Boolean);
+    return item.operationId && quarantinedOperations.includes(item.operationId) ? "quarantined" : "pending";
+  }
+  return pipelineIntegrationFailureIsDefinitive(result) ? "rejected" : "pending";
+}
+
+async function refreshPipelineRecord(record, { persist = true } = {}) {
   if (["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"].includes(record.status)) {
     return record;
   }
+  // A crash between the journal commit and the pipeline update leaves an item integrating
+  // although its operation committed; the journal decides before the status is derived.
+  await reconcilePipelineIntegrationOperationStates(record, { persist });
+  const applyPatch = persist
+    ? (patch) => updatePipelineRecord(record, patch)
+    : async (patch) => Object.assign(record, typeof patch === "function" ? patch(record) : patch);
   let queueSnapshots = [];
   if (effectiveQueueMode() === "sqlite") {
     const children = await readPersistedPipelineChildren(record);
     if (!children.ok) {
-      await updatePipelineRecord(record, {
+      await applyPatch({
         status: "failed",
         finishedAt: record.finishedAt || new Date().toISOString(),
         batchState: "incomplete",
@@ -18347,7 +18404,7 @@ async function refreshPipelineRecord(record) {
     });
 
     if (failed.length || cancelled.length) {
-      await updatePipelineRecord(record, {
+      await applyPatch({
         status: failed.length ? "failed" : "cancelled",
         finishedAt: record.finishedAt || new Date().toISOString(),
         events,
@@ -18359,16 +18416,18 @@ async function refreshPipelineRecord(record) {
         })),
       });
     } else if (completed.length === queueSnapshots.length) {
-      const integrationQueue = mergePipelineIntegrationQueue(record.integrationQueue || [], queueSnapshots);
-      const allIntegrated = integrationQueue.every((item) => item.status === "integrated");
-      await updatePipelineRecord(record, {
-        status: allIntegrated ? "awaiting_finalization" : "awaiting_integration",
-        finishedAt: record.finishedAt || new Date().toISOString(),
-        events,
-        integrationQueue,
+      await applyPatch((current) => {
+        const integrationQueue = mergePipelineIntegrationQueue(current.integrationQueue || [], queueSnapshots);
+        const allIntegrated = integrationQueue.every((item) => item.status === "integrated");
+        return {
+          status: allIntegrated ? "awaiting_finalization" : "awaiting_integration",
+          finishedAt: current.finishedAt || new Date().toISOString(),
+          events,
+          integrationQueue,
+        };
       });
     } else if (active.length) {
-      await updatePipelineRecord(record, { status: "running", events });
+      await applyPatch({ status: "running", events });
     }
   }
 
@@ -18407,6 +18466,50 @@ async function reconcileParentPipelineAfterQueueTerminal(childRecord) {
 function pipelineHasPendingIntegrations(record) {
   const queue = record.integrationQueue || [];
   return queue.some((item) => item.status !== "integrated");
+}
+
+// Finalization judges the reviewed result: HEAD, tree, status, working patch and index.
+// captureIntegrationTargetState also fingerprints ignored files (mtime/ctime), so a test run
+// that writes __pycache__/ or coverage/ looked like a changed target and failed the pipeline.
+function trackedTargetStateSha256(state) {
+  if (!state?.ok) return "";
+  return createHash("sha256")
+    .update([state.targetHead, state.targetTree, state.statusSha256, state.workingPatchSha256, state.indexSha256].join("\0"))
+    .digest("hex");
+}
+
+// Gate and final-validation outcomes that judge the result itself end the pipeline; anything
+// else (a provider rate limit, a lost lease, a snapshot fault, drift from another client) is
+// retried by finalizing again.
+const PIPELINE_TERMINAL_GATE_ERROR_TYPES = new Set([
+  "pipeline_gate_verdict_fail",
+  "pipeline_gate_agent_not_read_only",
+  // A gate agent that edited files (changedFileValidationErrorType of its validation).
+  ...PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES,
+]);
+const PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES = new Set([
+  "validation_command_failed",
+  "validation_command_untrusted",
+  "validation_command_parse_error",
+  "final_validation_required",
+]);
+
+async function deferPipelineFinalization(record, { type, errorType, error, patch = {} }) {
+  const at = new Date().toISOString();
+  await updatePipelineRecord(record, (current) => ({
+    ...patch,
+    status: "awaiting_finalization",
+    finishedAt: "",
+    errors: (current.errors || []).concat({ type, errorType, error, retryable: true }),
+    events: (current.events || []).concat({ type: "finalization_deferred", at, errorType }),
+  }));
+  return {
+    ok: false,
+    errorType,
+    error: `${error} The pipeline stays awaiting_finalization; finalize again once the cause is cleared. Source worktrees were retained.`,
+    retryable: true,
+    record,
+  };
 }
 
 // A gate agent that ends cleanly has not therefore approved the result: its verdict is read
@@ -18453,9 +18556,14 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null,
   }
 
   const executeGateJob = typeof pipelineGateExecutorTestHook === "function" ? pipelineGateExecutorTestHook : executeOpenCodeJob;
+  // The integrated changes are uncommitted in record.cwd, so a gate must read that checkout:
+  // under CODEX_OPENCODE_WORKTREE_MODE=all a fresh worktree from HEAD would review the
+  // pre-integration tree. Each attempt gets its own job id (a retried gate reused one).
+  const gateAttemptJobId = `${record.pipelineId}-${randomBytes(4).toString("hex")}-${gateName}`;
   const execution = await executeGateJob({
     ...gateJob,
-    cwd: gateJob.cwd || record.cwd,
+    cwd: record.cwd,
+    noWorktree: true,
     write: false,
     lockType: "read",
     lockMode: "off",
@@ -18472,7 +18580,7 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null,
       "",
       PIPELINE_GATE_VERDICT_INSTRUCTION,
     ].filter(Boolean).join("\n"),
-  }, { toolStarted: nowMs(), jobId: `${record.pipelineId}-${gateName}`, signal });
+  }, { toolStarted: nowMs(), jobId: gateAttemptJobId, signal });
 
   // An agent that errored or edited files fails on that ground; its verdict is not consulted.
   const runErrorType = execution.result?.errorType
@@ -18538,8 +18646,12 @@ async function finalizePipelineSourceCleanup(record, {
       const branchRef = branch
         ? await runCommand("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], record.cwd, 1000 * 15)
         : { exitCode: 1 };
+      // git prints `worktree C:/Users/...` (forward slashes, its own case); compare resolved,
+      // case-normalized paths or a registered worktree reads as already removed on Windows.
+      const itemWorktreeKey = normalizeFilesystemCase(path.resolve(item.worktreePath), record.cwd);
       const registered = worktrees.exitCode === 0
-        && worktrees.stdout.split(/\r?\n/).some((line) => line === `worktree ${path.resolve(item.worktreePath)}`);
+        && worktrees.stdout.split(/\r?\n/).some((line) => line.startsWith("worktree ")
+          && normalizeFilesystemCase(path.resolve(line.slice("worktree ".length)), record.cwd) === itemWorktreeKey);
       cleanupPlan.push({
         result: !registered && branchRef.exitCode !== 0
           ? { worktreePath: item.worktreePath, branch, cleanup: "success", reason: "recovered_already_removed" }
@@ -18641,10 +18753,27 @@ async function resumeAuthorizedPipelineCleanup(record) {
   const expectedTargetStateSha256 = authorizationEvent?.targetStateSha256 || "";
   const cleanupItems = (record.integrationQueue || []).filter((item) => item.cleanupRequested && item.worktreePath);
   const eventWorktrees = Array.isArray(authorizationEvent?.worktrees) ? authorizationEvent.worktrees : [];
-  const authorizationCardinalityMatches = eventWorktrees.length === cleanupItems.length
-    && cleanupItems.every((item) => eventWorktrees.filter((authorization) => cleanupAuthorizationMatchesItem(record, authorization, item)).length === 1);
+  // Each authorization must name exactly one item and vice versa. An item that finalized as
+  // retained/already removed before the crash has a terminal cleanup result and no
+  // authorization; requiring one authorization per item kept every authorized worktree.
+  const cwd = record.cwd || process.cwd();
+  const worktreeKey = (value) => normalizeFilesystemCase(path.resolve(String(value || "")), cwd);
+  // "failed" stays retryable; "authorized" is what recovery is for.
+  const terminalCleanupResults = (record.sourceCleanupResults || [])
+    .filter((result) => result?.worktreePath && ["success", "partial", "retained_for_review"].includes(result.cleanup));
+  const terminalCleanupKeys = new Set(terminalCleanupResults.map((result) => worktreeKey(result.worktreePath)));
+  const itemsAwaitingCleanup = cleanupItems.filter((item) => !terminalCleanupKeys.has(worktreeKey(item.worktreePath)));
+  const authorizedWorktrees = eventWorktrees.filter((authorization) => {
+    const matchingItems = itemsAwaitingCleanup.filter((item) => cleanupAuthorizationMatchesItem(record, authorization, item));
+    if (matchingItems.length !== 1) return false;
+    return eventWorktrees.filter((other) => cleanupAuthorizationMatchesItem(record, other, matchingItems[0])).length === 1;
+  });
   const targetState = expectedTargetStateSha256 ? await captureIntegrationTargetState(record.cwd) : null;
-  if (!expectedTargetStateSha256 || !targetState?.ok || targetState.targetStateSha256 !== expectedTargetStateSha256) {
+  const expectedTrackedTargetStateSha256 = authorizationEvent?.trackedTargetStateSha256 || "";
+  const targetStateMatches = expectedTrackedTargetStateSha256
+    ? targetState?.ok && trackedTargetStateSha256(targetState) === expectedTrackedTargetStateSha256
+    : targetState?.ok && targetState.targetStateSha256 === expectedTargetStateSha256;
+  if (!expectedTargetStateSha256 || !targetStateMatches) {
     await updatePipelineRecord(record, {
       status: "completed",
       finishedAt: record.finishedAt || new Date().toISOString(),
@@ -18659,10 +18788,11 @@ async function resumeAuthorizedPipelineCleanup(record) {
     return { ok: true, retainedSources: true, warningType: "pipeline_cleanup_target_state_changed", record };
   }
 
-  const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
+  const resumedCleanupResults = await finalizePipelineSourceCleanup({ ...record, integrationQueue: itemsAwaitingCleanup }, {
     authorizeCleanup: async () => {},
-    authorizedWorktrees: authorizationCardinalityMatches ? eventWorktrees : [],
+    authorizedWorktrees,
   });
+  const sourceCleanupResults = terminalCleanupResults.concat(resumedCleanupResults);
   const failures = sourceCleanupResults.filter((result) => result.cleanup === "failed");
   const retained = sourceCleanupResults.filter((result) => ["retained_for_review", "partial"].includes(result.cleanup));
   await updatePipelineRecord(record, {
@@ -18706,7 +18836,30 @@ async function finalizePipelineRecord(record, options = {}) {
 
 async function finalizePipelineRecordUnderLease(record, options = {}) {
   const targetCwd = await resolveProjectStateRoot(record.cwd || process.cwd());
-  const lockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
+  if (options.dryRun) {
+    // A dry run reports whether finalization could start now without taking the repository
+    // lease, and derives the current status in memory: it never changes the durable record.
+    const conflict = (await listLocks(targetCwd))
+      .map((lock) => conflictsWithActiveLock({ lockType: "read", paths: [REPOSITORY_SCOPE_LOCK_PATH] }, lock))
+      .find(Boolean);
+    if (conflict) {
+      return {
+        ok: false,
+        errorType: "pipeline_finalization_lock_conflict",
+        error: `Pipeline finalization requires a stable repository snapshot: active ${conflict.lockType} lock ${conflict.lockId} (${conflict.agent || "unknown"}) holds ${conflictPathsFromConflict(conflict).join(", ") || "the repository"}.`,
+        conflictingPaths: conflictPathsFromConflict(conflict),
+        record,
+      };
+    }
+    const view = {
+      ...record,
+      integrationQueue: (record.integrationQueue || []).map((item) => ({ ...item })),
+      events: [...(record.events || [])],
+      errors: [...(record.errors || [])],
+    };
+    return { ...(await finalizePipelineRecordWhileLocked(view, options)), record };
+  }
+  const lockTtlMs =Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
   const lockResult = await acquireHardLock({
     owner: "codex",
     agent: "pipeline_finalizer",
@@ -18736,7 +18889,10 @@ async function finalizePipelineRecordUnderLease(record, options = {}) {
 }
 
 async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false, dryRun = false, beforeFinalValidationHook = null, signal = null } = {}) {
-  await refreshPipelineRecord(record);
+  // The journal decides items whose integration committed before a crash (refresh reconciles
+  // them too, but returns early for a crashed "finalizing" record).
+  await reconcilePipelineIntegrationOperationStates(record, { persist: !dryRun });
+  await refreshPipelineRecord(record, { persist: !dryRun });
   const now = new Date().toISOString();
   const events = (record.events || []).concat({
     type: "finalization_started",
@@ -18938,7 +19094,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     try {
       finalValidationBeforeState = await captureIntegrationTargetState(record.cwd);
       if (!finalValidationBeforeState.ok) finalValidationEvidenceError = finalValidationBeforeState.error || "Could not capture pipeline target state before final validation.";
-      else finalValidationBeforeFiles = await gitChangedFileSnapshot(record.cwd);
+      else finalValidationBeforeFiles = await gitChangedFileSnapshot(record.cwd, { includeIgnored: false });
     } catch (error) {
       finalValidationEvidenceError = redactSensitiveText(error.message || String(error));
     }
@@ -18962,10 +19118,12 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   if (!record.sanitizedWorkspace && !dryRun && !finalValidationEvidenceError) {
     try {
       finalValidationAfterState = await captureIntegrationTargetState(record.cwd);
-      const finalValidationAfterFiles = await gitChangedFileSnapshot(record.cwd);
+      const finalValidationAfterFiles = await gitChangedFileSnapshot(record.cwd, { includeIgnored: false });
       finalValidationMutationFiles = changedFilesBetween(finalValidationBeforeFiles, finalValidationAfterFiles);
+      // Tracked state only: ignored output of the validation command (__pycache__/) is not
+      // a change to the reviewed result.
       const stateChanged = !finalValidationAfterState.ok
-        || finalValidationAfterState.targetStateSha256 !== finalValidationBeforeState.targetStateSha256;
+        || trackedTargetStateSha256(finalValidationAfterState) !== trackedTargetStateSha256(finalValidationBeforeState);
       if (stateChanged || finalValidationMutationFiles.length) {
         finalValidationResult = {
           ...finalValidationResult,
@@ -18989,6 +19147,16 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   const finalValidationRequired = (record.integrationQueue || []).length > 0;
   if (finalValidationResult.errorType || (finalValidationRequired && finalValidationResult.status !== "passed")) {
     const finalErrorType = finalValidationResult.errorType || "final_validation_required";
+    // Only a validation that ran and failed judges the result. A snapshot fault, state drift
+    // from another client, or a lost lease (an aborted command) is retried by finalizing again.
+    if (signal?.aborted || !PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES.has(finalErrorType)) {
+      return deferPipelineFinalization(record, {
+        type: "final_validation",
+        errorType: signal?.aborted ? abortSignalErrorType(signal, "read_lock_ownership_lost") : finalErrorType,
+        error: finalValidationResult.stderr || finalValidationResult.stdout || "Final validation could not be completed.",
+        patch: { finalValidationResult },
+      });
+    }
     await updatePipelineRecord(record, {
       status: "failed",
       finishedAt: new Date().toISOString(),
@@ -19022,28 +19190,22 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   const gateRejection = gateOutcomes.find((outcome) => outcome.status === "rejected");
   if (gateRejection) throw gateRejection.reason;
   const [reviewerResult = null, testerResult = null] = gateOutcomes.map((outcome) => outcome.value);
-  if (reviewerResult?.status === "failed") {
-    await updatePipelineRecord(record, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      finalValidationResult,
-      reviewerResult,
-      testerResult,
-      errors: (record.errors || []).concat({
-        type: "reviewer",
-        errorType: reviewerResult.errorType,
-        error: "Reviewer gate failed.",
-      }),
+  // GATE_VERDICT: fail (or a gate that is not read-only or edited files) ends the pipeline. A
+  // gate that could not deliver a verdict (rate limit, lost read lease, missing or misplaced
+  // verdict line) leaves it awaiting_finalization so the gates can run again.
+  const failedGates = [["reviewer", reviewerResult], ["tester", testerResult]].filter(([, gateResult]) => gateResult?.status === "failed");
+  const terminalGate = failedGates.find(([, gateResult]) => PIPELINE_TERMINAL_GATE_ERROR_TYPES.has(gateResult.errorType));
+  const [failedGateName = "", failedGateResult = null] = terminalGate || failedGates[0] || [];
+  const failedGateLabel = failedGateName === "tester" ? "Tester" : "Reviewer";
+  if (failedGateResult && !terminalGate) {
+    return deferPipelineFinalization(record, {
+      type: failedGateName,
+      errorType: failedGateResult.errorType || `${failedGateName}_gate_failed`,
+      error: `${failedGateLabel} gate did not deliver a verdict (${failedGateResult.errorType || "unknown"}).`,
+      patch: { finalValidationResult, reviewerResult, testerResult },
     });
-    return {
-      ok: false,
-      errorType: reviewerResult.errorType || "reviewer_gate_failed",
-      error: "Reviewer gate failed.",
-      record,
-    };
   }
-
-  if (testerResult?.status === "failed") {
+  if (failedGateResult) {
     await updatePipelineRecord(record, {
       status: "failed",
       finishedAt: new Date().toISOString(),
@@ -19051,15 +19213,15 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
       reviewerResult,
       testerResult,
       errors: (record.errors || []).concat({
-        type: "tester",
-        errorType: testerResult.errorType,
-        error: "Tester gate failed.",
+        type: failedGateName,
+        errorType: failedGateResult.errorType,
+        error: `${failedGateLabel} gate failed.`,
       }),
     });
     return {
       ok: false,
-      errorType: testerResult.errorType || "tester_gate_failed",
-      error: "Tester gate failed.",
+      errorType: failedGateResult.errorType || `${failedGateName}_gate_failed`,
+      error: `${failedGateLabel} gate failed.`,
       record,
     };
   }
@@ -19086,20 +19248,16 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
 
   if (!record.sanitizedWorkspace && !dryRun && finalValidationAfterState?.ok) {
     const beforeCleanupState = await captureIntegrationTargetState(record.cwd);
-    if (!beforeCleanupState.ok || beforeCleanupState.targetStateSha256 !== finalValidationAfterState.targetStateSha256) {
-      await updatePipelineRecord(record, {
-        status: "failed",
-        finishedAt: new Date().toISOString(),
-        finalValidationResult,
-        reviewerResult,
-        testerResult,
-        errors: (record.errors || []).concat({
-          type: "finalization",
-          errorType: "pipeline_target_changed_before_cleanup",
-          error: "Pipeline target changed after final validation/gates and before source cleanup.",
-        }),
+    // The gates' own test runs write ignored output; only tracked state must be unchanged.
+    if (!beforeCleanupState.ok || trackedTargetStateSha256(beforeCleanupState) !== trackedTargetStateSha256(finalValidationAfterState)) {
+      return deferPipelineFinalization(record, {
+        type: "finalization",
+        errorType: "pipeline_target_changed_before_cleanup",
+        error: beforeCleanupState.ok
+          ? "Pipeline target changed after final validation/gates and before source cleanup."
+          : beforeCleanupState.error || "Could not capture the pipeline target state before source cleanup.",
+        patch: { finalValidationResult, reviewerResult, testerResult },
       });
-      return { ok: false, errorType: "pipeline_target_changed_before_cleanup", error: "Pipeline target changed before cleanup; source worktrees were retained.", record };
     }
   }
 
@@ -19109,20 +19267,13 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     afterAllWaves: sanitizedFinal,
   } : null;
   if (signal?.aborted) {
-    const errorType = abortSignalErrorType(signal, "read_lock_ownership_lost");
-    await updatePipelineRecord(record, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      finalValidationResult,
-      reviewerResult,
-      testerResult,
-      errors: (record.errors || []).concat({
-        type: "finalization",
-        errorType,
-        error: signal.reason?.message || "Pipeline finalization lost its repository consistency lease.",
-      }),
+    // Losing the lease says nothing about the result; finalize again under a new one.
+    return deferPipelineFinalization(record, {
+      type: "finalization",
+      errorType: abortSignalErrorType(signal, "read_lock_ownership_lost"),
+      error: signal.reason?.message || "Pipeline finalization lost its repository consistency lease.",
+      patch: { finalValidationResult, reviewerResult, testerResult },
     });
-    return { ok: false, errorType, error: "Pipeline finalization lost its repository consistency lease; source worktrees were retained.", record };
   }
   const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
     dryRun,
@@ -19145,6 +19296,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
           type: "source_cleanup_authorized",
           at: new Date().toISOString(),
           targetStateSha256: finalValidationAfterState?.targetStateSha256 || "",
+          trackedTargetStateSha256: trackedTargetStateSha256(finalValidationAfterState),
           worktrees: authorizations.map((authorization) => ({
             worktreePath: authorization.worktreePath,
             branch: authorization.branch,
