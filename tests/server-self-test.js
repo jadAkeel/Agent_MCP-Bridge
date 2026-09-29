@@ -89,6 +89,7 @@ const {
   existsSync,
   filesystemCaseModeForRoot,
   finalizePipelineRecord,
+  parsePipelineGateVerdict,
   findQueueWriteConflict,
   formatRejectedExecution,
   gitChangedFileSnapshot,
@@ -4275,6 +4276,199 @@ async function runSelfTests() {
     assert.deepEqual(mutationPipelineRecord.sourceCleanupResults, []);
     await rm(path.join(tempDir, "src", "final-validation-extra.txt"), { force: true });
     assert.equal((await cleanupWorktree(finalValidationCleanupCandidate, "always", true)).cleanup, "success");
+
+    // Gate verdicts: a clean agent exit is not approval; the verdict line is.
+    assert.equal(parsePipelineGateVerdict("Looks fine.\nGATE_VERDICT: pass"), "pass");
+    assert.equal(parsePipelineGateVerdict("Looks fine.\r\nGATE_VERDICT: pass\r\n\r\n"), "pass");
+    assert.equal(parsePipelineGateVerdict("## Final Verdict\n**GATE_VERDICT:** FAIL\n"), "fail");
+    assert.equal(parsePipelineGateVerdict("Checks pass.\n`GATE_VERDICT: pass`"), "pass");
+    assert.equal(parsePipelineGateVerdict("Found 2 blocking bugs."), "missing");
+    assert.equal(parsePipelineGateVerdict(""), "missing");
+    // A verdict that is quoted, listed, or given as an example is not a verdict.
+    assert.equal(parsePipelineGateVerdict("I could not finish the review.\nThe expected format is:\n> GATE_VERDICT: pass"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("I could not finish the review.\n> GATE_VERDICT: pass\nStopping here."), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Summary:\n- GATE_VERDICT: pass"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Summary:\n>GATE_VERDICT: pass"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Summary:\n-GATE_VERDICT: pass"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Summary:\n  > GATE_VERDICT: pass  "), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Summary:\n1. GATE_VERDICT: pass"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: pass\nModel used: gemini"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("Review\n```\nGATE_VERDICT: pass\n```"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("End with GATE_VERDICT: pass or GATE_VERDICT: fail."), "misplaced");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: <pass|fail>"), "misplaced");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: pass."), "misplaced");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: passed"), "misplaced");
+    // Any second mention, even an example before a real final line, is ambiguous.
+    assert.equal(parsePipelineGateVerdict("Example: > GATE_VERDICT: pass\nBlocking bug found.\nGATE_VERDICT: pass"), "ambiguous");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: pass\nGATE_VERDICT: fail"), "ambiguous");
+    assert.equal(parsePipelineGateVerdict("GATE_VERDICT: fail\nGATE_VERDICT: pass"), "ambiguous");
+
+    const gateTasks = [];
+    const gateStarted = new Set();
+    const gateStub = (verdicts) => async (job, { jobId }) => {
+      const gateName = jobId.endsWith("-tester") ? "tester" : "reviewer";
+      gateTasks.push({ gateName, task: job.task, write: job.write });
+      gateStarted.add(gateName);
+      // Both gates must be in flight at once; a serial runner would never get past this wait.
+      const deadline = Date.now() + 5000;
+      while (gateStarted.size < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      return {
+        result: { errorType: null, changedFiles: [], stdout: verdicts[gateName] },
+        validation: { disallowedFiles: [] },
+        response: { content: [{ type: "text", text: `Assistant final response:\n${verdicts[gateName]}` }] },
+      };
+    };
+    const gatePipelineRecord = (pipelineId) => ({
+      ...structuredClone(persistedPipelinePlan.record),
+      pipelineId,
+      revision: 0,
+      ownerInstanceId: BRIDGE_INSTANCE_ID,
+      status: "awaiting_finalization",
+      queueJobIds: [],
+      finalValidationCommand: "git status --short",
+      finalValidationSource: "caller",
+      finalValidationSpec: null,
+      finalValidationResult: null,
+      reviewerJob: { agent: "reviewer", task: "Review the integrated result." },
+      testerJob: { agent: "tester", task: "Check the integrated result." },
+      reviewerResult: null,
+      testerResult: null,
+      sourceCleanupResults: [],
+      events: [],
+      errors: [],
+      finishedAt: "",
+      integrationQueue: [],
+    });
+    const previousGateExecutor = selfTestHooks.pipelineGateExecutorTestHook;
+    try {
+      selfTestHooks.pipelineGateExecutorTestHook = gateStub({
+        reviewer: "Blocking: off-by-one in the retry loop.\nGATE_VERDICT: fail",
+        tester: "All checks pass.\nGATE_VERDICT: pass",
+      });
+      const failingReviewRecord = gatePipelineRecord("pipeline-gate-verdict-fail");
+      await persistPipelineRecord(failingReviewRecord);
+      const failingReview = await finalizePipelineRecord(failingReviewRecord);
+      assert.equal(failingReview.ok, false, JSON.stringify(failingReview.record?.errors));
+      assert.equal(failingReview.errorType, "pipeline_gate_verdict_fail");
+      assert.equal(failingReviewRecord.status, "failed");
+      assert.equal(failingReviewRecord.reviewerResult.verdict, "fail");
+      assert.equal(failingReviewRecord.testerResult.verdict, "pass");
+      assert.equal(failingReviewRecord.testerResult.checkedTargetStateSha256, failingReviewRecord.reviewerResult.checkedTargetStateSha256);
+      assert.match(failingReviewRecord.reviewerResult.checkedTargetStateSha256, /^[a-f0-9]{64}$/);
+      assert.deepEqual(new Set(gateTasks.map((item) => item.gateName)), new Set(["reviewer", "tester"]));
+      assert.ok(gateTasks.every((item) => item.write === false && item.task.includes("GATE_VERDICT: pass or GATE_VERDICT: fail")));
+
+      gateTasks.length = 0;
+      gateStarted.clear();
+      selfTestHooks.pipelineGateExecutorTestHook = gateStub({
+        reviewer: "No issues.\nGATE_VERDICT: pass",
+        tester: "Ran the checks; everything looked good.",
+      });
+      const missingVerdictRecord = gatePipelineRecord("pipeline-gate-verdict-missing");
+      await persistPipelineRecord(missingVerdictRecord);
+      const missingVerdict = await finalizePipelineRecord(missingVerdictRecord);
+      assert.equal(missingVerdict.ok, false);
+      assert.equal(missingVerdict.errorType, "pipeline_gate_verdict_missing");
+      assert.equal(missingVerdictRecord.testerResult.status, "failed");
+
+      gateTasks.length = 0;
+      gateStarted.clear();
+      selfTestHooks.pipelineGateExecutorTestHook = gateStub({
+        reviewer: "No issues.\nGATE_VERDICT: pass",
+        tester: "Checks pass.\n**GATE_VERDICT:** pass",
+      });
+      const passingRecord = gatePipelineRecord("pipeline-gate-verdict-pass");
+      await persistPipelineRecord(passingRecord);
+      const passing = await finalizePipelineRecord(passingRecord);
+      assert.equal(passing.ok, true, JSON.stringify({ errorType: passing.errorType, errors: passingRecord.errors }));
+      assert.equal(passingRecord.status, "completed");
+      assert.equal(passingRecord.reviewerResult.status, "passed");
+      assert.equal(passingRecord.testerResult.status, "passed");
+
+      // A completed pipeline is terminal: finalizing again, even after the tree changed, reruns
+      // nothing and keeps the recorded result.
+      gateTasks.length = 0;
+      gateStarted.clear();
+      const completedRevision = passingRecord.revision;
+      await writeFile(path.join(tempDir, "src", "after-completion.txt"), "changed after completion\n", "utf8");
+      try {
+        const refinalized = await finalizePipelineRecord(passingRecord);
+        assert.equal(refinalized.ok, true);
+        assert.equal(refinalized.alreadyFinalized, true);
+        assert.equal(gateTasks.length, 0);
+        assert.equal(passingRecord.status, "completed");
+        assert.equal(passingRecord.revision, completedRevision);
+        assert.equal((await readPersistedPipelineRecord(passingRecord.pipelineId, tempDir)).status, "completed");
+      } finally {
+        await rm(path.join(tempDir, "src", "after-completion.txt"), { force: true });
+      }
+
+      // A quoted example verdict does not approve an unfinished review.
+      selfTestHooks.pipelineGateExecutorTestHook = gateStub({
+        reviewer: "I could not finish the review.\nThe expected format is:\n> GATE_VERDICT: pass",
+        tester: "Checks pass.\nGATE_VERDICT: pass",
+      });
+      const quotedVerdictRecord = gatePipelineRecord("pipeline-gate-verdict-quoted");
+      await persistPipelineRecord(quotedVerdictRecord);
+      const quotedVerdict = await finalizePipelineRecord(quotedVerdictRecord);
+      assert.equal(quotedVerdict.ok, false);
+      assert.equal(quotedVerdict.errorType, "pipeline_gate_verdict_misplaced");
+      assert.equal(quotedVerdictRecord.status, "failed");
+
+      // Pipelines whose jobs have not all completed are not finalizable, and nothing runs.
+      for (const unfinishedStatus of ["planned", "running", "awaiting_integration"]) {
+        gateTasks.length = 0;
+        gateStarted.clear();
+        const unfinishedRecord = { ...gatePipelineRecord(`pipeline-gate-unfinished-${unfinishedStatus}`), status: unfinishedStatus };
+        await persistPipelineRecord(unfinishedRecord);
+        const unfinished = await finalizePipelineRecord(unfinishedRecord);
+        assert.equal(unfinished.ok, false, unfinishedStatus);
+        assert.equal(unfinished.errorType, "pipeline_jobs_incomplete", unfinishedStatus);
+        assert.equal(unfinishedRecord.status, unfinishedStatus);
+        assert.equal(gateTasks.length, 0, unfinishedStatus);
+      }
+
+      // A dry run runs no agent and changes nothing, whether it would pass or be rejected.
+      gateTasks.length = 0;
+      gateStarted.clear();
+      const dryRunRecord = gatePipelineRecord("pipeline-gate-dry-run");
+      await persistPipelineRecord(dryRunRecord);
+      const dryRunRevision = dryRunRecord.revision;
+      const dryRunFinalize = await finalizePipelineRecord(dryRunRecord, { dryRun: true });
+      assert.equal(dryRunFinalize.ok, true);
+      assert.equal(dryRunFinalize.dryRun, true);
+      assert.deepEqual(dryRunFinalize.wouldRun.gates, ["reviewer", "tester"]);
+      assert.equal(dryRunFinalize.wouldRun.finalValidationCommand, "git status --short");
+      assert.equal(gateTasks.length, 0);
+      assert.equal(dryRunRecord.status, "awaiting_finalization");
+      assert.equal(dryRunRecord.revision, dryRunRevision);
+      assert.equal((await readPersistedPipelineRecord(dryRunRecord.pipelineId, tempDir)).status, "awaiting_finalization");
+      const plannedDryRunRecord = { ...gatePipelineRecord("pipeline-gate-dry-run-planned"), status: "planned" };
+      await persistPipelineRecord(plannedDryRunRecord);
+      const plannedDryRunRevision = plannedDryRunRecord.revision;
+      const plannedDryRun = await finalizePipelineRecord(plannedDryRunRecord, { dryRun: true });
+      assert.equal(plannedDryRun.errorType, "pipeline_jobs_incomplete");
+      assert.equal(plannedDryRunRecord.revision, plannedDryRunRevision);
+      assert.deepEqual(plannedDryRunRecord.errors, []);
+
+      // Two finalizations of one pipeline in one bridge never run side by side.
+      gateTasks.length = 0;
+      gateStarted.clear();
+      selfTestHooks.pipelineGateExecutorTestHook = gateStub({
+        reviewer: "No issues.\nGATE_VERDICT: pass",
+        tester: "Checks pass.\nGATE_VERDICT: pass",
+      });
+      const concurrentRecord = gatePipelineRecord("pipeline-gate-concurrent");
+      await persistPipelineRecord(concurrentRecord);
+      const [firstFinalize, secondFinalize] = await Promise.all([
+        finalizePipelineRecord(concurrentRecord),
+        finalizePipelineRecord(concurrentRecord),
+      ]);
+      assert.deepEqual([firstFinalize.ok, secondFinalize.errorType], [true, "pipeline_finalization_in_progress"]);
+      assert.equal(gateTasks.length, 2);
+    } finally {
+      selfTestHooks.pipelineGateExecutorTestHook = previousGateExecutor;
+    }
 
     const cleanupFaultRecord = (pipelineId, worktree, identity) => ({
       ...structuredClone(persistedPipelinePlan.record),

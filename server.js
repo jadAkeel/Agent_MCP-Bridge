@@ -344,6 +344,7 @@ let selfTestModelOverrideAllowlist = null;
 let pipelinePersistenceTestHook = null;
 let queueCancellationTestHook = null;
 let worktreeCleanupTestHook = null;
+let pipelineGateExecutorTestHook = null;
 
 const server = new McpServer({
   name: "codex-opencode-bridge",
@@ -13158,7 +13159,7 @@ server.tool(
     pipelineId: z.string(),
     cwd: z.string().min(1),
     skipReviewers: z.boolean().optional().describe("Skip configured reviewer/tester gates and run only final validation."),
-    dryRun: z.boolean().optional().describe("Do not run final validation or reviewer/tester commands; record skipped dry-run gates."),
+    dryRun: z.boolean().optional().describe("Check finalization preconditions only: no final validation, no reviewer/tester agents, and no pipeline status change."),
   },
   async ({ pipelineId, cwd = "", skipReviewers = false, dryRun = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
@@ -13206,7 +13207,11 @@ server.tool(
         {
           type: "text",
           text: [
-            "Multi-agent pipeline finalized.",
+            result.dryRun
+              ? `Multi-agent pipeline finalization dry run: preconditions pass. Would run final validation ${result.wouldRun.finalValidationCommand ? `"${result.wouldRun.finalValidationCommand}"` : "(none)"} and gates: ${result.wouldRun.gates.join(", ") || "none"}. Nothing was run or changed.`
+              : result.alreadyFinalized
+                ? "Multi-agent pipeline was already finalized; its recorded gate results stand and nothing was rerun."
+                : "Multi-agent pipeline finalized.",
             "",
             JSON.stringify(pipelineRecordSnapshot(record), null, 2),
           ].join("\n"),
@@ -18122,7 +18127,35 @@ function pipelineHasPendingIntegrations(record) {
   return queue.some((item) => item.status !== "integrated");
 }
 
-async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null) {
+// A gate agent that ends cleanly has not therefore approved the result: its verdict is read
+// from its own report, and a missing, conflicting, or unreadable verdict fails closed.
+const PIPELINE_GATE_VERDICT_INSTRUCTION = [
+  "Gate verdict (required): the bridge reads your verdict mechanically from your final report.",
+  "The very last line of the report must be exactly GATE_VERDICT: pass or GATE_VERDICT: fail, with nothing after it: put it after any Final Report section, not inside a list, quote, or code block.",
+  "Do not write the word GATE_VERDICT anywhere else in the report, not even as an example or a quote.",
+  "Write fail if you found any blocking issue, if a check the task asks for fails or could not be run, or if you could not finish the review.",
+  "Any other placement or form fails the gate.",
+].join("\n");
+// Only bold or code emphasis may wrap the verdict; a quote or list marker makes it an example.
+const PIPELINE_GATE_VERDICT_LINE = /^[*_`]*GATE_VERDICT[*_`]*:[*_`]* ?[*_`]*(pass|fail)[*_`]*$/i;
+
+function parsePipelineGateVerdict(text) {
+  const lines = String(text || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const mentions = lines.filter((line) => /GATE_VERDICT/i.test(line));
+  if (mentions.length > 1) return "ambiguous";
+  const match = lines.length ? PIPELINE_GATE_VERDICT_LINE.exec(lines[lines.length - 1]) : null;
+  if (!match) return mentions.length ? "misplaced" : "missing";
+  return match[1].toLowerCase();
+}
+
+const PIPELINE_GATE_VERDICT_ERROR_TYPES = {
+  fail: "pipeline_gate_verdict_fail",
+  missing: "pipeline_gate_verdict_missing",
+  misplaced: "pipeline_gate_verdict_misplaced",
+  ambiguous: "pipeline_gate_verdict_ambiguous",
+};
+
+async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null, checkedTargetStateSha256 = "") {
   if (!gateJob) {
     return null;
   }
@@ -18137,7 +18170,8 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null)
     };
   }
 
-  const execution = await executeOpenCodeJob({
+  const executeGateJob = typeof pipelineGateExecutorTestHook === "function" ? pipelineGateExecutorTestHook : executeOpenCodeJob;
+  const execution = await executeGateJob({
     ...gateJob,
     cwd: gateJob.cwd || record.cwd,
     write: false,
@@ -18153,17 +18187,27 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null)
       "",
       `Pipeline id: ${record.pipelineId}`,
       "Review/test the integrated result only. Do not edit files.",
+      "",
+      PIPELINE_GATE_VERDICT_INSTRUCTION,
     ].filter(Boolean).join("\n"),
   }, { toolStarted: nowMs(), jobId: `${record.pipelineId}-${gateName}`, signal });
 
-  const result = {
+  // An agent that errored or edited files fails on that ground; its verdict is not consulted.
+  const runErrorType = execution.result?.errorType
+    || (execution.validation?.disallowedFiles?.length ? changedFileValidationErrorType(execution.validation) : "");
+  // result.stdout is the agent's own final response, untruncated whenever errorType is empty
+  // (a bridge-truncated response is itself the essential_output_truncated error).
+  const verdict = runErrorType ? "not_read" : parsePipelineGateVerdict(execution.result?.stdout);
+  const errorType = runErrorType || (verdict === "pass" ? "" : PIPELINE_GATE_VERDICT_ERROR_TYPES[verdict]);
+  return {
     gate: gateName,
-    status: execution.result?.errorType || execution.validation?.disallowedFiles?.length ? "failed" : "passed",
-    errorType: execution.result?.errorType || (execution.validation?.disallowedFiles?.length ? changedFileValidationErrorType(execution.validation) : ""),
+    status: errorType ? "failed" : "passed",
+    errorType,
+    verdict,
+    checkedTargetStateSha256,
     changedFiles: execution.result?.changedFiles || [],
-    text: truncateText(execution.response?.content?.[0]?.text || "", 12000),
+    text: truncateResultText(execution.response?.content?.[0]?.text || "", 12000),
   };
-  return result;
 }
 
 function cleanupAuthorizationMatchesItem(record, authorization, item) {
@@ -18356,7 +18400,29 @@ async function resumeAuthorizedPipelineCleanup(record) {
     : { ok: true, record };
 }
 
+// The finalizer's repository lease is shared, so this set is what stops two finalizations of
+// one pipeline in this process from running their gates and cleanup side by side.
+const FINALIZING_PIPELINE_IDS = new Set();
+
 async function finalizePipelineRecord(record, options = {}) {
+  const pipelineKey = record.pipelineId || "";
+  if (pipelineKey && FINALIZING_PIPELINE_IDS.has(pipelineKey)) {
+    return {
+      ok: false,
+      errorType: "pipeline_finalization_in_progress",
+      error: `Pipeline ${pipelineKey} is already being finalized by this bridge.`,
+      record,
+    };
+  }
+  if (pipelineKey) FINALIZING_PIPELINE_IDS.add(pipelineKey);
+  try {
+    return await finalizePipelineRecordUnderLease(record, options);
+  } finally {
+    if (pipelineKey) FINALIZING_PIPELINE_IDS.delete(pipelineKey);
+  }
+}
+
+async function finalizePipelineRecordUnderLease(record, options = {}) {
   const targetCwd = await resolveProjectStateRoot(record.cwd || process.cwd());
   const lockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
   const lockResult = await acquireHardLock({
@@ -18396,9 +18462,25 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     dryRun,
     skipReviewers,
   });
+  // A dry run reports what finalization would do; it never persists a rejection or a status.
+  const recordRejection = dryRun ? async () => {} : (patch) => updatePipelineRecord(record, patch);
+
+  // A finalized pipeline is terminal: its gates already ran against the state they recorded,
+  // and running them again later would judge a different tree under the same result.
+  if (record.status === "completed") {
+    return { ok: true, alreadyFinalized: true, record };
+  }
+  if (["cleanup_pending", "cleanup_failed"].includes(record.status)) {
+    return {
+      ok: false,
+      errorType: "pipeline_already_finalized",
+      error: `Pipeline gates already passed; status is ${record.status} and source cleanup is resumed by the bridge's cleanup recovery.`,
+      record,
+    };
+  }
 
   if (["failed", "cancelled"].includes(record.status)) {
-    await updatePipelineRecord(record, {
+    await recordRejection({
       events,
       errors: (record.errors || []).concat({
         type: "finalization",
@@ -18415,8 +18497,8 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   }
 
   if (pipelineHasPendingIntegrations(record)) {
-    await updatePipelineRecord(record, {
-      status: record.status === "planned" ? "planned" : "awaiting_integration",
+    await recordRejection({
+      status: ["awaiting_finalization", "finalizing"].includes(record.status) ? "awaiting_integration" : record.status,
       events,
       errors: (record.errors || []).concat({
         type: "finalization",
@@ -18432,8 +18514,27 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     };
   }
 
+  // refreshPipelineRecord derives awaiting_finalization from the durable children only once
+  // every job completed and every integration landed; "finalizing" is a crashed finalization.
+  if (!["awaiting_finalization", "finalizing"].includes(record.status)) {
+    await recordRejection({
+      events,
+      errors: (record.errors || []).concat({
+        type: "finalization",
+        errorType: "pipeline_jobs_incomplete",
+        error: `Pipeline status is ${record.status}; every job must complete before finalization.`,
+      }),
+    });
+    return {
+      ok: false,
+      errorType: "pipeline_jobs_incomplete",
+      error: `Pipeline status is ${record.status}; every job must complete and be integrated before finalization.`,
+      record,
+    };
+  }
+
   if (skipReviewers && (record.reviewerJob || record.testerJob)) {
-    await updatePipelineRecord(record, {
+    await recordRejection({
       status: "awaiting_finalization",
       events,
       errors: (record.errors || []).concat({
@@ -18456,7 +18557,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     ? ["caller", "policy"].includes(finalValidationSource)
     : finalValidationSource === "none";
   if (!finalValidationSourceValid) {
-    await updatePipelineRecord(record, {
+    await recordRejection({
       status: "awaiting_finalization",
       events,
       errors: (record.errors || []).concat({
@@ -18473,7 +18574,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     };
   }
   if (["policy", "legacy_unknown"].includes(finalValidationSource) && record.finalValidationCommand && !record.finalValidationSpec) {
-    await updatePipelineRecord(record, {
+    await recordRejection({
       status: "awaiting_finalization",
       events,
       errors: (record.errors || []).concat({
@@ -18505,7 +18606,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
       && currentPolicy.sha256 === record.policy.sha256
       && currentPolicy.policy?.finalValidationSpec?.commandSha256 === record.finalValidationSpec.commandSha256;
     if (!samePolicy) {
-      await updatePipelineRecord(record, {
+      await recordRejection({
         status: "awaiting_finalization",
         events,
         errors: (record.errors || []).concat({
@@ -18521,6 +18622,18 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
         record,
       };
     }
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      dryRun: true,
+      wouldRun: {
+        finalValidationCommand: record.sanitizedWorkspace ? "" : record.finalValidationCommand || "",
+        gates: skipReviewers ? [] : ["reviewer", "tester"].filter((gateName) => record[`${gateName}Job`]),
+      },
+      record,
+    };
   }
 
   await updatePipelineRecord(record, { status: "finalizing", events });
@@ -18617,13 +18730,23 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     };
   }
 
-  const reviewerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "reviewer", record.reviewerJob, signal);
+  // Both gates are read-only and inspect the same validated target state, so they run together;
+  // the pre-cleanup state check below proves that state did not move while they ran.
+  const gateTargetStateSha256 = finalValidationAfterState?.targetStateSha256 || "";
+  const gateOutcomes = skipReviewers ? [] : await Promise.allSettled([
+    runPipelineReadOnlyGate(record, "reviewer", record.reviewerJob, signal, gateTargetStateSha256),
+    runPipelineReadOnlyGate(record, "tester", record.testerJob, signal, gateTargetStateSha256),
+  ]);
+  const gateRejection = gateOutcomes.find((outcome) => outcome.status === "rejected");
+  if (gateRejection) throw gateRejection.reason;
+  const [reviewerResult = null, testerResult = null] = gateOutcomes.map((outcome) => outcome.value);
   if (reviewerResult?.status === "failed") {
     await updatePipelineRecord(record, {
       status: "failed",
       finishedAt: new Date().toISOString(),
       finalValidationResult,
       reviewerResult,
+      testerResult,
       errors: (record.errors || []).concat({
         type: "reviewer",
         errorType: reviewerResult.errorType,
@@ -18638,7 +18761,6 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     };
   }
 
-  const testerResult = skipReviewers ? null : await runPipelineReadOnlyGate(record, "tester", record.testerJob, signal);
   if (testerResult?.status === "failed") {
     await updatePipelineRecord(record, {
       status: "failed",
@@ -20730,6 +20852,7 @@ export const __selfTest = {
     parseCommandLine,
     parseDependencyRequest,
     parseModelAllowlistEntry,
+    parsePipelineGateVerdict,
     path,
     persistPipelineRecord,
     persistQueueRecord,
@@ -20751,6 +20874,7 @@ export const __selfTest = {
     readPersistedPipelineRecord,
     readPersistedQueueRecord,
     reconcileParentPipelineAfterQueueTerminal,
+    runPipelineReadOnlyGate,
     reconcileStaleQueueRecords,
     recordMatchesProject,
     recoverIntegrationOperationsWhileLocked,
@@ -20842,6 +20966,8 @@ export const __selfTest = {
     set stateDirectoryOverride(value) { stateDirectoryOverride = value; },
     get worktreeCleanupTestHook() { return worktreeCleanupTestHook; },
     set worktreeCleanupTestHook(value) { worktreeCleanupTestHook = value; },
+    get pipelineGateExecutorTestHook() { return pipelineGateExecutorTestHook; },
+    set pipelineGateExecutorTestHook(value) { pipelineGateExecutorTestHook = value; },
   },
 };
 
