@@ -6,9 +6,11 @@ import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, sym
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
+requireSelfTestRun(import.meta.url);
 const LEGACY_PUBLISH_ENTRIES = Object.freeze([
   "server.js",
   "package.json",
@@ -409,6 +411,7 @@ async function runSelfTest() {
     await rm(fixture, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
   }
   process.stdout.write("Release builder self-test passed.\n");
+  selfTestPassed("build-release");
 }
 
 async function main() {
@@ -426,7 +429,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-if (normalizeFilesystemCase(process.argv[1] || "") === normalizeFilesystemCase(SCRIPT_PATH)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.message || String(error)}\n`);
     process.exitCode = 1;

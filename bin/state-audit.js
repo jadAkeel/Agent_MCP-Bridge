@@ -5,9 +5,9 @@ import { lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
-const SCRIPT_PATH = fileURLToPath(import.meta.url);
+requireSelfTestRun(import.meta.url);
 
 const ACTIVE_QUEUE_STATUSES = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
 
@@ -194,6 +194,7 @@ async function runSelfTest() {
     assert.equal(auditHasFailures(report, false), false);
     assert.equal(auditHasFailures(report, true), true);
     process.stdout.write("State audit self-test passed.\n");
+    selfTestPassed("state-audit");
   } finally {
     const resolvedFixture = path.resolve(fixtureRoot);
     if (resolvedFixture.startsWith(`${tempBase}${path.sep}`)) {
@@ -214,7 +215,7 @@ async function main() {
   if (auditHasFailures(report, options.strict)) process.exitCode = 1;
 }
 
-if (path.resolve(process.argv[1] || "") === path.resolve(SCRIPT_PATH)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
     process.exitCode = 1;

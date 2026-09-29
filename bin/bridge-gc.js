@@ -12,11 +12,11 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "n
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
 const execFileAsync = promisify(execFile);
-const SCRIPT_PATH = fileURLToPath(import.meta.url);
+requireSelfTestRun(import.meta.url);
 const ACTIVE_QUEUE_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
 const ACTIVE_PIPELINE_STATUSES = new Set(["running", "cleanup_pending", "cleanup_failed", "awaiting_integration", "integrating"]);
 const LIVE_REGISTRY_STATUSES = new Set(["creating", "retained", "cleanup_failed"]);
@@ -661,6 +661,7 @@ async function selfTest() {
     assert.equal(final.report.summary.removableWorktrees, 0);
     assert.equal(final.report.summary.staleRegistryRows, 0);
     process.stdout.write("Bridge GC self-test passed.\n");
+    selfTestPassed("bridge-gc");
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
@@ -681,7 +682,7 @@ async function main() {
   if (applied && applied.some((outcome) => !outcome.ok)) process.exitCode = 1;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
     process.exitCode = 1;

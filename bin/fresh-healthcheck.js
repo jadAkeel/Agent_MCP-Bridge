@@ -12,9 +12,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
+requireSelfTestRun(import.meta.url);
 const DEFAULT_TIMEOUT_MS = 120_000;
 const HEALTHCHECK_INHERITED_ENV_KEYS = new Set([
   "COMSPEC",
@@ -475,6 +477,7 @@ async function runSelfTest() {
     await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   process.stdout.write("Fresh MCP health-check self-test passed.\n");
+  selfTestPassed("fresh-healthcheck");
 }
 
 async function runSelfTestServer() {
@@ -514,7 +517,7 @@ async function main() {
   process.stdout.write(`Fresh MCP health check passed for ${result.serverName} (${result.profile}); ${result.toolCount} tools advertised; integrity mode ${result.integrityMode}.\n`);
 }
 
-if (normalizedPath(process.argv[1] || "") === normalizedPath(SCRIPT_PATH)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.message || String(error)}\n`);
     process.exitCode = 1;

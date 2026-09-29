@@ -30,8 +30,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildRelease } from "./build-release.js";
 import { loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+requireSelfTestRun(import.meta.url);
 const SERVER_NAME = "opencode";
 const KEEP_CONFIG_BACKUPS = 2;
 
@@ -305,6 +307,7 @@ function selfTest() {
   assert.match(clientToolTimeoutWarning(withTimeout("1500.0"), {}), /^WARNING: .*1800/, "The contractor timeout counts too.");
   assert.match(clientToolTimeoutWarning("[mcp_servers.opencode]\n", {}), /no tool_timeout_sec/);
   process.stdout.write("release-activate self-test passed\n");
+  selfTestPassed("release-activate");
 }
 
 function runHealthSmoke(configPath) {
@@ -518,7 +521,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`\nrelease:activate failed: ${error?.message || error}\n`);
-  process.exitCode = 1;
-});
+if (isMainModule(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`\nrelease:activate failed: ${error?.message || error}\n`);
+    process.exitCode = 1;
+  });
+}

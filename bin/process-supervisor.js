@@ -1155,6 +1155,7 @@ async function runSelfTest() {
     assert.equal(spawnFailure.spawnErrorCode, "ENOENT", JSON.stringify(spawnFailure));
     await waitForChildExit(spawnFailureHarness.child);
     process.stdout.write("Process supervisor self-test passed.\n");
+    process.stdout.write("process-supervisor self-test: ok\n");
   } finally {
     await stopHarness(noLaunchHarness);
     await stopHarness(lifecycleHarness);

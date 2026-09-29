@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { auditHasFailures, auditStateDirectory } from "./state-audit.js";
 import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { inventory as gcInventory } from "./bridge-gc.js";
+import { isMainModule } from "./main-module.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,9 +128,11 @@ async function main() {
   if (!report.ok) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error?.stack || error}\n`);
-  process.exitCode = 1;
-});
+if (isMainModule(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
+}
 
 export { gitSnapshot, parseArguments, runDailyDoctor };

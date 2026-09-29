@@ -16,9 +16,11 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadMcpEntry } from "./fresh-healthcheck.js";
+import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const PROJECT_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
+requireSelfTestRun(import.meta.url);
 
 function parseArguments(argv) {
   const options = {
@@ -213,6 +215,7 @@ async function selfTest() {
     const final = await runSync(base);
     assert.equal(final.plans.every((plan) => plan.actions.length === 0), true);
     process.stdout.write("Managed runtime sync self-test passed.\n");
+    selfTestPassed("sync-managed-runtime");
   } finally {
     await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
@@ -229,7 +232,7 @@ async function main() {
   if (report.applied && report.applied.some((item) => !item.ok)) process.exitCode = 1;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
     process.exitCode = 1;
