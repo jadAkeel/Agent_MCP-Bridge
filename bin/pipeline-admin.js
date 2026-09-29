@@ -2,12 +2,10 @@
 
 import { homedir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { loadMcpEntry } from "./fresh-healthcheck.js";
-
-const SCRIPT_PATH = fileURLToPath(import.meta.url);
+import { isMainModule } from "./main-module.js";
 
 function parseArguments(argv) {
   const options = {
@@ -50,8 +48,12 @@ function resultText(result) {
   return (result?.content || []).map((item) => item?.type === "text" ? item.text : "").filter(Boolean).join("\n");
 }
 
+// The server answers an unknown pipeline id with a plain text result (no isError), which
+// must still fail the command: nothing was abandoned.
 function resultIndicatesFailure(result, text) {
-  return result?.isError === true || /^Multi-agent pipeline abandonment rejected\./m.test(text);
+  return result?.isError === true
+    || /^Multi-agent pipeline abandonment rejected\./m.test(text)
+    || /^Multi-agent pipeline not found:/m.test(text);
 }
 
 async function main() {
@@ -84,7 +86,7 @@ async function main() {
   }
 }
 
-if (path.resolve(process.argv[1] || "") === path.resolve(SCRIPT_PATH)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
     process.exitCode = 1;

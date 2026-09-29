@@ -1,3 +1,15 @@
+// Windows has no process-group proof, so the supervisor always reports
+// treeTerminationConfirmed: false there. Its contained outcomes are a payload whose direct
+// child was observed to exit and close its stdio on its own, and a taskkill termination
+// whose best-effort verdict (direct child gone and pipes closed) succeeded. Anything else,
+// including a descendant that outlived the payload, is not contained.
+export function terminationContained(result) {
+  if (result?.treeTerminationConfirmed === true) return true;
+  if (result?.terminationErrorType) return false;
+  if (result?.containmentGuarantee === "windows_direct_child_observed") return true;
+  return result?.containmentGuarantee === "windows_taskkill_best_effort" && result.terminationBestEffortSucceeded === true;
+}
+
 // An explicit operator policy, bounded to a failure before any tool execution.
 export function builderFallbackEligible(agent, result, { enabled, modelRequirement, forcePure } = {}) {
   return enabled === true && agent === "builder" && !modelRequirement && !forcePure
@@ -6,7 +18,7 @@ export function builderFallbackEligible(agent, result, { enabled, modelRequireme
     && ["opencode_auth_error", "opencode_quota_exhausted", "opencode_billing_error",
       "opencode_model_error", "opencode_rate_limited", "opencode_transient_provider_error",
       "opencode_provider_unavailable", "opencode_transport_error"].includes(result.errorType)
-    && result.streamIntegrity === "valid" && result.treeTerminationConfirmed === true
+    && result.streamIntegrity === "valid" && terminationContained(result)
     && !result.cancelled && !result.timedOut && !result.rawOutputTruncated
     && !result.assistantResponseTruncated && !result.assistantFinalResponseDetected
     && !result.openCodeFallbackDetected && !result.runtimeModelConflict
