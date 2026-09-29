@@ -311,7 +311,21 @@ const BRIDGE_INSTANCE_ID = `${process.pid}-${Date.now()}-${randomBytes(8).toStri
 const QUEUE_CAPABILITY_KEY = randomBytes(32);
 const INTEGRATION_PREVIEWS = new Map();
 const KNOWN_STATE_DB_PATHS = new Set();
-const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new Set();
+// Repository roots whose writers wait for integration-journal recovery. Keys are normalized
+// once here (resolved, case-folded on win32) so every add/has/delete site agrees on
+// C:\Repo vs c:\repo; the entries are the normalized keys.
+class RepositoryRootSet extends Set {
+  static key(root) {
+    return normalizeFilesystemCase(path.resolve(String(root || "") || process.cwd()));
+  }
+
+  add(root) { return super.add(RepositoryRootSet.key(root)); }
+
+  has(root) { return super.has(RepositoryRootSet.key(root)); }
+
+  delete(root) { return super.delete(RepositoryRootSet.key(root)); }
+}
+const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new RepositoryRootSet();
 const PRIVATE_STATE_VACUUMED_DB_PATHS = new Set();
 const INTEGRATION_PREVIEW_TTL_MS = 1000 * 60 * 60;
 const REPOSITORY_SCOPE_LOCK_PATH = ".";
@@ -375,6 +389,42 @@ function startToolProgressHeartbeat(extra) {
   return () => clearInterval(timer);
 }
 
+// Startup recovery runs right after the transport connects, so a slow recovery can no longer
+// exceed the client's MCP startup timeout. Every tool call still waits for it (bounded) and
+// then answers with a clear rejection instead of hanging or acting on unrecovered state.
+let bridgeStartupRecovery = null;
+const STARTUP_RECOVERY_TOOL_WAIT_MS = readPositiveIntEnv("CODEX_OPENCODE_STARTUP_RECOVERY_WAIT_MS", 1000 * 60 * 2);
+
+async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT_MS) {
+  const pending = bridgeStartupRecovery;
+  if (!pending) return { ok: true };
+  let timer = null;
+  try {
+    return await Promise.race([
+      pending.then(() => ({ ok: true }), () => ({ ok: true })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false }), Math.max(0, Number(timeoutMs) || 0));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function startupRecoveryPendingResult() {
+  return {
+    isError: true,
+    content: [{
+      type: "text",
+      text: [
+        "Bridge startup recovery still running.",
+        "errorType: startup_recovery_pending",
+        `The bridge is still recovering durable queue, pipeline and integration state (waited ${Math.round(STARTUP_RECOVERY_TOOL_WAIT_MS / 1000)} s). Retry the call shortly; get_opencode_bridge_status reports the bridge once recovery finishes.`,
+      ].join("\n"),
+    }],
+  };
+}
+
 const registerToolWithoutProgress = server.tool.bind(server);
 server.tool = (...registration) => {
   const handler = registration[registration.length - 1];
@@ -382,6 +432,7 @@ server.tool = (...registration) => {
     registration[registration.length - 1] = async (...handlerArgs) => {
       const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
       try {
+        if (!(await awaitBridgeStartupRecovery()).ok) return startupRecoveryPendingResult();
         return await handler(...handlerArgs);
       } finally {
         stop();
@@ -6916,7 +6967,10 @@ function makeQueueJobId(agent = "agent") {
 
 function queueRequestFingerprint(request) {
   const comparable = structuredClone(request);
+  // Both are minted per enqueue (the job id is random), so an idempotent retry of the same
+  // contractor request must not see them as different content.
   delete comparable.internalQueueContractorProof;
+  delete comparable.internalQueueJobId;
   return createHash("sha256").update(JSON.stringify(comparable)).digest("hex");
 }
 
@@ -10532,6 +10586,41 @@ function renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt)
   return true;
 }
 
+const QUEUE_PRE_EXECUTION_STATUSES = ["held", "pending", "planned", "blocked"];
+
+// A lapsed lease (a sleeping laptop, a few failed heartbeats on a busy database) is not lost
+// ownership: every takeover writes a new owner generation and every foreign write bumps the
+// revision, so an unchanged generation + revision proves nobody else took the row. The
+// current owner re-takes its own lease here without the lease predicate; before this, the
+// row could never be renewed, claimed or planned again while the bridge lived.
+function reacquirePersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt) {
+  if (!record?.ownerGeneration) return false;
+  const reacquired = db.prepare(`
+    UPDATE opencode_jobs
+    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?, revision = revision + 1
+    WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
+      AND revision = ?
+      AND status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
+      AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+    RETURNING revision
+  `).get(
+    heartbeatAt,
+    leaseExpiresAt,
+    heartbeatAt,
+    record.jobId,
+    BRIDGE_INSTANCE_ID,
+    record.ownerGeneration,
+    Number(record.revision || 0)
+  );
+  if (!reacquired) return false;
+  record.heartbeatAt = heartbeatAt;
+  record.leaseExpiresAt = leaseExpiresAt;
+  record.revision = Number(reacquired.revision || record.revision || 0);
+  record.queueOwnershipLost = false;
+  logEvent("warn", "queue.lease_reacquired", { jobId: record.jobId, ownerGeneration: record.ownerGeneration });
+  return true;
+}
+
 function queueOwnershipLossError(detail = "Durable queue ownership could not be renewed before lease expiry.") {
   const error = new Error(detail);
   error.errorType = "queue_ownership_lost";
@@ -10656,7 +10745,9 @@ function heartbeatKnownQueueState() {
       `).run(BRIDGE_INSTANCE_ID, process.pid, heartbeatAt, heartbeatAt, leaseExpiresAt);
       db.prepare("DELETE FROM bridge_instances WHERE lease_expires_at < ?").run(new Date(Date.now() - CONFIG.queueStaleAfterMs).toISOString());
       for (const record of localRecords) {
-        if (!renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt)) {
+        if (!renewPersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt)
+          && !(QUEUE_PRE_EXECUTION_STATUSES.includes(record.status)
+            && reacquirePersistedQueueRecordLease(db, record, heartbeatAt, leaseExpiresAt))) {
           noteQueueLeaseRenewalFailure(record, {
             definitive: true,
             detail: "The durable queue row no longer matches this owner generation.",
@@ -10670,6 +10761,13 @@ function heartbeatKnownQueueState() {
           AND owner_lease_expires_at > ?
           AND status NOT IN ('completed', 'failed', 'cancelled')
       `);
+      const reclaimPipeline = db.prepare(`
+        UPDATE opencode_pipelines
+        SET owner_heartbeat_at = ?, owner_lease_expires_at = ?
+        WHERE pipeline_id = ? AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+      `);
+      const pipelineOwner = db.prepare("SELECT owner_instance_id, owner_generation FROM opencode_pipelines WHERE pipeline_id = ?");
       for (const record of localPipelines) {
         const renewed = renewPipeline.run(
           heartbeatAt,
@@ -10679,11 +10777,28 @@ function heartbeatKnownQueueState() {
           record.ownerGeneration,
           heartbeatAt
         );
-        if (Number(renewed.changes || 0) === 1) {
+        // A lapsed lease under this instance's generation is still ours (every takeover writes
+        // a new generation), so it is re-taken instead of being reported lost. Only a row that
+        // another generation took is lost; dropping it from PIPELINE_RUNS stops this
+        // instance's heartbeat from covering it so recovery can resume it.
+        if (Number(renewed.changes || 0) === 1
+          || Number(reclaimPipeline.run(
+            heartbeatAt,
+            leaseExpiresAt,
+            record.pipelineId,
+            BRIDGE_INSTANCE_ID,
+            record.ownerGeneration
+          ).changes || 0) === 1) {
           record.ownerHeartbeatAt = heartbeatAt;
           record.ownerLeaseExpiresAt = leaseExpiresAt;
         } else {
           record.pipelineOwnershipLost = true;
+          const owner = pipelineOwner.get(record.pipelineId);
+          if ((!owner || owner.owner_instance_id !== BRIDGE_INSTANCE_ID
+            || String(owner.owner_generation || "") !== String(record.ownerGeneration || ""))
+            && PIPELINE_RUNS.get(record.pipelineId) === record) {
+            PIPELINE_RUNS.delete(record.pipelineId);
+          }
           logEvent("warn", "pipeline.ownership_lost", {
             pipelineId: record.pipelineId,
             ownerGeneration: record.ownerGeneration,
@@ -15784,10 +15899,17 @@ function commandFingerprintFields(value, prefix = "validationCommand") {
 
 function scopeContractDurableSummary(contract) {
   if (!contract) return null;
+  // An already-summarized contract carries an empty command and its original fingerprint;
+  // re-summarizing it must keep that fingerprint instead of replacing it with sha256("").
+  const alreadySummarized = !contract.validationCommand
+    && Object.prototype.hasOwnProperty.call(contract, "validationCommandSha256")
+    && Object.prototype.hasOwnProperty.call(contract, "validationCommandChars");
   return sanitizePersistedValue({
     ...contract,
     validationCommand: "",
-    ...commandFingerprintFields(contract.validationCommand),
+    ...(alreadySummarized
+      ? { validationCommandChars: contract.validationCommandChars, validationCommandSha256: contract.validationCommandSha256 }
+      : commandFingerprintFields(contract.validationCommand)),
   });
 }
 
@@ -16225,6 +16347,10 @@ function persistTerminalQueueRecord(db, record) {
       }
       current = selectCurrent.get(record.jobId);
     }
+    // No lease predicate: a lapsed lease is not a lost one. A takeover always writes a new
+    // generation and every foreign write bumps the revision, so generation + revision fence a
+    // stale owner; requiring an unexpired lease left a finished job "running" forever after
+    // its lease lapsed (the owner instance stays alive, so recovery never reclaimed it).
     const terminalCommitAt = new Date().toISOString();
     const terminalChange = db.prepare(`
       UPDATE opencode_jobs
@@ -16233,7 +16359,6 @@ function persistTerminalQueueRecord(db, record) {
       WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
         AND owner_generation <> ''
         AND revision = ?
-        AND lease_expires_at > ?
         AND status IN (${activeStatuses})
         AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
         AND EXISTS (
@@ -16255,7 +16380,6 @@ function persistTerminalQueueRecord(db, record) {
       BRIDGE_INSTANCE_ID,
       attemptedOwnerGeneration,
       attemptedRevision,
-      terminalCommitAt,
       terminalCommitAt
     );
     if (Number(terminalChange.changes || 0) === 1) {
@@ -16327,13 +16451,10 @@ function persistTerminalQueueRecord(db, record) {
 
     db.exec("COMMIT");
     transactionOpen = false;
-    const currentLeaseExpiresAt = Date.parse(current?.lease_expires_at || "");
     const ownershipLost = Boolean(current) && (
       current.owner_instance_id !== BRIDGE_INSTANCE_ID
       || String(current.owner_generation || "") !== attemptedOwnerGeneration
       || Number(current.revision || 0) !== attemptedRevision
-      || !Number.isFinite(currentLeaseExpiresAt)
-      || currentLeaseExpiresAt <= Date.parse(terminalCommitAt)
     );
     loadPersistedQueueRecord(record, current);
     return {
@@ -16350,8 +16471,12 @@ function persistTerminalQueueRecord(db, record) {
   }
 }
 
+// Test-only: runs before every queue persistence write (a throw simulates SQLITE_BUSY).
+let queuePersistTestHook = null;
+
 async function persistQueueRecord(record) {
   enforceQueueResultEvidence(record);
+  if (typeof queuePersistTestHook === "function") await queuePersistTestHook(record);
   if (effectiveQueueMode() !== "sqlite") {
     record.revision = Number(record.revision || 0) + 1;
     return { persisted: true, status: record.status };
@@ -16646,11 +16771,66 @@ async function findQueueWriteConflict(record) {
       return {
         jobId: running.jobId,
         paths: conflict.overlap,
+        source: "queue",
+        errorType: "write_lock_conflict",
+        reason: `Waiting for queued write job ${running.jobId} to release: ${(conflict.overlap || []).join(", ")}`,
       };
     }
   }
 
-  return null;
+  return await findQueueRecordRepositoryBlock(record, cwdKey);
+}
+
+// What acquireHardLock would refuse for this record, read without taking anything: an
+// unresolved integration operation of the repository (writers only) and active hard locks
+// from direct runs, manual locks, integrations and finalizers. Without it the scheduler
+// claimed the job and ran agent discovery and attestation before the lock failed, every
+// poll, and reported every refusal as a queue lock conflict.
+async function findQueueRecordRepositoryBlock(record, cwdKey = path.resolve(record.cwd || process.cwd())) {
+  // A dry run never takes a hard lock, so nothing here could refuse it.
+  if (record.dryRun || record.request?.dryRun) return null;
+  const lockType = record.mode === "read" ? "read" : "write";
+  const request = { lockType, paths: queueLockPathsForRecord(record), origin: "internal" };
+  const db = await openLockDb(cwdKey);
+  try {
+    if (lockType !== "read") {
+      const comparableRoot = normalizeFilesystemCase(path.resolve(cwdKey));
+      const operation = db.prepare(`
+        SELECT operation_id, cwd, status FROM integration_operations
+        WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        ORDER BY updated_at, operation_id
+      `).all().find((row) => normalizeFilesystemCase(path.resolve(row.cwd || "")) === comparableRoot);
+      if (operation) {
+        return {
+          jobId: "",
+          operationId: operation.operation_id,
+          operationStatus: operation.status,
+          paths: [REPOSITORY_SCOPE_LOCK_PATH],
+          source: "integration",
+          errorType: "integration_recovery_pending",
+          reason: operation.status === "quarantined"
+            ? `Waiting for quarantined integration operation ${operation.operation_id} of this repository to be recovered; see diagnose_opencode_bridge.`
+            : `Waiting for integration operation ${operation.operation_id} (${operation.status}) of this repository to finish.`,
+        };
+      }
+    }
+    for (const lock of listLocksFromDb(db)) {
+      const conflict = conflictsWithActiveLock(request, lock);
+      if (!conflict) continue;
+      const overlap = (conflict.overlap || []).filter(Boolean);
+      return {
+        jobId: "",
+        lockId: lock.id,
+        paths: overlap.length ? overlap : conflict.paths || [],
+        source: "lock",
+        errorType: "write_lock_conflict",
+        reason: `Waiting for the active ${lock.origin || "legacy"} ${lock.lockType} lock ${lock.id} (${lock.agent || "unknown"}) to release: ${(overlap.length ? overlap : conflict.paths || []).join(", ") || "the repository"}`,
+      };
+    }
+    return null;
+  } finally {
+    closeDb(db);
+  }
 }
 
 async function assessQueuePlan(lockPlans = []) {
@@ -16676,7 +16856,9 @@ async function assessQueuePlan(lockPlans = []) {
     if (conflict) {
       return {
         status: effectiveQueueWriteConflictPolicy() === "reject" ? "conflict" : "must_wait",
-        reason: `Queued/running write job ${conflict.jobId} overlaps this plan on ${(conflict.paths || []).join(", ") || "the repository"}.`,
+        reason: conflict.source === "queue"
+          ? `Queued/running write job ${conflict.jobId} overlaps this plan on ${(conflict.paths || []).join(", ") || "the repository"}.`
+          : `${conflict.reason}.`,
         conflictingPaths: conflict.paths,
       };
     }
@@ -16828,6 +17010,12 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     scheduleQueue();
   }
   return { ok: true, record };
+}
+
+// node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
+// code in errcode (2067 = SQLITE_CONSTRAINT_UNIQUE); there is no "SQLITE_CONSTRAINT_UNIQUE" code.
+function sqliteUniqueConstraintError(error) {
+  return error?.errcode === 2067 || /UNIQUE constraint failed/i.test(error?.message || "");
 }
 
 async function activatePipelineBatch(record, preparedRecords) {
@@ -17017,7 +17205,7 @@ async function activatePipelineBatch(record, preparedRecords) {
       }
       return {
         ok: false,
-        errorType: error?.code === "SQLITE_CONSTRAINT_UNIQUE" ? "pipeline_batch_idempotency_conflict" : "pipeline_batch_persistence_failed",
+        errorType: sqliteUniqueConstraintError(error) ? "pipeline_batch_idempotency_conflict" : "pipeline_batch_persistence_failed",
         error: error?.message || "Pipeline batch activation failed and was rolled back.",
       };
     } finally {
@@ -17048,7 +17236,9 @@ async function updateQueueTerminalRecordDurable(record, patch) {
   return result;
 }
 
-async function handleQueueWorkerInfrastructureFailure(record, error) {
+// `evidence` is the terminal patch the worker could not commit: its result text, changed
+// files, patch hash and validation result are kept on the failed record instead of being lost.
+async function handleQueueWorkerInfrastructureFailure(record, error, evidence = null) {
   const errorText = truncateText(redactSensitiveText(error?.message || String(error)), 2000);
   record.abortController?.abort(error instanceof Error ? error : new Error(errorText));
   logEvent("error", "queue.worker_unhandled_failure", {
@@ -17056,16 +17246,20 @@ async function handleQueueWorkerInfrastructureFailure(record, error) {
     ownerGeneration: record.ownerGeneration || "",
     error: errorText,
   });
+  const intendedStatus = evidence?.status || "";
   try {
     const persisted = await updateQueueTerminalRecordDurable(record, {
+      ...(evidence || {}),
       status: "failed",
-      finishedAt: new Date().toISOString(),
+      finishedAt: evidence?.finishedAt || new Date().toISOString(),
       heartbeatAt: "",
       leaseExpiresAt: "",
       errorType: "queue_worker_infrastructure_failed",
-      errorReason: errorText,
-      childProcessId: 0,
-      childProcessStartedAt: "",
+      errorReason: intendedStatus
+        ? truncateText(`The job ended ${intendedStatus}${evidence?.errorType ? ` (${evidence.errorType})` : ""}, but its terminal record could not be committed: ${errorText}`, 2000)
+        : errorText,
+      childProcessId: evidence?.containmentQuarantined ? evidence.childProcessId || 0 : 0,
+      childProcessStartedAt: evidence?.containmentQuarantined ? evidence.childProcessStartedAt || "" : "",
     });
     if (!persisted.persisted) {
       logEvent("error", "queue.worker_terminal_persistence_rejected", {
@@ -17252,6 +17446,174 @@ async function claimQueueRecord(record) {
   }
 }
 
+// Test-only: replaces executeOpenCodeJob for queue workers so the worker's persistence paths
+// can be exercised without spawning OpenCode.
+let queueJobExecutorTestHook = null;
+const QUEUE_ACTIVE_STATUSES = ["running", "validating", "reviewing", "testing"];
+const QUEUE_TERMINAL_STATUSES = ["completed", "failed", "cancelled", "interrupted", "not_resumable"];
+// Lock refusals of a queued job that clear by themselves; the job waits (blocked) and retries.
+const QUEUE_RETRYABLE_LOCK_ERROR_TYPES = new Set(["queue_lock_conflict", "integration_recovery_pending"]);
+const QUEUE_BLOCKED_BACKOFF_MAX_MS = 60 * 1000;
+const QUEUE_TERMINAL_COMMIT_ATTEMPTS = 5;
+
+// Each consecutive block of the same job after a claim doubles its wait (up to 60 s): a job
+// that keeps failing its lock no longer re-runs agent discovery and attestation every poll.
+function queueBlockedBackoffPatch(record, now = Date.now()) {
+  const count = Number(record.queueBlockedCount || 0) + 1;
+  const delayMs = Math.min(QUEUE_BLOCKED_BACKOFF_MAX_MS, Math.max(1, CONFIG.queueBlockedPollMs) * 2 ** Math.min(count - 1, 16));
+  return { queueBlockedCount: count, queueBlockedRetryAt: now + delayMs };
+}
+
+async function reacquireQueueRecordLease(record) {
+  if (effectiveQueueMode() !== "sqlite") return false;
+  const db = await openLockDb(record.cwd);
+  try {
+    const heartbeatAt = new Date().toISOString();
+    return reacquirePersistedQueueRecordLease(db, record, heartbeatAt, new Date(Date.now() + CONFIG.queueLeaseMs).toISOString());
+  } finally {
+    closeDb(db);
+  }
+}
+
+// A non-terminal transition that was refused only because this owner's lease lapsed re-takes
+// the lease (same generation and revision) and tries once more.
+async function updateQueueRecordDurableReacquiringLease(record, patch) {
+  const ownerGeneration = String(record.ownerGeneration || "");
+  const result = await updateQueueRecordDurable(record, patch);
+  if (result.persisted || !ownerGeneration || effectiveQueueMode() !== "sqlite") return result;
+  if (record.ownerInstanceId !== BRIDGE_INSTANCE_ID
+    || String(record.ownerGeneration || "") !== ownerGeneration
+    || record.cancellationRequested
+    || QUEUE_TERMINAL_STATUSES.includes(record.status)) return result;
+  if (!(await reacquireQueueRecordLease(record))) return result;
+  return await updateQueueRecordDurable(record, patch);
+}
+
+function queueRecordOwnedElsewhere(record, ownerGeneration) {
+  return record.ownerInstanceId !== BRIDGE_INSTANCE_ID
+    || String(record.ownerGeneration || "") !== String(ownerGeneration || "");
+}
+
+// The terminal patch is built once and committed with bounded retries: a transient error
+// (SQLITE_BUSY after busy_timeout, an encryption failure) no longer turns a finished job into
+// a bare failure. If every attempt fails, the failure is recorded with the job's evidence.
+async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMINAL_COMMIT_ATTEMPTS } = {}) {
+  let lastError = null;
+  let lastResult = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0) await delayWithSignal(Math.min(2000, 100 * 2 ** (attempt - 1)));
+    try {
+      lastResult = await updateQueueTerminalRecordDurable(record, patch);
+      lastError = null;
+      if (lastResult.persisted || lastResult.ownershipLost || !QUEUE_ACTIVE_STATUSES.includes(lastResult.status)) return lastResult;
+    } catch (error) {
+      lastError = error;
+      logEvent("warn", "queue.terminal_commit_retry", {
+        jobId: record.jobId,
+        attempt: attempt + 1,
+        status: patch.status || "",
+        error: truncateText(redactSensitiveText(error?.message || String(error)), 500),
+      });
+    }
+  }
+  await handleQueueWorkerInfrastructureFailure(
+    record,
+    lastError || new Error(`The terminal ${patch.status || "unknown"} record was refused ${attempts} times while this bridge still owned the running job.`),
+    patch
+  );
+  return lastResult || { persisted: false, status: record.status };
+}
+
+// What acquireHardLock refuses before it looks at other locks; such a refusal never clears.
+function queueHardLockRequestRefusal(record) {
+  const rawPaths = record.mode === "read"
+    ? firstNonEmptyList(record.lockedPaths, record.scopeContract?.scope?.read, [REPOSITORY_SCOPE_LOCK_PATH])
+    : firstNonEmptyList(record.allowedEdits, record.lockedPaths);
+  const repositoryScope = rawPaths.length === 1 && rawPaths[0] === REPOSITORY_SCOPE_LOCK_PATH;
+  if (repositoryScope && record.mode !== "read") {
+    return "Repository-wide scope is reserved for internal read or serial-integration consistency leases.";
+  }
+  if (!repositoryScope) {
+    const unsafe = unsafePathReason(rawPaths, record.cwd || "");
+    if (unsafe) return `Write lock rejected: ${unsafe}`;
+  }
+  let normalizedPaths = [];
+  try {
+    normalizedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : normalizeLockPathListForCwd(rawPaths, record.cwd || "");
+  } catch (error) {
+    return `Write lock rejected: ${error?.message || String(error)}`;
+  }
+  if (!normalizedPaths.length) return "Write lock rejected: paths are required.";
+  if (hasAmbiguousPathPattern(normalizedPaths)) return "Write lock rejected: wildcard or ambiguous paths are not allowed.";
+  return "";
+}
+
+// After a claimed job's lock was refused: name the real cause (an integration operation, a
+// direct or manual lock), fail a request the lock layer can never accept, and otherwise
+// record `blocked` with a backoff. A blocked state that cannot be persisted must not leave
+// the record "running" in memory without a worker (it counted against capacity forever).
+async function blockQueueRecordAfterLockRefusal(record, errorType) {
+  let cause = null;
+  try {
+    cause = await findQueueWriteConflict(record);
+  } catch (error) {
+    logEvent("warn", "queue.lock_refusal_probe_failed", {
+      jobId: record.jobId,
+      error: truncateText(redactSensitiveText(error?.message || String(error)), 500),
+    });
+  }
+  if (!cause && errorType !== "integration_recovery_pending") {
+    const refusal = queueHardLockRequestRefusal(record);
+    if (refusal) return { outcome: "failed", errorType: "lock_request_rejected", errorReason: refusal };
+  }
+  const blockedErrorType = cause?.errorType === "integration_recovery_pending" || errorType === "integration_recovery_pending"
+    ? "integration_recovery_pending"
+    : "queue_lock_conflict";
+  const errorReason = cause?.reason || (blockedErrorType === "integration_recovery_pending"
+    ? "Waiting for the repository's unresolved integration operation to finish or be recovered; see diagnose_opencode_bridge."
+    : "Waiting for the active cross-process reader/writer consistency lock to be released.");
+  const patch = {
+    status: "blocked",
+    errorType: blockedErrorType,
+    errorReason,
+    childProcessId: 0,
+    childProcessStartedAt: "",
+    ...queueBlockedBackoffPatch(record),
+  };
+  let blocked = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) await delayWithSignal(100 * 2 ** (attempt - 1));
+    try {
+      blocked = await updateQueueRecordDurableReacquiringLease(record, patch);
+      break;
+    } catch (error) {
+      logEvent("warn", "queue.blocked_persist_failed", {
+        jobId: record.jobId,
+        attempt: attempt + 1,
+        error: truncateText(redactSensitiveText(error?.message || String(error)), 500),
+      });
+    }
+  }
+  if (blocked?.persisted) return { outcome: "blocked" };
+  if (record.cancellationRequested) {
+    await commitQueueTerminalRecord(record, {
+      status: "cancelled",
+      finishedAt: new Date().toISOString(),
+      heartbeatAt: "",
+      leaseExpiresAt: "",
+      errorType: "agent_cancelled",
+      errorReason: "Cancelled by request while the job waited for its lock.",
+      childProcessId: 0,
+      childProcessStartedAt: "",
+    });
+    return { outcome: "handled" };
+  }
+  if (!QUEUE_TERMINAL_STATUSES.includes(record.status)) {
+    abandonLocalQueueWorker(record, "The blocked queue state could not be persisted; local lease renewal was stopped for deterministic recovery.");
+  }
+  return { outcome: "handled" };
+}
+
 async function startQueueRecord(record) {
   const claim = await claimQueueRecord(record);
   if (!claim.ok) return false;
@@ -17263,7 +17625,7 @@ async function startQueueRecord(record) {
     const started = nowMs();
     try {
       if (record.cancellationRequested) {
-        await updateQueueTerminalRecordDurable(record, {
+        await commitQueueTerminalRecord(record, {
           status: "cancelled",
           finishedAt: new Date().toISOString(),
           durationMs: nowMs() - started,
@@ -17273,7 +17635,12 @@ async function startQueueRecord(record) {
         return;
       }
 
-      const execution = await executeOpenCodeJob(record.request, {
+      // Only the execution is caught as a job failure. A transient error while writing the
+      // terminal record used to land here too and turn a completed job into a bare
+      // queue_job_failed without its result, changed files or patch evidence.
+      let execution;
+      try {
+        execution = await (typeof queueJobExecutorTestHook === "function" ? queueJobExecutorTestHook : executeOpenCodeJob)(record.request, {
         toolStarted: started,
         jobId: record.jobId,
         fromQueue: true,
@@ -17309,14 +17676,29 @@ async function startQueueRecord(record) {
           }
           return { ok: true, deadlineAt: Date.parse(record.leaseExpiresAt || "") };
         },
-      });
+        });
+      } catch (error) {
+        await commitQueueTerminalRecord(record, {
+          status: "failed",
+          finishedAt: new Date().toISOString(),
+          durationMs: nowMs() - started,
+          heartbeatAt: "",
+          leaseExpiresAt: "",
+          errorType: "queue_job_failed",
+          errorReason: error.message || String(error),
+          childProcessId: 0,
+          childProcessStartedAt: "",
+        });
+        return;
+      }
       const validationError = execution.validation?.disallowedFiles?.length
         ? changedFileValidationErrorType(execution.validation)
         : "";
       const errorType = execution.result?.errorType || validationError || "";
 
+      let terminalPatch = null;
       if ((record.cancellationRequested || errorType === "agent_cancelled") && errorType !== "process_tree_termination_unconfirmed") {
-        await updateQueueTerminalRecordDurable(record, {
+        terminalPatch = {
           status: "cancelled",
           finishedAt: new Date().toISOString(),
           durationMs: nowMs() - started,
@@ -17345,23 +17727,26 @@ async function startQueueRecord(record) {
           worktreeSourceStateSha256: execution.result?.worktree?.sourceStateSha256 || "",
           childProcessId: 0,
           childProcessStartedAt: "",
-        });
-        return;
-      }
-
-      if (errorType === "queue_lock_conflict" && effectiveQueueWriteConflictPolicy() === "wait") {
-        await updateQueueRecordDurable(record, {
-          status: "blocked",
-          errorType,
-          errorReason: "Waiting for the active cross-process reader/writer consistency lock to be released.",
+        };
+      } else if (QUEUE_RETRYABLE_LOCK_ERROR_TYPES.has(errorType) && effectiveQueueWriteConflictPolicy() === "wait") {
+        const refusal = await blockQueueRecordAfterLockRefusal(record, errorType);
+        if (refusal.outcome !== "failed") return;
+        terminalPatch = {
+          status: "failed",
+          finishedAt: new Date().toISOString(),
+          durationMs: nowMs() - started,
+          heartbeatAt: "",
+          leaseExpiresAt: "",
+          errorType: refusal.errorType,
+          errorReason: refusal.errorReason,
+          resultText: execution.response?.content?.[0]?.text || "",
           childProcessId: 0,
           childProcessStartedAt: "",
-        });
-        return;
+        };
       }
 
       const containmentUnconfirmed = errorType === "process_tree_termination_unconfirmed";
-      await updateQueueTerminalRecordDurable(record, {
+      terminalPatch = terminalPatch || {
         status: errorType ? "failed" : "completed",
         finishedAt: new Date().toISOString(),
         durationMs: nowMs() - started,
@@ -17396,19 +17781,8 @@ async function startQueueRecord(record) {
         childProcessId: containmentUnconfirmed ? record.childProcessId : 0,
         childProcessStartedAt: containmentUnconfirmed ? record.childProcessStartedAt : "",
         containmentQuarantined: containmentUnconfirmed,
-      });
-    } catch (error) {
-      await updateQueueTerminalRecordDurable(record, {
-        status: "failed",
-        finishedAt: new Date().toISOString(),
-        durationMs: nowMs() - started,
-        heartbeatAt: "",
-        leaseExpiresAt: "",
-        errorType: "queue_job_failed",
-        errorReason: error.message || String(error),
-        childProcessId: 0,
-        childProcessStartedAt: "",
-      });
+      };
+      await commitQueueTerminalRecord(record, terminalPatch);
     } finally {
       clearQueueLeaseFence(record);
       if (record.parentJobId && ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
@@ -17424,6 +17798,8 @@ async function startQueueRecord(record) {
       }
       if (["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
         delete record.request;
+        delete record.queueBlockedCount;
+        delete record.queueBlockedRetryAt;
       }
       delete record.abortController;
       delete record.executionPromise;
@@ -17434,26 +17810,51 @@ async function startQueueRecord(record) {
   return true;
 }
 
-function nextQueueScheduleDelay(records, hasCapacity) {
+// `progressed` is false when a pass advanced no record: pending records that could not be
+// planned or claimed (a lost or lapsed lease) are then polled, not rescheduled at 0 ms,
+// which used to spin the scheduler (encryptions, database opens, git) until the bridge exited.
+function nextQueueScheduleDelay(records, hasCapacity, progressed = true, now = Date.now()) {
   if (!hasCapacity) {
     return null;
   }
   if (records.some((record) => ["pending", "planned"].includes(record.status))) {
-    return 0;
+    return progressed ? 0 : CONFIG.queueBlockedPollMs;
   }
-  return records.some((record) => record.status === "blocked")
-    ? CONFIG.queueBlockedPollMs
-    : null;
+  const blocked = records.filter((record) => record.status === "blocked");
+  if (!blocked.length) return null;
+  const nextRetryMs = Math.min(...blocked.map((record) => Math.max(0, Number(record.queueBlockedRetryAt || 0) - now)));
+  return Math.max(CONFIG.queueBlockedPollMs, nextRetryMs);
 }
 
+let queueWakeAt = 0;
+let queueSchedulerRunning = false;
+let queueScheduleRequested = false;
+
 function scheduleQueue(delayMs = 0) {
-  if (effectiveQueueMode() === "off" || queueSchedulerActive) {
+  if (effectiveQueueMode() === "off") {
     return;
+  }
+  const delay = Math.max(0, Number(delayMs) || 0);
+  if (queueSchedulerRunning) {
+    // A pass is running: it re-checks right away when it finishes instead of polling.
+    if (delay === 0) queueScheduleRequested = true;
+    return;
+  }
+  if (queueSchedulerActive) {
+    // A wake is pending; a sooner request (a new job, a finished one) must not wait behind a
+    // blocked job's backoff.
+    if (!queueWakeTimer || Date.now() + delay >= queueWakeAt) return;
+    clearTimeout(queueWakeTimer);
+    queueWakeTimer = null;
   }
 
   queueSchedulerActive = true;
+  queueWakeAt = Date.now() + delay;
   queueWakeTimer = setTimeout(async () => {
     queueWakeTimer = null;
+    queueSchedulerRunning = true;
+    queueScheduleRequested = false;
+    let progressed = false;
     try {
       const runningCount = runningQueueRecords().length;
       let capacity = Math.max(0, CONFIG.queueParallelLimit - runningCount);
@@ -17469,65 +17870,91 @@ function scheduleQueue(delayMs = 0) {
         if (!["pending", "blocked", "planned"].includes(record.status)) {
           continue;
         }
-        const recordRoot = path.resolve(record.cwd || process.cwd());
-        if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(recordRoot) && record.mode !== "read") {
-          // Readers do not mutate the checkout, so only writers wait for journal recovery.
-          if (record.errorType !== "integration_recovery_pending") {
-            await updateQueueRecordDurable(record, {
-              status: "blocked",
-              errorType: "integration_recovery_pending",
-              errorReason: "Waiting for the repository's integration journal to recover (a quarantined integration blocks writers); see diagnose_opencode_bridge.",
-            });
+        // Progress is a record changing state or leaving this instance; a planned record
+        // that is planned again and cannot be claimed is not progress.
+        const statusBefore = record.status;
+        try {
+          if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(record.cwd || process.cwd()) && record.mode !== "read") {
+            // Readers do not mutate the checkout, so only writers wait for journal recovery.
+            if (record.errorType !== "integration_recovery_pending") {
+              await updateQueueRecordDurable(record, {
+                status: "blocked",
+                errorType: "integration_recovery_pending",
+                errorReason: "Waiting for the repository's integration journal to recover (a quarantined integration blocks writers); see diagnose_opencode_bridge.",
+              });
+            }
+            continue;
           }
-          continue;
-        }
 
-        if (record.cancellationRequested) {
-          await updateQueueRecordDurable(record, {
-            status: "cancelled",
-            finishedAt: new Date().toISOString(),
-          });
-          continue;
-        }
-
-        const plannedPersistence = await updateQueueRecordDurable(record, { status: "planned" });
-        if (!plannedPersistence.persisted || record.status !== "planned") continue;
-        const conflict = await findQueueWriteConflict(record);
-        if (conflict) {
-          if (effectiveQueueWriteConflictPolicy() === "reject") {
+          if (record.cancellationRequested) {
             await updateQueueRecordDurable(record, {
-              status: "failed",
+              status: "cancelled",
               finishedAt: new Date().toISOString(),
-              errorType: "write_lock_conflict",
-              errorReason: `Write lock conflict on: ${conflict.paths[0] || "unknown"}`,
             });
-          } else {
-            await updateQueueRecordDurable(record, {
-              status: "blocked",
-              errorType: "write_lock_conflict",
-              errorReason: `Waiting for queued write job ${conflict.jobId} to release: ${conflict.paths.join(", ")}`,
-            });
+            continue;
           }
-          continue;
-        }
 
-        const started = await startQueueRecord(record);
-        if (started) capacity -= 1;
+          if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
+          if (record.status === "blocked") {
+            // An unchanged block needs no durable write: re-plan only once the cause is gone
+            // or has changed.
+            const standing = await findQueueWriteConflict(record);
+            if (standing && standing.errorType === record.errorType && standing.reason === record.errorReason) continue;
+          }
+
+          const ownerGeneration = record.ownerGeneration || "";
+          const plannedPersistence = await updateQueueRecordDurableReacquiringLease(record, { status: "planned" });
+          if (!plannedPersistence.persisted) {
+            if (queueRecordOwnedElsewhere(record, ownerGeneration) && QUEUE_JOBS.get(record.jobId) === record) {
+              // Another owner or generation holds the row now: stop covering it with this
+              // instance's lease so recovery can resume it.
+              QUEUE_JOBS.delete(record.jobId);
+              logEvent("warn", "queue.record_owned_elsewhere", { jobId: record.jobId, ownerGeneration });
+            }
+            continue;
+          }
+          if (record.status !== "planned") continue;
+          const conflict = await findQueueWriteConflict(record);
+          if (conflict) {
+            if (effectiveQueueWriteConflictPolicy() === "reject" && conflict.errorType !== "integration_recovery_pending") {
+              await updateQueueRecordDurable(record, {
+                status: "failed",
+                finishedAt: new Date().toISOString(),
+                errorType: "write_lock_conflict",
+                errorReason: `Write lock conflict on: ${conflict.paths[0] || "unknown"}`,
+              });
+            } else {
+              await updateQueueRecordDurable(record, {
+                status: "blocked",
+                errorType: conflict.errorType || "write_lock_conflict",
+                errorReason: conflict.reason || `Waiting for queued write job ${conflict.jobId} to release: ${conflict.paths.join(", ")}`,
+              });
+            }
+            continue;
+          }
+
+          const started = await startQueueRecord(record);
+          if (started) capacity -= 1;
+        } finally {
+          if (record.status !== statusBefore || QUEUE_JOBS.get(record.jobId) !== record) progressed = true;
+        }
       }
     } catch (error) {
       logEvent("warn", "queue.scheduler_failed", { error: error.message || String(error) });
     } finally {
+      queueSchedulerRunning = false;
       queueSchedulerActive = false;
       const records = [...QUEUE_JOBS.values()].filter((record) =>
-        record.mode === "read" || !INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(record.cwd || process.cwd()))
+        record.mode === "read" || !INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(record.cwd || process.cwd())
       );
       const hasCapacity = runningQueueRecords().length < CONFIG.queueParallelLimit;
-      const nextDelay = nextQueueScheduleDelay(records, hasCapacity);
+      const nextDelay = nextQueueScheduleDelay(records, hasCapacity, progressed || queueScheduleRequested);
+      queueScheduleRequested = false;
       if (nextDelay !== null) {
         scheduleQueue(nextDelay);
       }
     }
-  }, Math.max(0, Number(delayMs) || 0));
+  }, delay);
 }
 
 async function readPersistedQueueRecord(jobId, cwd = "") {
@@ -17850,9 +18277,10 @@ async function claimPersistedPipeline(record) {
       ? db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(authoritative.ownerInstanceId)
       : null;
     const ownerExpiresAt = Date.parse(owner?.lease_expires_at || "");
-    const sameLiveOwner = authoritative.ownerInstanceId === BRIDGE_INSTANCE_ID
+    const sameOwnerGeneration = authoritative.ownerInstanceId === BRIDGE_INSTANCE_ID
       && authoritative.ownerGeneration
-      && authoritative.ownerGeneration === record.ownerGeneration
+      && authoritative.ownerGeneration === record.ownerGeneration;
+    const sameLiveOwner = sameOwnerGeneration
       && Number.isFinite(expiresAt)
       && expiresAt > now;
     if (sameLiveOwner) {
@@ -17860,7 +18288,37 @@ async function claimPersistedPipeline(record) {
       transactionOpen = false;
       Object.assign(record, authoritative);
       PIPELINE_RUNS.set(record.pipelineId, record);
-      return { ok: true, record };
+      return { ok: true, record, alreadyOwnedLive: true };
+    }
+    if (sameOwnerGeneration) {
+      // This instance's own generation with a lapsed lease: nobody took it (a takeover writes
+      // a new generation), so renew it in place. Treating it as a foreign live owner left the
+      // pipeline unclaimable and every update failing until the bridge exited.
+      const renewedAt = new Date().toISOString();
+      const renewedLeaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
+      const renewed = db.prepare(`
+        UPDATE opencode_pipelines
+        SET owner_heartbeat_at = ?, owner_lease_expires_at = ?
+        WHERE pipeline_id = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
+      `).run(
+        renewedAt,
+        renewedLeaseExpiresAt,
+        record.pipelineId,
+        Number(authoritative.revision || 0),
+        BRIDGE_INSTANCE_ID,
+        authoritative.ownerGeneration
+      );
+      if (Number(renewed.changes || 0) !== 1) {
+        db.exec("ROLLBACK");
+        transactionOpen = false;
+        return { ok: false, reason: "concurrent_update" };
+      }
+      db.exec("COMMIT");
+      transactionOpen = false;
+      Object.assign(record, authoritative, { ownerHeartbeatAt: renewedAt, ownerLeaseExpiresAt: renewedLeaseExpiresAt });
+      PIPELINE_RUNS.set(record.pipelineId, record);
+      logEvent("warn", "pipeline.lease_reacquired", { pipelineId: record.pipelineId, ownerGeneration: record.ownerGeneration });
+      return { ok: true, record, reacquired: true };
     }
     if ((Number.isFinite(expiresAt) && expiresAt > now) || (Number.isFinite(ownerExpiresAt) && ownerExpiresAt > now)) {
       db.exec("COMMIT");
@@ -18021,7 +18479,7 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
           owner_instance_id = ?, owner_generation = ?, owner_heartbeat_at = ?, owner_lease_expires_at = ?,
           expected_child_count = ?, batch_state = ?, cleanup_state = ?, queue_mode = ?
       WHERE pipeline_id = ? AND revision = ? AND owner_instance_id = ? AND owner_generation = ?
-        AND owner_lease_expires_at > ?
+        AND owner_generation <> ''
         AND EXISTS (
           SELECT 1 FROM bridge_instances
           WHERE instance_id = opencode_pipelines.owner_instance_id AND lease_expires_at > ?
@@ -18047,15 +18505,25 @@ async function writePipelineRecordSnapshot(snapshot, { create = false, expectedR
       expected,
       committedSnapshot.ownerInstanceId || "",
       committedSnapshot.ownerGeneration || "",
-      commitAt,
       commitAt
     );
     if (updated.changes !== 1) {
-      const row = db.prepare("SELECT status, revision, record_json FROM opencode_pipelines WHERE pipeline_id = ?").get(snapshot.pipelineId);
+      const row = db.prepare(`
+        SELECT status, revision, record_json, owner_instance_id, owner_generation, owner_heartbeat_at,
+               owner_lease_expires_at, expected_child_count, batch_state, cleanup_state
+        FROM opencode_pipelines WHERE pipeline_id = ?
+      `).get(snapshot.pipelineId);
       const authoritative = row?.record_json ? {
         ...JSON.parse(row.record_json),
         status: row.status,
         revision: Number(row.revision || 0),
+        ownerInstanceId: row.owner_instance_id || "",
+        ownerGeneration: row.owner_generation || "",
+        ownerHeartbeatAt: row.owner_heartbeat_at || "",
+        ownerLeaseExpiresAt: row.owner_lease_expires_at || "",
+        expectedChildCount: Number(row.expected_child_count || 0),
+        batchState: row.batch_state || "unstarted",
+        cleanupState: row.cleanup_state || "none",
       } : null;
       throw pipelineConcurrentUpdateError(snapshot, authoritative);
     }
@@ -18120,7 +18588,14 @@ async function updatePipelineRecord(record, patch = {}) {
       return record;
     });
   } catch (error) {
-    if (error?.authoritative) Object.assign(record, error.authoritative);
+    // The authoritative row is the redacted durable summary (no final validation spec, no
+    // events, items without validation specs). Copy only the ownership and state fields;
+    // assigning all of it let the next write persist the stripped fields as the record.
+    if (error?.authoritative) {
+      for (const key of ["status", "revision", "ownerInstanceId", "ownerGeneration", "ownerHeartbeatAt", "ownerLeaseExpiresAt", "batchState", "cleanupState"]) {
+        if (Object.prototype.hasOwnProperty.call(error.authoritative, key)) record[key] = error.authoritative[key];
+      }
+    }
     logEvent("warn", "pipeline.persist_failed", {
       pipelineId: record.pipelineId,
       error: error.message || String(error),
@@ -20403,20 +20878,22 @@ function immutableReleasePluginModeError({
 
 async function verifyReleaseIntegrity() {
   const expected = String(process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 || "").trim().toLowerCase();
-  const serverPath = path.resolve(process.argv[1] || __filename);
+  // The module's own file, never argv[1]: imported (the self-test suite) argv[1] is the
+  // importer, and ESM has no __filename, so an empty argv[1] threw a ReferenceError.
+  const serverPath = BRIDGE_SERVER_PATH;
   if (expected) {
     const actual = await sha256File(serverPath);
     if (actual !== expected) {
       throw new Error(`Bridge release integrity check failed. Expected ${expected}, got ${actual}.`);
     }
   }
-  await verifyReleaseManifest(path.dirname(serverPath));
+  await verifyReleaseManifest(BRIDGE_RUNTIME_DIR);
   if (String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim()) {
     const pluginModeError = immutableReleasePluginModeError();
     if (pluginModeError) {
       throw new Error(`Bridge release integrity check failed. ${pluginModeError}`);
     }
-    const sourcePathError = releaseManagedSourcePathError(path.dirname(serverPath));
+    const sourcePathError = releaseManagedSourcePathError(BRIDGE_RUNTIME_DIR);
     if (sourcePathError) {
       throw new Error(`Bridge release integrity check failed. ${sourcePathError}`);
     }
@@ -20720,6 +21197,13 @@ function scheduleDeferredRecovery(delayMs) {
   deferredRecoveryTimer.unref?.();
 }
 
+// dbPath -> repository root keys with non-terminal integration operations at its last
+// successful scan, so a failed scan keeps its roots blocked.
+const INTEGRATION_RECOVERY_ROOTS_BY_DB = new Map();
+// root key -> last requalification attempt for a repository with only quarantined operations.
+const INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS = new Map();
+const INTEGRATION_QUARANTINE_RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
+
 async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   if (deferredRecoveryRunning) return;
   deferredRecoveryRunning = true;
@@ -20731,7 +21215,8 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   const candidates = [path.join(stateRoot, "bridge-state.sqlite")];
   const cleanupRecoveryCandidates = [];
   const pipelineAggregationCandidates = [];
-  const integrationRecoveryCandidates = new Set();
+  // root key -> { cwd, needsRecovery, quarantinedOnly }; only databases scanned in this pass.
+  const integrationRecoveryCandidates = new Map();
   try {
     const projectsDir = path.join(stateRoot, "projects");
     for (const entry of await readdir(projectsDir, { withFileTypes: true })) {
@@ -20740,7 +21225,15 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       }
     }
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    // A missing projects directory means no project databases yet. Any other error must not
+    // abort the pass (at startup it crashed the bridge): log it and recover what is readable.
+    if (error?.code !== "ENOENT") {
+      anyPending = true;
+      logEvent("warn", "state.recovery_projects_scan_failed", { errorCode: error?.code || "", error: redactSensitiveText(error?.message || String(error)) });
+    }
+  }
+  for (const knownDbPath of [...INTEGRATION_RECOVERY_ROOTS_BY_DB.keys()]) {
+    if (!candidates.includes(knownDbPath) || !existsSync(knownDbPath)) INTEGRATION_RECOVERY_ROOTS_BY_DB.delete(knownDbPath);
   }
   for (const dbPath of candidates) {
     if (!existsSync(dbPath)) continue;
@@ -20749,6 +21242,9 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
     if (memo && !memo.pending && memo.fingerprint === fingerprint) continue;
     let db = null;
     let dbPending = false;
+    let dbScanFailed = false;
+    let dbOperationsScanned = false;
+    const dbIntegrationRoots = new Set();
     try {
       db = new DatabaseSync(dbPath);
       db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, Number(busyTimeoutMs) || 250))};`);
@@ -20775,13 +21271,33 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         lease_expires_at TEXT NOT NULL
       )`);
       ensureIntegrationJournalSchema(db);
+      const scanAt = Date.now();
+      // An operation whose owner process holds a live lease while a serial-integration lock is
+      // active is an ordinary integration in progress (possibly in the other client's bridge),
+      // not something to recover: recovering it only failed on the serial lock and blocked
+      // the repository's writers with a false "quarantined integration" reason.
+      const serialIntegrationActive = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='locks'").get()
+        && db.prepare("SELECT 1 FROM locks WHERE lock_mode = 'serial_integration' AND expires_at > ? LIMIT 1").get(scanAt));
       for (const row of db.prepare(`
-        SELECT DISTINCT cwd FROM integration_operations
-        WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
-      `).all()) {
+        SELECT operation.cwd, operation.status,
+               EXISTS (
+                 SELECT 1 FROM bridge_instances AS instance
+                 WHERE instance.instance_id = operation.owner_instance_id AND instance.lease_expires_at > ?
+               ) AS owner_live
+        FROM integration_operations AS operation
+        WHERE operation.status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      `).all(new Date(scanAt).toISOString())) {
         dbPending = true;
-        if (row.cwd) integrationRecoveryCandidates.add(path.resolve(row.cwd));
+        if (!row.cwd) continue;
+        const rootKey = RepositoryRootSet.key(row.cwd);
+        dbIntegrationRoots.add(rootKey);
+        const live = row.status !== "quarantined" && Boolean(row.owner_live) && serialIntegrationActive;
+        const candidate = integrationRecoveryCandidates.get(rootKey) || { cwd: path.resolve(row.cwd), needsRecovery: false, quarantinedOnly: true };
+        if (!live) candidate.needsRecovery = true;
+        if (row.status !== "quarantined") candidate.quarantinedOnly = false;
+        integrationRecoveryCandidates.set(rootKey, candidate);
       }
+      dbOperationsScanned = true;
       const hasPipelines = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_pipelines'").get();
       if (hasPipelines) {
         ensurePipelineRevisionSchema(db);
@@ -20912,31 +21428,60 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       }
     } catch (error) {
       dbPending = true;
+      dbScanFailed = true;
       logEvent("warn", "queue.startup_recovery_failed", { dbPath, error: error.message || String(error) });
     } finally {
       if (db) closeDb(db);
       DEFERRED_RECOVERY_DB_MEMO.set(dbPath, { fingerprint, pending: dbPending });
       if (dbPending) anyPending = true;
+      // A database whose scan failed (SQLITE_BUSY at the short deferred busy timeout) keeps
+      // the roots it had: its quarantined repositories must not unblock for one pass.
+      if (!dbScanFailed || dbOperationsScanned) INTEGRATION_RECOVERY_ROOTS_BY_DB.set(dbPath, dbIntegrationRoots);
     }
   }
-  for (const blockedRoot of INTEGRATION_RECOVERY_BLOCKED_ROOTS) {
-    if (!integrationRecoveryCandidates.has(blockedRoot)) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(blockedRoot);
+  const knownIntegrationRoots = new Set();
+  for (const roots of INTEGRATION_RECOVERY_ROOTS_BY_DB.values()) {
+    for (const root of roots) knownIntegrationRoots.add(root);
   }
-  for (const cwd of integrationRecoveryCandidates) {
+  for (const blockedRoot of [...INTEGRATION_RECOVERY_BLOCKED_ROOTS]) {
+    if (!knownIntegrationRoots.has(blockedRoot)) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(blockedRoot);
+  }
+  for (const [rootKey, candidate] of integrationRecoveryCandidates) {
+    const { cwd } = candidate;
+    if (!candidate.needsRecovery) continue;
+    // A repository with only quarantined operations needs the requalification pass once per
+    // start and then every few minutes, not a repository-wide serial lock every 5 s.
+    const lastAttemptAt = INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.get(rootKey) || 0;
+    if (candidate.quarantinedOnly && lastAttemptAt && Date.now() - lastAttemptAt < INTEGRATION_QUARANTINE_RECOVERY_INTERVAL_MS) {
+      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
+      continue;
+    }
+    if (candidate.quarantinedOnly) INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.set(rootKey, Date.now());
     try {
       const recovery = await recoverIntegrationRepositorySerially(cwd);
+      if (!recovery.ok && recovery.errorType === "integration_recovery_lock_conflict") {
+        // Someone holds the repository's serial lock (a live integration, the other bridge's
+        // recovery): the state is unknown, so leave the blocked set as it is and retry later.
+        INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.delete(rootKey);
+        logEvent("info", "integration.startup_recovery_deferred", {
+          cwdSha256: createHash("sha256").update(cwd).digest("hex"),
+          errorType: recovery.errorType,
+        });
+        continue;
+      }
       if (!recovery.ok) {
-        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
         logEvent("error", "integration.startup_recovery_blocked", {
           cwdSha256: createHash("sha256").update(cwd).digest("hex"),
           errorType: recovery.errorType || "integration_recovery_quarantined",
           operationIds: recovery.operationIds || [],
         });
       } else {
-        INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(path.resolve(cwd));
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(cwd);
+        INTEGRATION_QUARANTINE_RECOVERY_ATTEMPTS.delete(rootKey);
       }
     } catch (error) {
-      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(path.resolve(cwd));
+      INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(cwd);
       logEvent("error", "integration.startup_recovery_failed", {
         cwdSha256: createHash("sha256").update(cwd).digest("hex"),
         errorType: error?.errorType || "integration_recovery_failed",
@@ -20945,10 +21490,12 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of pipelineAggregationCandidates) {
     try {
+      // A pipeline this process is finalizing or already drives live is not recovery's to touch.
+      if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok) continue;
+      if (!claim.ok || claim.alreadyOwnedLive || claim.reacquired) continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await refreshPipelineRecord(record);
     } catch (error) {
@@ -20960,10 +21507,15 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of cleanupRecoveryCandidates) {
     try {
+      // The live finalizer removes these worktrees itself; resuming its cleanup concurrently
+      // removed the same worktrees twice. Recovery resumes only cleanup nobody drives: a
+      // foreign or dead owner's, or this process's own once it rests in cleanup_failed.
+      if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok) continue;
+      if (!claim.ok || FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
+      if ((claim.alreadyOwnedLive || claim.reacquired) && record.status !== "cleanup_failed") continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await resumeAuthorizedPipelineCleanup(record);
     } catch (error) {
@@ -21047,6 +21599,21 @@ export const __selfTest = {
     BRIDGE_SERVER_PATH,
     CONFIG,
     CONTRACTOR_ALLOWED_SUBAGENTS,
+    FINALIZING_PIPELINE_IDS,
+    INTEGRATION_RECOVERY_BLOCKED_ROOTS,
+    awaitBridgeStartupRecovery,
+    blockQueueRecordAfterLockRefusal,
+    bridgeLaunchedAsMain,
+    claimPersistedPipeline,
+    commitQueueTerminalRecord,
+    heartbeatKnownQueueState,
+    queueHardLockRequestRefusal,
+    queueRequestFingerprint,
+    reacquirePersistedQueueRecordLease,
+    reconcileQueueStateAtStartup,
+    scopeContractDurableSummary,
+    sqliteUniqueConstraintError,
+    startQueueRecord,
     DEFAULT_FORBIDDEN_EDIT_PATHS,
     DEFAULT_OPENCODE_CONFIG_DIR,
     DEFAULT_OPENCODE_DATA_DIR,
@@ -21302,11 +21869,32 @@ export const __selfTest = {
     set worktreeCleanupTestHook(value) { worktreeCleanupTestHook = value; },
     get pipelineGateExecutorTestHook() { return pipelineGateExecutorTestHook; },
     set pipelineGateExecutorTestHook(value) { pipelineGateExecutorTestHook = value; },
+    get queueJobExecutorTestHook() { return queueJobExecutorTestHook; },
+    set queueJobExecutorTestHook(value) { queueJobExecutorTestHook = value; },
+    get queuePersistTestHook() { return queuePersistTestHook; },
+    set queuePersistTestHook(value) { queuePersistTestHook = value; },
+    get bridgeStartupRecovery() { return bridgeStartupRecovery; },
+    set bridgeStartupRecovery(value) { bridgeStartupRecovery = value; },
   },
 };
 
 // Imported by the self-test suite: register tools only, never connect or recover.
-const BRIDGE_RUN_AS_MAIN = normalizeFilesystemCase(path.resolve(process.argv[1] || "")) === normalizeFilesystemCase(BRIDGE_SERVER_PATH);
+// argv[1] is compared by real path: a launch through a junction or symlink, or as
+// `node server` (Node adds the extension), used to fail the plain path comparison, do
+// nothing and exit 0, which the client only saw as "connection closed".
+function bridgeLaunchedAsMain(argvPath = process.argv[1]) {
+  if (!argvPath) return false;
+  const resolved = path.resolve(String(argvPath));
+  const launched = existsSync(resolved) ? resolved : existsSync(`${resolved}.js`) ? `${resolved}.js` : "";
+  if (!launched) return false;
+  try {
+    return normalizeFilesystemCase(realpathSync(launched)) === normalizeFilesystemCase(realpathSync(BRIDGE_SERVER_PATH));
+  } catch {
+    return false;
+  }
+}
+
+const BRIDGE_RUN_AS_MAIN = bridgeLaunchedAsMain();
 
 if (!BRIDGE_RUN_AS_MAIN) {
   // Module import: the importer drives everything.
@@ -21331,9 +21919,17 @@ if (!BRIDGE_RUN_AS_MAIN) {
   if (!startupPluginPolicy.ok) {
     throw new Error(`OpenCode external plugin policy rejected startup: ${startupPluginPolicy.error}`);
   }
-  await reconcileQueueStateAtStartup();
-  void reclaimProvenGoneProviderQuarantines({ force: true });
-  void sweepStaleIndexScratchDirs();
+  // Connect first so the client's MCP startup timeout never waits on recovery; tool calls
+  // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
+  bridgeStartupRecovery = reconcileQueueStateAtStartup().catch((error) => {
+    logEvent("error", "state.startup_recovery_failed", {
+      errorType: error?.errorType || "startup_recovery_failed",
+      error: redactSensitiveText(error?.message || String(error)),
+    });
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  await bridgeStartupRecovery;
+  void reclaimProvenGoneProviderQuarantines({ force: true });
+  void sweepStaleIndexScratchDirs();
 }
