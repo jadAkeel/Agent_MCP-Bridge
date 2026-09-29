@@ -8,7 +8,7 @@ import { execFile, spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
@@ -3523,12 +3523,24 @@ async function readManagedSkillDebugMetadata(cwd, { forcePure = false, runtimeCo
   return runSingleFlight(managedSkillDebugFlights, key, read);
 }
 
-async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
+// Speed-up option 3 (user decision, 2026-09-29): a freshly created, proven-clean worktree holds
+// exactly its base tree, and OpenCode's project directory there is the worktree root, so every
+// such worktree of one repository and base tree attests the same (global inputs are in the cache
+// fingerprint). Keyed that way instead of by the new worktree path, which never repeated. The
+// final uncached pre-spawn attestation in runOpenCode still runs in each worktree.
+function agentMetadataCacheKey(agent, cwd, worktreeIdentity = null) {
+  const place = worktreeIdentity?.repoRoot && /^[0-9a-f]{40,64}$/i.test(String(worktreeIdentity.baseTree || ""))
+    ? `worktree\0${attestationCwdKey(worktreeIdentity.repoRoot)}\0${String(worktreeIdentity.baseTree).toLowerCase()}`
+    : attestationCwdKey(cwd);
+  return `agent-metadata\0${String(agent)}\0${place}`;
+}
+
+async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null, worktreeIdentity = null } = {}) {
   if (forcePure || runtimeContext) {
     return readAgentDebugMetadataUncached(agent, cwd, { forcePure, runtimeContext, verifiedPluginPolicy });
   }
   return cachedAttestation(
-    `agent-metadata\0${String(agent)}\0${attestationCwdKey(cwd)}`,
+    agentMetadataCacheKey(agent, cwd, worktreeIdentity),
     () => readAgentDebugMetadataUncached(agent, cwd, { verifiedPluginPolicy }),
     (value) => Boolean(value?.ok),
   );
@@ -9744,7 +9756,28 @@ async function captureGitIndexIdentity(cwd) {
   };
 }
 
-async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgnoredSource = false } = {}) {
+// Speed-up option 1 (user decision, 2026-09-29): a whole-tree capture of the TARGET checkout
+// starts from a copy of that checkout's own index, so `git add -A` re-reads only files whose
+// size or mtime changed (about 1 s instead of 12-19 s on 22,708 files). Trade-off accepted: a
+// rewrite that keeps a file's size and mtime is not seen. Never used for an agent's source
+// worktree: the agent controls that index, and stat data it wrote could make the reviewed patch
+// differ from the files. Falls back to the fresh index when any entry is assume-unchanged or
+// skip-worktree (git would not look at those files at all) or the index cannot be copied.
+async function seedIndexFromRealIndex(cwd, indexPath, gitEnv) {
+  const located = await runCommand("git", ["rev-parse", "--git-path", "index"], cwd, 1000 * 15);
+  if (located.exitCode !== 0 || !located.stdout.trim()) return false;
+  try {
+    await copyFile(path.resolve(cwd, located.stdout.trim()), indexPath);
+  } catch {
+    return false;
+  }
+  const entries = await runCommand("git", ["ls-files", "-v", "-z"], cwd, 1000 * 30, gitEnv);
+  if (entries.exitCode !== 0) return false;
+  // ls-files -v tags assume-unchanged entries in lower case and skip-worktree entries "S".
+  return !splitNulSeparated(entries.stdout).some((entry) => /^(?:[a-z]|S) /.test(entry));
+}
+
+async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgnoredSource = false, trustIndexStat = false } = {}) {
   let scratch = "";
   try {
     const sourcePath = path.resolve(cwd || process.cwd());
@@ -9789,11 +9822,17 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
         };
       }
     }
-    const readTree = await runCommand("git", ["read-tree", base.stdout.trim()], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv);
-    if (readTree.exitCode !== 0) {
-      return { ok: false, errorType: "integration_patch_create_failed", error: readTree.stderr || "Could not create an isolated temporary Git index." };
+    const seeded = trustIndexStat && !rejectIgnoredSource && await seedIndexFromRealIndex(sourcePath, indexPath, gitEnv);
+    if (!seeded) {
+      await rm(indexPath, { force: true });
+      const readTree = await runCommand("git", ["read-tree", base.stdout.trim()], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv);
+      if (readTree.exitCode !== 0) {
+        return { ok: false, errorType: "integration_patch_create_failed", error: readTree.stderr || "Could not create an isolated temporary Git index." };
+      }
     }
-    const add = await integrationTimed("freshIndexHash", () => runCommand("git", ["add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv));
+    // The temporary index must stay a plain, self-contained file: no split index or untracked
+    // cache written next to the repository's own index, no fsmonitor answers.
+    const add = await integrationTimed(seeded ? "seededIndexHash" : "freshIndexHash", () => runCommand("git", ["-c", "core.splitIndex=false", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false", "add", "-A", "--", "."], sourcePath, CONFIG.gitHeavyTimeoutMs, gitEnv));
     if (add.exitCode !== 0) {
       return { ok: false, errorType: "integration_patch_create_failed", error: add.stderr || "Could not populate the isolated temporary Git index." };
     }
@@ -10317,7 +10356,8 @@ async function integrationTimed(name, fn) {
 const INTEGRATION_PHASE_LABELS = Object.freeze({
   targetState: "full target identity (status + fresh-index content hash of every file)",
   sourcePatch: "source worktree patch (fresh-index content hash of every file)",
-  freshIndexHash: "git add -A into a fresh temporary index (inside the two above)",
+  freshIndexHash: "git add -A into a fresh temporary index: every file re-read (source captures)",
+  seededIndexHash: "git add -A into a copy of the target's index: only changed files re-read",
   changedFileSnapshot: "changed-file snapshot",
   rollbackBaseline: "rollback baseline",
   simulate: "patch simulation in an isolated index",
@@ -10350,7 +10390,7 @@ async function captureIntegrationTargetStateUntimed(cwd) {
   const targetHead = head.stdout.trim();
   const targetTree = tree.stdout.trim();
   const statusSha256 = createHash("sha256").update(status.stdout || "").digest("hex");
-  const workingPatch = await createPatchFromWorkingTree(cwd, targetHead);
+  const workingPatch = await createPatchFromWorkingTree(cwd, targetHead, { trustIndexStat: true });
   if (!workingPatch.ok) {
     return { ok: false, errorType: "integration_target_state_failed", error: workingPatch.error || "Could not hash integration target working content." };
   }
@@ -11224,7 +11264,11 @@ async function integratePatchWithoutSerialLock({
     if (typeof beforeApplyHook === "function") {
       await beforeApplyHook({ targetCwd, patch, targetState: finalPreApplyState });
     }
-    const immediatePreApplyState = await captureIntegrationTargetState(targetCwd);
+    // Speed-up option 2 (user decision, 2026-09-29): with no hook between them this capture only
+    // repeated finalPreApplyState a moment later; it is kept where a hook runs in between.
+    const immediatePreApplyState = typeof beforeApplyHook === "function"
+      ? await captureIntegrationTargetState(targetCwd)
+      : finalPreApplyState;
     if (!immediatePreApplyState.ok || immediatePreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       let unresolvedFiles = [];
       try {
@@ -17230,7 +17274,10 @@ async function executeOpenCodeJob(requestedJob, {
     }
     const finalAgentMetadata = dryRun
       ? agentMetadata
-      : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+      : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, {
+        forcePure,
+        worktreeIdentity: worktree ? { repoRoot: worktree.repoRoot, baseTree: worktree.baseTree } : null,
+      });
     const finalMetadataPolicyError = effectiveReadOnlyMetadataError(
       finalAgentMetadata,
       lockPlan,
@@ -23889,6 +23936,8 @@ async function runProviderLeaseWorker() {
 // variables through the live accessors in __selfTest.hooks.
 export const __selfTest = {
   internals: {
+    agentMetadataCacheKey,
+    seedIndexFromRealIndex,
     createPhaseClock,
     directRunAuditStore,
     formatIntegrationTimings,

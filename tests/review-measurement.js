@@ -361,15 +361,17 @@ test("B-026: integration reports its phases and rehashes each tree fewer times",
   assert.equal(applied.status, "applied");
   assert.equal(applied.sourceCleanup?.cleanup, "success", JSON.stringify(applied.sourceCleanup));
   // Before: 7 target and 3 source whole-tree captures. Now: receipt check, final pre-apply,
-  // immediate pre-apply, integrated state and the cleanup recheck; source twice.
-  assert.equal(applyTimings.targetState.count, 5, JSON.stringify(applyTimings));
+  // integrated state and the cleanup recheck (the immediate repeat runs only with a hook);
+  // source twice. Target captures start from the target index (speed-up option 1).
+  assert.equal(applyTimings.targetState.count, 4, JSON.stringify(applyTimings));
   assert.equal(applyTimings.sourcePatch.count, 2, JSON.stringify(applyTimings));
   assert.equal(applyTimings.worktreeRemove.count, 1);
   assert.equal(applyTimings.validation.count, 1);
   const text = formatIntegrationTimings({ totalMs: 10, phases: applyTimings });
   assert.match(text, /^Integration timing: total 10 ms\n/);
-  assert.match(text, /targetState: \d+ ms over 5 call\(s\)/);
-  assert.match(text, /freshIndexHash: \d+ ms over 7 call\(s\)/);
+  assert.match(text, /targetState: \d+ ms over 4 call\(s\)/);
+  assert.match(text, /freshIndexHash: \d+ ms over 2 call\(s\)/);
+  assert.match(text, /seededIndexHash: \d+ ms over 4 call\(s\)/);
   await git(["reset", "-q", "--hard", "HEAD"]);
 });
 
