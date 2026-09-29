@@ -5243,7 +5243,18 @@ async function runSelfTests() {
     assert.equal(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "integrated allowed\n");
     assert.equal(await readFile(path.join(tempDir, "src", "api.txt"), "utf8"), "validation worktree B\n");
     assert.equal((await runCommand("git", ["restore", "--staged", "--worktree", "--", "src/api.txt"], tempDir, 1000 * 15)).exitCode, 0);
-    await clearSelfTestIntegrationQuarantine();
+    // The staged path (src/api.txt) is outside the patch: recovery judges the affected path's
+    // index entry only, so the failed integration is rolled back and nothing is quarantined.
+    const validationIndexJournal = await openLockDb(tempDir);
+    try {
+      assert.equal(
+        Number(validationIndexJournal.prepare("SELECT COUNT(*) AS count FROM integration_operations WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')").get(path.resolve(tempDir)).count),
+        0,
+        "Index drift outside the patch does not quarantine the repository."
+      );
+    } finally {
+      closeDb(validationIndexJournal);
+    }
     assert.equal((await cleanupWorktree(validationIndexWorktree, "always", true)).cleanup, "success");
 
     await writeFile(path.join(tempDir, "src", "delete-me.txt"), "delete rollback sentinel\n", "utf8");
