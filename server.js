@@ -5361,10 +5361,14 @@ function normalizeLockPath(value) {
     .replace(/\/+/g, "/");
   // Only "dir/**" means the whole directory. "dir/*" is one level and stays a glob:
   // stripping it turned allowedEdits ["src/cli/*"] into "src/cli", which allowed src/cli/deep/x.ts.
-  const normalized = slashNormalized
-    .replace(/\/+$/, "")
-    .replace(/\/\*\*$/, "")
-    .replace(/\/+$/, "");
+  // A plain directory name already covers its subtree, so its "/**" is dropped. With wildcards
+  // before the suffix ("**/secrets/**", "**/.git/**") the path is matched as a glob, where
+  // "**/secrets" is only a directory named secrets: dropping the suffix there let
+  // pkg/secrets/credentials.txt pass the forbidden rule. globToRegex reads the kept suffix.
+  let normalized = slashNormalized.replace(/\/+$/, "");
+  if (normalized.endsWith("/**") && !/[*?[\]{}!]/.test(normalized.slice(0, -3))) {
+    normalized = normalized.slice(0, -3).replace(/\/+$/, "");
+  }
   return normalized || (slashNormalized.startsWith("/") ? "/" : "");
 }
 
@@ -5959,7 +5963,13 @@ function globSourceToRegex(glob) {
 }
 
 function globToRegex(pattern, matchDescendants = false) {
-  const normalized = normalizeLockPath(pattern);
+  let normalized = normalizeLockPath(pattern);
+  // A glob directory pattern ("**/secrets/**") keeps its suffix through normalizeLockPath and
+  // means the directory and everything below it, whatever the caller passes for the flag.
+  if (normalized.endsWith("/**")) {
+    normalized = normalized.slice(0, -3);
+    matchDescendants = true;
+  }
   const regex = globSourceToRegex(normalized);
   return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
 }
@@ -13543,6 +13553,7 @@ async function acquireHardLock({
   const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin, editsCheckout: lockEditsCheckout };
 
   let committed = false;
+  let commitAttempted = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     if (normalizedLockType !== "read" && !recoveryAuthority) {
@@ -13590,6 +13601,7 @@ async function acquireHardLock({
     // rows) reported the acquire as rejected while the lock rows stayed committed with a
     // token nobody had, orphaning the lock for its whole TTL.
     const activeLocks = listLocksFromDb(db, now);
+    commitAttempted = true;
     db.exec("COMMIT");
     committed = true;
 
@@ -13617,6 +13629,22 @@ async function acquireHardLock({
         db.exec("ROLLBACK");
       } catch {
         // Ignore rollback errors after failed begin/commit.
+      }
+    }
+    // COMMIT can report an error after its rows are durable, and anything that throws after it
+    // lands here too. This acquire is reported as failed and nobody holds the token, so a row
+    // that did commit would stay locked for the whole TTL (up to a day). Remove what this call
+    // inserted, identified by its own run id and fresh token, so a failed acquire never leaves
+    // a lock. The DELETE is a no-op when the transaction rolled back.
+    if (commitAttempted) {
+      try {
+        db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(runId, tokenSha256);
+        db.prepare("UPDATE runs SET status = 'released', finished_at = ? WHERE run_id = ? AND status = 'running'").run(Date.now(), runId);
+      } catch (cleanupError) {
+        logEvent("error", "lock.acquire_cleanup_failed", {
+          lockId: runId,
+          error: cleanupError?.message || String(cleanupError),
+        });
       }
     }
     return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
