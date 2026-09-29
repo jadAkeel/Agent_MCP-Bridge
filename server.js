@@ -540,7 +540,11 @@ function readPositiveIntEnv(name, fallback) {
 }
 
 function readNonNegativeIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
+  // Blank is unset: Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS="" silently
+  // disabled progress heartbeats instead of keeping the default.
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
+  const value = Number(raw);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
@@ -575,9 +579,19 @@ function readCsvEnv(name, fallback = []) {
   return [...new Set(String(raw).split(",").map((item) => item.trim()).filter(Boolean))];
 }
 
+// Windows editors (Notepad, PowerShell 5 Out-File) write UTF-8 with a byte-order mark, which
+// JSON.parse rejects. Callers hash the raw bytes first; only the parse ignores the BOM.
+function parseJsonText(text) {
+  return JSON.parse(String(text).replace(/^\uFEFF/, ""));
+}
+
 function readChoiceEnv(name, allowedValues, fallback) {
+  // An unknown value used to fall back silently (WORKTREE_MODE=writes ran writers in the
+  // checkout with worktrees off). Unset or blank keeps the default; anything else must be listed.
   const value = String(process.env[name] || "").trim().toLowerCase();
-  return allowedValues.includes(value) ? value : fallback;
+  if (!value) return fallback;
+  if (allowedValues.includes(value)) return value;
+  throw new Error(`${name} must be one of ${allowedValues.join(", ")} (or unset for ${fallback}); got ${JSON.stringify(String(process.env[name]).trim())}.`);
 }
 
 async function runSingleFlight(flights, key, operation) {
@@ -3860,10 +3874,44 @@ function exactPluginPackageName(specifier) {
   return separator > 0 ? value.slice(0, separator) : "";
 }
 
+// OpenCode config files the plugin policy must account for. Every bridge child runs with
+// OPENCODE_DISABLE_PROJECT_CONFIG=true (buildOpenCodeEnv), so OpenCode never loads a
+// repository's opencode.json(c); counting those files rejected every repository that ships
+// its own plugin config. They are skipped (and logged) while that flag is enforced; project
+// plugin directories are still checked, and the `debug config` effective-plugin attestation
+// still fails closed if OpenCode ever loads a plugin the manifest does not pin.
+function pluginConfigCandidatePaths(projectDirectories = [], managedDirectories = [], {
+  projectConfigDisabled = buildOpenCodeEnv().OPENCODE_DISABLE_PROJECT_CONFIG === "true",
+} = {}) {
+  const projectCandidates = projectDirectories.flatMap((directory) => [
+    path.join(directory, "opencode.json"),
+    path.join(directory, "opencode.jsonc"),
+    path.join(directory, ".opencode", "opencode.json"),
+    path.join(directory, ".opencode", "opencode.jsonc"),
+  ]).map((item) => path.resolve(item));
+  if (projectConfigDisabled) {
+    const ignored = projectCandidates.filter((item) => existsSync(item));
+    if (ignored.length) {
+      logEvent("info", "plugin.project_config_ignored", {
+        reason: "OPENCODE_DISABLE_PROJECT_CONFIG=true",
+        files: ignored.slice(0, 8),
+      });
+    }
+  }
+  return [...new Set([
+    path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.json"),
+    path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.jsonc"),
+    ...managedDirectories.flatMap((directory) => [path.join(directory, "opencode.json"), path.join(directory, "opencode.jsonc")]),
+    ...(projectConfigDisabled ? [] : projectCandidates),
+  ].map((item) => path.resolve(item)))];
+}
+
 function expectedOpenCodePluginResolution(specifier) {
   const packageName = exactPluginPackageName(specifier);
   if (!packageName) return null;
-  const root = path.join(USER_HOME_DIR, ".cache", "opencode", "packages", specifier);
+  // OpenCode resolves packages under $XDG_CACHE_HOME/opencode, and buildOpenCodeEnv() sets
+  // XDG_CACHE_HOME to DEFAULT_OPENCODE_CACHE_HOME; a hard-coded ~/.cache checked another tree.
+  const root = path.join(DEFAULT_OPENCODE_CACHE_HOME, "opencode", "packages", specifier);
   return {
     root: path.resolve(root),
     packageRoot: path.resolve(path.join(root, "node_modules", packageName)),
@@ -3891,7 +3939,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     if (actualManifestSha256 !== CONFIG.expectedExternalPluginManifestSha256) {
       throw new Error(`External plugin manifest hash mismatch. Expected ${CONFIG.expectedExternalPluginManifestSha256}, got ${actualManifestSha256}.${await staleBridgeProcessHint(actualManifestSha256)}`);
     }
-    const manifest = JSON.parse(manifestContent.toString("utf8"));
+    const manifest = parseJsonText(manifestContent.toString("utf8"));
     if (manifest?.version !== 1 || !Array.isArray(manifest.plugins) || !manifest.plugins.length
       || !Array.isArray(manifest.configs) || !manifest.configs.length
       || !Array.isArray(manifest.settings) || !manifest.settings.length
@@ -3930,17 +3978,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
 
     const projectDirectories = await openCodeProjectConfigDirectories(cwd);
     const managedDirectories = managedOpenCodeConfigDirectories();
-    const configCandidates = [...new Set([
-      path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.json"),
-      path.join(DEFAULT_OPENCODE_CONFIG_DIR, "opencode.jsonc"),
-      ...managedDirectories.flatMap((directory) => [path.join(directory, "opencode.json"), path.join(directory, "opencode.jsonc")]),
-      ...projectDirectories.flatMap((directory) => [
-        path.join(directory, "opencode.json"),
-        path.join(directory, "opencode.jsonc"),
-        path.join(directory, ".opencode", "opencode.json"),
-        path.join(directory, ".opencode", "opencode.jsonc"),
-      ]),
-    ].map((item) => path.resolve(item)))];
+    const configCandidates = pluginConfigCandidatePaths(projectDirectories, managedDirectories);
     const activeConfigs = (await Promise.all(configCandidates.map(readPluginConfigSource))).filter(Boolean);
     const configuredManifestPaths = new Set(manifest.configs.map((item) => path.resolve(String(item?.path || ""))));
     const pluginBearingConfigPaths = new Set(activeConfigs.filter((item) => item.specs.length).map((item) => item.path));
@@ -3993,7 +4031,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       if (packageDetails.isSymbolicLink() || !packageDetails.isDirectory()) {
         throw new Error(`External plugin package root is not a real directory: ${plugin.specifier}.`);
       }
-      const packageJson = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
+      const packageJson = parseJsonText(await readFile(path.join(packageRoot, "package.json"), "utf8"));
       const expectedName = plugin.specifier.replace(/@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "");
       const expectedVersion = plugin.specifier.slice(expectedName.length + 1);
       if (packageJson.name !== expectedName || packageJson.version !== expectedVersion) {
@@ -4009,7 +4047,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       if (await sha256File(settingPath) !== setting.sha256) {
         throw new Error(`Pinned external plugin settings changed: ${settingPath}`);
       }
-      const parsed = JSON.parse(await readFile(settingPath, "utf8"));
+      const parsed = parseJsonText(await readFile(settingPath, "utf8"));
       for (const [key, expected] of Object.entries(setting.requiredValues || {})) {
         if (parsed[key] !== expected) {
           throw new Error(`External plugin security setting ${key} does not match the pinned value.`);
@@ -4209,7 +4247,7 @@ async function verifySanitizedWorkspace(contract, phase = "manual") {
     if (actualManifestSha256 !== parsedContract.manifestSha256.toLowerCase()) {
       throw new Error(`Sanitized workspace manifest hash mismatch. Expected ${parsedContract.manifestSha256.toLowerCase()}, got ${actualManifestSha256}.`);
     }
-    const manifest = JSON.parse(manifestContent.toString("utf8"));
+    const manifest = parseJsonText(manifestContent.toString("utf8"));
     if (manifest?.version !== 1 || !manifest.files || typeof manifest.files !== "object" || Array.isArray(manifest.files) || !Array.isArray(manifest.directories)) {
       throw new Error("Sanitized workspace manifest must contain version 1, a files object, and an exact directories array.");
     }
@@ -5172,7 +5210,7 @@ async function loadProjectAgentPolicy(
         trustedForAuthority = false;
       }
     }
-    const raw = JSON.parse(content);
+    const raw = parseJsonText(content);
     if (raw?.requiresWorktrees === false) {
       return {
         ok: false,
@@ -5589,7 +5627,9 @@ const dependencyRequestPayloadSchema = z.object({
 // still fails, so a real request written as prose ("DEPENDENCY_REQUIRED numpy") is not lost.
 const DEPENDENCY_ABSENT = /^(?:[-\u2013\u2014:]\s*)?(?:none|n\/a|no|not\s+(?:required|needed|applicable)|nothing)\b/i;
 function parseDependencyRequest(text) {
-  const match = String(text || "").match(/^DEPENDENCY_REQUIRED\s+([^\r\n]+)\s*$/m);
+  // Horizontal whitespace only: \s+ crossed the line break, so a bare "DEPENDENCY_REQUIRED"
+  // heading captured the next line of the report as the payload.
+  const match = String(text || "").match(/^DEPENDENCY_REQUIRED[ \t]+([^\r\n]+?)[ \t]*\r?$/m);
   if (!match) return { request: null, error: "" };
   if (DEPENDENCY_ABSENT.test(match[1].trim())) return { request: null, error: "" };
   try {
@@ -6258,6 +6298,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   }
 
   let lastResult = null;
+  let attemptsMade = 0;
   const childExecutionIntervals = [];
   const policyStarted = nowMs();
   // The retry budget bounds retries; it must never shorten the first attempt below the
@@ -6275,6 +6316,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
       onSpawn,
       onSupervisorHeartbeat,
     });
+    attemptsMade = attempt + 1;
     childExecutionIntervals.push(...(lastResult.childExecutionIntervals || []));
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
     lastResult.retryAttempt = attempt;
@@ -6296,13 +6338,29 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     }
   }
 
+  return readOnlyRetryBudgetExhaustedResult(lastResult, attemptsMade, maxReadOnlyAgentRetries);
+}
+
+// The loop above leaves early when the retry budget cannot fit another attempt. A single
+// timed-out attempt was then reported as read_only_agent_unavailable "after 3 bounded
+// attempts" with retryAttempt 0; report the attempts actually made, and keep agent_timeout
+// when the last attempt timed out.
+function readOnlyRetryBudgetExhaustedResult(lastResult, attemptsMade, maxRetries = maxReadOnlyAgentRetries) {
+  const attempts = Math.max(1, Number(attemptsMade) || 0);
+  const attemptText = `${attempts} bounded attempt${attempts === 1 ? "" : "s"}`;
+  const timedOut = isTimeoutResult(lastResult);
   return {
     ...lastResult,
     readOnlyUnavailable: true,
-    errorType: "read_only_agent_unavailable",
+    retryAttempt: attempts - 1,
+    maxRetries,
+    attemptsMade: attempts,
+    errorType: timedOut ? "agent_timeout" : "read_only_agent_unavailable",
     stderr: [
       lastResult?.stderr || "",
-      `Read-only agent remained unavailable after ${maxReadOnlyAgentRetries + 1} bounded attempts and was marked unavailable.`,
+      timedOut
+        ? `Read-only agent timed out; the retry budget left no room for another attempt after ${attemptText}.`
+        : `Read-only agent remained unavailable after ${attemptText} and was marked unavailable.`,
     ].filter(Boolean).join("\n"),
   };
 }
