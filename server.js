@@ -21221,15 +21221,12 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of pipelineAggregationCandidates) {
     try {
-      // The live finalizer removes these worktrees itself; resuming its cleanup concurrently
-      // removed the same worktrees twice. Recovery resumes only cleanup nobody drives: a
-      // foreign or dead owner's, or this process's own once it rests in cleanup_failed.
+      // A pipeline this process is finalizing or already drives live is not recovery's to touch.
       if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok || FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
-      if ((claim.alreadyOwnedLive || claim.reacquired) && record.status !== "cleanup_failed") continue;
+      if (!claim.ok || claim.alreadyOwnedLive || claim.reacquired) continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await refreshPipelineRecord(record);
     } catch (error) {
@@ -21241,12 +21238,15 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const candidate of cleanupRecoveryCandidates) {
     try {
-      // A pipeline this process is finalizing or already drives live is not recovery's to touch.
+      // The live finalizer removes these worktrees itself; resuming its cleanup concurrently
+      // removed the same worktrees twice. Recovery resumes only cleanup nobody drives: a
+      // foreign or dead owner's, or this process's own once it rests in cleanup_failed.
       if (FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
       const record = await readPersistedPipelineRecord(candidate.pipelineId, candidate.cwd);
       if (!record) continue;
       const claim = await claimPersistedPipeline(record);
-      if (!claim.ok || claim.alreadyOwnedLive || claim.reacquired) continue;
+      if (!claim.ok || FINALIZING_PIPELINE_IDS.has(candidate.pipelineId)) continue;
+      if ((claim.alreadyOwnedLive || claim.reacquired) && record.status !== "cleanup_failed") continue;
       PIPELINE_RUNS.set(record.pipelineId, record);
       await resumeAuthorizedPipelineCleanup(record);
     } catch (error) {
