@@ -651,7 +651,12 @@ async function runSelfTests() {
       await writeFile(path.join(headMoveRoot, "log.md"), "rewritten\n", "utf8");
       await git("commit", "-qam", "rewrite");
       const rewritten = (await git("rev-parse", "HEAD")).stdout.trim();
-      assert.equal(await readOnlyHeadMove(readPlan, headMoveRoot, docsOnly, rewritten), null, "A HEAD that did not move forward is not explained away.");
+      // A reader cannot move HEAD, so a rewritten history (commit --amend, pull --rebase by the
+      // user) is kept and reported as non-fast-forward instead of failing the review.
+      const rewrittenMove = await readOnlyHeadMove(readPlan, headMoveRoot, docsOnly, rewritten);
+      assert.equal(rewrittenMove?.nonFastForward, true, "A non-fast-forward HEAD move keeps the read-only result.");
+      assert.match(formatReadOnlyHeadMove(rewrittenMove), /non-fast-forward/);
+      assert.equal(await readOnlyHeadMove({ lockType: "write", scopeContract: readPlan.scopeContract }, headMoveRoot, docsOnly, rewritten), null);
     } finally {
       await rm(headMoveRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
     }
@@ -3888,17 +3893,24 @@ async function runSelfTests() {
       await mkdir(path.join(tempDir, "big-ignored-build", "obj", name), { recursive: true });
       await writeFile(path.join(tempDir, "big-ignored-build", "obj", name, "unit.o"), "o", "utf8");
     }
+    // Ignored entries are listed with --directory (a regenerable directory is one "dir/" entry,
+    // so a large node_modules/ or .venv/ no longer overflows the capture budget); a wholly
+    // ignored non-regenerable directory is walked down to its regenerable subdirectories.
     const ignoredEntries = (await gitChangedFiles(tempDir, { includeIgnored: true })).filter((file) => file.startsWith("big-ignored-build"));
-    assert.equal(ignoredEntries.length, 3, `Ignored files are listed individually: ${JSON.stringify(ignoredEntries)}`);
-    const grouped = groupIgnoredFiles(["z.log", ...ignoredEntries, ".venv/lib/site.py", "src/pkg/__pycache__/m.pyc", "src/pkg/.env", "build/.env"], { cwd: tempDir });
+    assert.deepEqual(ignoredEntries, ["big-ignored-build/obj/"], `A regenerable ignored directory is one entry: ${JSON.stringify(ignoredEntries)}`);
+    const ignoredBuildFiles = ["a", "b", "c"].map((name) => `big-ignored-build/obj/${name}/unit.o`);
+    const grouped = groupIgnoredFiles(["z.log", ...ignoredBuildFiles, ".venv/lib/site.py", "src/pkg/__pycache__/m.pyc", "src/pkg/.env", "build/.env"], { cwd: tempDir });
     assert.deepEqual([...grouped.keys()].sort(), [".venv/", "big-ignored-build/obj/", "build/.env", "src/pkg/.env", "src/pkg/__pycache__/", "z.log"]);
     assert.equal(grouped.get("big-ignored-build/obj/").length, 3);
-    assert.equal(groupIgnoredFiles(ignoredEntries.slice(0, 1), { cwd: tempDir }).has("big-ignored-build/obj/"), true, "Grouping must not depend on how many ignored files exist.");
+    assert.equal(groupIgnoredFiles(ignoredBuildFiles.slice(0, 1), { cwd: tempDir }).has("big-ignored-build/obj/"), true, "Grouping must not depend on how many ignored files exist.");
+    assert.equal(groupIgnoredFiles(ignoredEntries, { cwd: tempDir }).has("big-ignored-build/obj/"), true, "A directory entry groups under itself.");
     assert.throws(() => groupIgnoredFiles(["a.log", "b.log", "c.log"], { limit: 2 }), /ignored entries outside build\/cache directories/);
     const buildSnapshotBefore = await gitChangedFileSnapshot(tempDir);
     assert.equal(buildSnapshotBefore.has("big-ignored-build/obj/"), true);
     await writeFile(path.join(tempDir, "big-ignored-build", "obj", "a", "new.o"), "o", "utf8");
-    assert.deepEqual(changedFilesBetween(buildSnapshotBefore, await gitChangedFileSnapshot(tempDir)), ["big-ignored-build/obj/"], "A file added inside an ignored build directory changes only its group.");
+    assert.deepEqual(changedFilesBetween(buildSnapshotBefore, await gitChangedFileSnapshot(tempDir)), [], "A regenerable ignored directory is fingerprinted by name, so build output inside it is not a change.");
+    await writeFile(path.join(tempDir, "big-ignored-build", "obj", "a", ".env"), "TOKEN=x\n", "utf8");
+    assert.deepEqual(changedFilesBetween(buildSnapshotBefore, await gitChangedFileSnapshot(tempDir)), ["big-ignored-build/obj/a/.env"], "A forbidden-looking file inside a collapsed ignored directory keeps its own entry.");
     await rm(path.join(tempDir, "big-ignored-build"), { recursive: true, force: true });
     await writeFile(excludePath, excludeBefore, "utf8");
 

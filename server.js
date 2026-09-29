@@ -4543,7 +4543,7 @@ function realPathBoundaryReason(rawPath, cwd) {
     const realRoot = realpathSync(root);
     const realNearest = realpathSync(nearest);
     const relativeReal = path.relative(realRoot, realNearest);
-    if (relativeReal.startsWith("..") || path.isAbsolute(relativeReal)) {
+    if (pathRelativeEscapes(relativeReal) || path.isAbsolute(relativeReal)) {
       return `Path ${JSON.stringify(rawPath)} resolves through a symlink or junction outside the allowed root ${realRoot}.`;
     }
 
@@ -4592,7 +4592,7 @@ function unsafePathReason(paths, cwd = "") {
     if (isAbsolutePathLike(normalized) && root) {
       const resolved = path.resolve(normalized);
       const relative = path.relative(root, resolved);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      if (!relative || pathRelativeEscapes(relative) || path.isAbsolute(relative)) {
         return `Unsafe path ${label} resolves outside the allowed root ${root}.`;
       }
     }
@@ -5966,21 +5966,84 @@ async function runGitReadOnlyCommand(args, cwd, timeoutMs = 1000 * 15, commandRu
   return result;
 }
 
+// Ignored entries, listed with --directory so a wholly ignored node_modules/ or .venv/ is one
+// "dir/" entry: listing every file in them exceeded the 30 MB capture budget in large
+// checkouts and every snapshot then failed closed. A wholly ignored directory that is not a
+// regenerable build/cache directory (.idea/, logs/, secrets/) is walked so its files keep
+// their own entries; regenerable directories inside it stay one entry, by name.
+function ignoredEntryIsRegenerable(entry) {
+  const segments = String(entry || "").split("/");
+  const directories = entry.endsWith("/") ? segments.filter(Boolean) : segments.slice(0, -1);
+  return directories.some((segment) => REGENERABLE_IGNORED_DIRECTORY.test(segment));
+}
+
+async function expandIgnoredDirectoryEntries(cwd, entries, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
+  const base = path.resolve(cwd || process.cwd());
+  const expanded = [];
+  const limitError = () => {
+    const error = new Error(`Ignored-file snapshot limit exceeded: more than ${limit} ignored entries outside build/cache directories exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${limit}.`);
+    error.errorType = "snapshot_safety_limit_exceeded";
+    return error;
+  };
+  for (const entry of entries) {
+    if (!entry.endsWith("/") || ignoredEntryIsRegenerable(entry)) {
+      expanded.push(entry);
+      continue;
+    }
+    const stack = [entry.replace(/\/+$/, "")];
+    while (stack.length) {
+      const directory = stack.pop();
+      let children;
+      try {
+        children = await readdir(path.join(base, ...directory.split("/")), { withFileTypes: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") expanded.push(`${directory}/`);
+        continue;
+      }
+      if (children.some((child) => child.name === ".git")) {
+        expanded.push(`${directory}/`);
+        continue;
+      }
+      for (const child of children) {
+        const childPath = `${directory}/${child.name}`;
+        if (child.isDirectory()) {
+          if (REGENERABLE_IGNORED_DIRECTORY.test(child.name)) expanded.push(`${childPath}/`);
+          else stack.push(childPath);
+        } else {
+          expanded.push(childPath);
+        }
+      }
+      if (expanded.length > limit + entries.length) throw limitError();
+    }
+  }
+  return expanded;
+}
+
+function splitNulSeparated(stdout) {
+  return String(stdout || "").split("\0").filter(Boolean);
+}
+
 async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
+  // --no-renames: a staged `git mv forbidden/x allowed/x` otherwise lists only the destination
+  // and the forbidden deletion passed scope validation. -z: exact paths, no quoting.
   const commands = [
-    runGitReadOnlyCommand(["diff", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["diff", "--cached", "--name-only"], cwd, 1000 * 15),
-    runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["diff", "--name-only", "--no-renames", "-z"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["diff", "--cached", "--name-only", "--no-renames", "-z"], cwd, 1000 * 15),
+    runGitReadOnlyCommand(["ls-files", "--others", "--exclude-standard", "-z"], cwd, 1000 * 15),
   ];
   if (includeIgnored) {
-    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard"], cwd, 1000 * 30));
+    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"], cwd, 1000 * 30));
+    // Forbidden-looking ignored files (.env, *.pem, *.key, secrets/) keep their own entry even
+    // inside a directory --directory collapsed; the pathspec keeps this listing small.
+    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...FORBIDDEN_LOOKING_PATHSPECS], cwd, 1000 * 30));
   }
-  const [workingTreeDiff, stagedDiff, untracked, ignored] = await Promise.all(commands);
+  const [workingTreeDiff, stagedDiff, untracked, ignored, forbiddenIgnored] = await Promise.all(commands);
   const failedChecks = [
     ["working tree", workingTreeDiff],
     ["staged files", stagedDiff],
     ["untracked files", untracked],
     ...(ignored ? [["ignored files", ignored]] : []),
+    ...(forbiddenIgnored ? [["ignored protected files", forbiddenIgnored]] : []),
   ].filter(([, result]) => result.exitCode !== 0);
   if (failedChecks.length) {
     const details = failedChecks
@@ -5989,14 +6052,15 @@ async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
     throw new Error(`Git changed-file inspection failed closed (${details}).`);
   }
 
+  const ignoredEntries = ignored ? await expandIgnoredDirectoryEntries(cwd, splitNulSeparated(ignored.stdout)) : [];
   return [
-    ...new Set(
-      [workingTreeDiff.stdout, stagedDiff.stdout, untracked.stdout, ignored?.stdout || ""]
-        .join("\n")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-    ),
+    ...new Set([
+      ...splitNulSeparated(workingTreeDiff.stdout),
+      ...splitNulSeparated(stagedDiff.stdout),
+      ...splitNulSeparated(untracked.stdout),
+      ...ignoredEntries,
+      ...(forbiddenIgnored ? splitNulSeparated(forbiddenIgnored.stdout).filter((file) => FORBIDDEN_LOOKING_PATH.test(file)) : []),
+    ]),
   ].sort();
 }
 
@@ -6208,7 +6272,15 @@ async function shouldAvoidSnapshotContent(cwd, file) {
   }
 }
 
-async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
+async function gitChangedFileSnapshot(cwd, options = {}) {
+  const { ordinary, ignored } = await gitChangedFileSnapshotParts(cwd, options);
+  return new Map([...ordinary, ...ignored]);
+}
+
+// Ordinary (tracked-dirty and untracked) entries and ignored entries apart: git apply never
+// writes ignored files, so integration decides on the ordinary part, and ignored metadata
+// only feeds the preview-receipt identity.
+async function gitChangedFileSnapshotParts(cwd, { includeIgnored = true } = {}) {
   const ordinaryFiles = await gitChangedFiles(cwd, { includeIgnored: false });
   const allFiles = includeIgnored ? await gitChangedFiles(cwd, { includeIgnored: true }) : ordinaryFiles;
   const ordinarySet = new Set(ordinaryFiles);
@@ -6221,22 +6293,24 @@ async function gitChangedFileSnapshot(cwd, { includeIgnored = true } = {}) {
     throw error;
   }
   const ignoredGroups = groupIgnoredFiles(ignoredFiles);
-  const snapshot = new Map();
+  const ordinary = new Map();
+  const ignored = new Map();
   for (const file of ordinaryFiles) {
-    snapshot.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
+    ordinary.set(file, await fileFingerprint(cwd, file, { metadataOnly: await shouldAvoidSnapshotContent(cwd, file) }));
   }
   for (const [entry, files] of ignoredGroups) {
-    if (files.length === 1 && files[0] === entry) {
-      snapshot.set(entry, await fileFingerprint(cwd, entry, { metadataOnly: true }));
+    if (files.length === 1 && files[0] === entry && !entry.endsWith("/")) {
+      ignored.set(entry, await fileFingerprint(cwd, entry, { metadataOnly: true }));
       continue;
     }
-    // Names only: git already listed every member, so files added to or removed from a
-    // cache directory still change the snapshot without an lstat per file.
+    // Names only: git already listed every member (a wholly ignored directory is one "dir/"
+    // member), so files added to or removed from a cache directory still change the snapshot
+    // without an lstat per file.
     const hash = createHash("sha256");
     for (const file of files) hash.update(`${file}\0`);
-    snapshot.set(entry, `group:${files.length}:${hash.digest("hex")}`);
+    ignored.set(entry, `group:${files.length}:${hash.digest("hex")}`);
   }
-  return snapshot;
+  return { ordinary, ignored };
 }
 
 // Ignored files inside regenerable directories (build outputs, virtualenvs, caches) are
@@ -6249,6 +6323,13 @@ const REGENERABLE_IGNORED_DIRECTORY = /^(?:node_modules|\.venv|venv|__pycache__|
 // Same set as DEFAULT_FORBIDDEN_EDIT_PATHS, as one regex: isWithinAnyPath per ignored file
 // cost about 6 s per snapshot on 30000 build files, several times per integration.
 const FORBIDDEN_LOOKING_PATH = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.pem|[^/]*\.key)$|(?:^|\/)secrets\//i;
+const FORBIDDEN_LOOKING_PATHSPECS = [
+  ":(glob,icase)**/.env",
+  ":(glob,icase)**/.env.*",
+  ":(glob,icase)**/*.pem",
+  ":(glob,icase)**/*.key",
+  ":(glob,icase)**/secrets/**",
+];
 
 function groupIgnoredFiles(ignoredFiles, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
   const groups = new Map();
@@ -8425,7 +8506,7 @@ async function markUntrackedFilesForDiff(cwd) {
 async function ignoredIntegrationSourceFiles(cwd) {
   const result = await runCommand(
     "git",
-    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"],
     cwd,
     1000 * 30,
     buildValidationEnv()
@@ -8438,45 +8519,106 @@ async function ignoredIntegrationSourceFiles(cwd) {
       files: [],
     };
   }
-  const files = normalizeLockPathList(result.stdout.split("\0"));
+  let entries;
+  try {
+    entries = await expandIgnoredDirectoryEntries(cwd, splitNulSeparated(result.stdout));
+  } catch (error) {
+    return {
+      ok: false,
+      errorType: error?.errorType || "integration_patch_create_failed",
+      error: error?.message || "Could not inspect ignored source paths.",
+      files: [],
+    };
+  }
+  // Regenerable caches a builder's test run leaves behind (node_modules/, __pycache__/,
+  // .pytest_cache/, build/ ...) are not integrated by design; only other ignored files are
+  // unique output the reviewable patch would silently drop.
+  const files = normalizeLockPathList(entries.filter((entry) => !ignoredEntryIsRegenerable(entry)));
   if (files.length > CONFIG.maxIgnoredSnapshotFiles) {
     return {
       ok: false,
       errorType: "snapshot_safety_limit_exceeded",
       error: `Ignored integration source path limit exceeded: ${files.length} files exceeds CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES=${CONFIG.maxIgnoredSnapshotFiles}.`,
-      files,
+      files: files.slice(0, 20),
     };
   }
-  return { ok: true, files };
+  return { ok: true, files, toleratedRegenerableEntries: entries.length - files.length };
 }
 
+// Hashes a read-only git command's stdout as it streams. The whole-index listing is only ever
+// hashed, and buffering it capped the repository size the bridge could integrate.
+async function streamGitReadOnlyOutputSha256(args, cwd, timeoutMs = 1000 * 60) {
+  const runOnce = () => new Promise((resolve) => {
+    const hash = createHash("sha256");
+    let bytes = 0;
+    let entries = 0;
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn("git", trustedGitArgs(args), {
+        cwd: cwd || process.cwd(),
+        shell: false,
+        windowsHide: true,
+        env: buildTrustedGitEnv(buildValidationEnv({ GIT_OPTIONAL_LOCKS: "0" })),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      finish({ exitCode: 1, stderr: error?.message || String(error) });
+      return;
+    }
+    timer = setTimeout(() => {
+      try { child.kill(); } catch { /* The timeout result stands. */ }
+      finish({ exitCode: "timeout", stderr: `git ${args[0] || ""} timed out after ${timeoutMs} ms.` });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      hash.update(chunk);
+      bytes += chunk.length;
+      for (let index = chunk.indexOf(0); index !== -1; index = chunk.indexOf(0, index + 1)) entries += 1;
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 8192) stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => finish({ exitCode: error?.code || 1, stderr: error?.message || String(error) }));
+    child.on("close", (code) => finish({ exitCode: code ?? 1, stderr, sha256: hash.digest("hex"), bytes, entries }));
+  });
+  let result = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    result = await runOnce();
+    if (result.exitCode === 0 || !transientGitIndexReadError(result) || attempt === 3) return result;
+    await new Promise((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
+  }
+  return result;
+}
+
+// The index identity is a streamed hash with no entry cap: capping it at
+// CODEX_OPENCODE_MAX_SNAPSHOT_FILES (a changed-file limit) meant a repository with more than
+// 25000 tracked files could never integrate.
 async function captureGitIndexIdentity(cwd) {
-  const result = await runGitReadOnlyCommand(
+  const result = await streamGitReadOnlyOutputSha256(
     ["ls-files", "--stage", "-z", "--"],
     cwd || process.cwd(),
-    1000 * 30
+    1000 * 60
   );
   if (result.exitCode !== 0) {
     return {
       ok: false,
       errorType: "integration_index_snapshot_failed",
-      error: result.stderr || result.stdout || "Could not capture the exact Git index identity.",
-    };
-  }
-  const entries = result.stdout.split("\0").filter(Boolean);
-  const bytes = Buffer.byteLength(result.stdout || "", "utf8");
-  if (entries.length > CONFIG.maxSnapshotFiles || bytes > CONFIG.maxSnapshotTotalBytes) {
-    return {
-      ok: false,
-      errorType: "snapshot_safety_limit_exceeded",
-      error: `Git index identity exceeds the configured snapshot limits (${entries.length} entries, ${bytes} bytes).`,
+      error: result.stderr || "Could not capture the exact Git index identity.",
     };
   }
   return {
     ok: true,
-    entryCount: entries.length,
-    bytes,
-    indexSha256: createHash("sha256").update(result.stdout || "").digest("hex"),
+    entryCount: result.entries,
+    bytes: result.bytes,
+    indexSha256: result.sha256,
   };
 }
 
@@ -8513,12 +8655,15 @@ async function createPatchFromWorkingTree(cwd, baseCommit = "HEAD", { rejectIgno
       const ignored = await ignoredIntegrationSourceFiles(sourcePath);
       if (!ignored.ok) return ignored;
       if (ignored.files.length) {
+        const listed = ignored.files.slice(0, 20);
+        const more = ignored.files.length - listed.length;
         return {
           ok: false,
           errorType: "integration_source_unrepresentable",
-          error: `The source contains ignored paths that are absent from the reviewable Git patch: ${ignored.files.join(", ")}. The bridge retained the source and will not report or clean it as successfully integrated.`,
-          ignoredFiles: ignored.files,
-          unresolvedFiles: ignored.files,
+          error: `The source contains ${ignored.files.length} ignored path(s) that are absent from the reviewable Git patch: ${listed.join(", ")}${more ? ` and ${more} more` : ""}. The bridge retained the source and will not report or clean it as successfully integrated.`,
+          ignoredFiles: listed,
+          ignoredFileCount: ignored.files.length,
+          unresolvedFiles: listed,
         };
       }
     }
@@ -8950,11 +9095,14 @@ async function captureIntegrationTargetState(cwd) {
     return { ok: false, errorType: "integration_target_state_failed", error: workingPatch.error || "Could not hash integration target working content." };
   }
   let workingState;
+  let trackedWorkingState;
   try {
     // Git status and patches intentionally omit ignored files. A bounded metadata-only
     // identity for ignored/protected content makes preview receipts stale when those
     // files change without persisting their contents.
-    workingState = await gitChangedFileSnapshot(cwd, { includeIgnored: true });
+    const parts = await gitChangedFileSnapshotParts(cwd, { includeIgnored: true });
+    trackedWorkingState = parts.ordinary;
+    workingState = new Map([...parts.ordinary, ...parts.ignored]);
   } catch (error) {
     return {
       ok: false,
@@ -8963,6 +9111,7 @@ async function captureIntegrationTargetState(cwd) {
     };
   }
   const workingStateSha256 = snapshotIdentitySha256(workingState);
+  const trackedWorkingStateSha256 = snapshotIdentitySha256(trackedWorkingState);
   return {
     ok: true,
     targetHead,
@@ -8972,30 +9121,41 @@ async function captureIntegrationTargetState(cwd) {
     indexSha256: workingPatch.indexSha256,
     workingStateSha256,
     targetStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, workingStateSha256].join("\0")).digest("hex"),
+    // The same identity without ignored-file metadata. git apply never writes ignored files, so
+    // once the receipt matched (targetStateSha256, ignored files included) the integration
+    // decides on this one: an IDE rewriting .idea/workspace.xml or a dev server appending to an
+    // ignored log during the apply is not drift the bridge caused.
+    trackedStateSha256: createHash("sha256").update([targetHead, targetTree, statusSha256, workingPatch.patchSha256, workingPatch.indexSha256, trackedWorkingStateSha256].join("\0")).digest("hex"),
   };
 }
 
-// A read-only agent cannot commit (its bash is limited to read-only git and is attested before
-// spawn), so a HEAD that moved forward during its run was moved by another client. Returns the
-// move so the caller keeps the result and reports it; null when the move cannot be shown to be
-// a plain fast-forward, which keeps the job failing.
+// A read-only agent cannot move HEAD (its bash is limited to read-only git and is attested
+// before spawn), so any HEAD move during its run was made by another client: a new commit, or a
+// `commit --amend` / `pull --rebase` that rewrote history. Returns the move so the caller keeps
+// the result and reports it, listing the commits and changed paths when git can show them;
+// writers get null and keep failing.
 async function readOnlyHeadMove(lockPlan, cwd, before, after) {
   if (lockPlan?.lockType !== "read" || !before || !after || before === after) return null;
   const env = buildValidationEnv();
   const ancestor = await runCommand("git", ["merge-base", "--is-ancestor", before, after], cwd, 1000 * 15, env);
-  if (ancestor.exitCode !== 0) return null;
   const log = await runCommand("git", ["log", "--format=%h %s", `${before}..${after}`], cwd, 1000 * 15, env);
-  const diff = await runCommand("git", ["diff", "--name-only", before, after], cwd, 1000 * 15, env);
-  if (log.exitCode !== 0 || diff.exitCode !== 0) return null;
-  const changedPaths = diff.stdout.split(/\r?\n/).filter(Boolean);
+  const diff = await runCommand("git", ["diff", "--name-only", "--no-renames", "-z", before, after], cwd, 1000 * 15, env);
   const readScope = lockPlan.scopeContract?.scope?.read || [];
-  const readScopeTouched = readScope.length
-    ? changedPaths.filter((changed) => overlaps([changed], readScope, cwd))
-    : changedPaths;
+  const pathsKnown = diff.exitCode === 0;
+  const changedPaths = pathsKnown ? splitNulSeparated(diff.stdout) : [];
+  // Without the changed-path list nothing shows the read scope was untouched.
+  const readScopeTouched = !pathsKnown
+    ? (readScope.length ? normalizeLockPathList(readScope) : ["(repository)"])
+    : readScope.length
+      ? changedPaths.filter((changed) => overlaps([changed], readScope, cwd))
+      : changedPaths;
   return {
     before,
     after,
-    commits: log.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20),
+    fastForward: ancestor.exitCode === 0,
+    nonFastForward: ancestor.exitCode !== 0,
+    pathsKnown,
+    commits: log.exitCode === 0 ? log.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20) : [],
     changedPaths: changedPaths.slice(0, 50),
     readScopeTouched: readScopeTouched.slice(0, 50),
   };
@@ -9004,9 +9164,12 @@ async function readOnlyHeadMove(lockPlan, cwd, before, after) {
 function formatReadOnlyHeadMove(move) {
   if (!move) return null;
   const touched = move.readScopeTouched.length
-    ? `yes (${move.readScopeTouched.join(", ")}); the review may describe the older version of these files`
+    ? `${move.pathsKnown === false ? "unknown, assumed yes" : "yes"} (${move.readScopeTouched.join(", ")}); the review may describe the older version of these files`
     : "no";
-  return `Repository HEAD moved during this read-only run (another client committed; result kept): ${move.before.slice(0, 12)}..${move.after.slice(0, 12)}, ${move.commits.length} commit(s): ${move.commits.join("; ")}. Read scope touched: ${touched}`;
+  const kind = move.nonFastForward
+    ? "non-fast-forward: history was rewritten, e.g. commit --amend or pull --rebase; result kept"
+    : "another client committed; result kept";
+  return `Repository HEAD moved during this read-only run (${kind}): ${move.before.slice(0, 12)}..${move.after.slice(0, 12)}, ${move.commits.length} new commit(s)${move.commits.length ? `: ${move.commits.join("; ")}` : ""}. Read scope touched: ${touched}`;
 }
 
 async function captureGitHead(cwd) {
@@ -9739,8 +9902,10 @@ async function integratePatchWithoutSerialLock({
       };
     }
 
+    // The receipt check above matched targetState in full (ignored-file metadata included);
+    // from here on only non-ignored drift fails the integration.
     const immediateTargetState = await captureIntegrationTargetState(targetCwd);
-    if (!immediateTargetState.ok || immediateTargetState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+    if (!immediateTargetState.ok || immediateTargetState.trackedStateSha256 !== targetState.trackedStateSha256) {
       return {
         ok: false,
         errorType: "integration_preview_stale",
@@ -9767,11 +9932,11 @@ async function integratePatchWithoutSerialLock({
     preApplyExactSnapshot = await exactIntegrationFileSnapshot(targetCwd, patch.changedFiles);
     preApplyIndexSnapshot = await gitIndexPathSnapshot(targetCwd, patch.changedFiles);
     rollbackBaseline = await captureRollbackBaseline(targetCwd);
-    before = await gitChangedFileSnapshot(targetCwd);
+    before = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const finalPreApplyState = await captureIntegrationTargetState(targetCwd);
     if (!finalPreApplyState.ok
       || rollbackBaseline.baseCommit !== previewReceipt.targetHead
-      || finalPreApplyState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+      || finalPreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       return {
         ok: false,
         errorType: "integration_preview_stale",
@@ -9786,10 +9951,10 @@ async function integratePatchWithoutSerialLock({
       await beforeApplyHook({ targetCwd, patch, targetState: finalPreApplyState });
     }
     const immediatePreApplyState = await captureIntegrationTargetState(targetCwd);
-    if (!immediatePreApplyState.ok || immediatePreApplyState.targetStateSha256 !== previewReceipt.targetStateSha256) {
+    if (!immediatePreApplyState.ok || immediatePreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       let unresolvedFiles = [];
       try {
-        unresolvedFiles = changedFilesBetween(before, await gitChangedFileSnapshot(targetCwd));
+        unresolvedFiles = changedFilesBetween(before, await gitChangedFileSnapshot(targetCwd, { includeIgnored: false }));
       } catch {
         unresolvedFiles = patch.changedFiles;
       }
@@ -9947,7 +10112,9 @@ async function integratePatchWithoutSerialLock({
       outcome: "exact_post_state_verified",
     }, integrationAuthority);
 
-    const after = await gitChangedFileSnapshot(targetCwd);
+    // Ignored entries are left out: git apply never writes them, so an ignored file another
+    // process rewrote is not an unexpected path of this patch.
+    const after = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const appliedFiles = changedFilesBetween(before, after);
     const appliedPathEvidence = changedPathSetEvidence(patch.changedFiles, appliedFiles);
     const appliedValidation = validateChangedFilesForPlan({ changedFiles: appliedFiles, lockPlan, parallel: false });
@@ -10016,7 +10183,7 @@ async function integratePatchWithoutSerialLock({
     }
     let validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec, signal });
     if (signal?.aborted) return ownershipLostResult("during validation");
-    const afterValidation = await gitChangedFileSnapshot(targetCwd);
+    const afterValidation = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const postValidationIndex = await captureGitIndexIdentity(targetCwd);
     const validationIndexChanged = !postValidationIndex.ok || postValidationIndex.indexSha256 !== preApplyFullIndexSha256;
     const postValidationFiles = changedFilesBetween(before, afterValidation);
@@ -10185,6 +10352,7 @@ async function integratePatchWithoutSerialLock({
       sourceStateSha256: patch.sourceStateSha256,
       targetPreviewStateSha256: targetState.targetStateSha256,
       integratedTargetStateSha256: integratedTargetState.targetStateSha256,
+      integratedTrackedStateSha256: integratedTargetState.trackedStateSha256,
       contractSha256,
       previewId: previewReceipt.previewId,
       preExistingTargetChanges: targetChanges,
@@ -10320,7 +10488,7 @@ async function cleanupIntegratedWorktreeWhileLocked({
     return;
   }
 
-  const preliminaryTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256);
+  const preliminaryTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
   if (preliminaryTargetError) {
     result.sourceCleanup = { cleanup: "retained_for_review", reason: "integration_target_changed_before_cleanup", error: preliminaryTargetError };
     result.cleanupWarning = preliminaryTargetError;
@@ -10331,7 +10499,7 @@ async function cleanupIntegratedWorktreeWhileLocked({
   }
 
   const sourceBranch = await runCommand("git", ["branch", "--show-current"], worktreePath, 1000 * 15);
-  const finalTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256);
+  const finalTargetError = await integrationCleanupTargetStateError(cwd, result.integratedTargetStateSha256, result.integratedTrackedStateSha256);
   const finalSourceMatches = await sourceMatches();
   if (finalTargetError || !finalSourceMatches || sourceBranch.exitCode !== 0 || !sourceBranch.stdout.trim()) {
     result.sourceCleanup = {
