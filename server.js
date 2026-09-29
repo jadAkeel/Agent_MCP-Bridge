@@ -7,7 +7,7 @@ import { execFile, spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -8576,60 +8576,106 @@ async function checkPatchApplies({ cwd, patchFile }) {
   };
 }
 
+// The patch is applied to an isolated index only (`--cached`), then exactly the patch paths
+// are checked out of that index. `git apply --3way` against the working tree fell back to a
+// merge whenever a reviewed path did not match the stat-less seeded index (a CRLF checkout
+// seen without the operator's core.autocrlf) and wrote conflict markers into the user's file.
+// A conflict now stays in the throwaway index and fails before any working-tree byte is
+// written, and checkout-index applies the same line-ending conversion as a checkout.
 async function applyPatchFile({ cwd, patchFile, targetHead, files = [], signal = null }) {
+  const base = cwd || process.cwd();
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
+  const patchPaths = normalizeLockPathList(files);
+  const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
+  const isolatedEol = async () => {
+    const eol = patchPaths.length
+      ? await runCommand("git", ["--literal-pathspecs", "ls-files", "--eol", "-z", "--", ...patchPaths], base, 1000 * 30, env, { signal })
+      : { exitCode: 0, stdout: "", stderr: "" };
+    return {
+      isolatedEolRecords: eol.exitCode === 0 ? gitEolRecordsFromOutput(eol.stdout) : new Map(),
+      isolatedEolError: eol.exitCode === 0 ? "" : (eol.stderr || eol.stdout || "Could not capture isolated-index EOL evidence."),
+    };
+  };
   try {
     if (!isPathInside(tmpdir(), scratch) || !isPathInside(scratch, indexFile)) {
       return { exitCode: 1, stdout: "", stderr: "Temporary integration index escaped its bounded root." };
     }
-    const env = buildValidationEnv({ GIT_INDEX_FILE: indexFile });
-    const seeded = await runCommand("git", ["read-tree", targetHead], cwd || process.cwd(), CONFIG.gitHeavyTimeoutMs, env, { signal });
+    const seeded = await runCommand("git", ["read-tree", targetHead], base, CONFIG.gitHeavyTimeoutMs, env, { signal });
     if (seeded.exitCode !== 0) {
       return { exitCode: seeded.exitCode, stdout: seeded.stdout || "", stderr: seeded.stderr || "Could not seed the isolated integration index." };
     }
-    const refreshPaths = normalizeLockPathList(files);
-    if (refreshPaths.length) {
-      const trackedAtTarget = await runCommand(
-        "git",
-        ["ls-tree", "-r", "--name-only", "-z", targetHead, "--", ...refreshPaths],
-        cwd || process.cwd(),
-        1000 * 30,
-        env,
-        { signal }
-      );
-      if (trackedAtTarget.exitCode !== 0) {
+    const applied = await runCommand("git", ["apply", "--cached", "--3way", patchFile], base, 1000 * 60, env, { signal });
+    if (applied.exitCode !== 0) {
+      return { ...applied, stderr: `${applied.stderr || applied.stdout || "Patch did not apply."} The working tree was not modified.`, worktreeWritten: false };
+    }
+    const [unmerged, staged] = await Promise.all([
+      runCommand("git", ["ls-files", "--unmerged", "-z"], base, 1000 * 30, env, { signal }),
+      runCommand("git", ["diff-index", "--cached", "--name-only", "-z", "--no-renames", targetHead, "--"], base, 1000 * 30, env, { signal }),
+    ]);
+    if (unmerged.exitCode !== 0 || String(unmerged.stdout || "").length || staged.exitCode !== 0) {
+      return {
+        exitCode: unmerged.exitCode || staged.exitCode || 1,
+        stdout: "",
+        stderr: unmerged.stderr || staged.stderr || "The patch left conflicted entries in the isolated index; the working tree was not modified.",
+        worktreeWritten: false,
+      };
+    }
+    const stagedPaths = normalizeLockPathList(String(staged.stdout || "").split("\0"));
+    const reviewed = new Set(patchPaths);
+    const unexpected = stagedPaths.filter((file) => !reviewed.has(file));
+    if (unexpected.length) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: `The patch changed paths outside the reviewed file list (${unexpected.slice(0, 10).join(", ")}); the working tree was not modified.`,
+        worktreeWritten: false,
+      };
+    }
+    const present = await runCommand("git", ["--literal-pathspecs", "ls-files", "-z", "--", ...patchPaths], base, 1000 * 30, env, { signal });
+    if (present.exitCode !== 0) {
+      return { exitCode: present.exitCode, stdout: "", stderr: present.stderr || "Could not list the isolated integration index.", worktreeWritten: false };
+    }
+    const presentPaths = new Set(normalizeLockPathList(String(present.stdout || "").split("\0")));
+    // Deletions first, so a patch that turns a file into a directory (or back) can check out.
+    for (const file of patchPaths.filter((candidate) => !presentPaths.has(candidate))) {
+      const target = path.resolve(base, file);
+      try {
+        await safeRollbackParent(base, target);
+        if (!await removeRollbackLeaf(target)) throw new Error(`${file} is a directory.`);
+        for (let parent = path.dirname(target); isPathInside(path.resolve(base), parent); parent = path.dirname(parent)) {
+          try {
+            if ((await readdir(parent)).length) break;
+            await rmdir(parent);
+          } catch {
+            break;
+          }
+        }
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
         return {
-          exitCode: trackedAtTarget.exitCode,
-          stdout: trackedAtTarget.stdout || "",
-          stderr: trackedAtTarget.stderr || "Could not identify target paths in the isolated integration index.",
+          exitCode: 1,
+          stdout: "",
+          stderr: `Could not remove ${file} deleted by the patch: ${error?.message || error}`,
+          worktreeWritten: true,
+          ...await isolatedEol(),
         };
       }
-      const trackedRefreshPaths = normalizeLockPathList(trackedAtTarget.stdout.split("\0"));
-      if (trackedRefreshPaths.length) {
-      const refreshed = await runCommand(
-        "git",
-        ["update-index", "--refresh", "--ignore-submodules", "--", ...trackedRefreshPaths],
-        cwd || process.cwd(),
-        1000 * 30,
-        env,
-        { signal }
-      );
-      // `update-index --refresh` may report an unrelated dirty path even with a
-      // pathspec. The reviewed-path snapshots and target receipt were already
-      // checked; the isolated `git apply --3way` below remains authoritative and
-      // fails closed if any reviewed target path does not match the seeded index.
-      void refreshed;
+    }
+    const checkoutPaths = patchPaths.filter((file) => presentPaths.has(file));
+    if (checkoutPaths.length) {
+      const checkout = await runCommand("git", ["checkout-index", "-f", "--", ...checkoutPaths], base, 1000 * 60, env, { signal });
+      if (checkout.exitCode !== 0) {
+        return {
+          exitCode: checkout.exitCode,
+          stdout: checkout.stdout || "",
+          stderr: checkout.stderr || "Could not write the patched paths from the isolated integration index.",
+          worktreeWritten: true,
+          ...await isolatedEol(),
+        };
       }
     }
-    const applied = await runCommand("git", ["apply", "--3way", patchFile], cwd || process.cwd(), 1000 * 60, env, { signal });
-    if (applied.exitCode !== 0) return applied;
-    const eol = await runCommand("git", ["ls-files", "--eol", "-z", "--", ...normalizeLockPathList(files)], cwd || process.cwd(), 1000 * 30, env, { signal });
-    return {
-      ...applied,
-      isolatedEolRecords: eol.exitCode === 0 ? gitEolRecordsFromOutput(eol.stdout) : new Map(),
-      isolatedEolError: eol.exitCode === 0 ? "" : (eol.stderr || eol.stdout || "Could not capture isolated-index EOL evidence."),
-    };
+    return { ...applied, worktreeWritten: true, ...await isolatedEol() };
   } finally {
     if (isPathInside(tmpdir(), scratch)) await rm(scratch, { recursive: true, force: true });
   }
