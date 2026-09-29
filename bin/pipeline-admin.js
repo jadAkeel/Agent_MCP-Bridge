@@ -48,8 +48,12 @@ function resultText(result) {
   return (result?.content || []).map((item) => item?.type === "text" ? item.text : "").filter(Boolean).join("\n");
 }
 
+// The server answers an unknown pipeline id with a plain text result (no isError), which
+// must still fail the command: nothing was abandoned.
 function resultIndicatesFailure(result, text) {
-  return result?.isError === true || /^Multi-agent pipeline abandonment rejected\./m.test(text);
+  return result?.isError === true
+    || /^Multi-agent pipeline abandonment rejected\./m.test(text)
+    || /^Multi-agent pipeline not found:/m.test(text);
 }
 
 async function main() {
