@@ -375,6 +375,9 @@ let queueCancellationTestHook = null;
 let worktreeCleanupTestHook = null;
 let integrationScratchCleanupTestHook = null;
 let pipelineGateExecutorTestHook = null;
+// Self-test only: stands in for agent discovery, attestation and the OpenCode run so the job
+// and parallel paths can be exercised against a real Git checkout without a provider.
+let agentRuntimeTestHook = null;
 
 const server = new McpServer({
   name: "codex-opencode-bridge",
@@ -1116,6 +1119,9 @@ function buildTrustedGitEnv(extra = null) {
   env.GIT_CONFIG_GLOBAL = BRIDGE_GIT_GLOBAL_CONFIG_PATH;
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
+  // Paths the bridge passes to git are file names (app/[slug]/page.tsx), never patterns; as
+  // glob pathspecs `git add -N -- app/[slug]/page.tsx` would also match app/s/page.tsx.
+  env.GIT_LITERAL_PATHSPECS = "1";
   delete env.GIT_ASKPASS;
   delete env.SSH_ASKPASS;
   for (const key of Object.keys(env)) {
@@ -6792,8 +6798,12 @@ async function gitChangedFiles(cwd, { includeIgnored = false } = {}) {
   if (includeIgnored) {
     commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"], cwd, 1000 * 30));
     // Forbidden-looking ignored files (.env, *.pem, *.key, secrets/) keep their own entry even
-    // inside a directory --directory collapsed; the pathspec keeps this listing small.
-    commands.push(runGitReadOnlyCommand(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...FORBIDDEN_LOOKING_PATHSPECS], cwd, 1000 * 30));
+    // inside a directory --directory collapsed. They are selected with exclude patterns (-x,
+    // gitignore syntax), not pathspecs: bridge git runs with GIT_LITERAL_PATHSPECS=1, under
+    // which a ":(glob)" pathspec matched nothing and these files were silently missed. Without
+    // --exclude-standard this also lists non-ignored matches, which the untracked listing
+    // already holds (the Set below dedupes them).
+    commands.push(runGitReadOnlyCommand(["-c", "core.ignorecase=true", "ls-files", "--others", "--ignored", "-z", ...FORBIDDEN_LOOKING_EXCLUDE_PATTERNS.flatMap((pattern) => ["-x", pattern])], cwd, 1000 * 30));
   }
   const [workingTreeDiff, stagedDiff, untracked, ignored, forbiddenIgnored] = await Promise.all(commands);
   const failedChecks = [
@@ -7122,13 +7132,8 @@ const REGENERABLE_IGNORED_DIRECTORY = /^(?:node_modules|\.venv|venv|__pycache__|
 // Same set as DEFAULT_FORBIDDEN_EDIT_PATHS, as one regex: isWithinAnyPath per ignored file
 // cost about 6 s per snapshot on 30000 build files, several times per integration.
 const FORBIDDEN_LOOKING_PATH = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.pem|[^/]*\.key)$|(?:^|\/)secrets\//i;
-const FORBIDDEN_LOOKING_PATHSPECS = [
-  ":(glob,icase)**/.env",
-  ":(glob,icase)**/.env.*",
-  ":(glob,icase)**/*.pem",
-  ":(glob,icase)**/*.key",
-  ":(glob,icase)**/secrets/**",
-];
+// The same set as gitignore-style exclude patterns (they match in every directory).
+const FORBIDDEN_LOOKING_EXCLUDE_PATTERNS = [".env", ".env.*", "*.pem", "*.key", "secrets/"];
 
 function groupIgnoredFiles(ignoredFiles, { limit = CONFIG.maxIgnoredSnapshotFiles } = {}) {
   const groups = new Map();
@@ -8139,8 +8144,11 @@ function integrationRecoveryErrorText(error) {
   return truncateText(redactSensitiveText(String(error?.message || error || "unknown error")), 500);
 }
 
+// Bridge git already runs with GIT_LITERAL_PATHSPECS=1, so plain paths are literal. A
+// ":(literal)" prefix is pathspec magic, which that setting disables: the prefixed path then
+// matched nothing and "no commit touched the affected paths" was always true (fail open).
 function integrationPathspecs(paths) {
-  return normalizeLockPathList(paths).map((file) => `:(literal)${file}`);
+  return normalizeLockPathList(paths);
 }
 
 // Decides whether HEAD and the real Git index still hold the state the operation was prepared
@@ -8739,6 +8747,9 @@ function shouldUseWorktree(job, lockPlan, worktreeMode = CONFIG.worktreeMode) {
   if (job.sanitizedWorkspace || lockPlan.sanitizedWorkspace) {
     return false;
   }
+
+  // Internal only (pipeline gates; tool schemas strip unknown keys): a reader of the checkout.
+  if (job.noWorktree === true && lockPlan.lockType === "read") return false;
 
   if (lockPlan.orchestratorMode === "contractor") {
     return true;
@@ -12838,7 +12849,10 @@ async function acquireHardLock({
     };
   }
 
-  if (hasAmbiguousPathPattern(lockPathsRequested)) {
+  // With the project root, a real file named like a pattern (app/[slug]/page.tsx) is accepted
+  // here exactly as the plan checks accept it; without it such a job passed its plan and then
+  // had every lock refused.
+  if (hasAmbiguousPathPattern(lockPathsRequested, projectRoot)) {
     return {
       ok: false,
       error: "Write lock rejected: wildcard or ambiguous paths are not allowed.",
@@ -13766,6 +13780,8 @@ server.tool(
 
     const queueAssessment = await assessQueuePlan(lockPlans);
     const plannedJobs = [];
+    const plannedResolutions = [];
+    const plannedMetadata = [];
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
       const lockPlan = lockPlans[index];
@@ -13790,7 +13806,7 @@ server.tool(
         };
       }
       const discoveryContext = sanitizedDiscoveryContext(job);
-      const resolution = await resolveAgent(
+      const resolution = await jobAgentRuntime().resolveAgent(
         job.agent,
         job.cwd,
         job.allowFallbackToBuild || false,
@@ -13843,7 +13859,7 @@ server.tool(
         };
       }
 
-      const metadata = await readAgentDebugMetadata(
+      const metadata = await jobAgentRuntime().readAgentDebugMetadata(
         resolution.actualAgent,
         discoveryContext.discoveryCwd,
         { forcePure: discoveryContext.forcePure }
@@ -13869,8 +13885,28 @@ server.tool(
         }) }] };
       }
       resolution.agentMetadata = metadata.metadata || null;
+      plannedResolutions[index] = resolution;
+      plannedMetadata[index] = metadata;
 
       plannedJobs.push(formatDelegationPlanJob({ index, job, lockPlan, resolution }));
+    }
+
+    // run_opencode_parallel rejects a batch above the per-provider slot limit; the preflight
+    // must not accept what the run would refuse.
+    const capacityError = executionMode === "parallel"
+      ? parallelBatchCapacityError(jobs, parallelProviderKeys(plannedResolutions, plannedMetadata, lockPlans))
+      : null;
+    if (capacityError) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Delegation plan rejected.",
+        errorType: capacityError.errorType,
+        reason: capacityError.error,
+        requestedAgent: requestedAgents,
+        actualAgent: "none",
+        lockMode,
+        durationMs: nowMs() - toolStarted,
+        suggestedFix: capacityError.suggestedFix,
+      }) }] };
     }
 
     return {
@@ -13937,6 +13973,11 @@ server.tool(
       agent,
       task,
       cwd,
+      // executeOpenCodeJob routes with these; dropping them made its own advice to set
+      // allowFallbackToBuild impossible to follow.
+      allowFallbackToBuild,
+      subagentStrategy,
+      proxyAgent,
       dryRun,
       orchestratorMode,
       userAuthorizedOrchestrator,
@@ -14000,11 +14041,15 @@ server.tool(
       };
     }
 
+    // The read scope keeps a reader from counting as the whole repository, and the job id keeps
+    // a writer the scheduler already claimed from conflicting with itself.
     const queueAssessment = await assessQueuePlan([{
+      jobId: enqueued.record.jobId,
       lockType: enqueued.record.mode === "read" ? "read" : "write",
       cwd: enqueued.record.cwd,
       lockedPaths: enqueued.record.lockedPaths,
       allowedEdits: enqueued.record.allowedEdits,
+      scopeContract: enqueued.record.scopeContract,
     }]);
     return {
       content: [
@@ -14158,8 +14203,12 @@ server.tool(
   async ({ jobId, cwd = "", detail = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const authoritative = await authoritativeQueueRecord(jobId, projectRoot || cwd);
-    const snapshot = authoritative
+    const persisted = authoritative
       ? (effectiveQueueMode() === "sqlite" ? authoritative : queueRecordSnapshot(authoritative))
+      : null;
+    // record_json keeps the stage and timings of its last write; a running job's are derived now.
+    const snapshot = persisted
+      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted) }
       : null;
     if (!snapshot) {
       return {
@@ -14342,13 +14391,36 @@ server.tool(
       heartbeatAt: "",
       leaseExpiresAt: "",
     });
-    await persistQueueRecord(record);
+    const persisted = await persistQueueRecord(record);
     scheduleQueue();
+    if (!persisted?.persisted) {
+      // The durable row moved first (claimed, finished, or owned elsewhere); persistQueueRecord
+      // reloaded it, so report what the job durably is instead of a cancellation that did not land.
+      return {
+        content: [
+          {
+            type: "text",
+            text: `OpenCode queue job ${jobId} was not cancelled: its durable status is ${persisted?.status || record.status || "unknown"}.${persisted?.ownershipLost ? " Another bridge generation owns it now." : ""}`,
+          },
+        ],
+      };
+    }
+    if (record.parentJobId || record.pipelinePropagation?.pipelineId) {
+      try {
+        await reconcileParentPipelineAfterQueueTerminal(record);
+      } catch (error) {
+        logEvent("warn", "pipeline.child_terminal_reconciliation_failed", {
+          pipelineId: record.parentJobId || record.pipelinePropagation?.pipelineId || "",
+          jobId,
+          errorType: error?.errorType || "pipeline_child_terminal_reconciliation_failed",
+        });
+      }
+    }
     return {
       content: [
         {
           type: "text",
-          text: `OpenCode queue job cancelled: ${jobId}`,
+          text: `OpenCode queue job cancelled: ${jobId} (durable status: ${persisted.status || record.status}).`,
         },
       ],
     };
@@ -14434,11 +14506,15 @@ server.tool(
     const targetCwd = sanitizedWorkspace
       ? path.resolve(sanitizedWorkspace.root)
       : await resolveProjectStateRoot(cwd || jobs[0]?.cwd || process.cwd());
+    // A job without its own cwd belongs to the pipeline's repository, not to the bridge's
+    // working directory (which made every such pipeline "multi-repository").
     const pipelineJobs = sanitizedWorkspace
       ? jobs.map((job) => ({ ...job, cwd: targetCwd, sanitizedWorkspace, subagentStrategy: "reject", write: false, lockType: "read", lockMode: "off" }))
-      : jobs;
+      : jobs.map((job) => ({ ...job, cwd: job.cwd || targetCwd }));
     const normalizedJobs = await Promise.all(pipelineJobs.map((job) => normalizeJobCwd(job)));
-    const foreignJob = normalizedJobs.find((job) => path.resolve(job.cwd) !== path.resolve(targetCwd));
+    // Children are inserted into the pipeline's own state database, so a child that resolves to
+    // another project would be run and recorded elsewhere while the parent waits for it forever.
+    const foreignJob = normalizedJobs.find((job) => normalizeFilesystemCase(path.resolve(job.cwd), targetCwd) !== normalizeFilesystemCase(path.resolve(targetCwd), targetCwd));
     if (foreignJob) {
       return {
         content: [
@@ -15008,11 +15084,7 @@ server.tool(
       if (!PIPELINE_RUNS.has(pipelineId)) PIPELINE_RUNS.set(pipelineId, pipeline);
       await refreshPipelineRecord(pipeline);
       await reconcilePipelineIntegrationOperationStates(pipeline);
-      const candidates = (pipeline.integrationQueue || []).filter((item) => {
-        const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-        const sameBranch = branch && item.branch === branch;
-        return sameWorktree || sameBranch;
-      });
+      const candidates = (pipeline.integrationQueue || []).filter((item) => pipelineIntegrationItemMatches(pipeline, item, { worktreePath, branch }));
       if (candidates.length !== 1 || !["pending", "integrating"].includes(candidates[0].status)) {
         return { content: [{ type: "text", text: formatRejectedExecution({
           headline: "Pipeline integration rejected.",
@@ -15105,23 +15177,18 @@ server.tool(
       pipelineId,
       pipelineJobId: pipelineItem?.jobId || "",
       onIntegrationPrepared: pipeline ? async ({ operationId }) => {
-        const integrationQueue = (pipeline.integrationQueue || []).map((item) => {
-          const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-          const sameBranch = branch && item.branch === branch;
-          return sameWorktree || sameBranch
+        await updatePipelineRecord(pipeline, (current) => ({
+          integrationQueue: (current.integrationQueue || []).map((item) => pipelineIntegrationItemMatches(current, item, { worktreePath, branch })
             ? { ...item, status: "integrating", operationId }
-            : item;
-        });
-        await updatePipelineRecord(pipeline, {
-          integrationQueue,
-          events: (pipeline.events || []).concat({
+            : item),
+          events: (current.events || []).concat({
             type: "integration_prepared",
             at: new Date().toISOString(),
             operationId,
             jobId: pipelineItem?.jobId || "",
           }),
-        });
-        pipelineItem = integrationQueue.find((item) => item.operationId === operationId) || pipelineItem;
+        }));
+        pipelineItem = (pipeline.integrationQueue || []).find((item) => item.operationId === operationId) || pipelineItem;
       } : null,
       expectedSourceIdentity: pipelineItem ? {
         sourceBaseCommit: pipelineItem.sourceBaseCommit,
@@ -15131,52 +15198,52 @@ server.tool(
     });
     if (pipelineId) {
       if (pipeline) {
-        const events = (pipeline.events || []).concat({
-          type: "integration",
-          at: new Date().toISOString(),
-          ok: Boolean(result.ok),
-          status: result.status || "rejected",
-          errorType: result.errorType || "",
-          sourceType: result.sourceType || (worktreePath ? "worktree" : branch ? "branch" : "unknown"),
-          source: result.source || worktreePath || branch || "",
-          changedFiles: result.changedFiles || [],
-          appliedFiles: result.appliedFiles || [],
-          operationId: result.operationId || pipelineItem?.operationId || "",
-        });
-        const nextIntegrationQueue = (pipeline.integrationQueue || []).map((item) => {
-          const sameWorktree = worktreePath && item.worktreePath && path.resolve(item.worktreePath) === path.resolve(worktreePath);
-          const sameBranch = branch && item.branch === branch;
-          return sameWorktree || sameBranch
-            ? {
-                ...item,
-                status: result.ok && result.status === "applied"
-                  ? "integrated"
-                  : result.ok
-                    ? (item.status === "integrating" ? "pending" : item.status)
-                    : result.errorType === "integration_recovery_quarantined"
-                      ? "quarantined"
-                      : "rejected",
-                errorType: result.errorType || "",
-                operationId: result.operationId || item.operationId || "",
-                cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && effectiveCleanupAfterSuccess && worktreePath),
-                sourceBaseCommit: result.sourceBaseCommit || "",
-                patchSha256: result.patchSha256 || "",
-                sourceStateSha256: result.sourceStateSha256 || "",
-              }
-            : item;
-        });
-        const applied = Boolean(result.ok && result.status === "applied");
-        const allIntegrated = nextIntegrationQueue.length && nextIntegrationQueue.every((item) => item.status === "integrated");
-        await updatePipelineRecord(pipeline, {
-          status: applied && allIntegrated ? "awaiting_finalization" : pipeline.status,
-          finishedAt: applied && allIntegrated ? "" : pipeline.finishedAt,
-          integrationQueue: nextIntegrationQueue,
-          events,
-          errors: result.ok ? pipeline.errors || [] : (pipeline.errors || []).concat({
-            type: "integration",
-            errorType: result.errorType || "integration_rejected",
-            error: result.error || "",
-          }),
+        // Computed from the record as it stands when the write runs, so a concurrent
+        // integration of another item on this pipeline keeps its own item update.
+        await updatePipelineRecord(pipeline, (current) => {
+          const integrated = !dryRun && Boolean(result.ok && ["applied", "no_changes"].includes(result.status));
+          const integrationQueue = (current.integrationQueue || []).map((item) => {
+            // A dry run changes nothing about the item: its outcome is only an event.
+            if (dryRun || !pipelineIntegrationItemMatches(current, item, { worktreePath, branch })) return item;
+            return {
+              ...item,
+              status: nextPipelineIntegrationItemStatus(item, result),
+              errorType: result.errorType || "",
+              operationId: result.operationId || item.operationId || "",
+              noChanges: result.ok && result.status === "no_changes" ? true : Boolean(item.noChanges),
+              cleanupRequested: Boolean(result.ok && result.status === "applied" && result.validationGate?.status === "passed" && effectiveCleanupAfterSuccess && worktreePath),
+              // A failed attempt returns only part of the source identity; the item keeps the
+              // attested identity a retry is checked against.
+              sourceBaseCommit: result.sourceBaseCommit || item.sourceBaseCommit || "",
+              patchSha256: result.patchSha256 || item.patchSha256 || "",
+              sourceStateSha256: result.sourceStateSha256 || item.sourceStateSha256 || "",
+            };
+          });
+          const allIntegrated = integrationQueue.length && integrationQueue.every((item) => item.status === "integrated");
+          return {
+            status: integrated && allIntegrated ? "awaiting_finalization" : current.status,
+            finishedAt: integrated && allIntegrated ? "" : current.finishedAt,
+            integrationQueue,
+            events: (current.events || []).concat({
+              type: "integration",
+              at: new Date().toISOString(),
+              ok: Boolean(result.ok),
+              dryRun: Boolean(dryRun),
+              status: result.status || "rejected",
+              errorType: result.errorType || "",
+              sourceType: result.sourceType || (worktreePath ? "worktree" : branch ? "branch" : "unknown"),
+              source: result.source || worktreePath || branch || "",
+              changedFiles: result.changedFiles || [],
+              appliedFiles: result.appliedFiles || [],
+              operationId: result.operationId || pipelineItem?.operationId || "",
+            }),
+            errors: result.ok ? current.errors || [] : (current.errors || []).concat({
+              type: "integration",
+              errorType: result.errorType || "integration_rejected",
+              error: result.error || "",
+              dryRun: Boolean(dryRun),
+            }),
+          };
         });
       }
     }
@@ -15337,16 +15404,38 @@ function effectiveContractorAuthorizationSha256() {
     : CONFIG.contractorAuthorizationSha256;
 }
 
-function makeInternalQueueContractorProof(jobId) {
-  return createHmac("sha256", QUEUE_CAPABILITY_KEY).update(`contractor\0${jobId}`).digest("hex");
+// A queued contractor job carries a proof instead of the caller's token. The proof is bound to
+// the configured authorization hash as well as the job: rotating or removing
+// CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 revokes every proof minted under the old one.
+// Its second half is a keyless binding digest that survives a restart, so recovery (which
+// re-mints the process-keyed half) re-authorizes a job only under the hash it was minted with.
+function internalQueueContractorBinding(jobId, authorizationSha256) {
+  return createHash("sha256").update(`contractor-binding\0${authorizationSha256}\0${jobId}`).digest("hex");
+}
+
+function currentContractorAuthorizationSha256() {
+  const configured = String(effectiveContractorAuthorizationSha256() || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(configured) ? configured : "";
+}
+
+function makeInternalQueueContractorProof(jobId, previousProof = "") {
+  const authorizationSha256 = currentContractorAuthorizationSha256();
+  if (!authorizationSha256) return "";
+  const binding = internalQueueContractorBinding(jobId, authorizationSha256);
+  // Re-minting a stored proof (startup recovery) keeps it only when it was minted under the
+  // hash configured now.
+  if (previousProof && String(previousProof).split(":")[1] !== binding) return "";
+  const keyed = createHmac("sha256", QUEUE_CAPABILITY_KEY).update(`contractor\0${authorizationSha256}\0${jobId}`).digest("hex");
+  return `${keyed}:${binding}`;
 }
 
 function internalQueueContractorProofValid(job) {
   const jobId = String(job?.internalQueueJobId || "");
   const proof = String(job?.internalQueueContractorProof || "");
-  if (!jobId || !/^[a-f0-9]{64}$/.test(proof)) return false;
+  if (!jobId || !/^[a-f0-9]{64}:[a-f0-9]{64}$/.test(proof)) return false;
   const expected = makeInternalQueueContractorProof(jobId);
-  return timingSafeEqual(Buffer.from(proof, "hex"), Buffer.from(expected, "hex"));
+  if (!expected) return false;
+  return timingSafeEqual(Buffer.from(proof, "utf8"), Buffer.from(expected, "utf8"));
 }
 
 function contractorAuthorizationValid(job, expectedHash = effectiveContractorAuthorizationSha256()) {
@@ -15495,8 +15584,12 @@ function normalizePathForCompare(value, cwd = "") {
   return normalizeFilesystemCase(normalized, cwd);
 }
 
-function hasAmbiguousPathPattern(paths) {
-  return normalizeList(paths).some((path) => /[*?[\]{}!]/.test(path));
+// A path with glob characters is ambiguous unless it names an existing file or directory
+// literally (Next.js app/[slug]/page.tsx). Bridge git commands run with
+// GIT_LITERAL_PATHSPECS=1 (buildTrustedGitEnv), so such a path is never expanded as a pattern.
+function hasAmbiguousPathPattern(paths, cwd = "") {
+  return normalizeList(paths).some((candidate) => /[*?[\]{}!]/.test(candidate)
+    && !(cwd && !/[*?]/.test(candidate) && existsSync(path.join(cwd, candidate))));
 }
 
 function overlaps(pathsA, pathsB, cwd = "") {
@@ -15820,14 +15913,33 @@ async function verifySanitizedJobsBeforeDiscovery(jobs, phase) {
 // for one (up to their timeout) and then run their full timeout, so the call could take
 // twice the agent timeout and outlive Codex's tool_timeout_sec. Pipelines and queued jobs
 // take a lease per job and are not limited here. Dry runs take no slot.
-function parallelBatchCapacityError(jobs) {
-  const leasedJobCount = jobs.filter((job) => !job.dryRun).length;
-  if (leasedJobCount <= CONFIG.providerConcurrencyLimit) return null;
+// Leases are counted per provider key (providerKeyForMetadata), so once each job's attested
+// metadata is known the limit applies to each provider's jobs; without keys every job counts
+// against one key, which is the conservative reading.
+function parallelBatchCapacityError(jobs, providerKeys = null) {
+  const leasedByKey = new Map();
+  jobs.forEach((job, index) => {
+    if (job.dryRun) return;
+    const key = Array.isArray(providerKeys) && providerKeys[index] ? providerKeys[index] : CONFIG.providerConcurrencyKey;
+    leasedByKey.set(key, (leasedByKey.get(key) || 0) + 1);
+  });
+  const [overKey, leasedJobCount] = [...leasedByKey.entries()].find(([, count]) => count > CONFIG.providerConcurrencyLimit) || [];
+  if (!overKey) return null;
+  const keyed = Array.isArray(providerKeys) && leasedByKey.size > 1;
   return {
-    error: `${leasedJobCount} parallel jobs exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
+    error: `${leasedJobCount} parallel jobs${keyed ? ` for provider key ${overKey}` : ""} exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
     errorType: "parallel_batch_exceeds_provider_capacity",
-    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
+    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per provider per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
   };
+}
+
+function parallelProviderKeys(resolutions = [], metadataResults = [], lockPlans = []) {
+  return resolutions.map((resolution, index) => {
+    const metadata = metadataResults[index]?.metadata || null;
+    if (!metadata) return "";
+    const override = allowlistedModelOverride(lockPlans[index]?.scopeContract?.modelRequirement, resolution?.actualAgent || lockPlans[index]?.agent);
+    return providerKeyForMetadata(applyModelOverrideToMetadata(metadata, override));
+  });
 }
 
 function validateParallelWritePlan(jobs) {
@@ -15956,7 +16068,7 @@ function validateParallelWritePlan(jobs) {
     }
 
     const ambiguousPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.sharedFiles, plan.scopeContract?.scope.write || []);
-    if (hasAmbiguousPathPattern(ambiguousPathInputs)) {
+    if (hasAmbiguousPathPattern(ambiguousPathInputs, plan.cwd)) {
       return {
         error: `Parallel write job for agent "${plan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks, or run serially.`,
         errorType: "parallel_plan_rejected",
@@ -16012,11 +16124,15 @@ function validateParallelWritePlan(jobs) {
 
   }
 
+  // Paths are repository-relative: the same relative path in two repositories is no overlap.
+  const sameProject = (left, right) => !left.cwd || !right.cwd
+    || normalizeFilesystemCase(path.resolve(left.cwd), left.cwd) === normalizeFilesystemCase(path.resolve(right.cwd), left.cwd);
   for (let i = 0; i < lockPlans.length; i += 1) {
     for (let j = i + 1; j < lockPlans.length; j += 1) {
       const left = lockPlans[i];
       const right = lockPlans[j];
       if ((left.lockType === "read") === (right.lockType === "read")) continue;
+      if (!sameProject(left, right)) continue;
       const overlap = overlaps(hardLockPathsForPlan(left), hardLockPathsForPlan(right), left.cwd || right.cwd);
       if (overlap) {
         return {
@@ -16033,9 +16149,11 @@ function validateParallelWritePlan(jobs) {
   if (writePlans.length > 1) {
     for (let i = 0; i < writePlans.length; i += 1) {
       for (let j = i + 1; j < writePlans.length; j += 1) {
+        if (!sameProject(writePlans[i], writePlans[j])) continue;
         const overlap = overlaps(
           writePlans[i].allowedEdits.concat(writePlans[i].lockedPaths),
-          writePlans[j].allowedEdits.concat(writePlans[j].lockedPaths)
+          writePlans[j].allowedEdits.concat(writePlans[j].lockedPaths),
+          writePlans[i].cwd || writePlans[j].cwd
         );
         if (overlap) {
           return {
@@ -16153,7 +16271,7 @@ function validateSingleLockPlan(job) {
   }
 
   const ambiguousPathInputs = lockPlan.lockedPaths.concat(lockPlan.allowedEdits, lockPlan.sharedFiles, lockPlan.scopeContract?.scope.write || []);
-  if (hasAmbiguousPathPattern(ambiguousPathInputs)) {
+  if (hasAmbiguousPathPattern(ambiguousPathInputs, lockPlan.cwd)) {
     return {
       error: `Write job for agent "${lockPlan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks.`,
       errorType: "lock_plan_rejected",
@@ -16186,6 +16304,46 @@ function validateSingleLockPlan(job) {
   }
 
   return { error: null, lockPlan };
+}
+
+function jobAgentRuntime() {
+  const hook = process.argv.includes("--self-test") ? agentRuntimeTestHook : null;
+  return {
+    resolveAgent: hook?.resolveAgent || resolveAgent,
+    readAgentDebugMetadata: hook?.readAgentDebugMetadata || readAgentDebugMetadata,
+    runOpenCodeWithPolicy: hook?.runOpenCodeWithPolicy || runOpenCodeWithPolicy,
+  };
+}
+
+// True only for a reader whose final pre-spawn attestation passed with edits denied; any other
+// reader keeps failing when the checkout changes, because it could have made the change.
+function readOnlyEditsDeniedByAttestation(lockPlan, agentMetadata) {
+  return lockPlan?.lockType === "read"
+    && agentMetadata?.ok !== false
+    && Boolean(agentMetadata?.metadata)
+    && agentMetadata.metadata.canEdit === false;
+}
+
+// Files that changed in the checkout while an edit-denied reader ran. A file that is clean
+// again after HEAD moved matches the new HEAD: it was committed, not edited.
+function readOnlyWorkspaceDrift(changedFiles, afterSnapshot, headMoved) {
+  const committedFiles = headMoved ? changedFiles.filter((file) => !afterSnapshot.has(file)) : [];
+  const committed = new Set(committedFiles);
+  const files = changedFiles.filter((file) => !committed.has(file));
+  return {
+    files: files.slice(0, 50),
+    fileCount: files.length,
+    committedFiles: committedFiles.slice(0, 50),
+  };
+}
+
+function formatReadOnlyWorkspaceDrift(drift) {
+  if (!drift || (!drift.fileCount && !drift.committedFiles?.length)) return null;
+  const changed = drift.fileCount
+    ? `${drift.fileCount} file(s) changed by another client: ${drift.files.join(", ")}${drift.fileCount > drift.files.length ? ", ..." : ""}`
+    : "no uncommitted external changes";
+  const committed = drift.committedFiles?.length ? `; committed during the run: ${drift.committedFiles.join(", ")}` : "";
+  return `Checkout changed during this read-only run (the attested agent cannot edit; result kept): ${changed}${committed}. The review may describe the older version of these files.`;
 }
 
 async function executeOpenCodeJob(requestedJob, {
@@ -16340,7 +16498,7 @@ async function executeOpenCodeJob(requestedJob, {
 
   const discoveryContext = sanitizedDiscoveryContext({ ...requestedJob, cwd: cwd || process.cwd() });
   const { forcePure, discoveryCwd } = discoveryContext;
-  const resolution = await resolveAgent(
+  const resolution = await jobAgentRuntime().resolveAgent(
     agent,
     cwd,
     allowFallbackToBuild,
@@ -16417,7 +16575,7 @@ async function executeOpenCodeJob(requestedJob, {
     };
   }
 
-  let agentMetadata = await readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
+  let agentMetadata = await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
   const metadataPolicyError = effectiveReadOnlyMetadataError(agentMetadata, lockPlan, agentMetadataPolicyOptions(resolution, lockPlan));
   const contractorNestedAttestation = lockPlan.orchestratorMode === "contractor"
     ? await attestContractorNestedAgents(discoveryCwd, { forcePure })
@@ -16471,8 +16629,42 @@ async function executeOpenCodeJob(requestedJob, {
   let worktree = null;
   let worktreeDiff = null;
   let worktreeCleanup = null;
+  let emptyWorktreeRemoved = false;
   let containmentQuarantined = false;
   let containmentEvidence = "";
+  // Stopping the heartbeat and releasing (or quarantining) the lock come first and happen once:
+  // a later failure (measuring the retained worktree) must not leave the heartbeat renewing
+  // the path lock until the process exits, and the report states what actually happened.
+  let lockReleaseOutcome = null;
+  const releaseAcquiredLock = async () => {
+    if (lockReleaseOutcome) return lockReleaseOutcome;
+    stopLockHeartbeat();
+    if (!acquiredLock) {
+      lockReleaseOutcome = { needed: false, released: false, text: "not needed" };
+      return lockReleaseOutcome;
+    }
+    try {
+      if (containmentQuarantined) {
+        const quarantined = await quarantineHardLock(acquiredLock, containmentEvidence);
+        if (!quarantined.ok) {
+          logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
+        }
+        lockReleaseOutcome = { needed: true, released: false, quarantined: Boolean(quarantined.ok), text: `no (containment quarantined${quarantined.ok ? "" : "; quarantine unconfirmed"})` };
+      } else {
+        const released = await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+        if (!released?.ok) {
+          logEvent("warn", "lock.release_failed", { lockId: acquiredLock.id, error: released?.error || "" });
+        }
+        lockReleaseOutcome = released?.ok
+          ? { needed: true, released: true, text: "yes" }
+          : { needed: true, released: false, text: `no (${redactSensitiveText(released?.error || "release failed")}; the lock expires with its TTL)` };
+      }
+    } catch (error) {
+      logEvent("error", "lock.release_failed", { lockId: acquiredLock.id, error: error?.message || String(error) });
+      lockReleaseOutcome = { needed: true, released: false, text: `no (${redactSensitiveText(error?.message || String(error))}; the lock expires with its TTL)` };
+    }
+    return lockReleaseOutcome;
+  };
   const shouldAcquireLock = !dryRun;
   let executionCwd = cwd || process.cwd();
   let sanitizedBefore = null;
@@ -16608,7 +16800,7 @@ async function executeOpenCodeJob(requestedJob, {
     }
     const finalAgentMetadata = dryRun
       ? agentMetadata
-      : await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+      : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
     const finalMetadataPolicyError = effectiveReadOnlyMetadataError(
       finalAgentMetadata,
       lockPlan,
@@ -16669,7 +16861,12 @@ async function executeOpenCodeJob(requestedJob, {
         };
       }
     }
-    const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+    // A reader whose attested effective policy denies every edit cannot have changed the
+    // checkout, so a difference there is another client's work (a commit, an editor save,
+    // coverage/ from a test run): it is reported, not held against the reader.
+    const readerEditsDenied = !dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, agentMetadata);
+    const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
+    const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
     const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
       const childAuthority = typeof onChildSpawn === "function"
@@ -16697,7 +16894,7 @@ async function executeOpenCodeJob(requestedJob, {
         ),
       };
     };
-    let result = await runOpenCodeWithPolicy(
+    let result = await jobAgentRuntime().runOpenCodeWithPolicy(
       resolution.actualAgent,
       prompt,
       executionCwd,
@@ -16718,7 +16915,12 @@ async function executeOpenCodeJob(requestedJob, {
       result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
       result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
     }
-    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+    // Validation is judged on tracked and untracked files only: ignored build/cache output
+    // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
+    const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
+      ? afterFiles
+      : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
     const sanitizedAfter = manifestProtected && !dryRun
       ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
@@ -16726,6 +16928,10 @@ async function executeOpenCodeJob(requestedJob, {
     result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
       ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
       : changedFilesBetween(beforeFiles, afterFiles);
+    if (readerEditsDenied && result.changedFiles.length) {
+      result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
+      result.changedFiles = [];
+    }
     if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
       const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
       if (move) {
@@ -16776,9 +16982,9 @@ async function executeOpenCodeJob(requestedJob, {
       result.errorType = validationGate.errorType;
     }
 
-    const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd);
+    const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     const executionHeadAfterValidation = dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
-    const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
+    const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
     if (executionHeadAfterValidation !== executionHeadBefore) {
       const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
         ? null
@@ -16792,7 +16998,7 @@ async function executeOpenCodeJob(requestedJob, {
       result.executionHeadAfter = executionHeadAfterValidation;
     }
     if (validationMutationFiles.length) {
-      result.changedFiles = changedFilesBetween(beforeFiles, afterValidationFiles);
+      result.changedFiles = normalizeLockPathList(result.changedFiles.concat(validationMutationFiles));
       validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
       result.validationMutationFiles = validationMutationFiles;
       result.errorType ||= "validation_mutated_workspace";
@@ -16866,14 +17072,20 @@ async function executeOpenCodeJob(requestedJob, {
             ? "failed or rejected write output is retained for diagnosis and recovery"
             : "successful write output is retained until reviewed integration and a passing validation gate",
         };
+      // Once the empty worktree is gone its path names nothing: reporting it made the queue
+      // record and the pipeline offer a removed worktree for integration forever.
+      emptyWorktreeRemoved = producedNothing && ["success", "partial"].includes(worktreeCleanup.cleanup);
+      if (producedNothing) result.noChanges = true;
       result.worktree = {
-        path: worktree.path,
-        branch: worktree.branch,
+        path: emptyWorktreeRemoved ? "" : worktree.path,
+        branch: emptyWorktreeRemoved ? "" : worktree.branch,
         baseCommit: worktree.baseCommit,
         baseTree: worktree.baseTree,
         patchSha256: worktreeDiff?.patchSha256 || "",
         sourceStateSha256: worktreeDiff?.sourceStateSha256 || "",
         cleanup: worktreeCleanup.cleanup,
+        removed: emptyWorktreeRemoved,
+        removedPath: emptyWorktreeRemoved ? worktree.path : "",
         changedFiles: worktreeDiff?.changedFiles || [],
         diffStat: worktreeDiff?.diffStat || "",
       };
@@ -16939,6 +17151,10 @@ async function executeOpenCodeJob(requestedJob, {
         ].join("\n")
       : ["", "Worktree review:", "Worktree: not used"].join("\n");
 
+    // The job's work is done; the lock is released before the report so the report can say
+    // whether it really was.
+    const lockRelease = await releaseAcquiredLock();
+    result.lockRelease = { needed: lockRelease.needed, released: lockRelease.released };
     return {
       response: {
         content: [
@@ -16946,15 +17162,16 @@ async function executeOpenCodeJob(requestedJob, {
             type: "text",
             text: [
               `Temporary lock acquired: ${hardLockSummary(acquiredLock)}`,
-              `Temporary lock released: ${acquiredLock ? (containmentQuarantined ? "no (containment quarantined)" : "yes") : "not needed"}`,
+              `Temporary lock released: ${lockRelease.text}`,
               formatSingleResult({ resolution, result, cwd: executionCwd, lockPlan }),
+              formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
               worktreeReview,
               nativeFallbackViolation,
               apiErrorViolation,
               finalResponseViolation,
               formatValidationGateResult(validationGate),
               lockViolation,
-            ].join("\n"),
+            ].filter((line) => line !== null).join("\n"),
           },
         ],
       },
@@ -16962,15 +17179,18 @@ async function executeOpenCodeJob(requestedJob, {
       lockPlan,
       resolution,
       validation,
-      worktree,
+      worktree: emptyWorktreeRemoved ? null : worktree,
       worktreeCleanup,
       sanitizedWorkspace: result.sanitizedWorkspaceVerification || null,
     };
   } catch (error) {
+    // An empty worktree that was already removed is not retained work.
+    if (emptyWorktreeRemoved) worktree = null;
     let retainedDiff = null;
     if (worktree) {
       try { retainedDiff = await collectWorktreeDiff(worktree); } catch { retainedDiff = null; }
     }
+    const lockRelease = await releaseAcquiredLock();
     const worktreeDetails = worktree ? {
       path: worktree.path,
       branch: worktree.branch,
@@ -16994,12 +17214,13 @@ async function executeOpenCodeJob(requestedJob, {
         durationMs: nowMs() - toolStarted,
         unresolvedFiles: worktreeDetails?.changedFiles || [],
         suggestedFix: "Inspect the retained worktree or target checkout before retrying; do not discard recovery evidence.",
-      }) }] },
+      }) + `\nTemporary lock released: ${lockRelease.text}` }] },
       result: {
         errorType: "job_infrastructure_failed",
         error: errorText,
         changedFiles: worktreeDetails?.changedFiles || [],
         worktree: worktreeDetails,
+        lockRelease: { needed: lockRelease.needed, released: lockRelease.released },
       },
       lockPlan,
       resolution,
@@ -17007,18 +17228,17 @@ async function executeOpenCodeJob(requestedJob, {
       worktreeCleanup: worktree ? { cleanup: "retained_for_review", reason: "infrastructure failure" } : null,
     };
   } finally {
+    // Release first (idempotent: the report paths above already did), then measure; a failed
+    // measurement is logged and never replaces the job result.
+    await releaseAcquiredLock();
     if (worktree?.path && existsSync(worktree.path)) {
-      await updateRetainedWorktreeMeasurement(worktree);
-    }
-    stopLockHeartbeat();
-    if (acquiredLock) {
-      if (containmentQuarantined) {
-        const quarantined = await quarantineHardLock(acquiredLock, containmentEvidence);
-        if (!quarantined.ok) {
-          logEvent("error", "lock.containment_quarantine_unconfirmed", { lockId: acquiredLock.id });
-        }
-      } else {
-        await releaseHardLock(acquiredLock.id, acquiredLock.token, acquiredLock.paths, acquiredLock.cwd);
+      try {
+        await updateRetainedWorktreeMeasurement(worktree);
+      } catch (error) {
+        logEvent("warn", "worktree.measurement_failed", {
+          worktreePath: worktree.path,
+          error: redactSensitiveText(error?.message || String(error)),
+        });
       }
     }
   }
@@ -18111,6 +18331,7 @@ async function assessQueuePlan(lockPlans = []) {
 
   for (const plan of lockPlans) {
     const candidate = {
+      jobId: plan.jobId || "",
       mode: plan.lockType === "read" ? "read" : "write",
       cwd: plan.cwd,
       lockedPaths: plan.lockedPaths,
@@ -18811,7 +19032,7 @@ function queueHardLockRequestRefusal(record) {
     return `Write lock rejected: ${error?.message || String(error)}`;
   }
   if (!normalizedPaths.length) return "Write lock rejected: paths are required.";
-  if (hasAmbiguousPathPattern(normalizedPaths)) return "Write lock rejected: wildcard or ambiguous paths are not allowed.";
+  if (hasAmbiguousPathPattern(normalizedPaths, record.cwd || "")) return "Write lock rejected: wildcard or ambiguous paths are not allowed.";
   return "";
 }
 
@@ -19040,6 +19261,7 @@ async function startQueueRecord(record) {
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
+        noChanges: Boolean(execution.result?.noChanges),
         worktreeBranch: execution.worktree?.branch || "",
         worktreeBaseCommit: execution.worktree?.baseCommit || "",
         worktreeBaseTree: execution.worktree?.baseTree || "",
@@ -19834,9 +20056,11 @@ async function updatePipelineRecord(record, patch = {}) {
   try {
     return await enqueuePipelinePersistence(record, async () => {
       const expectedRevision = Number(record.revision || 0);
+      // A function patch is computed from the record as it stands when this write runs, so
+      // two callers that each change one integration item do not overwrite each other.
       const candidate = {
         ...record,
-        ...patch,
+        ...(typeof patch === "function" ? patch(record) : patch),
         revision: expectedRevision + 1,
         updatedAt: new Date().toISOString(),
         ownerHeartbeatAt: new Date().toISOString(),
@@ -19871,15 +20095,13 @@ async function updatePipelineRecord(record, patch = {}) {
   }
 }
 
-async function reconcilePipelineIntegrationOperationStates(record) {
-  let changed = false;
-  const events = [...(record.events || [])];
-  const integrationQueue = [];
+async function reconcilePipelineIntegrationOperationStates(record, { persist = true } = {}) {
+  // The journal is the authority for an item whose operation was prepared: an integrating
+  // item may have committed or rolled back before a crash, and a quarantined item's operation
+  // may since have been requalified (recovered_noop) or recovered by the bridge.
+  const statuses = new Map();
   for (const item of record.integrationQueue || []) {
-    if (item.status !== "integrating" || !item.operationId) {
-      integrationQueue.push(item);
-      continue;
-    }
+    if (!["integrating", "quarantined"].includes(item.status) || !item.operationId) continue;
     const operation = await readIntegrationOperationSummary(record.cwd, item.operationId);
     const operationMatchesItem = Boolean(operation)
       && operation.pipelineId === record.pipelineId
@@ -19891,19 +20113,33 @@ async function reconcilePipelineIntegrationOperationStates(record) {
     else if (operation.status === "committed") status = "integrated";
     else if (["rolled_back", "recovered_noop"].includes(operation.status)) status = "pending";
     else if (operation.status === "quarantined") status = "quarantined";
-    if (status !== item.status) {
-      changed = true;
+    if (status !== item.status) statuses.set(item.operationId, { from: item.status, to: status });
+  }
+  if (!statuses.size) return record;
+  const patch = (current) => {
+    const events = [...(current.events || [])];
+    const integrationQueue = (current.integrationQueue || []).map((item) => {
+      const change = item.operationId ? statuses.get(item.operationId) : null;
+      if (!change || item.status !== change.from) return item;
       events.push({
         type: "integration_journal_reconciled",
         at: new Date().toISOString(),
         operationId: item.operationId,
         jobId: item.jobId || "",
-        status,
+        status: change.to,
       });
-    }
-    integrationQueue.push({ ...item, status });
-  }
-  if (changed) await updatePipelineRecord(record, { integrationQueue, events });
+      return { ...item, status: change.to };
+    });
+    // Same rule as a completed integration: the last item landing makes the pipeline finalizable.
+    const allIntegrated = integrationQueue.length && integrationQueue.every((item) => item.status === "integrated");
+    return {
+      integrationQueue,
+      events,
+      status: allIntegrated && current.status === "awaiting_integration" ? "awaiting_finalization" : current.status,
+    };
+  };
+  if (persist) await updatePipelineRecord(record, patch);
+  else Object.assign(record, patch(record));
   return record;
 }
 
@@ -20047,7 +20283,9 @@ function pipelineJobStatus(jobId, cwd = "") {
 function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) {
   const existing = existingQueue.map((item) => ({ ...item }));
   const used = new Set();
-  const writeSnapshots = queueSnapshots.filter((job) => job.worktreePath);
+  // A writer that changed nothing has its empty worktree removed and nothing to integrate;
+  // an item for it could never become integrated and would block finalization for good.
+  const writeSnapshots = queueSnapshots.filter((job) => job.worktreePath && !job.noChanges && (job.changedFiles || []).length);
   return writeSnapshots.map((job) => {
     let matchIndex = existing.findIndex((item, index) => !used.has(index) && item.jobId && item.jobId === job.jobId);
     if (matchIndex < 0) {
@@ -20080,15 +20318,62 @@ function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) 
   });
 }
 
-async function refreshPipelineRecord(record) {
+// Pipeline items are named by their retained worktree or branch. On a case-insensitive
+// filesystem the caller may spell the same worktree with different case or slashes.
+function pipelineIntegrationItemMatches(record, item, { worktreePath = "", branch = "" } = {}) {
+  const cwd = record?.cwd || "";
+  const sameWorktree = Boolean(worktreePath && item?.worktreePath)
+    && normalizeFilesystemCase(path.resolve(item.worktreePath), cwd) === normalizeFilesystemCase(path.resolve(worktreePath), cwd);
+  const sameBranch = Boolean(branch) && item?.branch === branch;
+  return sameWorktree || sameBranch;
+}
+
+const PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES = new Set([
+  "forbidden_file_changed",
+  "changed_file_validation_error",
+  "shared_file_parallel_write",
+  "serial_only_parallel_write",
+]);
+
+// Only a result that says this exact source can never be integrated rejects its item: the
+// source changed after the writer completed, its patch conflicts with the target, or the
+// patch itself touches paths outside its contract. The same scope types after an apply
+// (appliedFiles present) mean another process wrote the checkout during it, which a retry
+// can clear, as can every lock, dirty-target, stale-preview, review, validation and journal
+// outcome.
+function pipelineIntegrationFailureIsDefinitive(result) {
+  const errorType = String(result?.errorType || "");
+  if (["pipeline_source_identity_changed", "integration_merge_conflict", "empty_allowed_edits"].includes(errorType)) return true;
+  return PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES.has(errorType) && !Array.isArray(result?.appliedFiles);
+}
+
+function nextPipelineIntegrationItemStatus(item, result, { dryRun = false } = {}) {
+  // A dry run never prepares a journal operation, so it cannot change what the item is.
+  if (dryRun) return item.status;
+  if (result?.ok && ["applied", "no_changes"].includes(result.status)) return "integrated";
+  if (result?.ok) return item.status === "integrating" ? "pending" : item.status;
+  if (result?.errorType === "integration_recovery_quarantined") {
+    const quarantinedOperations = [result.operationId, ...(result.operationIds || [])].filter(Boolean);
+    return item.operationId && quarantinedOperations.includes(item.operationId) ? "quarantined" : "pending";
+  }
+  return pipelineIntegrationFailureIsDefinitive(result) ? "rejected" : "pending";
+}
+
+async function refreshPipelineRecord(record, { persist = true } = {}) {
   if (["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"].includes(record.status)) {
     return record;
   }
+  // A crash between the journal commit and the pipeline update leaves an item integrating
+  // although its operation committed; the journal decides before the status is derived.
+  await reconcilePipelineIntegrationOperationStates(record, { persist });
+  const applyPatch = persist
+    ? (patch) => updatePipelineRecord(record, patch)
+    : async (patch) => Object.assign(record, typeof patch === "function" ? patch(record) : patch);
   let queueSnapshots = [];
   if (effectiveQueueMode() === "sqlite") {
     const children = await readPersistedPipelineChildren(record);
     if (!children.ok) {
-      await updatePipelineRecord(record, {
+      await applyPatch({
         status: "failed",
         finishedAt: record.finishedAt || new Date().toISOString(),
         batchState: "incomplete",
@@ -20135,7 +20420,7 @@ async function refreshPipelineRecord(record) {
     });
 
     if (failed.length || cancelled.length) {
-      await updatePipelineRecord(record, {
+      await applyPatch({
         status: failed.length ? "failed" : "cancelled",
         finishedAt: record.finishedAt || new Date().toISOString(),
         events,
@@ -20147,16 +20432,18 @@ async function refreshPipelineRecord(record) {
         })),
       });
     } else if (completed.length === queueSnapshots.length) {
-      const integrationQueue = mergePipelineIntegrationQueue(record.integrationQueue || [], queueSnapshots);
-      const allIntegrated = integrationQueue.every((item) => item.status === "integrated");
-      await updatePipelineRecord(record, {
-        status: allIntegrated ? "awaiting_finalization" : "awaiting_integration",
-        finishedAt: record.finishedAt || new Date().toISOString(),
-        events,
-        integrationQueue,
+      await applyPatch((current) => {
+        const integrationQueue = mergePipelineIntegrationQueue(current.integrationQueue || [], queueSnapshots);
+        const allIntegrated = integrationQueue.every((item) => item.status === "integrated");
+        return {
+          status: allIntegrated ? "awaiting_finalization" : "awaiting_integration",
+          finishedAt: current.finishedAt || new Date().toISOString(),
+          events,
+          integrationQueue,
+        };
       });
     } else if (active.length) {
-      await updatePipelineRecord(record, { status: "running", events });
+      await applyPatch({ status: "running", events });
     }
   }
 
@@ -20195,6 +20482,50 @@ async function reconcileParentPipelineAfterQueueTerminal(childRecord) {
 function pipelineHasPendingIntegrations(record) {
   const queue = record.integrationQueue || [];
   return queue.some((item) => item.status !== "integrated");
+}
+
+// Finalization judges the reviewed result: HEAD, tree, status, working patch and index.
+// captureIntegrationTargetState also fingerprints ignored files (mtime/ctime), so a test run
+// that writes __pycache__/ or coverage/ looked like a changed target and failed the pipeline.
+function trackedTargetStateSha256(state) {
+  if (!state?.ok) return "";
+  return createHash("sha256")
+    .update([state.targetHead, state.targetTree, state.statusSha256, state.workingPatchSha256, state.indexSha256].join("\0"))
+    .digest("hex");
+}
+
+// Gate and final-validation outcomes that judge the result itself end the pipeline; anything
+// else (a provider rate limit, a lost lease, a snapshot fault, drift from another client) is
+// retried by finalizing again.
+const PIPELINE_TERMINAL_GATE_ERROR_TYPES = new Set([
+  "pipeline_gate_verdict_fail",
+  "pipeline_gate_agent_not_read_only",
+  // A gate agent that edited files (changedFileValidationErrorType of its validation).
+  ...PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES,
+]);
+const PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES = new Set([
+  "validation_command_failed",
+  "validation_command_untrusted",
+  "validation_command_parse_error",
+  "final_validation_required",
+]);
+
+async function deferPipelineFinalization(record, { type, errorType, error, patch = {} }) {
+  const at = new Date().toISOString();
+  await updatePipelineRecord(record, (current) => ({
+    ...patch,
+    status: "awaiting_finalization",
+    finishedAt: "",
+    errors: (current.errors || []).concat({ type, errorType, error, retryable: true }),
+    events: (current.events || []).concat({ type: "finalization_deferred", at, errorType }),
+  }));
+  return {
+    ok: false,
+    errorType,
+    error: `${error} The pipeline stays awaiting_finalization; finalize again once the cause is cleared. Source worktrees were retained.`,
+    retryable: true,
+    record,
+  };
 }
 
 // A gate agent that ends cleanly has not therefore approved the result: its verdict is read
@@ -20241,9 +20572,14 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null,
   }
 
   const executeGateJob = typeof pipelineGateExecutorTestHook === "function" ? pipelineGateExecutorTestHook : executeOpenCodeJob;
+  // The integrated changes are uncommitted in record.cwd, so a gate must read that checkout:
+  // under CODEX_OPENCODE_WORKTREE_MODE=all a fresh worktree from HEAD would review the
+  // pre-integration tree. Each attempt gets its own job id (a retried gate reused one).
+  const gateAttemptJobId = `${record.pipelineId}-${randomBytes(4).toString("hex")}-${gateName}`;
   const execution = await executeGateJob({
     ...gateJob,
-    cwd: gateJob.cwd || record.cwd,
+    cwd: record.cwd,
+    noWorktree: true,
     write: false,
     lockType: "read",
     lockMode: "off",
@@ -20260,7 +20596,7 @@ async function runPipelineReadOnlyGate(record, gateName, gateJob, signal = null,
       "",
       PIPELINE_GATE_VERDICT_INSTRUCTION,
     ].filter(Boolean).join("\n"),
-  }, { toolStarted: nowMs(), jobId: `${record.pipelineId}-${gateName}`, signal });
+  }, { toolStarted: nowMs(), jobId: gateAttemptJobId, signal });
 
   // An agent that errored or edited files fails on that ground; its verdict is not consulted.
   const runErrorType = execution.result?.errorType
@@ -20326,8 +20662,12 @@ async function finalizePipelineSourceCleanup(record, {
       const branchRef = branch
         ? await runCommand("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], record.cwd, 1000 * 15)
         : { exitCode: 1 };
+      // git prints `worktree C:/Users/...` (forward slashes, its own case); compare resolved,
+      // case-normalized paths or a registered worktree reads as already removed on Windows.
+      const itemWorktreeKey = normalizeFilesystemCase(path.resolve(item.worktreePath), record.cwd);
       const registered = worktrees.exitCode === 0
-        && worktrees.stdout.split(/\r?\n/).some((line) => line === `worktree ${path.resolve(item.worktreePath)}`);
+        && worktrees.stdout.split(/\r?\n/).some((line) => line.startsWith("worktree ")
+          && normalizeFilesystemCase(path.resolve(line.slice("worktree ".length)), record.cwd) === itemWorktreeKey);
       cleanupPlan.push({
         result: !registered && branchRef.exitCode !== 0
           ? { worktreePath: item.worktreePath, branch, cleanup: "success", reason: "recovered_already_removed" }
@@ -20429,10 +20769,27 @@ async function resumeAuthorizedPipelineCleanup(record) {
   const expectedTargetStateSha256 = authorizationEvent?.targetStateSha256 || "";
   const cleanupItems = (record.integrationQueue || []).filter((item) => item.cleanupRequested && item.worktreePath);
   const eventWorktrees = Array.isArray(authorizationEvent?.worktrees) ? authorizationEvent.worktrees : [];
-  const authorizationCardinalityMatches = eventWorktrees.length === cleanupItems.length
-    && cleanupItems.every((item) => eventWorktrees.filter((authorization) => cleanupAuthorizationMatchesItem(record, authorization, item)).length === 1);
+  // Each authorization must name exactly one item and vice versa. An item that finalized as
+  // retained/already removed before the crash has a terminal cleanup result and no
+  // authorization; requiring one authorization per item kept every authorized worktree.
+  const cwd = record.cwd || process.cwd();
+  const worktreeKey = (value) => normalizeFilesystemCase(path.resolve(String(value || "")), cwd);
+  // "failed" stays retryable; "authorized" is what recovery is for.
+  const terminalCleanupResults = (record.sourceCleanupResults || [])
+    .filter((result) => result?.worktreePath && ["success", "partial", "retained_for_review"].includes(result.cleanup));
+  const terminalCleanupKeys = new Set(terminalCleanupResults.map((result) => worktreeKey(result.worktreePath)));
+  const itemsAwaitingCleanup = cleanupItems.filter((item) => !terminalCleanupKeys.has(worktreeKey(item.worktreePath)));
+  const authorizedWorktrees = eventWorktrees.filter((authorization) => {
+    const matchingItems = itemsAwaitingCleanup.filter((item) => cleanupAuthorizationMatchesItem(record, authorization, item));
+    if (matchingItems.length !== 1) return false;
+    return eventWorktrees.filter((other) => cleanupAuthorizationMatchesItem(record, other, matchingItems[0])).length === 1;
+  });
   const targetState = expectedTargetStateSha256 ? await captureIntegrationTargetState(record.cwd) : null;
-  if (!expectedTargetStateSha256 || !targetState?.ok || targetState.targetStateSha256 !== expectedTargetStateSha256) {
+  const expectedTrackedTargetStateSha256 = authorizationEvent?.trackedTargetStateSha256 || "";
+  const targetStateMatches = expectedTrackedTargetStateSha256
+    ? targetState?.ok && trackedTargetStateSha256(targetState) === expectedTrackedTargetStateSha256
+    : targetState?.ok && targetState.targetStateSha256 === expectedTargetStateSha256;
+  if (!expectedTargetStateSha256 || !targetStateMatches) {
     await updatePipelineRecord(record, {
       status: "completed",
       finishedAt: record.finishedAt || new Date().toISOString(),
@@ -20447,10 +20804,11 @@ async function resumeAuthorizedPipelineCleanup(record) {
     return { ok: true, retainedSources: true, warningType: "pipeline_cleanup_target_state_changed", record };
   }
 
-  const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
+  const resumedCleanupResults = await finalizePipelineSourceCleanup({ ...record, integrationQueue: itemsAwaitingCleanup }, {
     authorizeCleanup: async () => {},
-    authorizedWorktrees: authorizationCardinalityMatches ? eventWorktrees : [],
+    authorizedWorktrees,
   });
+  const sourceCleanupResults = terminalCleanupResults.concat(resumedCleanupResults);
   const failures = sourceCleanupResults.filter((result) => result.cleanup === "failed");
   const retained = sourceCleanupResults.filter((result) => ["retained_for_review", "partial"].includes(result.cleanup));
   await updatePipelineRecord(record, {
@@ -20494,7 +20852,30 @@ async function finalizePipelineRecord(record, options = {}) {
 
 async function finalizePipelineRecordUnderLease(record, options = {}) {
   const targetCwd = await resolveProjectStateRoot(record.cwd || process.cwd());
-  const lockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
+  if (options.dryRun) {
+    // A dry run reports whether finalization could start now without taking the repository
+    // lease, and derives the current status in memory: it never changes the durable record.
+    const conflict = (await listLocks(targetCwd))
+      .map((lock) => conflictsWithActiveLock({ lockType: "read", paths: [REPOSITORY_SCOPE_LOCK_PATH] }, lock))
+      .find(Boolean);
+    if (conflict) {
+      return {
+        ok: false,
+        errorType: "pipeline_finalization_lock_conflict",
+        error: `Pipeline finalization requires a stable repository snapshot: active ${conflict.lockType} lock ${conflict.lockId} (${conflict.agent || "unknown"}) holds ${conflictPathsFromConflict(conflict).join(", ") || "the repository"}.`,
+        conflictingPaths: conflictPathsFromConflict(conflict),
+        record,
+      };
+    }
+    const view = {
+      ...record,
+      integrationQueue: (record.integrationQueue || []).map((item) => ({ ...item })),
+      events: [...(record.events || [])],
+      errors: [...(record.errors || [])],
+    };
+    return { ...(await finalizePipelineRecordWhileLocked(view, options)), record };
+  }
+  const lockTtlMs =Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + CONFIG.readOnlyRetryMaxElapsedMs * 2 + 1000 * 60 * 5);
   const lockResult = await acquireHardLock({
     owner: "codex",
     agent: "pipeline_finalizer",
@@ -20524,7 +20905,10 @@ async function finalizePipelineRecordUnderLease(record, options = {}) {
 }
 
 async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false, dryRun = false, beforeFinalValidationHook = null, signal = null } = {}) {
-  await refreshPipelineRecord(record);
+  // The journal decides items whose integration committed before a crash (refresh reconciles
+  // them too, but returns early for a crashed "finalizing" record).
+  await reconcilePipelineIntegrationOperationStates(record, { persist: !dryRun });
+  await refreshPipelineRecord(record, { persist: !dryRun });
   const now = new Date().toISOString();
   const events = (record.events || []).concat({
     type: "finalization_started",
@@ -20726,7 +21110,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     try {
       finalValidationBeforeState = await captureIntegrationTargetState(record.cwd);
       if (!finalValidationBeforeState.ok) finalValidationEvidenceError = finalValidationBeforeState.error || "Could not capture pipeline target state before final validation.";
-      else finalValidationBeforeFiles = await gitChangedFileSnapshot(record.cwd);
+      else finalValidationBeforeFiles = await gitChangedFileSnapshot(record.cwd, { includeIgnored: false });
     } catch (error) {
       finalValidationEvidenceError = redactSensitiveText(error.message || String(error));
     }
@@ -20750,10 +21134,12 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   if (!record.sanitizedWorkspace && !dryRun && !finalValidationEvidenceError) {
     try {
       finalValidationAfterState = await captureIntegrationTargetState(record.cwd);
-      const finalValidationAfterFiles = await gitChangedFileSnapshot(record.cwd);
+      const finalValidationAfterFiles = await gitChangedFileSnapshot(record.cwd, { includeIgnored: false });
       finalValidationMutationFiles = changedFilesBetween(finalValidationBeforeFiles, finalValidationAfterFiles);
+      // Tracked state only: ignored output of the validation command (__pycache__/) is not
+      // a change to the reviewed result.
       const stateChanged = !finalValidationAfterState.ok
-        || finalValidationAfterState.targetStateSha256 !== finalValidationBeforeState.targetStateSha256;
+        || trackedTargetStateSha256(finalValidationAfterState) !== trackedTargetStateSha256(finalValidationBeforeState);
       if (stateChanged || finalValidationMutationFiles.length) {
         finalValidationResult = {
           ...finalValidationResult,
@@ -20777,6 +21163,16 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   const finalValidationRequired = (record.integrationQueue || []).length > 0;
   if (finalValidationResult.errorType || (finalValidationRequired && finalValidationResult.status !== "passed")) {
     const finalErrorType = finalValidationResult.errorType || "final_validation_required";
+    // Only a validation that ran and failed judges the result. A snapshot fault, state drift
+    // from another client, or a lost lease (an aborted command) is retried by finalizing again.
+    if (signal?.aborted || !PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES.has(finalErrorType)) {
+      return deferPipelineFinalization(record, {
+        type: "final_validation",
+        errorType: signal?.aborted ? abortSignalErrorType(signal, "read_lock_ownership_lost") : finalErrorType,
+        error: finalValidationResult.stderr || finalValidationResult.stdout || "Final validation could not be completed.",
+        patch: { finalValidationResult },
+      });
+    }
     await updatePipelineRecord(record, {
       status: "failed",
       finishedAt: new Date().toISOString(),
@@ -20810,28 +21206,22 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
   const gateRejection = gateOutcomes.find((outcome) => outcome.status === "rejected");
   if (gateRejection) throw gateRejection.reason;
   const [reviewerResult = null, testerResult = null] = gateOutcomes.map((outcome) => outcome.value);
-  if (reviewerResult?.status === "failed") {
-    await updatePipelineRecord(record, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      finalValidationResult,
-      reviewerResult,
-      testerResult,
-      errors: (record.errors || []).concat({
-        type: "reviewer",
-        errorType: reviewerResult.errorType,
-        error: "Reviewer gate failed.",
-      }),
+  // GATE_VERDICT: fail (or a gate that is not read-only or edited files) ends the pipeline. A
+  // gate that could not deliver a verdict (rate limit, lost read lease, missing or misplaced
+  // verdict line) leaves it awaiting_finalization so the gates can run again.
+  const failedGates = [["reviewer", reviewerResult], ["tester", testerResult]].filter(([, gateResult]) => gateResult?.status === "failed");
+  const terminalGate = failedGates.find(([, gateResult]) => PIPELINE_TERMINAL_GATE_ERROR_TYPES.has(gateResult.errorType));
+  const [failedGateName = "", failedGateResult = null] = terminalGate || failedGates[0] || [];
+  const failedGateLabel = failedGateName === "tester" ? "Tester" : "Reviewer";
+  if (failedGateResult && !terminalGate) {
+    return deferPipelineFinalization(record, {
+      type: failedGateName,
+      errorType: failedGateResult.errorType || `${failedGateName}_gate_failed`,
+      error: `${failedGateLabel} gate did not deliver a verdict (${failedGateResult.errorType || "unknown"}).`,
+      patch: { finalValidationResult, reviewerResult, testerResult },
     });
-    return {
-      ok: false,
-      errorType: reviewerResult.errorType || "reviewer_gate_failed",
-      error: "Reviewer gate failed.",
-      record,
-    };
   }
-
-  if (testerResult?.status === "failed") {
+  if (failedGateResult) {
     await updatePipelineRecord(record, {
       status: "failed",
       finishedAt: new Date().toISOString(),
@@ -20839,15 +21229,15 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
       reviewerResult,
       testerResult,
       errors: (record.errors || []).concat({
-        type: "tester",
-        errorType: testerResult.errorType,
-        error: "Tester gate failed.",
+        type: failedGateName,
+        errorType: failedGateResult.errorType,
+        error: `${failedGateLabel} gate failed.`,
       }),
     });
     return {
       ok: false,
-      errorType: testerResult.errorType || "tester_gate_failed",
-      error: "Tester gate failed.",
+      errorType: failedGateResult.errorType || `${failedGateName}_gate_failed`,
+      error: `${failedGateLabel} gate failed.`,
       record,
     };
   }
@@ -20874,20 +21264,16 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
 
   if (!record.sanitizedWorkspace && !dryRun && finalValidationAfterState?.ok) {
     const beforeCleanupState = await captureIntegrationTargetState(record.cwd);
-    if (!beforeCleanupState.ok || beforeCleanupState.targetStateSha256 !== finalValidationAfterState.targetStateSha256) {
-      await updatePipelineRecord(record, {
-        status: "failed",
-        finishedAt: new Date().toISOString(),
-        finalValidationResult,
-        reviewerResult,
-        testerResult,
-        errors: (record.errors || []).concat({
-          type: "finalization",
-          errorType: "pipeline_target_changed_before_cleanup",
-          error: "Pipeline target changed after final validation/gates and before source cleanup.",
-        }),
+    // The gates' own test runs write ignored output; only tracked state must be unchanged.
+    if (!beforeCleanupState.ok || trackedTargetStateSha256(beforeCleanupState) !== trackedTargetStateSha256(finalValidationAfterState)) {
+      return deferPipelineFinalization(record, {
+        type: "finalization",
+        errorType: "pipeline_target_changed_before_cleanup",
+        error: beforeCleanupState.ok
+          ? "Pipeline target changed after final validation/gates and before source cleanup."
+          : beforeCleanupState.error || "Could not capture the pipeline target state before source cleanup.",
+        patch: { finalValidationResult, reviewerResult, testerResult },
       });
-      return { ok: false, errorType: "pipeline_target_changed_before_cleanup", error: "Pipeline target changed before cleanup; source worktrees were retained.", record };
     }
   }
 
@@ -20897,20 +21283,13 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     afterAllWaves: sanitizedFinal,
   } : null;
   if (signal?.aborted) {
-    const errorType = abortSignalErrorType(signal, "read_lock_ownership_lost");
-    await updatePipelineRecord(record, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      finalValidationResult,
-      reviewerResult,
-      testerResult,
-      errors: (record.errors || []).concat({
-        type: "finalization",
-        errorType,
-        error: signal.reason?.message || "Pipeline finalization lost its repository consistency lease.",
-      }),
+    // Losing the lease says nothing about the result; finalize again under a new one.
+    return deferPipelineFinalization(record, {
+      type: "finalization",
+      errorType: abortSignalErrorType(signal, "read_lock_ownership_lost"),
+      error: signal.reason?.message || "Pipeline finalization lost its repository consistency lease.",
+      patch: { finalValidationResult, reviewerResult, testerResult },
     });
-    return { ok: false, errorType, error: "Pipeline finalization lost its repository consistency lease; source worktrees were retained.", record };
   }
   const sourceCleanupResults = await finalizePipelineSourceCleanup(record, {
     dryRun,
@@ -20933,6 +21312,7 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
           type: "source_cleanup_authorized",
           at: new Date().toISOString(),
           targetStateSha256: finalValidationAfterState?.targetStateSha256 || "",
+          trackedTargetStateSha256: trackedTargetStateSha256(finalValidationAfterState),
           worktrees: authorizations.map((authorization) => ({
             worktreePath: authorization.worktreePath,
             branch: authorization.branch,
@@ -21220,6 +21600,82 @@ function settleIndependentParallelJobs(executionPromises) {
   return Promise.allSettled(executionPromises);
 }
 
+// Every job runs its agent, its read-only retries and its validation command under the one
+// group signal, so the deadline covers the longest of those sums; the agent timeout alone
+// aborted a validation that started late in a long builder run.
+const PARALLEL_GROUP_DEADLINE_MARGIN_MS = 1000 * 60;
+
+function parallelGroupDeadlineMs(lockPlans = []) {
+  const budgets = lockPlans.map((plan) => {
+    const agentTimeoutMs = timeoutForAgent(plan.agent, plan, plan.timeoutMs);
+    // runOpenCodeWithPolicy bounds a reader's attempts by max(retry budget, timeout).
+    const agentBudgetMs = plan.lockType === "read"
+      ? Math.max(CONFIG.readOnlyRetryMaxElapsedMs, agentTimeoutMs)
+      : agentTimeoutMs;
+    const validationBudgetMs = String(plan.validationCommand || "").trim() ? CONFIG.validationCommandTimeoutMs : 0;
+    return agentBudgetMs + validationBudgetMs;
+  });
+  return Math.max(0, ...budgets) + PARALLEL_GROUP_DEADLINE_MARGIN_MS;
+}
+
+// Group-scope check of one execution workspace after every job of a parallel batch settled.
+async function parallelGroupScopeReport({ cwdKey, lockPlans, indexesForCwd, results, before, expectedHead, driftTolerated = false }) {
+  const after = await gitChangedFileSnapshot(cwdKey, driftTolerated ? { includeIgnored: false } : {});
+  const afterHead = await captureGitHead(cwdKey);
+  const headChanged = afterHead !== expectedHead;
+  let changedFiles = changedFilesBetween(before, after);
+  let externalDriftFiles = [];
+  if (driftTolerated && changedFiles.length) {
+    // Only edit-denied readers ran here: the change is another client's, reported not rejected.
+    const drift = readOnlyWorkspaceDrift(changedFiles, after, headChanged);
+    externalDriftFiles = drift.files;
+    changedFiles = [];
+  }
+  const plansForCwd = indexesForCwd.map((index) => lockPlans[index]);
+  if (headChanged) {
+    const readOnlyCwd = !changedFiles.length && plansForCwd.every((plan) => plan.lockType === "read");
+    for (const index of indexesForCwd) {
+      const jobResult = results[index];
+      if (!jobResult?.result) continue;
+      const move = readOnlyCwd && !jobResult.result.errorType
+        ? await readOnlyHeadMove(lockPlans[index], cwdKey, expectedHead, afterHead)
+        : null;
+      if (move) jobResult.result.readOnlyHeadMove = move;
+      else jobResult.result.errorType ||= "repository_head_changed_during_execution";
+      jobResult.result.executionHeadBefore = expectedHead;
+      jobResult.result.executionHeadAfter = afterHead;
+    }
+  }
+  const writePlansForCwd = plansForCwd.filter((plan) => plan.lockType === "write");
+  const allowedEditsForCwd = writePlansForCwd.flatMap((plan) => plan.allowedEdits);
+  const forbiddenForCwd = plansForCwd.flatMap((plan) => plan.forbiddenEdits.concat(plan.sharedFiles));
+  const serialOnlyMatches = findSerialOnlyMatches(changedFiles);
+  const disallowedFiles = normalizeLockPathList([
+    ...(writePlansForCwd.length ? unsafeChangedFiles(changedFiles, allowedEditsForCwd, cwdKey) : changedFiles),
+    ...changedFiles.filter((file) => isWithinAnyPath(file, forbiddenForCwd, cwdKey)),
+    ...changedFiles.filter((file) => findSerialOnlyMatches([file]).length),
+  ]);
+  const rollbackResult = disallowedFiles.length
+    ? {
+        rollback: "not_attempted_unattributed_changes",
+        rollbackFiles: [],
+        unresolvedFiles: disallowedFiles,
+        reason: "Parallel path-only evidence cannot safely distinguish OpenCode output from concurrent external edits; affected worktrees/output are retained for inspection.",
+      }
+    : { rollback: "not_needed", rollbackFiles: [], unresolvedFiles: [] };
+  return {
+    cwd: cwdKey,
+    headChanged,
+    expectedHead,
+    actualHead: afterHead,
+    changedFiles,
+    disallowedFiles,
+    serialOnlyMatches,
+    externalDriftFiles,
+    ...rollbackResult,
+  };
+}
+
 function parallelExecutionOverlapEvidence(results) {
   const pairs = [];
   for (let leftIndex = 0; leftIndex < results.length; leftIndex += 1) {
@@ -21243,10 +21699,9 @@ server.tool(
   async ({ jobs }) => {
     jobs = await Promise.all(jobs.map((job) => normalizeJobCwd(job)));
     const toolStarted = nowMs();
-    const capacityError = parallelBatchCapacityError(jobs);
-    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = capacityError
-      ? { ...capacityError, lockPlans: [] }
-      : validateParallelWritePlan(jobs);
+    // Provider capacity is checked per provider key once every route is attested (below),
+    // before any lock, worktree or agent; each key's leases are limited separately.
+    const { error: writePlanError, errorType: writePlanErrorType, suggestedFix: writePlanSuggestedFix, lockPlans, conflictingPaths = [], serialOnlyMatches = [] } = validateParallelWritePlan(jobs);
     if (writePlanError) {
       const requestedAgents = lockPlans?.map((plan) => plan.agent).filter(Boolean).join(", ") || "multiple";
       const lockMode = lockPlans?.map((plan) => plan.lockMode).filter(Boolean).join(", ") || "unknown";
@@ -21348,7 +21803,7 @@ server.tool(
         }
         parallelSanitizedPreflight[index] = verification;
       }
-      const resolution = await resolveAgent(
+      const resolution = await jobAgentRuntime().resolveAgent(
         job.agent,
         job.cwd,
         job.allowFallbackToBuild || false,
@@ -21358,7 +21813,7 @@ server.tool(
         discoveryContext
       );
       const routingError = resolution.error ? { errorType: "agent_routing_error", error: resolution.error } : readOnlyRoutingPolicyError(resolution, lockPlan);
-      const metadata = resolution.error ? null : await readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
+      const metadata = resolution.error ? null : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
       const metadataError = resolution.error ? null : effectiveReadOnlyMetadataError(metadata, lockPlan, agentMetadataPolicyOptions(resolution, lockPlan));
       const sanitizedMetadataError = resolution.error || !job.sanitizedWorkspace ? null : sanitizedAgentMetadataError(metadata, job.sanitizedWorkspace.root);
       const sanitizedError = sanitizedRoutingPolicyError(job, resolution, discoveryCwd);
@@ -21378,6 +21833,20 @@ server.tool(
       resolution.agentMetadata = metadata?.metadata || null;
       parallelResolutions[index] = resolution;
       parallelAgentMetadata[index] = metadata;
+    }
+
+    const capacityError = parallelBatchCapacityError(jobs, parallelProviderKeys(parallelResolutions, parallelAgentMetadata, lockPlans));
+    if (capacityError) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Parallel OpenCode execution rejected.",
+        errorType: capacityError.errorType,
+        reason: capacityError.error,
+        requestedAgent: lockPlans.map((plan) => plan.agent).filter(Boolean).join(", ") || "multiple",
+        actualAgent: "none",
+        lockMode: lockPlans.map((plan) => plan.lockMode).filter(Boolean).join(", ") || "unknown",
+        durationMs: nowMs() - toolStarted,
+        suggestedFix: capacityError.suggestedFix,
+      }) }] };
     }
 
     const acquiredLocks = [];
@@ -21525,7 +21994,7 @@ server.tool(
       const resolution = parallelResolutions[index];
       const executionCwd = executionCwdForIndex(index);
       const { forcePure } = sanitizedDiscoveryContext({ ...job, cwd: job.cwd || process.cwd() });
-      const finalMetadata = await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+      const finalMetadata = await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
       const metadataError = effectiveReadOnlyMetadataError(
         finalMetadata,
         lockPlan,
@@ -21557,11 +22026,18 @@ server.tool(
     const parallelSnapshottedCwds = new Set();
     const parallelBefore = new Map();
     const parallelHeadBefore = new Map();
+    // A checkout used only by readers whose attested policy denies edits changes only through
+    // another client, so its group check reports that drift instead of rejecting the batch.
+    const parallelDriftToleratedCwds = new Set(cwdKeys.filter((cwdKey) => {
+      const indexes = jobs.map((_, index) => index).filter((index) => path.resolve(executionCwdForIndex(index)) === cwdKey && !jobs[index].dryRun);
+      return indexes.length > 0 && indexes.every((index) => !jobs[index].sanitizedWorkspace && readOnlyEditsDeniedByAttestation(lockPlans[index], parallelAgentMetadata[index]));
+    }));
+    const parallelRemovedWorktrees = new Set();
     try {
       for (const cwdKey of cwdKeys) {
         const needsGitSnapshot = jobs.some((job, index) => path.resolve(executionCwdForIndex(index)) === cwdKey && !job.dryRun && !job.sanitizedWorkspace);
         if (needsGitSnapshot) parallelSnapshottedCwds.add(cwdKey);
-        parallelBefore.set(cwdKey, needsGitSnapshot ? await gitChangedFileSnapshot(cwdKey) : new Map());
+        parallelBefore.set(cwdKey, needsGitSnapshot ? await gitChangedFileSnapshot(cwdKey, parallelDriftToleratedCwds.has(cwdKey) ? { includeIgnored: false } : {}) : new Map());
         parallelHeadBefore.set(cwdKey, needsGitSnapshot ? await captureGitHead(cwdKey) : "");
       }
     } catch (error) {
@@ -21590,7 +22066,7 @@ server.tool(
       if (heartbeat.signal?.aborted) abortGroupForLostLock();
       else heartbeat.signal?.addEventListener("abort", abortGroupForLostLock, { once: true });
     }
-    const groupDeadlineMs = Math.max(...lockPlans.map((plan) => timeoutForAgent(plan.agent, plan, plan.timeoutMs))) + 1000 * 60;
+    const groupDeadlineMs = parallelGroupDeadlineMs(lockPlans);
     let groupDeadlineExpired = false;
     const groupDeadlineTimer = setTimeout(() => {
       groupDeadlineExpired = true;
@@ -21677,19 +22153,25 @@ server.tool(
               },
               startedAtMs: jobStartedAtMs,
               finishedAtMs: nowMs(),
-              text: formatRejectedExecution({
-                headline: "Sanitized workspace changed between preflight and the parallel wave.",
-                errorType: verification.errorType,
-                reason: verification.error,
-                requestedAgent: resolution.requestedAgent,
-                actualAgent: resolution.actualAgent,
-                conflictingPaths: verification.discrepancies?.map((item) => item.path) || [],
-                suggestedFix: "Retain the workspace for investigation and rebuild it from the trusted manifest.",
-              }),
+              // The JOB label is what the report keys the Run id on.
+              text: [
+                `JOB ${index + 1}`,
+                formatRejectedExecution({
+                  headline: "Sanitized workspace changed between preflight and the parallel wave.",
+                  errorType: verification.errorType,
+                  reason: verification.error,
+                  requestedAgent: resolution.requestedAgent,
+                  actualAgent: resolution.actualAgent,
+                  conflictingPaths: verification.discrepancies?.map((item) => item.path) || [],
+                  suggestedFix: "Retain the workspace for investigation and rebuild it from the trusted manifest.",
+                }),
+              ].join("\n"),
             };
           }
         }
-        const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+        const readerEditsDenied = !job.dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, parallelAgentMetadata[index]);
+        const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
+        const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
         const delegation = {
           scope: job.delegation?.scope,
           lockMode: lockPlan.lockMode,
@@ -21711,7 +22193,7 @@ server.tool(
         if (resolution.proxyUsed) {
           prompt = buildSubagentProxyPrompt(resolution.requestedAgent, await readAgentDefinition(resolution.requestedAgent), prompt);
         }
-        const result = await runOpenCodeWithPolicy(
+        const result = await jobAgentRuntime().runOpenCodeWithPolicy(
           resolution.actualAgent,
           prompt,
           executionCwd,
@@ -21720,7 +22202,10 @@ server.tool(
           lockPlan.timeoutMs,
           { signal: groupController.signal, agentMetadata: parallelAgentMetadata[index] }
         );
-        const afterFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd);
+        const afterFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+        const afterFilesForValidation = job.dryRun || manifestProtected || readerEditsDenied
+          ? afterFiles
+          : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
         const executionHeadAfterAgent = job.dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
         const sanitizedAfter = manifestProtected && !job.dryRun
           ? await verifySanitizedWorkspace(job.sanitizedWorkspace, "after_wave")
@@ -21729,6 +22214,10 @@ server.tool(
           ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
           : changedFilesBetween(beforeFiles, afterFiles);
         const expectedExecutionHead = parallelHeadBefore.get(path.resolve(executionCwd)) || "";
+        if (readerEditsDenied && result.changedFiles.length) {
+          result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, Boolean(executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead));
+          result.changedFiles = [];
+        }
         if (executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead) {
           const move = result.changedFiles.length || result.errorType ? null : await readOnlyHeadMove(lockPlan, executionCwd, expectedExecutionHead, executionHeadAfterAgent);
           if (move) {
@@ -21774,9 +22263,9 @@ server.tool(
         if (validationGate.errorType && !result.errorType) {
           result.errorType = validationGate.errorType;
         }
-        const afterValidationFiles = job.dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd);
+        const afterValidationFiles = job.dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
         const executionHeadAfterValidation = job.dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
-        const validationMutationFiles = job.dryRun || manifestProtected ? [] : changedFilesBetween(afterFiles, afterValidationFiles);
+        const validationMutationFiles = job.dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
         if (executionHeadAfterValidation && executionHeadAfterValidation !== expectedExecutionHead) {
           const move = result.errorType || validationMutationFiles.length || result.changedFiles.length
             ? null
@@ -21786,7 +22275,7 @@ server.tool(
           result.executionHeadAfter = executionHeadAfterValidation;
         }
         if (validationMutationFiles.length) {
-          result.changedFiles = changedFilesBetween(beforeFiles, afterValidationFiles);
+          result.changedFiles = normalizeLockPathList(result.changedFiles.concat(validationMutationFiles));
           const postValidation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: true });
           unsafeFiles = normalizeLockPathList(postValidation.disallowedFiles.concat(validationMutationFiles));
           result.validationMutationFiles = validationMutationFiles;
@@ -21811,15 +22300,31 @@ server.tool(
             result.stderr = [result.stderr, `Execution output and the integratable Git patch differ at: ${unrepresentableFiles.join(", ")}. The worktree was retained and cannot be reported as successful.`].filter(Boolean).join("\n");
           }
         }
+        // Same rule as a single job: a writer whose verified diff is empty has nothing to
+        // review, so its worktree is removed instead of filling the retained-worktree cap.
+        const producedNothing = Boolean(worktree && worktreeDiff)
+          && !worktreeDiff.errorType
+          && !(worktreeDiff.changedFiles || []).length
+          && !(result.changedFiles || []).length
+          && !(result.unrepresentableFiles || []).length
+          && !unsafeFiles.length;
+        const worktreeCleanup = producedNothing
+          ? { ...(await cleanupWorktree(worktree, "always", true)), errorType: undefined, reason: "the job changed no files, so there was nothing to retain" }
+          : null;
+        const worktreeRemoved = producedNothing && ["success", "partial"].includes(worktreeCleanup.cleanup);
+        if (worktreeRemoved) parallelRemovedWorktrees.add(path.resolve(worktree.path));
+        if (producedNothing) result.noChanges = true;
         if (worktree) {
           result.worktree = {
-            path: worktree.path,
-            branch: worktree.branch,
+            path: worktreeRemoved ? "" : worktree.path,
+            branch: worktreeRemoved ? "" : worktree.branch,
             baseCommit: worktree.baseCommit,
             baseTree: worktree.baseTree,
             patchSha256: worktreeDiff?.patchSha256 || "",
             sourceStateSha256: worktreeDiff?.sourceStateSha256 || "",
-            cleanup: "retained_for_review",
+            cleanup: worktreeCleanup?.cleanup || "retained_for_review",
+            removed: worktreeRemoved,
+            removedPath: worktreeRemoved ? worktree.path : "",
             changedFiles: worktreeDiff?.changedFiles || [],
             diffStat: worktreeDiff?.diffStat || "",
           };
@@ -21828,6 +22333,7 @@ server.tool(
           index,
           lockPlan,
           result,
+          worktreeCleanup,
           startedAtMs: jobStartedAtMs,
           finishedAtMs: nowMs(),
           text: [
@@ -21839,7 +22345,8 @@ server.tool(
             cwd: executionCwd,
             lockPlan,
           }),
-          formatWorktreeSummary(worktree, null),
+          formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
+          formatWorktreeSummary(worktree, worktreeCleanup),
           worktreeDiff?.diffStat ? `Worktree diff stat:\n${worktreeDiff.diffStat}` : null,
           formatValidationGateResult(validationGate),
           `Unsafe changed files: ${unsafeFiles.length ? unsafeFiles.join(", ") : "none detected"}`,
@@ -21870,52 +22377,47 @@ server.tool(
       }));
       for (const cwdKey of cwdKeys) {
         if (!parallelSnapshottedCwds.has(cwdKey)) continue;
-        const after = await gitChangedFileSnapshot(cwdKey);
-        const afterHead = await captureGitHead(cwdKey);
-        const expectedHead = parallelHeadBefore.get(cwdKey) || "";
-        const headChanged = afterHead !== expectedHead;
-        const changedFiles = changedFilesBetween(parallelBefore.get(cwdKey) || new Map(), after);
-        const plansForCwd = lockPlans.filter((_, index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
-        if (headChanged) {
-          const readOnlyCwd = !changedFiles.length && plansForCwd.every((plan) => plan.lockType === "read");
-          for (const [index, jobResult] of results.entries()) {
-            if (path.resolve(executionCwdForIndex(index)) !== cwdKey) continue;
-            const move = readOnlyCwd && !jobResult.result.errorType
-              ? await readOnlyHeadMove(lockPlans[index], cwdKey, expectedHead, afterHead)
-              : null;
-            if (move) jobResult.result.readOnlyHeadMove = move;
-            else jobResult.result.errorType ||= "repository_head_changed_during_execution";
-            jobResult.result.executionHeadBefore = expectedHead;
-            jobResult.result.executionHeadAfter = afterHead;
+        // A writer worktree that produced nothing was removed; there is no group state left there.
+        if (parallelRemovedWorktrees.has(cwdKey)) continue;
+        const indexesForCwd = lockPlans.map((_, index) => index).filter((index) => path.resolve(executionCwdForIndex(index)) === cwdKey);
+        // A snapshot or git failure here (limit exceeded, git error) fails this workspace's
+        // check closed; it must not discard every job result and Run id with it.
+        try {
+          parallelRollbackReports.push(await parallelGroupScopeReport({
+            cwdKey,
+            lockPlans,
+            indexesForCwd,
+            results,
+            before: parallelBefore.get(cwdKey) || new Map(),
+            expectedHead: parallelHeadBefore.get(cwdKey) || "",
+            driftTolerated: parallelDriftToleratedCwds.has(cwdKey),
+          }));
+        } catch (error) {
+          const errorType = error?.errorType || "parallel_group_snapshot_failed";
+          const reason = redactSensitiveText(error?.message || String(error));
+          for (const index of indexesForCwd) {
+            const jobResult = results[index];
+            if (!jobResult?.result) continue;
+            jobResult.result.errorType ||= errorType;
+            jobResult.result.stderr = [jobResult.result.stderr, `Group-scope check of ${cwdKey} failed closed: ${reason}`].filter(Boolean).join("\n");
           }
+          parallelRollbackReports.push({
+            cwd: cwdKey,
+            headChanged: false,
+            expectedHead: parallelHeadBefore.get(cwdKey) || "",
+            actualHead: "unknown",
+            changedFiles: [],
+            disallowedFiles: [],
+            serialOnlyMatches: [],
+            externalDriftFiles: [],
+            checkFailed: true,
+            errorType,
+            error: reason,
+            rollback: "not_attempted_check_failed",
+            rollbackFiles: [],
+            unresolvedFiles: [],
+          });
         }
-        const writePlansForCwd = plansForCwd.filter((plan) => plan.lockType === "write");
-        const allowedEditsForCwd = writePlansForCwd.flatMap((plan) => plan.allowedEdits);
-        const forbiddenForCwd = plansForCwd.flatMap((plan) => plan.forbiddenEdits.concat(plan.sharedFiles));
-        const serialOnlyMatches = findSerialOnlyMatches(changedFiles);
-        const disallowedFiles = normalizeLockPathList([
-          ...(writePlansForCwd.length ? unsafeChangedFiles(changedFiles, allowedEditsForCwd, cwdKey) : changedFiles),
-          ...changedFiles.filter((file) => isWithinAnyPath(file, forbiddenForCwd, cwdKey)),
-          ...changedFiles.filter((file) => findSerialOnlyMatches([file]).length),
-        ]);
-        const rollbackResult = disallowedFiles.length
-          ? {
-              rollback: "not_attempted_unattributed_changes",
-              rollbackFiles: [],
-              unresolvedFiles: disallowedFiles,
-              reason: "Parallel path-only evidence cannot safely distinguish OpenCode output from concurrent external edits; affected worktrees/output are retained for inspection.",
-            }
-          : { rollback: "not_needed", rollbackFiles: [], unresolvedFiles: [] };
-        parallelRollbackReports.push({
-          cwd: cwdKey,
-          headChanged,
-          expectedHead,
-          actualHead: afterHead,
-          changedFiles,
-          disallowedFiles,
-          serialOnlyMatches,
-          ...rollbackResult,
-        });
       }
     } finally {
       clearTimeout(groupDeadlineTimer);
@@ -21925,7 +22427,7 @@ server.tool(
 
     const lockViolations = verifyParallelLockResults(results);
     const parallelSuccess = !lockViolations.length
-      && !parallelRollbackReports.some((report) => report.disallowedFiles.length)
+      && !parallelRollbackReports.some((report) => report.disallowedFiles.length || report.checkFailed)
       && !results.some((jobResult) => jobResult.result?.errorType);
     const executionOverlap = parallelExecutionOverlapEvidence(results);
     const ranConcurrently = executionOverlap.ranConcurrently;
@@ -21935,15 +22437,28 @@ server.tool(
     const parallelWorktreeCleanupReports = parallelWorktrees
       .map((worktree, index) => ({ worktree, index }))
       .filter(({ worktree }) => Boolean(worktree))
-      .map(({ worktree, index }) => ({
-        index,
-        path: worktree.path,
-        branch: worktree.branch,
-        cleanup: "retained_for_review",
-        reason: parallelSuccess
-          ? "successful output awaits reviewed serial integration"
-          : "partial or failed batch output is retained for diagnosis and recovery",
-      }));
+      .map(({ worktree, index }) => {
+        const cleanup = results[index]?.worktreeCleanup || null;
+        return cleanup
+          ? {
+              index,
+              path: worktree.path,
+              branch: worktree.branch,
+              cleanup: cleanup.cleanup,
+              reason: cleanup.reason || "",
+              error: cleanup.error || "",
+            }
+          : {
+              index,
+              path: worktree.path,
+              branch: worktree.branch,
+              cleanup: "retained_for_review",
+              reason: parallelSuccess
+                ? "successful output awaits reviewed serial integration"
+                : "partial or failed batch output is retained for diagnosis and recovery",
+            };
+      });
+    const retainedWorktreeCount = parallelWorktreeCleanupReports.filter((report) => report.cleanup === "retained_for_review" || report.cleanup === "failed").length;
     const verification = [
       "Parallel lock verification:",
       lockViolations.length
@@ -21953,25 +22468,34 @@ server.tool(
     ].join("\n");
     const rollbackVerification = [
       "Parallel rollback verification:",
-      parallelRollbackReports.some((report) => report.disallowedFiles.length)
-        ? "Rejected. Disallowed changed files were detected and rollback was attempted."
+      parallelRollbackReports.some((report) => report.checkFailed)
+        ? "Rejected. A group-scope check could not complete; the affected jobs failed closed and their output was retained."
+        : parallelRollbackReports.some((report) => report.disallowedFiles.length)
+        // The bridge never rolls back parallel output: path-only evidence cannot attribute it.
+        ? "Rejected. Disallowed changed files were detected; no rollback was attempted and the changes and worktrees were retained for inspection."
         : "Accepted. No disallowed changed files detected at group scope.",
       ...parallelRollbackReports.map((report) =>
         [
           `Workspace: ${report.cwd}`,
+          report.checkFailed ? `Group check failed: ${report.errorType}: ${report.error}` : null,
           `Changed files: ${report.changedFiles.length ? report.changedFiles.join(", ") : "none detected"}`,
+          report.externalDriftFiles?.length ? `External changes (another client; the attested readers cannot edit): ${report.externalDriftFiles.join(", ")}` : null,
           `HEAD changed: ${report.headChanged ? `yes (${report.expectedHead} -> ${report.actualHead})` : "no"}`,
           `Disallowed files: ${report.disallowedFiles.length ? report.disallowedFiles.join(", ") : "none detected"}`,
           `Serial-only matches: ${report.serialOnlyMatches.length ? report.serialOnlyMatches.join(", ") : "none detected"}`,
           `Rollback: ${report.rollback}`,
           `Rollback files: ${report.rollbackFiles.length ? report.rollbackFiles.join(", ") : "none"}`,
           `Unresolved files: ${report.unresolvedFiles.length ? report.unresolvedFiles.join(", ") : "none"}`,
-        ].join("\n")
+        ].filter(Boolean).join("\n")
       ),
     ].join("\n");
     const worktreeCleanupVerification = [
       "Parallel worktree cleanup:",
-      parallelWorktreeCleanupReports.length ? "All writer worktrees were retained for review." : "No worktrees used.",
+      !parallelWorktreeCleanupReports.length
+        ? "No worktrees used."
+        : retainedWorktreeCount === parallelWorktreeCleanupReports.length
+        ? "All writer worktrees were retained for review."
+        : `${retainedWorktreeCount} of ${parallelWorktreeCleanupReports.length} writer worktrees were retained; writers that changed nothing had their empty worktree removed.`,
       ...parallelWorktreeCleanupReports.map((report) =>
         [
           `JOB ${report.index + 1}`,
@@ -21990,6 +22514,7 @@ server.tool(
           type: "text",
           text: [
             `Parallel group status: ${groupStatus}`,
+            `Group deadline ms: ${groupDeadlineMs} (longest agent budget plus validation timeout, plus margin)${groupDeadlineExpired ? "; the deadline expired and aborted the remaining work" : ""}`,
             `Ran concurrently (OpenCode child interval overlap): ${ranConcurrently ? "yes" : "no"}`,
             `Concurrent execution pairs: ${executionOverlap.pairs.length ? executionOverlap.pairs.map(([left, right]) => `JOB ${left + 1} + JOB ${right + 1}`).join(", ") : "none"}`,
             "Cancellation: this synchronous tool has no durable operation id; use queue/pipeline tools when cancellation or restart-safe status is required.",
@@ -22661,7 +23186,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
         try {
           request = await decryptQueueRequest(row.request_encrypted, row.job_id);
           if (request?.internalQueueContractorProof) {
-            request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id);
+            request.internalQueueContractorProof = makeInternalQueueContractorProof(row.job_id, request.internalQueueContractorProof);
           }
         } catch (error) {
           logEvent("warn", "queue.request_resume_failed", { jobId: row.job_id, dbPath, error: redactSensitiveText(error.message || String(error)) });
@@ -23158,6 +23683,22 @@ export const __selfTest = {
     readOnlyRetryBudgetExhaustedResult,
     releaseProviderLease,
     runOpenCode,
+    // tests/review-tools-pipelines.js
+    finalizePipelineRecordWhileLocked,
+    finalizePipelineSourceCleanup,
+    formatReadOnlyWorkspaceDrift,
+    hasAmbiguousPathPattern,
+    internalQueueContractorProofValid,
+    mergePipelineIntegrationQueue,
+    nextPipelineIntegrationItemStatus,
+    parallelGroupDeadlineMs,
+    parallelGroupScopeReport,
+    parallelProviderKeys,
+    pipelineIntegrationItemMatches,
+    readOnlyEditsDeniedByAttestation,
+    readOnlyWorkspaceDrift,
+    reconcilePipelineIntegrationOperationStates,
+    trackedTargetStateSha256,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -23188,6 +23729,8 @@ export const __selfTest = {
     set queuePersistTestHook(value) { queuePersistTestHook = value; },
     get bridgeStartupRecovery() { return bridgeStartupRecovery; },
     set bridgeStartupRecovery(value) { bridgeStartupRecovery = value; },
+    get agentRuntimeTestHook() { return agentRuntimeTestHook; },
+    set agentRuntimeTestHook(value) { agentRuntimeTestHook = value; },
   },
 };
 

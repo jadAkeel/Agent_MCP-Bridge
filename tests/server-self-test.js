@@ -4428,7 +4428,8 @@ async function runSelfTests() {
       const quotedVerdict = await finalizePipelineRecord(quotedVerdictRecord);
       assert.equal(quotedVerdict.ok, false);
       assert.equal(quotedVerdict.errorType, "pipeline_gate_verdict_misplaced");
-      assert.equal(quotedVerdictRecord.status, "failed");
+      // No verdict was delivered, so the gates may run again; only GATE_VERDICT: fail is final.
+      assert.equal(quotedVerdictRecord.status, "awaiting_finalization");
 
       // Pipelines whose jobs have not all completed are not finalizable, and nothing runs.
       for (const unfinishedStatus of ["planned", "running", "awaiting_integration"]) {

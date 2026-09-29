@@ -715,6 +715,41 @@ test("D20 whether a writer edits the checkout is read from its lock row", async 
   await releaseHardLock(inPlace.lock.id, inPlace.lock.token, [], repo.root);
 });
 
+// Found while merging the review branches: review/queue2 accepted real files named like a
+// pattern in the plan checks, but acquireHardLock (and the queue's copy of its refusal rules)
+// still rejected them, so such a job passed its plan and then had every lock refused.
+test("M1 a real file named like a pattern can be locked, a missing pattern still cannot", async () => {
+  const repo = await makeRepo("m1");
+  await commitFiles(repo, { "app/[slug]/page.tsx": "export default 1;\n" }, "next route");
+  const lock = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["app/[slug]/page.tsx"] });
+  assert.equal(lock.ok, true, lock.error);
+  await releaseHardLock(lock.lock.id, lock.lock.token, [], repo.root);
+  const missing = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["app/[other]/page.tsx"] });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /wildcard or ambiguous/);
+  const { queueHardLockRequestRefusal } = __selfTest.internals;
+  assert.equal(queueHardLockRequestRefusal({ mode: "write", cwd: repo.root, allowedEdits: ["app/[slug]/page.tsx"] }), "");
+  assert.match(queueHardLockRequestRefusal({ mode: "write", cwd: repo.root, allowedEdits: ["app/*/page.tsx"] }), /wildcard or ambiguous/);
+});
+
+// Bridge git runs with GIT_LITERAL_PATHSPECS=1 (review/queue2), under which pathspec magic
+// matches nothing: the recovery "no commit touched the affected paths" check and the listing
+// of forbidden-looking ignored files both used magic and silently returned empty lists.
+test("M2 literal pathspecs: committed changes to an affected path and ignored .env files are still seen", async () => {
+  const repo = await makeRepo("m2");
+  await commitFiles(repo, { "src/a.txt": "one\n", ".gitignore": "build/\n" }, "base");
+  const before = (await repo.git("rev-parse", "HEAD")).trim();
+  await commitFiles(repo, { "src/a.txt": "two\n" }, "change the affected path");
+  const after = (await repo.git("rev-parse", "HEAD")).trim();
+  const diff = await runGitReadOnlyCommand(["diff", "--name-only", "--no-renames", "-z", before, after, "--", "src/a.txt"], repo.root, 1000 * 30);
+  assert.deepEqual(diff.stdout.split("\0").filter(Boolean), ["src/a.txt"]);
+  await repo.write("build/out/.env", "TOKEN=x\n");
+  await repo.write("build/out/app.o", "o\n");
+  const listed = await gitChangedFiles(repo.root, { includeIgnored: true });
+  assert.ok(listed.includes("build/out/.env"), JSON.stringify(listed));
+  assert.equal(listed.includes("build/out/app.o"), false, "regenerable build output stays collapsed");
+});
+
 const only = process.argv.find((argument) => argument.startsWith("--only="))?.slice("--only=".length) || "";
 const failures = [];
 let ran = 0;
