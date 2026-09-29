@@ -1387,12 +1387,68 @@ function applyGitControlSurfaceCheck(result, before, after, phase = "agent execu
 // (An allowlist of text extensions left every other extension, and extensionless files,
 // free to arrive as unreviewed binary.) Executables and libraries are deliberately absent.
 const KNOWN_BINARY_EXTENSION = /\.(?:png|jpe?g|gif|bmp|ico|icns|webp|avif|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|7z|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|ogg|flac|webm|mov|wasm)$/i;
+// R-154: git C-quotes a path that has a quote, backslash, control character (or, without the
+// bridge's core.quotePath=false, a non-ASCII byte) in "diff --git" headers: "a/x\"y" "b/x\"y".
+// The unquoted-only header pattern did not match such a header, so its binary hunk was
+// attributed to the previous file (or to no file) and passed the gate.
+const GIT_C_QUOTE_ESCAPES = Object.freeze({ a: 0x07, b: 0x08, t: 0x09, n: 0x0a, v: 0x0b, f: 0x0c, r: 0x0d, '"': 0x22, "\\": 0x5c });
+function gitUnquotePath(body) {
+  const input = Buffer.from(body, "utf8");
+  const bytes = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const byte = input[index];
+    if (byte !== 0x5c) { bytes.push(byte); continue; }
+    const octal = input.subarray(index + 1, index + 4).toString("latin1");
+    if (/^[0-7]{3}$/.test(octal)) {
+      bytes.push(Number.parseInt(octal, 8) & 0xff);
+      index += 3;
+      continue;
+    }
+    const escaped = GIT_C_QUOTE_ESCAPES[String.fromCharCode(input[index + 1])];
+    if (escaped === undefined) { bytes.push(byte); continue; }
+    bytes.push(escaped);
+    index += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+// The post-image path of a "diff --git" header, unquoted; null when the header is not understood.
+function gitDiffHeaderNewPath(line) {
+  const rest = /^diff --git (.*)$/.exec(line)?.[1];
+  if (rest === undefined) return null;
+  const quotedAt = (text) => {
+    if (!text.startsWith('"')) return null;
+    for (let index = 1; index < text.length; index += 1) {
+      if (text[index] === "\\") index += 1;
+      else if (text[index] === '"') return { value: gitUnquotePath(text.slice(1, index)), after: text.slice(index + 1) };
+    }
+    return null;
+  };
+  let newSide;
+  const oldQuoted = quotedAt(rest);
+  if (oldQuoted) {
+    if (!oldQuoted.after.startsWith(" ")) return null;
+    newSide = oldQuoted.after.slice(1);
+  } else {
+    // An unquoted old path cannot contain a quote, so a quoted new side starts at ` "b/`.
+    newSide = /^a\/.+? ("b\/.*")$/.exec(rest)?.[1] ?? (/^a\/.+? (b\/.+)$/.exec(rest)?.[1]);
+    if (newSide === undefined) return null;
+  }
+  const newQuoted = quotedAt(newSide);
+  const value = newQuoted ? (newQuoted.after === "" ? newQuoted.value : "") : newSide;
+  return value.startsWith("b/") && value.length > 2 ? value.slice(2) : null;
+}
+
 function binaryTextFilesInPatch(patchText) {
   const files = [];
   let current = "";
   for (const line of String(patchText || "").split(/\r?\n/)) {
-    const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-    if (header) { current = header[2]; continue; }
+    if (line.startsWith("diff --git ")) {
+      // A header that cannot be parsed must not lend its binary hunk the previous file's name;
+      // the unresolved name is reported (and never matches a binary extension).
+      current = gitDiffHeaderNewPath(line) ?? `${line} (unparsed diff header)`;
+      continue;
+    }
     if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
       && !KNOWN_BINARY_EXTENSION.test(current)) {
       files.push(current);
@@ -10102,7 +10158,7 @@ function applyPatchFile(...args) {
   return integrationTimed("apply", () => applyPatchFileUntimed(...args));
 }
 
-async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], signal = null }) {
+async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], baselineSnapshot = null, signal = null }) {
   const base = cwd || process.cwd();
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
@@ -10157,6 +10213,29 @@ async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], s
       return { exitCode: present.exitCode, stdout: "", stderr: present.stderr || "Could not list the isolated integration index.", worktreeWritten: false };
     }
     const presentPaths = new Set(normalizeLockPathList(String(present.stdout || "").split("\0")));
+    // R-151: the target checks run before the journal and this function's index work, so an
+    // editor write to a patched path since then would be overwritten by the force checkout
+    // below. Re-read the exact bytes of every patched path right before the first delete or
+    // force checkout, and fail closed without touching a file that no longer matches. Reading
+    // the bytes is not an identity capture: the tree-wide rehash is not repeated here.
+    if (baselineSnapshot) {
+      let mismatches;
+      try {
+        mismatches = snapshotMismatches(baselineSnapshot, await exactIntegrationFileSnapshot(base, patchPaths), patchPaths);
+      } catch {
+        // A path that can no longer be read as a bounded file is not the reviewed one either.
+        mismatches = patchPaths;
+      }
+      if (mismatches.length) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Target paths changed immediately before the patch write: ${mismatches.slice(0, 10).join(", ")}. The working tree was not modified.`,
+          worktreeWritten: false,
+          externalChanges: mismatches,
+        };
+      }
+    }
     // Deletions first, so a patch that turns a file into a directory (or back) can check out.
     for (const file of patchPaths.filter((candidate) => !presentPaths.has(candidate))) {
       const target = path.resolve(base, file);
@@ -10509,7 +10588,7 @@ async function captureGitHead(cwd) {
   return result.stdout.trim();
 }
 
-function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget }) {
+function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget, cleanupAfterSuccess }) {
   return {
     cwd: path.resolve(cwd || process.cwd()),
     worktreePath: worktreePath ? path.resolve(worktreePath) : "",
@@ -10520,6 +10599,7 @@ function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, for
     serialOnly: normalizeLockPathList(serialOnly).sort(),
     validationCommand: String(validationCommand || "").trim(),
     allowDirtyTarget: Boolean(allowDirtyTarget),
+    cleanupAfterSuccess: Boolean(cleanupAfterSuccess),
   };
 }
 
@@ -10904,6 +10984,7 @@ async function integratePatchWithoutSerialLock({
   validationPolicyTrust = null,
   dryRun = false,
   allowDirtyTarget = false,
+  cleanupAfterSuccess = false,
   acceptFlaggedSecretLines = false,
   acceptBinaryHunks = false,
   reviewed = false,
@@ -10986,6 +11067,7 @@ async function integratePatchWithoutSerialLock({
     serialOnly,
     validationCommand,
     allowDirtyTarget,
+    cleanupAfterSuccess,
   });
   const contractSha256 = integrationContractSha256(contract);
   const currentPreviewIdentity = {
@@ -11375,10 +11457,25 @@ async function integratePatchWithoutSerialLock({
       patchFile,
       targetHead: previewReceipt.targetHead,
       files: patch.changedFiles,
+      baselineSnapshot: preApplyExactSnapshot,
       signal,
     });
     if (signal?.aborted) return ownershipLostResult("during patch application");
     if (applied.exitCode !== 0) {
+      if (applied.worktreeWritten === false && applied.externalChanges?.length) {
+        await transitionIntegrationOperation(targetCwd, integrationOperationId, "applying", "recovered_noop", {
+          outcome: "target_changed_before_patch_write",
+          paths: applied.externalChanges,
+        }, integrationAuthority);
+        integrationOperationCommitted = true;
+        return {
+          ok: false,
+          errorType: "integration_preview_stale",
+          error: "Target paths changed immediately before patch write. The patch was not applied and the source was retained.",
+          changedFiles: patch.changedFiles,
+          unexpectedTargetChanges: applied.externalChanges,
+        };
+      }
       const indexReset = await isolatedIndexPreservationEvidence({ cwd: targetCwd, files: patch.changedFiles, baselineSnapshot: preApplyIndexSnapshot });
       let changedSincePreApply = patch.changedFiles;
       try {

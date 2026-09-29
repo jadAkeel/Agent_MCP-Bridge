@@ -270,6 +270,16 @@ async function databaseAgeDays(dbPath, now = Date.now()) {
   return newest ? Math.max(0, Math.floor((now - newest) / DAY_MS)) : 0;
 }
 
+// R-153: `git status` leaves out ignored files, so a worktree holding only ignored output (a
+// .env, a local database, build results) counted as clean and was removed without
+// --force-dirty. Ignored entries are listed too (`matching` collapses an ignored directory
+// into one entry, keeping the output small); the count is of uncommitted, untracked and
+// ignored entries, and -1 means Git could not say.
+async function uncommittedWorktreeEntries(worktreePath) {
+  const status = await runGit(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], worktreePath, 1000 * 30);
+  return status.exitCode === 0 ? status.stdout.split(/\r?\n/).filter(Boolean).length : -1;
+}
+
 async function inventory(stateDir, options) {
   const worktreeRoot = path.join(stateDir, "worktrees");
   const projectsRoot = path.join(stateDir, "projects");
@@ -390,16 +400,15 @@ async function inventory(stateDir, options) {
       }
       if (item.action === "remove_worktree") {
         // Integration reads the worktree's working tree, not only its branch, so
-        // uncommitted or untracked files there are unintegrated work. Removing the
+        // uncommitted, untracked or ignored files there are unintegrated work. Removing the
         // directory would lose them even though the branch is kept.
-        const status = await runGit(["status", "--porcelain=v1", "--untracked-files=all"], worktreePath, 1000 * 30);
-        const dirtyEntries = status.exitCode === 0 ? status.stdout.split(/\r?\n/).filter(Boolean).length : -1;
+        const dirtyEntries = await uncommittedWorktreeEntries(worktreePath);
         item.uncommittedEntries = dirtyEntries;
         if (dirtyEntries !== 0 && !options.forceDirty) {
           item.classification = "retained_uncommitted_work";
           item.action = "keep";
           item.reason = dirtyEntries > 0
-            ? `The worktree still holds ${dirtyEntries} uncommitted/untracked entr${dirtyEntries === 1 ? "y" : "ies"}; integrate it, commit it onto ${item.branch || "its branch"}, or pass --force-dirty to discard.`
+            ? `The worktree still holds ${dirtyEntries} uncommitted/untracked/ignored entr${dirtyEntries === 1 ? "y" : "ies"}; integrate it, commit it onto ${item.branch || "its branch"}, or pass --force-dirty to discard.`
             : "The worktree's Git status could not be read, so it is kept; pass --force-dirty to discard it anyway.";
         }
       }
@@ -463,6 +472,25 @@ async function inventory(stateDir, options) {
   return report;
 }
 
+// Why a worktree the inventory marked removable must be kept after all; "" when it may go.
+async function removalBlocker(item, projectsRoot, options) {
+  const databasePath = path.join(projectsRoot, `${item.projectHash}.sqlite`);
+  if (existsSync(databasePath)) {
+    try {
+      const current = inspectProjectDatabase(databasePath, options);
+      if (current.activeReasons.length) return `the project became active (${current.activeReasons.join("; ")})`;
+    } catch (error) {
+      return `the project database could not be inspected (${error?.message || error})`;
+    }
+  }
+  if (item.action === "remove_worktree" && !options.forceDirty) {
+    const entries = await uncommittedWorktreeEntries(item.path);
+    if (entries > 0) return `the worktree now holds ${entries} uncommitted, untracked or ignored entr${entries === 1 ? "y" : "ies"}`;
+    if (entries < 0) return "the worktree's Git status could not be read";
+  }
+  return "";
+}
+
 async function applyReport(report, options) {
   const results = [];
   const projectsRoot = path.join(report.stateDir, "projects");
@@ -470,6 +498,16 @@ async function applyReport(report, options) {
     if (item.action === "keep") continue;
     const outcome = { path: item.path, action: item.action, ok: false, detail: "" };
     try {
+      // R-152: the inventory can be old by the time --apply reaches this worktree. A bridge may
+      // have started using the project, and work may have appeared in the worktree, since; check
+      // both again for this worktree right before the destructive step (R-118 did it only for
+      // databases).
+      const blocker = await removalBlocker(item, projectsRoot, options);
+      if (blocker) {
+        outcome.detail = `kept: ${blocker}`;
+        results.push(outcome);
+        continue;
+      }
       if (item.action === "remove_worktree") {
         const removed = await runGit(["worktree", "remove", "--force", item.path], item.sourceRepo);
         if (removed.exitCode !== 0 && existsSync(item.path)) {
