@@ -6,7 +6,7 @@ The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded
 1. Tiny or obvious change: do it yourself.
 2. Second opinion, exploration, review, or a plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester).
 3. One bounded fix or feature: one `builder` or `debugger` via `run_opencode_agent` with a write Scope Contract.
-4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most 2 real (non-dry-run) jobs per call, the provider slot limit (parallel writers always lock in `strict` mode; each job prints a `Run id` for your notes, not a queue id); queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
+4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most as many real (non-dry-run) jobs per call as the provider slot limit (`CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` per provider; currently 4) (parallel writers always lock in `strict` mode; each job prints a `Run id` for your notes, not a queue id); queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
 Do not call the OpenCode orchestrator unless the user names it. Do not call `acquire_agent_lock`/`release_agent_lock`; the bridge manages locks.
 
 ## Job shape
