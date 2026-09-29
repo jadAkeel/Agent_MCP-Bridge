@@ -17,7 +17,26 @@ const AUDIT_METRIC_COLUMNS = [
   ["tokens_cache_write", "INTEGER"],
   ["cost", "REAL"],
   ["provider_retry_warnings", "INTEGER"],
+  // B-029: the bridge process that wrote the start record, so a record whose owner died can be
+  // closed instead of staying "started" forever.
+  ["owner_instance_id", "TEXT NOT NULL DEFAULT ''"],
+  ["owner_process_id", "INTEGER"],
 ];
+
+// A start record without an owner process (written before B-029) is abandoned after this long;
+// no bridge job runs a day.
+const LEGACY_ABANDON_AFTER_MS = 24 * 60 * 60 * 1000;
+
+function defaultProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to someone else; alive for this purpose.
+    return error?.code === "EPERM";
+  }
+}
 
 export function ensureDirectRunAuditSchema(db) {
   db.exec(`
@@ -87,7 +106,10 @@ const RECORD_SELECT = `SELECT run_id AS runId, project_key AS projectKey, kind, 
 const viewRecord = (record) => ({ ...record, modelEvidencePresent: Boolean(record.modelEvidencePresent) });
 
 // This table deliberately has no serialized request, response, error message, or output column.
-export function createDirectRunAudit({ openDb, closeDb, resolveProjectRoot, redact, retentionDays = 90, maxRows = 1000 }) {
+export function createDirectRunAudit({
+  openDb, closeDb, resolveProjectRoot, redact, retentionDays = 90, maxRows = 1000,
+  instanceId = "", processId = process.pid, processAlive = defaultProcessAlive, legacyAbandonAfterMs = LEGACY_ABANDON_AFTER_MS,
+}) {
   if (!Number.isInteger(maxRows) || maxRows < 1 || !Number.isFinite(retentionDays) || retentionDays <= 0) {
     throw new Error("Direct run audit retention must have positive bounds.");
   }
@@ -95,7 +117,27 @@ export function createDirectRunAudit({ openDb, closeDb, resolveProjectRoot, reda
     const text = typeof value === "string" ? value : "";
     return text.length <= 200 && /^[a-zA-Z0-9_./:-]*$/.test(text) && redact(text) === text ? text : "redacted";
   };
+  // B-029: close start records whose owning bridge process is gone. Only a record of another
+  // bridge instance is judged, only by its process (a live process, or a reused PID, keeps the
+  // record open: a running job is never closed), and a record without an owner only by its age.
+  const abandonOrphans = (db) => {
+    const now = new Date().toISOString();
+    const orphans = db.prepare(`SELECT run_id AS runId, owner_instance_id AS ownerInstanceId, owner_process_id AS ownerProcessId,
+      started_at AS startedAt FROM opencode_direct_runs WHERE status = 'started'`).all()
+      .filter((row) => {
+        if (instanceId && row.ownerInstanceId === instanceId) return false;
+        if (Number.isInteger(Number(row.ownerProcessId)) && Number(row.ownerProcessId) > 0) {
+          return !processAlive(Number(row.ownerProcessId));
+        }
+        return Date.parse(row.startedAt) < Date.now() - legacyAbandonAfterMs;
+      });
+    const close = db.prepare(`UPDATE opencode_direct_runs SET status = 'abandoned', error_type = 'direct_run_owner_gone',
+      finished_at = ? WHERE run_id = ? AND status = 'started'`);
+    for (const row of orphans) close.run(now, row.runId);
+    return orphans.length;
+  };
   const prune = (db, reserve = 0) => {
+    abandonOrphans(db);
     db.prepare("DELETE FROM opencode_direct_runs WHERE finished_at IS NOT NULL AND finished_at < ?")
       .run(new Date(Date.now() - retentionDays * 86400000).toISOString());
     const excess = Number(db.prepare("SELECT COUNT(*) AS count FROM opencode_direct_runs").get().count) - maxRows + reserve;
@@ -116,9 +158,10 @@ export function createDirectRunAudit({ openDb, closeDb, resolveProjectRoot, reda
           if (Number(db.prepare("SELECT COUNT(*) AS count FROM opencode_direct_runs").get().count) >= maxRows) {
             throw new Error("Direct run audit is full of unfinished records.");
           }
-          db.prepare(`INSERT INTO opencode_direct_runs (run_id, project_key, kind, job_id, status, started_at, agent)
-            VALUES (?, ?, ?, ?, 'started', ?, ?)`)
-            .run(record.runId, projectKey, record.kind, record.jobId, record.startedAt, record.agent);
+          db.prepare(`INSERT INTO opencode_direct_runs (run_id, project_key, kind, job_id, status, started_at, agent,
+            owner_instance_id, owner_process_id) VALUES (?, ?, ?, ?, 'started', ?, ?, ?, ?)`)
+            .run(record.runId, projectKey, record.kind, record.jobId, record.startedAt, record.agent,
+              identifier(instanceId), Number.isInteger(processId) ? processId : null);
         } else {
           const metrics = record.metrics || {};
           const updated = db.prepare(`UPDATE opencode_direct_runs SET status = ?, error_type = ?, finished_at = ?,
@@ -131,6 +174,8 @@ export function createDirectRunAudit({ openDb, closeDb, resolveProjectRoot, reda
               metrics.usageSteps ?? null, metrics.inputCount ?? null, metrics.outputCount ?? null,
               metrics.reasoningCount ?? null, metrics.cacheReadCount ?? null, metrics.cacheWriteCount ?? null,
               metrics.cost ?? null, metrics.providerRetryWarnings ?? null, record.runId);
+          // An abandoned record is only ever one whose owner looked dead; the owner finishing
+          // after all is the better evidence.
           if (Number(updated.changes) !== 1) throw new Error("Direct run audit record is missing.");
         }
         db.exec("COMMIT");
@@ -247,7 +292,7 @@ export function createDirectRunAudit({ openDb, closeDb, resolveProjectRoot, reda
         includes: ["direct_handler_success", "direct_handler_failure", "direct_handler_rejection", "dry_run", "parallel_jobs"],
         excludes: ["pre_upgrade_history", "parallel_jobs_rejected_before_execution", "requests_rejected_before_tool_handler"],
         queueCancellationApplies: false,
-        unfinishedRecordMeaning: "Terminal outcome unknown; a start record does not prove a process is still running.",
+        unfinishedRecordMeaning: "Terminal outcome unknown; a start record does not prove a process is still running. A start record whose bridge process is gone is closed as abandoned (error type direct_run_owner_gone).",
       };
       let db;
       try {

@@ -13072,6 +13072,8 @@ function directRunAuditStore() {
     resolveProjectRoot: resolveProjectStateRoot,
     redact: redactSensitiveText,
     retentionDays: CONFIG.auditRetentionDays,
+    instanceId: BRIDGE_INSTANCE_ID,
+    processId: process.pid,
   });
 }
 
@@ -14036,7 +14038,7 @@ server.tool(
         nonterminalJobs: nonterminal.length,
         failedJobs: failed.length,
         directRuns: directRunAudit.records.length,
-        failedDirectRuns: directRunAudit.records.filter((run) => ["failed", "rejected"].includes(run.status)).length,
+        failedDirectRuns: directRunAudit.records.filter((run) => ["failed", "rejected", "abandoned"].includes(run.status)).length,
         unfinishedDirectRuns: directRunAudit.records.filter((run) => run.status === "started").length,
         pipelines: pipelines.length,
         nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,

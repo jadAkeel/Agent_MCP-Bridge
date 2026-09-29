@@ -124,8 +124,9 @@ test("retention bounds terminal history but never removes unfinished records", a
   assert.equal((await audit.snapshot(root)).records.length, 0);
   const capacityDb = await openDb();
   for (const id of ["unfinished-1", "unfinished-2"]) {
-    capacityDb.prepare("INSERT INTO opencode_direct_runs (run_id, project_key, status, started_at, agent) VALUES (?, ?, 'started', ?, 'reviewer')")
-      .run(id, root, "2000-01-01T00:00:00.000Z");
+    // Owned by another, still running bridge process: never closed, never pruned.
+    capacityDb.prepare("INSERT INTO opencode_direct_runs (run_id, project_key, status, started_at, agent, owner_instance_id, owner_process_id) VALUES (?, ?, 'started', ?, 'reviewer', 'other-bridge', ?)")
+      .run(id, root, "2000-01-01T00:00:00.000Z", process.pid);
   }
   capacityDb.close();
   const overflow = await audit.run({ cwd: root, agent: "reviewer" }, async () => response());
@@ -162,4 +163,34 @@ test("an audit table from before the metric columns is migrated and parallel run
   assert.equal(await audit.get(root, "missing"), null);
   const text = await readFile(dbPath).then((bytes) => bytes.toString("latin1"));
   assert.doesNotMatch(text, /sk-canary/);
+});
+
+test("B-029: start records whose bridge process is gone are closed as abandoned; live ones stay open", async (t) => {
+  const deadPid = 2 ** 30 + 7;
+  const { root, openDb, options } = await fixture(t, { instanceId: "this-bridge", processAlive: (pid) => pid !== deadPid });
+  const audit = createDirectRunAudit(options);
+  const db = await openDb();
+  const insert = db.prepare("INSERT INTO opencode_direct_runs (run_id, project_key, status, started_at, agent, owner_instance_id, owner_process_id) VALUES (?, ?, 'started', ?, 'builder', ?, ?)");
+  const recent = new Date().toISOString();
+  insert.run("dead-owner", root, recent, "other-bridge", deadPid);
+  insert.run("live-owner", root, "2000-01-01T00:00:00.000Z", "other-bridge", process.pid);
+  insert.run("this-bridge-running", root, recent, "this-bridge", deadPid);
+  insert.run("legacy-old", root, "2000-01-01T00:00:00.000Z", "", null);
+  insert.run("legacy-recent", root, recent, "", null);
+  db.close();
+  const byId = new Map((await audit.snapshot(root)).records.map((record) => [record.runId, record]));
+  assert.equal(byId.get("dead-owner").status, "abandoned");
+  assert.equal(byId.get("dead-owner").errorType, "direct_run_owner_gone");
+  assert.ok(byId.get("dead-owner").finishedAt);
+  assert.equal(byId.get("live-owner").status, "started", "a live owner keeps its record open whatever its age");
+  assert.equal(byId.get("this-bridge-running").status, "started", "this bridge never closes its own records");
+  assert.equal(byId.get("legacy-old").status, "abandoned", "an owner-less record older than a day is closed");
+  assert.equal(byId.get("legacy-recent").status, "started");
+  // A new start records its owner.
+  const handle = await audit.start({ cwd: root, agent: "reviewer" }, { runId: "owned-1" });
+  assert.equal(handle.audit.startedPersisted, true);
+  const check = await openDb();
+  const row = check.prepare("SELECT owner_instance_id AS instance, owner_process_id AS pid FROM opencode_direct_runs WHERE run_id = ?").get("owned-1");
+  check.close();
+  assert.deepEqual({ ...row }, { instance: "this-bridge", pid: process.pid });
 });
