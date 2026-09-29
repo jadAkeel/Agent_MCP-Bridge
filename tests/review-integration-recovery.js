@@ -750,6 +750,31 @@ test("M2 literal pathspecs: committed changes to an affected path and ignored .e
   assert.equal(listed.includes("build/out/app.o"), false, "regenerable build output stays collapsed");
 });
 
+// gitControlSurfaceFingerprint was added with the .git deny rules but never called: a writer that
+// rewrote .git/config or dropped a hook passed every changed-file check (git never lists .git/).
+test("M3 a write job that changes .git/config or a hook fails; an untouched one does not", async () => {
+  const { applyGitControlSurfaceCheck, gitControlSurfaceFingerprint } = __selfTest.internals;
+  const repo = await makeRepo("m3");
+  const clean = { stderr: "" };
+  const before = await gitControlSurfaceFingerprint(repo.root);
+  assert.equal(before.ok, true, before.error);
+  applyGitControlSurfaceCheck(clean, before, await gitControlSurfaceFingerprint(repo.root));
+  assert.equal(clean.errorType, undefined);
+  await repo.git("config", "core.hooksPath", "evil-hooks");
+  const configChanged = { stderr: "" };
+  applyGitControlSurfaceCheck(configChanged, before, await gitControlSurfaceFingerprint(repo.root));
+  assert.equal(configChanged.errorType, "git_control_surface_modified");
+  assert.deepEqual(configChanged.gitControlSurfaceChanges, ["common/config"]);
+  await repo.write(".git/hooks/pre-commit", "#!/bin/sh\necho pwned\n");
+  const hookAdded = { stderr: "", errorType: "earlier_error" };
+  applyGitControlSurfaceCheck(hookAdded, before, await gitControlSurfaceFingerprint(repo.root));
+  assert.equal(hookAdded.errorType, "earlier_error", "an earlier error type is kept");
+  assert.ok(hookAdded.gitControlSurfaceChanges.includes("common/hooks/pre-commit"), JSON.stringify(hookAdded.gitControlSurfaceChanges));
+  const unavailable = { stderr: "" };
+  applyGitControlSurfaceCheck(unavailable, { ok: false, entries: {}, error: "x" }, before);
+  assert.equal(unavailable.errorType, undefined, "no baseline proves nothing");
+});
+
 const only = process.argv.find((argument) => argument.startsWith("--only="))?.slice("--only=".length) || "";
 const failures = [];
 let ran = 0;

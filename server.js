@@ -1360,6 +1360,25 @@ function gitControlSurfaceChanges(before, after) {
   return labels.filter((label) => (before?.entries || {})[label] !== (after?.entries || {})[label]);
 }
 
+// Marks a write job failed when its .git/ control files (config, hooks, a worktree's .git
+// pointer) changed while it ran. A fingerprint that could not be taken before proves nothing
+// either way (logged, not failed); one that fails only afterwards fails closed.
+function applyGitControlSurfaceCheck(result, before, after, phase = "agent execution") {
+  if (!before) return;
+  if (!before.ok) {
+    logEvent("warn", "git.control_surface_fingerprint_unavailable", { phase, error: before.error || "" });
+    return;
+  }
+  const changed = after?.ok ? gitControlSurfaceChanges(before, after) : ["(fingerprint unavailable afterwards)"];
+  if (!changed.length) return;
+  result.gitControlSurfaceChanges = changed;
+  result.errorType ||= "git_control_surface_modified";
+  result.stderr = [
+    result.stderr,
+    `Git control files changed during ${phase}: ${changed.join(", ")}${after?.ok ? "" : ` (${after?.error || "unreadable"})`}. Git never lists .git/ as a change, so this is checked separately; the output was retained. Inspect .git/config and .git/hooks before running git in this checkout.`,
+  ].filter(Boolean).join("\n");
+}
+
 // A NUL byte or a .gitattributes "binary" entry turns a file into a base85 "GIT binary
 // patch" hunk the reviewer cannot read, and the secret scan only sees "+" text lines, so the
 // preview would approve content nobody saw. Every binary hunk is rejected unless its path
@@ -13601,7 +13620,9 @@ server.tool(
             `External plugin manifest SHA-256: ${pluginPolicy.manifestSha256 || "not applicable"}`,
             `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
             `Provider active leases: ${providerCapacity.leases.length}`,
-            ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId}: pid=${lease.ownerProcessId}, remainingMs=${lease.remainingMs}, heartbeat=${lease.heartbeatAt || "none"}`),
+            // Slots are counted per provider key; one total against one limit read as over capacity.
+            ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
+            ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId} (${lease.providerKey}): pid=${lease.ownerProcessId}, ${lease.quarantined ? "quarantined" : `remainingMs=${lease.remainingMs}`}, heartbeat=${lease.heartbeatAt || "none"}`),
             `Bridge instance id: ${BRIDGE_INSTANCE_ID}`,
             "Default OpenCode orchestrator mode: planning-only",
             `Explicit user-authorized OpenCode contractor mode: ${/^[a-f0-9]{64}$/.test(effectiveContractorAuthorizationSha256()) ? "capability configured" : "disabled (capability not configured)"}`,
@@ -13657,6 +13678,7 @@ server.tool(
         locks: locks.length,
         unresolvedIntegrationOperations: integrationOperations.unresolvedCount ?? "unavailable",
         providerCapacity: provider.capacity,
+        providerSlotsByKey: (provider.keys || []).map((item) => `${item.providerKey}=${item.leases}/${item.capacity}`),
         providerActiveLeases: provider.leases.length,
       },
       directRuns: detailDirectRuns,
@@ -14459,12 +14481,14 @@ server.tool(
         serialOnly: z.array(z.string()).optional(),
         validationCommand: z.string().optional(),
         sanitizedWorkspace: sanitizedWorkspaceSchema.optional(),
-        timeoutMs: z.number().int().positive().optional(),
+        timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
         scope: scopePathSetSchema.optional(),
         validation: scopeValidationSchema.optional(),
         scopeContract: scopeContractSchema.optional(),
         allowFallbackToBuild: z.boolean().optional(),
-        subagentStrategy: z.enum(["proxy", "direct", "reject"]).optional(),
+        // "direct" is not offered: a subagent run as `--agent <subagent>` falls back to the default
+        // agent, which the bridge cannot attest as the requested role (see resolveAgent).
+        subagentStrategy: z.enum(["proxy", "reject"]).optional(),
         proxyAgent: z.string().optional(),
         dryRun: z.boolean().optional(),
         delegation: z.any().optional(),
@@ -16867,6 +16891,7 @@ async function executeOpenCodeJob(requestedJob, {
     const readerEditsDenied = !dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, agentMetadata);
     const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
     const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+    const gitControlBefore = dryRun || manifestProtected || lockPlan.lockType === "read" ? null : await gitControlSurfaceFingerprint(executionCwd);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
     const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
       const childAuthority = typeof onChildSpawn === "function"
@@ -16932,6 +16957,7 @@ async function executeOpenCodeJob(requestedJob, {
       result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
       result.changedFiles = [];
     }
+    if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
     if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
       const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
       if (move) {
@@ -16983,6 +17009,9 @@ async function executeOpenCodeJob(requestedJob, {
     }
 
     const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
+    if (gitControlBefore && lockPlan.validationCommand) {
+      applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd), "validation");
+    }
     const executionHeadAfterValidation = dryRun || manifestProtected ? executionHeadAfterAgent : await captureGitHead(executionCwd);
     const validationMutationFiles = dryRun || manifestProtected ? [] : changedFilesBetween(afterFilesForValidation, afterValidationFiles);
     if (executionHeadAfterValidation !== executionHeadBefore) {
@@ -22172,6 +22201,7 @@ server.tool(
         const readerEditsDenied = !job.dryRun && !manifestProtected && readOnlyEditsDeniedByAttestation(lockPlan, parallelAgentMetadata[index]);
         const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
         const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+        const gitControlBefore = job.dryRun || manifestProtected || lockPlan.lockType === "read" ? null : await gitControlSurfaceFingerprint(executionCwd);
         const delegation = {
           scope: job.delegation?.scope,
           lockMode: lockPlan.lockMode,
@@ -22218,6 +22248,7 @@ server.tool(
           result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, Boolean(executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead));
           result.changedFiles = [];
         }
+        if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
         if (executionHeadAfterAgent && executionHeadAfterAgent !== expectedExecutionHead) {
           const move = result.changedFiles.length || result.errorType ? null : await readOnlyHeadMove(lockPlan, executionCwd, expectedExecutionHead, executionHeadAfterAgent);
           if (move) {
@@ -23664,6 +23695,7 @@ export const __selfTest = {
     commandShape,
     containmentRecord,
     expectedOpenCodePluginResolution,
+    applyGitControlSurfaceCheck,
     gitControlSurfaceChanges,
     gitControlSurfaceFingerprint,
     globToRegex,

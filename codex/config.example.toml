@@ -15,7 +15,9 @@ service_tier = "default"
 command = "node"
 args = ["C:\\path\\to\\codex-opencode-mcp\\server.js"]
 startup_timeout_sec = 120
-tool_timeout_sec = 1500
+# Must cover the provider-slot wait (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS, 20 min) + the longest
+# agent timeout (contractor 20 min here) + validation (5 min) + 5 min margin = 50 min.
+tool_timeout_sec = 3000
 
 [mcp_servers.opencode.env]
 CODEX_OPENCODE_WORKTREE_MODE = "write"
