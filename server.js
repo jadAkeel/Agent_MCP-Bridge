@@ -7234,12 +7234,12 @@ async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, file
     }
 
     if ([...classifications.values()].every((value) => value === "pre")) {
-      if (currentTargetState.targetStateSha256 !== operation.target_state_sha256) {
-        await quarantineIntegrationOperation(cwd, operation.operation_id, "recovering", "repository_state_drift", authority);
-        return { ok: false, operationId: operation.operation_id, status: "quarantined" };
-      }
+      // HEAD, the index and every affected path are at their preimage, so the patch left no
+      // trace. Other drift (an ignored file another process rewrote, an edit outside the patch)
+      // is not the bridge's and used to quarantine the repository, blocking every writer.
       await transitionIntegrationOperation(cwd, operation.operation_id, "recovering", "recovered_noop", {
         outcome: "pre_state_verified",
+        externalDriftOutsidePatch: currentTargetState.targetStateSha256 !== operation.target_state_sha256,
       }, authority);
       return { ok: true, operationId: operation.operation_id, status: "recovered_noop" };
     }
@@ -7256,13 +7256,13 @@ async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, file
     if (restoreMismatches.length
       || !restoredTargetState.ok
       || restoredTargetState.targetHead !== operation.target_head
-      || restoredTargetState.indexSha256 !== operation.pre_index_sha256
-      || restoredTargetState.targetStateSha256 !== operation.target_state_sha256) {
+      || restoredTargetState.indexSha256 !== operation.pre_index_sha256) {
       await quarantineIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rollback_verification_failed", authority);
       return { ok: false, operationId: operation.operation_id, status: "quarantined" };
     }
     await transitionIntegrationOperation(cwd, operation.operation_id, "rolling_back", "rolled_back", {
       outcome: "exact_pre_state_restored",
+      externalDriftOutsidePatch: restoredTargetState.targetStateSha256 !== operation.target_state_sha256,
     }, authority);
     return { ok: true, operationId: operation.operation_id, status: "rolled_back" };
   } catch {
@@ -7274,6 +7274,44 @@ async function recoverSingleIntegrationOperationWhileLocked(cwd, operation, file
       authority
     );
     return { ok: false, operationId: operation.operation_id, status: "quarantined" };
+  }
+}
+
+// Earlier bridges quarantined an operation for repository_state_drift even when HEAD, the index
+// and every affected path were back at their preimage (only files outside the patch had
+// changed). Such an operation is re-checked under the integration lock and closed as
+// recovered_noop when that still holds; anything else stays quarantined.
+async function requalifyStateDriftQuarantine(cwd, operation, fileRows, authority) {
+  let reason = "";
+  try { reason = JSON.parse(operation.result_json || "{}").reason || ""; } catch {}
+  if (reason !== "repository_state_drift") return false;
+  try {
+    const expectedPaths = normalizeLockPathList(JSON.parse(operation.affected_paths_json || "[]"));
+    if (!expectedPaths.length
+      || fileRows.length !== expectedPaths.length
+      || fileRows.some((row, ordinal) => row.ordinal !== ordinal || row.path !== expectedPaths[ordinal])) {
+      return false;
+    }
+    const currentTargetState = await captureIntegrationTargetState(cwd);
+    if (!currentTargetState.ok
+      || currentTargetState.targetHead !== operation.target_head
+      || currentTargetState.indexSha256 !== operation.pre_index_sha256) {
+      return false;
+    }
+    const currentSnapshot = await exactIntegrationFileSnapshot(cwd, expectedPaths);
+    for (const row of fileRows) {
+      const evidence = await readIntegrationJournalFileEvidence(operation, row);
+      if (currentSnapshot.get(evidence.path) !== evidence.preFingerprint) return false;
+    }
+    await transitionIntegrationOperation(cwd, operation.operation_id, "quarantined", "recovered_noop", {
+      outcome: "pre_state_verified",
+      requalifiedFrom: "repository_state_drift",
+      externalDriftOutsidePatch: true,
+    }, authority);
+    logEvent("info", "integration.quarantine_requalified", { operationId: operation.operation_id });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -7308,6 +7346,16 @@ async function recoverIntegrationOperationsWhileLocked(cwd, { operationId = "", 
     closeDb(db);
   }
 
+  for (const operation of operations.filter((row) => row.status === "quarantined")) {
+    const requalified = await requalifyStateDriftQuarantine(
+      canonicalCwd,
+      operation,
+      files.filter((row) => row.operation_id === operation.operation_id),
+      recoveryAuthority
+    );
+    if (requalified) operation.status = "recovered_noop";
+  }
+  operations = operations.filter((row) => row.status !== "recovered_noop");
   const existingQuarantine = operations.filter((row) => row.status === "quarantined");
   if (existingQuarantine.length) {
     return {
@@ -9582,6 +9630,9 @@ async function integratePatchWithoutSerialLock({
           ? changedFileValidationErrorType(appliedValidation)
           : "integration_post_apply_path_mismatch",
         error: "The target path set did not exactly match the reviewed patch. Matching bridge-owned state was rolled back; unexpected external paths and the source were retained.",
+        suggestedFix: appliedPathEvidence.unexpectedFiles.length || appliedValidation.disallowedFiles.length
+          ? `Another process wrote ${normalizeLockPathList(appliedPathEvidence.unexpectedFiles.concat(appliedValidation.disallowedFiles)).join(", ")} in the checkout during the apply (a background loop, a test run, an editor). Stop it, then dry-run again and apply with the new receipt.`
+          : "Dry-run again and apply with the new receipt.",
         changedFiles: patch.changedFiles,
         appliedFiles,
         missingFiles: appliedPathEvidence.missingFiles,
@@ -17150,7 +17201,15 @@ function scheduleQueue(delayMs = 0) {
           continue;
         }
         const recordRoot = path.resolve(record.cwd || process.cwd());
-        if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(recordRoot)) {
+        if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(recordRoot) && record.mode !== "read") {
+          // Readers do not mutate the checkout, so only writers wait for journal recovery.
+          if (record.errorType !== "integration_recovery_pending") {
+            await updateQueueRecordDurable(record, {
+              status: "blocked",
+              errorType: "integration_recovery_pending",
+              errorReason: "Waiting for the repository's integration journal to recover (a quarantined integration blocks writers); see diagnose_opencode_bridge.",
+            });
+          }
           continue;
         }
 
@@ -17191,7 +17250,7 @@ function scheduleQueue(delayMs = 0) {
     } finally {
       queueSchedulerActive = false;
       const records = [...QUEUE_JOBS.values()].filter((record) =>
-        !INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(record.cwd || process.cwd()))
+        record.mode === "read" || !INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(record.cwd || process.cwd()))
       );
       const hasCapacity = runningQueueRecords().length < CONFIG.queueParallelLimit;
       const nextDelay = nextQueueScheduleDelay(records, hasCapacity);
@@ -20748,6 +20807,8 @@ export const __selfTest = {
     assertSupportedCallerModel,
     assertSupportedQueueRetryConfig,
     assessQueuePlan,
+    requalifyStateDriftQuarantine,
+    quarantineIntegrationOperation,
     buildOpenCodeEnv,
     buildTrustedGitEnv,
     buildValidationEnv,

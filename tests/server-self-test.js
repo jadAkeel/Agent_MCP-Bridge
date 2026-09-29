@@ -135,6 +135,7 @@ const {
   compactQueueJobLines,
   essentialQueueJobView,
   diagnoseJobView,
+  requalifyStateDriftQuarantine,
   queueAgentTiming,
   queueRunStage,
   staleBridgeProcessHint,
@@ -156,6 +157,7 @@ const {
   persistTerminalQueueRecord,
   pluginSpecsFromConfigText,
   prepareIntegrationOperation,
+  quarantineIntegrationOperation,
   prepareValidationCommand,
   providerErrorTypeFromStructuredEvent,
   providerErrorTypeFromText,
@@ -5060,6 +5062,52 @@ async function runSelfTests() {
     assert.equal(await readFile(journalRecoveryPath, "utf8"), journalRecoveryPreimage);
     assert.equal((await readIntegrationOperationSummary(tempDir, journalRecoveryPrepared.operationId))?.status, "rolled_back");
     await rm(journalRecoveryPath, { force: true });
+    // Phase-4 incident: a failed apply was rolled back cleanly, but another process rewrote a
+    // file outside the patch meanwhile. Recovery closes it as a no-op instead of quarantining
+    // the repository, and a quarantine the old rule left behind is re-checked and closed.
+    const driftPatchFile = "src/drift-new.txt";
+    const driftOutsidePath = path.join(tempDir, "outside-heartbeat.json");
+    const driftOperation = async (label) => {
+      const targetState = await captureIntegrationTargetState(tempDir);
+      assert.equal(targetState.ok, true);
+      const prepared = await prepareIntegrationOperation({
+        cwd: tempDir,
+        targetState,
+        patch: {
+          changedFiles: [driftPatchFile],
+          patchSha256: createHash("sha256").update(`${label} patch`).digest("hex"),
+          sourceBaseCommit: targetState.targetHead,
+          sourceStateSha256: createHash("sha256").update(`${label} source`).digest("hex"),
+        },
+        contractSha256: createHash("sha256").update(`${label} contract`).digest("hex"),
+        expectedPostSnapshot: new Map([[driftPatchFile, `file:0:${createHash("sha256").update(`${label} post`).digest("hex")}`]]),
+      });
+      await transitionIntegrationOperation(tempDir, prepared.operationId, "prepared", "applying", { outcome: "self_test_simulated_failure" });
+      return prepared.operationId;
+    };
+    const driftNoopId = await driftOperation("drift noop");
+    await writeFile(driftOutsidePath, "{\"heartbeat\": 1}\n", "utf8");
+    const driftNoop = await recoverIntegrationOperationsWhileLocked(tempDir, { operationId: driftNoopId });
+    assert.equal(driftNoop.ok, true, JSON.stringify(driftNoop, null, 2));
+    assert.equal(driftNoop.recovered[0]?.status, "recovered_noop", "Drift outside the patch does not quarantine the repository.");
+    const legacyQuarantineId = await driftOperation("legacy quarantine");
+    await writeFile(driftOutsidePath, "{\"heartbeat\": 2}\n", "utf8");
+    await quarantineIntegrationOperation(tempDir, legacyQuarantineId, "applying", "repository_state_drift");
+    assert.equal((await readIntegrationOperationSummary(tempDir, legacyQuarantineId))?.status, "quarantined");
+    const requalified = await recoverIntegrationOperationsWhileLocked(tempDir);
+    assert.equal(requalified.ok, true, JSON.stringify(requalified, null, 2));
+    assert.equal((await readIntegrationOperationSummary(tempDir, legacyQuarantineId))?.status, "recovered_noop", "A state-drift quarantine whose paths are at their preimage is closed.");
+    const realDriftId = await driftOperation("real drift");
+    await quarantineIntegrationOperation(tempDir, realDriftId, "applying", "repository_state_drift");
+    await writeFile(path.join(tempDir, ...driftPatchFile.split("/")), "someone else wrote the patched path\n", "utf8");
+    const stillQuarantined = await recoverIntegrationOperationsWhileLocked(tempDir);
+    assert.equal(stillQuarantined.ok, false, "A quarantine whose affected path changed stays quarantined.");
+    assert.equal((await readIntegrationOperationSummary(tempDir, realDriftId))?.status, "quarantined");
+    await rm(path.join(tempDir, ...driftPatchFile.split("/")), { force: true });
+    assert.equal(await requalifyStateDriftQuarantine(tempDir, { operation_id: realDriftId, status: "quarantined", result_json: JSON.stringify({ reason: "rollback_verification_failed" }) }, [], null), false, "Only state-drift quarantines are re-checked.");
+    assert.equal((await recoverIntegrationOperationsWhileLocked(tempDir)).ok, true, "Once the path is back at its preimage the quarantine is closed.");
+    assert.equal((await readIntegrationOperationSummary(tempDir, realDriftId))?.status, "recovered_noop");
+    await rm(driftOutsidePath, { force: true });
     await writeFile(path.join(tempDir, "src", "api.txt"), "changed between integration and cleanup\n", "utf8");
     assert.match(
       await integrationCleanupTargetStateError(tempDir, integrationApplied.integratedTargetStateSha256),
