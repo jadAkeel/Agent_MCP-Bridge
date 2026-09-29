@@ -594,6 +594,32 @@ await test("#18 the capacity snapshot reports each provider key with its own cap
   assert.equal(need("providerKeyLikePattern")("a_b%c\\d"), "a\\_b\\%c\\\\d:%");
 });
 
+// #18b a stored limit from before a raise binds only while leases taken under it are held
+await test("#18b an idle key with an old stored limit reports the configured capacity", async () => {
+  const key = `${CONFIG.providerConcurrencyKey}:review-stale-capacity`;
+  const setStored = async (capacity) => {
+    const db = await need("openProviderLeaseDb")({ deadlineAt: Date.now() + 5000 });
+    try {
+      db.prepare("INSERT INTO provider_capacities (provider_key, capacity, updated_at) VALUES (?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET capacity = excluded.capacity").run(key, capacity, Date.now());
+    } finally {
+      need("closeDb")(db);
+    }
+  };
+  const lower = Math.max(1, CONFIG.providerConcurrencyLimit - 1);
+  const entryFor = async () => (await need("providerCapacitySnapshot")()).keys.find((item) => item.providerKey === key);
+  await setStored(CONFIG.providerConcurrencyLimit + 5);
+  assert.equal((await entryFor()).capacity, CONFIG.providerConcurrencyLimit, "an idle key shows the limit its next acquire will use");
+  const lease = await need("acquireProviderLease")({ providerKey: key, timeoutMs: 5000 });
+  try {
+    await setStored(lower);
+    const held = await entryFor();
+    assert.equal(held.leases, 1);
+    assert.equal(held.capacity, Math.min(lower, CONFIG.providerConcurrencyLimit), "while leases are held the stricter stored limit binds");
+  } finally {
+    await need("releaseProviderLease")(lease.lease);
+  }
+});
+
 // #19 DEPENDENCY_REQUIRED heading
 await test("#19 a bare DEPENDENCY_REQUIRED heading does not capture the next line", async () => {
   const parse = need("parseDependencyRequest");

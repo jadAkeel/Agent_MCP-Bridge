@@ -3131,9 +3131,14 @@ async function providerCapacitySnapshot() {
     }));
     // Leases are stored per "<key>:<provider>"; the base key's capacity said nothing about
     // them ("capacity 4, 6 leases" across two providers). Report each key on its own.
+    // Same rule as acquireProviderLease: a stored limit that differs from the config only binds
+    // while leases taken under it are held (an older bridge process); an idle key takes the
+    // configured limit on its next acquire, so "0 of 2" after a raise to 4 was wrong.
     const capacityFor = (key) => {
       const stored = capacityByKey.get(key);
-      return Number.isInteger(stored) && stored > 0 ? stored : CONFIG.providerConcurrencyLimit;
+      const configured = CONFIG.providerConcurrencyLimit;
+      if (!Number.isInteger(stored) || stored <= 0 || stored === configured) return configured;
+      return leases.some((lease) => lease.providerKey === key) ? Math.min(stored, configured) : configured;
     };
     const keyNames = [...new Set([...capacityByKey.keys(), ...leases.map((lease) => lease.providerKey)])].sort();
     const keys = keyNames.map((key) => {
