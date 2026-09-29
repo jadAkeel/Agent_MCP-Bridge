@@ -2715,7 +2715,7 @@ function providerLeaseOwnershipLossError(detail = "Durable provider-capacity own
 
 function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 0, refreshLease = null } = {}) {
   const controller = new AbortController();
-  const inertStop = Object.assign(() => {}, { signal: controller.signal, pulse: async () => false });
+  const inertStop = Object.assign(async () => {}, { signal: controller.signal, pulse: async () => false });
   if (!lease?.id) return inertStop;
   const effectiveLeaseMs = Math.max(250, Number(CONFIG.providerLeaseMs) || 250);
   const intervalMs = requestedIntervalMs > 0
@@ -2759,8 +2759,8 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
           db = await openProviderLeaseDb({ deadlineAt: Date.now() + Math.min(10000, intervalMs) });
           const result = db.prepare(`
             UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
-            WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
-          `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID, now);
+            WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ? AND expires_at < ?
+          `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID, now, Number.MAX_SAFE_INTEGER);
           renewed = Number(result.changes || 0) === 1;
         }
         if (!renewed) {
@@ -2796,10 +2796,15 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
   scheduleFence();
   const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
-  return Object.assign(() => {
+  // stop() settles once an in-flight renewal has finished, so a caller that awaits it can
+  // release or quarantine the lease without a late pulse writing after it. It never rejects:
+  // callers stop the heartbeat in a finally block right before that write.
+  return Object.assign(async () => {
     stopped = true;
     clearInterval(timer);
     if (fenceTimer) clearTimeout(fenceTimer);
+    const inFlight = refreshPromise;
+    if (inFlight) await inFlight.catch(() => {});
   }, { signal: controller.signal, pulse });
 }
 
@@ -3125,7 +3130,9 @@ async function providerCapacitySnapshot() {
       ownerProcessId: Number(row.owner_pid || 0),
       createdAt: new Date(Number(row.created_at)).toISOString(),
       heartbeatAt: row.heartbeat_at ? new Date(Number(row.heartbeat_at)).toISOString() : "",
-      expiresAt: new Date(Number(row.expires_at)).toISOString(),
+      expiresAt: Number(row.expires_at) === Number.MAX_SAFE_INTEGER
+        ? "quarantined (no expiry)"
+        : new Date(Number(row.expires_at)).toISOString(),
       remainingMs: Math.max(0, Number(row.expires_at) - now),
       quarantined: Number(row.expires_at) === Number.MAX_SAFE_INTEGER,
     }));
@@ -6276,7 +6283,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   let remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6300,7 +6307,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   const preSpawnPluginPolicy = forcePure ? { ok: true, mode: "pure", plugins: [] } : await verifyExternalPluginPolicy(workDir);
   if (!preSpawnPluginPolicy.ok) {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6325,7 +6332,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     try {
       isolatedRuntime = await createIsolatedOpenCodeRuntime();
     } catch (error) {
-      stopProviderLeaseHeartbeat();
+      await stopProviderLeaseHeartbeat();
       await releaseProviderLease(providerLease.lease);
       return {
         stdout: "",
@@ -6362,7 +6369,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   });
   if (finalPreSpawnMetadataError) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6386,7 +6393,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const attestedProviderKey = providerKeyForMetadata(configuredMetadata);
   if (attestedProviderKey !== providerKey) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6412,7 +6419,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6456,7 +6463,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
   } finally {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
       providerQuarantine = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
       if (!providerQuarantine.ok) {
@@ -13392,15 +13399,36 @@ async function quarantineHardLock(lock, containment = "") {
     const now = Date.now();
     const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
     db.exec("BEGIN IMMEDIATE");
-    const quarantined = db.prepare(`
+    db.prepare(`
       UPDATE locks SET expires_at = ?
-      WHERE run_id = ? AND token = ? AND expires_at > ?
-    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256, now);
-    if (Number(quarantined.changes || 0) < 1) {
+      WHERE run_id = ? AND token = ?
+    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256);
+    // Expired rows may already have been pruned, including only some of the
+    // original paths. Restore the complete scope before another writer starts.
+    const heldPaths = new Set(db.prepare("SELECT normalized_path FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
+      .all(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER).map((row) => row.normalized_path));
+    if (!heldPaths.size && (!Array.isArray(lock.paths) || !lock.paths.length)) {
       db.exec("ROLLBACK");
       return { ok: false };
     }
-    db.prepare("UPDATE runs SET status = 'quarantined', finished_at = NULL, containment = ? WHERE run_id = ?").run(String(containment || ""), lock.id);
+    if (Array.isArray(lock.paths) && lock.paths.some((lockPath) => !heldPaths.has(lockPath))) {
+      const insert = db.prepare(`
+        INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const lockPath of lock.paths) {
+        if (heldPaths.has(lockPath)) continue;
+        insert.run(lockPath, lock.agent || lock.owner || "opencode", lock.origin || "internal", lock.id,
+          tokenSha256, lock.lockType || lock.lockMode || "write", Number.MAX_SAFE_INTEGER,
+          Number(lock.createdAt) || now, lock.cwd, `sha256:${lock.taskSha256 || ""}`, lock.editsCheckout === false ? 0 : 1);
+      }
+    }
+    db.prepare(`
+      INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at, containment)
+      VALUES (?, ?, 'quarantined', ?, ?, NULL, ?)
+      ON CONFLICT(run_id) DO UPDATE SET status = 'quarantined', finished_at = NULL, containment = excluded.containment
+    `).run(lock.id, lock.agent || lock.owner || "opencode", lock.lockType || lock.lockMode || "write",
+      Number(lock.createdAt) || now, String(containment || ""));
     db.exec("COMMIT");
     lock.expiresAt = Number.MAX_SAFE_INTEGER;
     return { ok: true };
@@ -17144,7 +17172,8 @@ async function executeOpenCodeJob(requestedJob, {
   let lockReleaseOutcome = null;
   const releaseAcquiredLock = async () => {
     if (lockReleaseOutcome) return lockReleaseOutcome;
-    stopLockHeartbeat();
+    // Wait for an in-flight renewal: it must not run after the release or quarantine below.
+    await stopLockHeartbeat();
     if (!acquiredLock) {
       lockReleaseOutcome = { needed: false, released: false, text: "not needed" };
       return lockReleaseOutcome;
