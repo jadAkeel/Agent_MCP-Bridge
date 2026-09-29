@@ -12154,7 +12154,7 @@ server.tool(
         };
       }
       const discoveryContext = sanitizedDiscoveryContext(job);
-      const resolution = await resolveAgent(
+      const resolution = await jobAgentRuntime().resolveAgent(
         job.agent,
         job.cwd,
         job.allowFallbackToBuild || false,
@@ -12207,7 +12207,7 @@ server.tool(
         };
       }
 
-      const metadata = await readAgentDebugMetadata(
+      const metadata = await jobAgentRuntime().readAgentDebugMetadata(
         resolution.actualAgent,
         discoveryContext.discoveryCwd,
         { forcePure: discoveryContext.forcePure }
@@ -14842,7 +14842,7 @@ async function executeOpenCodeJob(requestedJob, {
 
   const discoveryContext = sanitizedDiscoveryContext({ ...requestedJob, cwd: cwd || process.cwd() });
   const { forcePure, discoveryCwd } = discoveryContext;
-  const resolution = await resolveAgent(
+  const resolution = await jobAgentRuntime().resolveAgent(
     agent,
     cwd,
     allowFallbackToBuild,
@@ -14919,7 +14919,7 @@ async function executeOpenCodeJob(requestedJob, {
     };
   }
 
-  let agentMetadata = await readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
+  let agentMetadata = await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
   const metadataPolicyError = effectiveReadOnlyMetadataError(agentMetadata, lockPlan, agentMetadataPolicyOptions(resolution, lockPlan));
   const contractorNestedAttestation = lockPlan.orchestratorMode === "contractor"
     ? await attestContractorNestedAgents(discoveryCwd, { forcePure })
@@ -15144,7 +15144,7 @@ async function executeOpenCodeJob(requestedJob, {
     }
     const finalAgentMetadata = dryRun
       ? agentMetadata
-      : await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+      : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
     const finalMetadataPolicyError = effectiveReadOnlyMetadataError(
       finalAgentMetadata,
       lockPlan,
@@ -15238,7 +15238,7 @@ async function executeOpenCodeJob(requestedJob, {
         ),
       };
     };
-    let result = await runOpenCodeWithPolicy(
+    let result = await jobAgentRuntime().runOpenCodeWithPolicy(
       resolution.actualAgent,
       prompt,
       executionCwd,
@@ -19787,7 +19787,7 @@ server.tool(
         }
         parallelSanitizedPreflight[index] = verification;
       }
-      const resolution = await resolveAgent(
+      const resolution = await jobAgentRuntime().resolveAgent(
         job.agent,
         job.cwd,
         job.allowFallbackToBuild || false,
@@ -19797,7 +19797,7 @@ server.tool(
         discoveryContext
       );
       const routingError = resolution.error ? { errorType: "agent_routing_error", error: resolution.error } : readOnlyRoutingPolicyError(resolution, lockPlan);
-      const metadata = resolution.error ? null : await readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
+      const metadata = resolution.error ? null : await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, discoveryCwd, { forcePure });
       const metadataError = resolution.error ? null : effectiveReadOnlyMetadataError(metadata, lockPlan, agentMetadataPolicyOptions(resolution, lockPlan));
       const sanitizedMetadataError = resolution.error || !job.sanitizedWorkspace ? null : sanitizedAgentMetadataError(metadata, job.sanitizedWorkspace.root);
       const sanitizedError = sanitizedRoutingPolicyError(job, resolution, discoveryCwd);
@@ -19978,7 +19978,7 @@ server.tool(
       const resolution = parallelResolutions[index];
       const executionCwd = executionCwdForIndex(index);
       const { forcePure } = sanitizedDiscoveryContext({ ...job, cwd: job.cwd || process.cwd() });
-      const finalMetadata = await readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
+      const finalMetadata = await jobAgentRuntime().readAgentDebugMetadata(resolution.actualAgent, executionCwd, { forcePure });
       const metadataError = effectiveReadOnlyMetadataError(
         finalMetadata,
         lockPlan,
@@ -20177,7 +20177,7 @@ server.tool(
         if (resolution.proxyUsed) {
           prompt = buildSubagentProxyPrompt(resolution.requestedAgent, await readAgentDefinition(resolution.requestedAgent), prompt);
         }
-        const result = await runOpenCodeWithPolicy(
+        const result = await jobAgentRuntime().runOpenCodeWithPolicy(
           resolution.actualAgent,
           prompt,
           executionCwd,
@@ -21527,6 +21527,22 @@ export const __selfTest = {
     wipeIsolatedOpenCodeRuntime,
     writeFile,
     z,
+    // tests/review-tools-pipelines.js
+    finalizePipelineRecordWhileLocked,
+    finalizePipelineSourceCleanup,
+    formatReadOnlyWorkspaceDrift,
+    hasAmbiguousPathPattern,
+    internalQueueContractorProofValid,
+    mergePipelineIntegrationQueue,
+    nextPipelineIntegrationItemStatus,
+    parallelGroupDeadlineMs,
+    parallelGroupScopeReport,
+    parallelProviderKeys,
+    pipelineIntegrationItemMatches,
+    readOnlyEditsDeniedByAttestation,
+    readOnlyWorkspaceDrift,
+    reconcilePipelineIntegrationOperationStates,
+    trackedTargetStateSha256,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -21549,6 +21565,8 @@ export const __selfTest = {
     set worktreeCleanupTestHook(value) { worktreeCleanupTestHook = value; },
     get pipelineGateExecutorTestHook() { return pipelineGateExecutorTestHook; },
     set pipelineGateExecutorTestHook(value) { pipelineGateExecutorTestHook = value; },
+    get agentRuntimeTestHook() { return agentRuntimeTestHook; },
+    set agentRuntimeTestHook(value) { agentRuntimeTestHook = value; },
   },
 };
 
