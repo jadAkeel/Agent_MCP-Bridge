@@ -68,6 +68,12 @@ Rules:
 - A containment quarantine records the whole live process tree (supervisor, payload and their descendants) and is released only when all of them are gone.
 - `diagnose_opencode_bridge` returns every unfinished job and direct run plus the 25 most recent finished ones; its summary counts cover all.
 - `release-activate.js --sync-clients` lists the uncommitted bridge files it is trusting when it re-pins server.js.
+- An integration receipt is bound to the dry run's arguments (`allowedEdits`, `forbiddenEdits`, `sharedFiles`, `serialOnly`, `validationCommand`, `allowDirtyTarget`). An apply with different arguments fails with `integration_preview_contract_mismatch` and names each differing argument; pass the same `validationCommand` to both calls.
+- `list_opencode_jobs` prints one compact line per job (newest 20; `limit`, and `detail: true` for full records). Queue records carry `runStage` (`waiting_for_provider_slot` until the agent process starts, then `agent_running`), `agentStartedAt`, `agentRunMs` (agent time only) and `waitBeforeAgentMs`; `durationMs` still includes the wait.
+- A stored queue result longer than `CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS` (default 24000) keeps its start and its end (the agent's final report) and drops the middle.
+- `diagnose_opencode_bridge` gives recovery steps only to jobs that stopped short; running and completed jobs get `None: ...`.
+- Default shared (serial) files also cover Python and CMake manifests: `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `requirements-dev.txt`, `Pipfile`, `Pipfile.lock`, `poetry.lock`, `uv.lock`, `conftest.py`, `tests/conftest.py`, `CMakeLists.txt` (root paths; the check is by path prefix).
+- A plugin-manifest mismatch whose current hash is already pinned in `~/.claude.json` or `~/.codex/config.toml` says the bridge process is older than the install and must be restarted with its client.
 - `run_opencode_parallel`: run independent jobs only when their write scopes are safe. Batches with more non-dry-run jobs than `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` are rejected (`parallel_batch_exceeds_provider_capacity`): the extra jobs would wait for a slot and then run their full timeout inside the same call, past Codex's `tool_timeout_sec`.
 - `enqueue_opencode_job`: schedule a job through the MCP queue.
 - `diagnose_opencode_bridge`: show correlated jobs, pipelines, locks, provider leases, preserved work, retry safety, and recovery actions for one repository.
@@ -225,7 +231,7 @@ CODEX_OPENCODE_QUEUE_RETENTION_DAYS=30
 CODEX_OPENCODE_AUDIT_RETENTION_DAYS=90
 CODEX_OPENCODE_PROVIDER_LEASE_MS=240000
 CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS=20000
-CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS=8000
+CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS=24000
 CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS=12000
 CODEX_OPENCODE_EXPECTED_SERVER_SHA256=<sha256-of-the-published-server.js>
 CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256=<sha256-of-release-manifest.json>

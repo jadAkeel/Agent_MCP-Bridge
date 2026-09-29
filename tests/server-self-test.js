@@ -131,6 +131,11 @@ const {
   normalizeLockPathForCwd,
   normalizeProjectAgentPolicy,
   normalizeScopeContract,
+  compactQueueJobLines,
+  queueAgentTiming,
+  queueRunStage,
+  staleBridgeProcessHint,
+  truncateResultText,
   noteQueueLeaseRenewalFailure,
   open,
   openCodeRunArgs,
@@ -3453,6 +3458,37 @@ async function runSelfTests() {
     assert.equal(staleHeartbeatTransition.persisted, true);
     assert.equal(staleHeartbeatTransitionRecord.status, "planned");
 
+    // A cut result keeps the end of the agent's report and never grows past the cap, so
+    // truncating a stored result again changes nothing.
+    const longReport = `${"preamble ".repeat(2000)}FINAL REPORT TAIL: DEPENDENCY_REQUIRED none`;
+    const cutReport = truncateResultText(longReport, 4000);
+    assert.ok(cutReport.length <= 4000, `cut result is ${cutReport.length} characters`);
+    assert.ok(cutReport.startsWith("preamble"));
+    assert.ok(cutReport.endsWith("FINAL REPORT TAIL: DEPENDENCY_REQUIRED none"));
+    assert.match(cutReport, new RegExp(`${longReport.length} characters in total; the middle was truncated`));
+    assert.equal(truncateResultText(cutReport, 4000), cutReport);
+    assert.equal(truncateResultText("short", 4000), "short");
+    // A claimed job that has not spawned its agent is waiting for a provider slot, and the
+    // agent's run time excludes that wait.
+    assert.equal(queueRunStage({ status: "running" }), "waiting_for_provider_slot");
+    assert.equal(queueRunStage({ status: "running", childProcessStartedAt: "2026-01-01T00:00:05.000Z" }), "agent_running");
+    assert.equal(queueRunStage({ status: "completed" }), "completed");
+    assert.deepEqual(queueAgentTiming({
+      startedAt: "2026-01-01T00:00:00.000Z",
+      agentStartedAt: "2026-01-01T00:03:45.000Z",
+      finishedAt: "2026-01-01T00:06:20.000Z",
+    }), { agentRunMs: 155000, waitBeforeAgentMs: 225000 });
+    assert.deepEqual(queueAgentTiming({ startedAt: "2026-01-01T00:00:00.000Z" }), { agentRunMs: 0, waitBeforeAgentMs: 0 });
+    const compactLines = compactQueueJobLines([
+      { jobId: "builder-1", idempotencyKey: "P1-A", agent: "builder", status: "running", scopeContract: { read: ["x".repeat(500)] } },
+      { jobId: "builder-2", agent: "builder", status: "completed", durationMs: 1200, changedFiles: ["a.py", "tests/test_a.py"],
+        startedAt: "2026-01-01T00:00:00.000Z", agentStartedAt: "2026-01-01T00:00:01.000Z", finishedAt: "2026-01-01T00:00:02.000Z" },
+    ]);
+    assert.equal(compactLines, [
+      "- builder-1 key=P1-A agent=builder status=running stage=waiting_for_provider_slot",
+      "- builder-2 agent=builder status=completed agentRunMs=1000 waitMs=1000 durationMs=1200 changed=a.py,tests/test_a.py",
+    ].join("\n"));
+    assert.equal(await staleBridgeProcessHint("0".repeat(64)), "", "An unpinned hash gives no stale-process hint.");
     const truncatedQueueRecord = makeQueuePersistenceRecord("queue-result-truncation-self-test");
     assert.equal((await persistQueueRecord(truncatedQueueRecord)).persisted, true);
     assert.equal((await claimQueueRecord(truncatedQueueRecord)).ok, true);
@@ -4297,6 +4333,10 @@ async function runSelfTests() {
     assert.equal(copiedPathPolicy.errorType, "policy_validation_command_untrusted");
     await rm(path.join(tempDir, ".mcp", "copied-policy.json"), { force: true });
     assert.throws(() => normalizeProjectAgentPolicy({ unexpected: true }), z.ZodError);
+    const defaultSharedFiles = normalizeProjectAgentPolicy({ version: 1 }).sharedFiles;
+    for (const manifest of ["package.json", "pyproject.toml", "requirements.txt", "tests/conftest.py", "CMakeLists.txt"]) {
+      assert.ok(defaultSharedFiles.includes(manifest), `${manifest} is a default shared file`);
+    }
     const weakPolicyPath = path.join(tempDir, ".mcp", "weak-policy.json");
     const weakPolicyContent = JSON.stringify({ version: 1, requiresWorktrees: false });
     await writeFile(weakPolicyPath, weakPolicyContent, "utf8");
@@ -5149,6 +5189,40 @@ async function runSelfTests() {
     assert.equal((await runCommand("git", ["restore", "--worktree", "--", "src/allowed.txt"], tempDir, 1000 * 15)).exitCode, 0);
     await clearSelfTestIntegrationQuarantine();
     assert.equal((await cleanupWorktree(validationMutationWorktree, "always", true)).cleanup, "success");
+
+    // A dry run without validationCommand and an apply with it: the refusal must name the
+    // differing argument instead of calling the preview stale, and the retry with the same
+    // arguments must work.
+    const contractWorktree = await createWorktreeForJob({
+      cwd: tempDir,
+      agent: "builder",
+      jobId: "integration-contract-mismatch",
+    });
+    assert.equal(contractWorktree.ok, true, JSON.stringify(contractWorktree, null, 2));
+    await writeFile(path.join(contractWorktree.path, "src", "allowed.txt"), "contract mismatch content\n", "utf8");
+    const contractPreview = await integratePatchSerially({
+      cwd: tempDir,
+      worktreePath: contractWorktree.path,
+      allowedEdits: ["src"],
+      dryRun: true,
+    });
+    assert.equal(contractPreview.ok, true, JSON.stringify(contractPreview, null, 2));
+    const contractApply = await integratePatchSerially({
+      cwd: tempDir,
+      worktreePath: contractWorktree.path,
+      allowedEdits: ["src"],
+      validationCommand: "git diff --check",
+      reviewed: true,
+      previewReceipt: contractPreview.previewReceipt,
+    });
+    assert.equal(contractApply.ok, false);
+    assert.equal(contractApply.errorType, "integration_preview_contract_mismatch", JSON.stringify(contractApply, null, 2));
+    assert.match(contractApply.error, /validationCommand \(dry run "", apply "git diff --check"\)/);
+    assert.doesNotMatch(contractApply.error, /allowedEdits/);
+    assert.deepEqual(contractApply.conflictingPaths, []);
+    assert.match(contractApply.suggestedFix, /same allowedEdits, forbiddenEdits, validationCommand/);
+    assert.notEqual(await readFile(path.join(tempDir, "src", "allowed.txt"), "utf8"), "contract mismatch content\n");
+    assert.equal((await cleanupWorktree(contractWorktree, "always", true)).cleanup, "success");
 
     const extraPathWorktree = await createWorktreeForJob({
       cwd: tempDir,

@@ -192,7 +192,7 @@ const CONFIG = Object.freeze({
   terminalIntegrationMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_INTEGRATION_MAX_ROWS", 10000),
   retainedWorktreeMaxCount: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_COUNT", 64),
   retainedWorktreeMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_BYTES", 1024 * 1024 * 1024 * 20),
-  queueResultMaxChars: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS", 8000),
+  queueResultMaxChars: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS", 24000),
   integrationPreviewMaxChars: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS", 12000),
   integrationPreviewGlobalMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_GLOBAL_MAX", 256),
   integrationPreviewProjectMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_PROJECT_MAX", 64),
@@ -269,6 +269,20 @@ const DEFAULT_SHARED_FILE_PATHS = Object.freeze([
   "packages/shared/**",
   "schema/**",
   "migrations/**",
+  // Python and CMake manifests are shared the same way (found porting a C++ repo to Python).
+  // overlaps() compares path prefixes, not globs, so these are literal root paths.
+  "pyproject.toml",
+  "setup.py",
+  "setup.cfg",
+  "requirements.txt",
+  "requirements-dev.txt",
+  "Pipfile",
+  "Pipfile.lock",
+  "poetry.lock",
+  "uv.lock",
+  "conftest.py",
+  "tests/conftest.py",
+  "CMakeLists.txt",
 ]);
 const defaultReadOnlyAgentTimeoutMs = CONFIG.readOnlyAgentTimeoutMs;
 const defaultWriteAgentTimeoutMs = CONFIG.writeAgentTimeoutMs;
@@ -285,7 +299,7 @@ const DEFAULT_RETURN_FORMAT = [
   "5. Files wanted but not edited",
   "6. Changes made or proposed",
   "7. NEEDS_INTEGRATION, if required",
-  "8. DEPENDENCY_REQUIRED, if a package manifest change is required",
+  "8. Dependencies: the DEPENDENCY_REQUIRED marker line only when a package manifest change is required; otherwise write \"Dependencies: none\"",
   "9. Risks",
   "10. Validation performed",
   "11. Validation still recommended",
@@ -3566,7 +3580,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     const manifestContent = await readFile(manifestPath);
     const actualManifestSha256 = createHash("sha256").update(manifestContent).digest("hex");
     if (actualManifestSha256 !== CONFIG.expectedExternalPluginManifestSha256) {
-      throw new Error(`External plugin manifest hash mismatch. Expected ${CONFIG.expectedExternalPluginManifestSha256}, got ${actualManifestSha256}.`);
+      throw new Error(`External plugin manifest hash mismatch. Expected ${CONFIG.expectedExternalPluginManifestSha256}, got ${actualManifestSha256}.${await staleBridgeProcessHint(actualManifestSha256)}`);
     }
     const manifest = JSON.parse(manifestContent.toString("utf8"));
     if (manifest?.version !== 1 || !Array.isArray(manifest.plugins) || !manifest.plugins.length
@@ -5128,7 +5142,9 @@ function buildCompactPrompt(agent, task, delegation = {}) {
     "If a new or unavailable package is required:",
     "Do not add an undeclared import and do not edit package manifests or lockfiles. Return exactly one single-line marker in this form: DEPENDENCY_REQUIRED {\"packages\":[{\"name\":\"package-name\",\"version\":\"optional-range\",\"reason\":\"why it is needed\"}],\"reason\":\"why the task cannot continue safely\"}",
     "",
-    "Return format:",
+    // Agents wrote the profile's "Output format", its "Final Report" list and this format one
+    // after another (a reviewer pair returned ~25k characters); one report is enough.
+    "Return format (write only this report, once; it replaces the Output format and Final Report sections of your profile, and each fact appears in one place):",
     delegation.returnFormat || DEFAULT_RETURN_FORMAT,
   ].join("\n");
 }
@@ -7349,9 +7365,46 @@ function isPathInside(parent, candidate) {
   return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
+const BRIDGE_PROCESS_STARTED_AT = new Date().toISOString();
+
+// Pins reach a bridge through its client's environment at launch. After
+// `release-activate.js --sync-clients` re-pins the client config files, a bridge that is still
+// running keeps the old pin and rejects every job with a bare hash mismatch that reads like a
+// broken install. When the current hash is already pinned in a client config file, the process
+// is only stale: say so.
+async function staleBridgeProcessHint(currentSha256) {
+  const configFiles = [
+    path.join(homedir(), ".claude.json"),
+    path.join(homedir(), ".codex", "config.toml"),
+  ];
+  for (const file of configFiles) {
+    try {
+      if ((await readFile(file, "utf8")).includes(currentSha256)) {
+        return ` The client config ${file} already pins ${currentSha256}: this bridge process (started ${BRIDGE_PROCESS_STARTED_AT}) is older than the current install. Restart the client (a new Claude Code session, or restart Codex) so it launches a bridge with the current pins.`;
+      }
+    } catch {
+      // A missing or unreadable client config gives no hint.
+    }
+  }
+  return "";
+}
+
 function truncateText(value, limit = 12000) {
   const text = String(value || "");
   return text.length > limit ? `${text.slice(0, limit)}\n... [truncated]` : text;
+}
+
+// A queued job's result text is the bridge preamble followed by the agent's final report, and
+// the report's end (open doubts, DEPENDENCY_REQUIRED) is what the coordinator needs most, so a
+// head-only cut lost exactly that. Keep the start and the longer end, and say what was dropped.
+function truncateResultText(value, limit = CONFIG.queueResultMaxChars) {
+  const text = String(value || "");
+  if (text.length <= limit) return text;
+  // The output stays within the limit, so truncating a stored result again is a no-op.
+  const marker = `\n... [${text.length} characters in total; the middle was truncated] ...\n`;
+  const head = Math.floor(Math.max(0, limit - marker.length) * 0.3);
+  const tail = Math.max(0, limit - marker.length - head);
+  return `${text.slice(0, head)}${marker}${tail ? text.slice(text.length - tail) : ""}`;
 }
 
 // Default integration cleanup removes only worktrees the bridge created; a worktree path
@@ -8578,8 +8631,8 @@ async function captureGitHead(cwd) {
   return result.stdout.trim();
 }
 
-function integrationContractSha256({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget }) {
-  const value = {
+function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget }) {
+  return {
     cwd: path.resolve(cwd || process.cwd()),
     worktreePath: worktreePath ? path.resolve(worktreePath) : "",
     branch: String(branch || ""),
@@ -8590,7 +8643,24 @@ function integrationContractSha256({ cwd, worktreePath, branch, allowedEdits, fo
     validationCommand: String(validationCommand || "").trim(),
     allowDirtyTarget: Boolean(allowDirtyTarget),
   };
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function integrationContractSha256(options) {
+  return createHash("sha256").update(JSON.stringify(integrationContractValue(options))).digest("hex");
+}
+
+// A reviewed apply whose arguments differ from its dry run used to fail with "contractSha256
+// changed after review", which reads like a moved target. Name the arguments that differ so the
+// caller can dry-run again with the same ones (the usual case: validationCommand only on apply).
+function integrationContractDifference(previewContract, applyContract) {
+  if (!previewContract || !applyContract) return "";
+  const show = (value) => (Array.isArray(value) ? `[${value.join(", ")}]` : JSON.stringify(value));
+  const fields = Object.keys(applyContract)
+    .filter((key) => JSON.stringify(previewContract[key]) !== JSON.stringify(applyContract[key]))
+    .map((key) => `${key} (dry run ${show(previewContract[key])}, apply ${show(applyContract[key])})`);
+  return fields.length
+    ? `The apply's arguments differ from the dry run's: ${fields.join("; ")}. Dry-run again with exactly the arguments you will apply with.`
+    : "";
 }
 
 function sweepIntegrationPreviews(now = Date.now()) {
@@ -8635,7 +8705,7 @@ async function claimIntegrationPreviewReceipt(projectKey, previewId, expiresAt, 
   }
 }
 
-async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, projectKey = "" }) {
+async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, contract = null, projectKey = "" }) {
   const normalizedProjectKey = path.resolve(projectKey || process.cwd());
   const previewKey = await integrationPreviewKey();
   const createdAtMs = Date.now();
@@ -8671,7 +8741,7 @@ async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha25
     previewId,
     ...identity,
   };
-  INTEGRATION_PREVIEWS.set(previewId, { identity, expiresAt: Date.parse(expiresAt), projectKey: normalizedProjectKey });
+  INTEGRATION_PREVIEWS.set(previewId, { identity, contract, expiresAt: Date.parse(expiresAt), projectKey: normalizedProjectKey });
   ensureIntegrationPreviewSweepTimer();
   return receipt;
 }
@@ -8692,7 +8762,12 @@ async function integrationPreviewReceiptError(receipt, expected, consume = false
   }
   const fields = ["patchSha256", "sourceBaseCommit", "sourceStateSha256", "targetHead", "targetStateSha256", "contractSha256"];
   for (const field of fields) {
-    if (parsed[field] !== expected[field]) return `Integration preview is stale: ${field} changed after review.`;
+    if (parsed[field] === expected[field]) continue;
+    if (field === "contractSha256") {
+      const difference = integrationContractDifference(INTEGRATION_PREVIEWS.get(parsed.previewId)?.contract, expected.contract);
+      if (difference) return `Integration preview does not match this apply. ${difference}`;
+    }
+    return `Integration preview is stale: ${field} changed after review.`;
   }
   const previewKey = await integrationPreviewKey();
   const identity = {
@@ -8943,7 +9018,7 @@ async function integratePatchWithoutSerialLock({
     }
   }
 
-  const contractSha256 = integrationContractSha256({
+  const contract = integrationContractValue({
     cwd: targetCwd,
     worktreePath,
     branch,
@@ -8954,6 +9029,7 @@ async function integratePatchWithoutSerialLock({
     validationCommand,
     allowDirtyTarget,
   });
+  const contractSha256 = integrationContractSha256(contract);
   const currentPreviewIdentity = {
     patchSha256: patch.patchSha256,
     sourceBaseCommit: patch.sourceBaseCommit,
@@ -8961,13 +9037,19 @@ async function integratePatchWithoutSerialLock({
     targetHead: targetState.targetHead,
     targetStateSha256: targetState.targetStateSha256,
     contractSha256,
+    contract,
   };
   if (!dryRun && reviewed) {
     const earlyReceiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, false, targetCwd);
     if (earlyReceiptError) {
+      const contractMismatch = earlyReceiptError.startsWith("Integration preview does not match this apply.");
       return {
         ok: false,
-        errorType: "integration_preview_stale",
+        errorType: contractMismatch ? "integration_preview_contract_mismatch" : "integration_preview_stale",
+        suggestedFix: contractMismatch
+          ? "Run the dry run again with the same allowedEdits, forbiddenEdits, validationCommand and allowDirtyTarget as the apply, then apply with its new previewReceipt."
+          : "Run the dry run again to review the current patch and target, then apply with its new previewReceipt.",
+        conflictingPaths: [],
         error: earlyReceiptError,
         changedFiles: patch.changedFiles,
         patchSha256: patch.patchSha256,
@@ -9135,6 +9217,7 @@ async function integratePatchWithoutSerialLock({
           patch,
           targetState,
           contractSha256,
+          contract,
           projectKey: targetCwd,
         });
       } catch (error) {
@@ -9189,6 +9272,8 @@ async function integratePatchWithoutSerialLock({
       return {
         ok: false,
         errorType: "integration_preview_stale",
+        suggestedFix: "Run the dry run again to review the current patch and target, then apply with its new previewReceipt.",
+        conflictingPaths: [],
         error: receiptError,
         changedFiles: patch.changedFiles,
         patchSha256: patch.patchSha256,
@@ -11799,7 +11884,7 @@ server.tool(
         jobId: job.jobId,
         pipelineId: job.parentJobId || "",
         status: job.status,
-        stage: job.status,
+        stage: queueRunStage(job),
         errorType: job.errorType || "",
         failureReason: job.errorReason || "",
         requestedAgent: job.agent || "",
@@ -11808,7 +11893,15 @@ server.tool(
         worktreePath: job.worktreePath || "",
         workPreserved: Boolean(job.worktreePath),
         retrySafe: job.mode === "read" && !["running", "validating", "reviewing", "testing"].includes(job.status),
-        recoveryAction: job.worktreePath
+        // Healthy jobs used to get "inspect preserved work before retrying", which reads as if
+        // something had gone wrong; only jobs that stopped short get recovery steps.
+        recoveryAction: ["pending", "planned", "running", "validating", "reviewing", "testing"].includes(job.status)
+          ? `None: the job is ${queueRunStage(job)}.`
+          : job.status === "completed"
+          ? (job.worktreePath && job.mode === "write"
+            ? "None: review the patch and integrate it with integrate_opencode_worktree (dry run first)."
+            : "None: the job completed.")
+          : job.worktreePath
           ? `Inspect preserved work: git -C "${job.worktreePath}" status --short and git diff --binary before retrying.`
           : job.status === "not_resumable"
           ? "Re-enqueue with a stable idempotencyKey; legacy records without encrypted requests cannot be replayed."
@@ -12199,8 +12292,10 @@ server.tool(
   {
     cwd: z.string().min(1).describe("Canonical repository path for project-scoped job listing."),
     status: z.enum(["pending", "planned", "blocked", "running", "validating", "reviewing", "testing", "completed", "failed", "cancelled", "interrupted", "not_resumable"]).optional(),
+    detail: z.boolean().optional().describe("Full job records (scope contracts, hashes, lease and containment fields). Default: one compact line per job."),
+    limit: z.number().int().positive().max(500).optional().describe("Newest jobs to show; default 20."),
   },
-  async ({ cwd = "", status = "" }) => {
+  async ({ cwd = "", status = "", detail = false, limit = 20 }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const records = (effectiveQueueMode() === "sqlite"
       ? await listPersistedQueueRecords(projectRoot || cwd, status)
@@ -12209,6 +12304,7 @@ server.tool(
         .map((record) => queueRecordSnapshot(record, false))
         .filter((record) => !status || record.status === status)
     ).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const shown = records.slice(0, limit);
 
     return {
       content: [
@@ -12216,14 +12312,38 @@ server.tool(
           type: "text",
           text: [
             `Queue mode: ${effectiveQueueMode()}`,
-            `Jobs: ${records.length}`,
-            JSON.stringify(records, null, 2),
+            `Jobs: ${records.length}${shown.length < records.length ? ` (showing the newest ${shown.length})` : ""}`,
+            detail ? JSON.stringify(shown, null, 2) : compactQueueJobLines(shown),
           ].join("\n"),
         },
       ],
     };
   }
 );
+
+// Polling four jobs with full records cost ~20k characters of coordinator context per poll.
+// The compact form keeps what a coordinator acts on; detail: true or get_opencode_job has the rest.
+function compactQueueJobLines(records) {
+  if (!records.length) return "(no jobs)";
+  return records.map((record) => {
+    const stage = queueRunStage(record);
+    const timing = queueAgentTiming(record);
+    const parts = [
+      record.jobId,
+      record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
+      `agent=${record.agent || "?"}`,
+      `status=${record.status || "?"}`,
+      stage && stage !== record.status ? `stage=${stage}` : "",
+      timing.agentRunMs ? `agentRunMs=${timing.agentRunMs}` : "",
+      timing.waitBeforeAgentMs ? `waitMs=${timing.waitBeforeAgentMs}` : "",
+      record.durationMs ? `durationMs=${record.durationMs}` : "",
+      record.errorType ? `error=${record.errorType}` : "",
+      record.completionOutcome ? `outcome=${record.completionOutcome}` : "",
+      (record.changedFiles || []).length ? `changed=${record.changedFiles.join(",")}` : "",
+    ].filter(Boolean);
+    return `- ${parts.join(" ")}`;
+  }).join("\n");
+}
 
 server.tool(
   "get_opencode_job",
@@ -13262,12 +13382,12 @@ server.tool(
                 actualAgent: "none",
                 lockMode: "serial_integration",
                 durationMs: nowMs() - started,
-                conflictingPaths: result.disallowedFiles || result.changedFiles || [],
+                conflictingPaths: result.conflictingPaths || result.disallowedFiles || result.changedFiles || [],
                 allowedEdits,
                 rollback: result.rollback?.rollback || "",
                 rollbackFiles: result.rollback?.rollbackFiles || [],
                 unresolvedFiles: result.rollback?.unresolvedFiles || [],
-                suggestedFix: "Resolve conflicts, narrow allowedEdits, move shared/global files to a serial contract step, or rerun with a passing validation command.",
+                suggestedFix: result.suggestedFix || "Resolve conflicts, narrow allowedEdits, move shared/global files to a serial contract step, or rerun with a passing validation command.",
               }),
               result.validationGate ? formatValidationGateResult(result.validationGate) : null,
             ].filter(Boolean).join("\n\n"),
@@ -15072,6 +15192,25 @@ async function executeOpenCodeJob(requestedJob, {
   }
 }
 
+// A queued job is "running" from the moment a worker claims it, but it may then wait minutes for
+// a provider slot before the agent starts, so status alone cannot tell waiting from working and
+// durationMs includes the wait. runStage and agentRunMs separate the two.
+function queueRunStage(record) {
+  if (record.status !== "running") return record.status || "";
+  return record.childProcessStartedAt ? "agent_running" : "waiting_for_provider_slot";
+}
+
+function queueAgentTiming(record, now = Date.now()) {
+  const agentStartedMs = Date.parse(record.agentStartedAt || "");
+  if (!Number.isFinite(agentStartedMs)) return { agentRunMs: 0, waitBeforeAgentMs: 0 };
+  const finishedMs = Date.parse(record.finishedAt || "");
+  const startedMs = Date.parse(record.startedAt || "");
+  return {
+    agentRunMs: Math.max(0, (Number.isFinite(finishedMs) ? finishedMs : now) - agentStartedMs),
+    waitBeforeAgentMs: Number.isFinite(startedMs) ? Math.max(0, agentStartedMs - startedMs) : 0,
+  };
+}
+
 function queueRecordSnapshot(record, includeResult = true) {
   const persistedResultText = redactSensitiveText(record.resultText || "");
   const essentialResultTruncated = record.status === "completed"
@@ -15099,10 +15238,13 @@ function queueRecordSnapshot(record, includeResult = true) {
     worktreePatchSha256: record.worktreePatchSha256 || "",
     worktreeSourceStateSha256: record.worktreeSourceStateSha256 || "",
     status: record.status,
+    runStage: queueRunStage(record),
     createdAt: record.createdAt,
     startedAt: record.startedAt || "",
+    agentStartedAt: record.agentStartedAt || "",
     finishedAt: record.finishedAt || "",
     durationMs: record.durationMs || 0,
+    ...queueAgentTiming(record),
     retryCount: record.retryCount || 0,
     maxRetries: record.maxRetries || 0,
     errorType: record.errorType || "",
@@ -15139,7 +15281,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     orphanChildProcessStartedAt: record.orphanChildProcessStartedAt || "",
     orphanChildProcessAlive: Boolean(record.orphanChildProcessAlive),
     revision: record.revision || 0,
-    resultText: includeResult ? truncateText(persistedResultText, CONFIG.queueResultMaxChars) : "",
+    resultText: includeResult ? truncateResultText(persistedResultText, CONFIG.queueResultMaxChars) : "",
     resultTextChars: includeResult ? persistedResultText.length : 0,
     resultTextSha256: includeResult ? createHash("sha256").update(persistedResultText).digest("hex") : "",
     resultTextTruncated: includeResult ? persistedResultText.length > CONFIG.queueResultMaxChars : false,
@@ -15149,7 +15291,7 @@ function queueRecordSnapshot(record, includeResult = true) {
 function queuePrivateDetails(record) {
   const resultText = redactSensitiveText(record.resultText || "");
   const details = sanitizePersistedValue({
-    resultText: truncateText(resultText, CONFIG.queueResultMaxChars),
+    resultText: truncateResultText(resultText, CONFIG.queueResultMaxChars),
     resultTextChars: resultText.length,
     resultTextSha256: createHash("sha256").update(resultText).digest("hex"),
     resultTextTruncated: resultText.length > CONFIG.queueResultMaxChars,
@@ -16698,6 +16840,7 @@ async function startQueueRecord(record) {
           const persisted = await updateQueueRecordDurable(record, {
             childProcessId: pid || 0,
             childProcessStartedAt: startedAt || new Date().toISOString(),
+            agentStartedAt: record.agentStartedAt || startedAt || new Date().toISOString(),
             childProcessRole: processRole || "supervisor",
             childContainmentIdentity: containmentIdentity || "",
             heartbeatAt: launchAuthorizedAt,
@@ -20413,6 +20556,11 @@ export const __selfTest = {
     normalizeLockPathForCwd,
     normalizeProjectAgentPolicy,
     normalizeScopeContract,
+    compactQueueJobLines,
+    queueAgentTiming,
+    queueRunStage,
+    staleBridgeProcessHint,
+    truncateResultText,
     noteQueueLeaseRenewalFailure,
     open,
     openCodeRunArgs,

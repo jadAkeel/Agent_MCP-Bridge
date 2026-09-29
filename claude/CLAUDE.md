@@ -21,13 +21,15 @@ Write:
 
 ## Review and integrate
 1. Read the agent report, the changed-file list, and the diff. Reject scope violations or unrelated edits.
-2. Preview with `integrate_opencode_worktree` (`dryRun: true`), show the user the patch, then apply with `reviewed: true`, the exact `previewReceipt`, and `validationCommand: "git diff --check"`. A passing validation lets the bridge delete the used worktree and branch; without it every worktree is kept and they pile up.
+2. Preview with `integrate_opencode_worktree` (`dryRun: true`, `validationCommand: "git diff --check"`), show the user the patch, then apply with the same arguments plus `reviewed: true` and the exact `previewReceipt`. The receipt is bound to the arguments: an apply that adds or changes one fails with `integration_preview_contract_mismatch`, naming the argument. A passing validation lets the bridge delete the used worktree and branch; without it every worktree is kept and they pile up.
 3. After integration, run the project's checks in the real checkout.
 4. `DEPENDENCY_REQUIRED` in a report means: add the dependency yourself, commit, retry the job.
 Never report success based only on an agent's own claim.
 
 ## Troubleshooting
 - Start with `get_opencode_bridge_status`; use `diagnose_opencode_bridge` when something looks stuck.
+- Poll queued jobs with `list_opencode_jobs` (one compact line per job; `detail: true` for full records) or `get_opencode_job`. `stage=waiting_for_provider_slot` means the job is claimed but its agent has not started; `agentRunMs` excludes that wait.
+- `External plugin manifest hash mismatch ... this bridge process ... is older than the current install`: the bridge was re-pinned after this session started. Start a new session (Codex: restart it).
 - `dirty_worktree_requires_checkpoint`: the job's files have uncommitted changes. If they are yours (a finished integration), commit them and retry. If another client (Codex) owns them, wait for it to commit; never commit or revert another client's work. Use `allowDirtyTarget: true` only for dirt on paths the patch does not touch.
 - Codex may be using the same bridge on the same repo at the same time; a lock conflict message means wait or pick disjoint paths.
 - `integration_preview_contains_sensitive_text`: open the flagged patch lines in the worktree; if none is a real credential, dry-run again with `acceptFlaggedSecretLines: true`.
