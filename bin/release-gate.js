@@ -25,7 +25,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,15 +41,67 @@ const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const RECEIPT_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const DEFAULT_RECEIPT_PATH = path.join(SOURCE_ROOT, ".release-gate", "receipt.json");
 const SOURCE_TREE_ENTRIES = Object.freeze(LEGACY_PUBLISH_ENTRIES.filter((entry) => entry !== "node_modules"));
-const REQUIRED_STEPS = Object.freeze(["npm test", "test:concurrency", "npm audit", "live health smoke"]);
+const REQUIRED_STEPS = Object.freeze(["installed dependencies", "npm test", "test:concurrency", "npm audit", "live health smoke"]);
+// The only publish entry a source tree may lack: it is untracked (it ignores itself), so a fresh
+// worktree has none. The release build still refuses a tree without it.
+const OPTIONAL_SOURCE_ENTRIES = Object.freeze(["opencode/.gitignore"]);
+const FAILED_OUTPUT_TAIL_LINES = 30;
 
 function defaultConfigPath() {
   return path.join(homedir(), ".codex", "config.toml");
 }
 
+// The tests run against node_modules, so what is installed must be what package-lock.json
+// pins: for every production package, the hidden lockfile npm wrote at install time
+// (node_modules/.package-lock.json) and the package's own package.json must carry the
+// locked version, and the hidden lockfile the locked integrity. An optional package that is
+// not installed (another platform's binary) is fine; anything else missing, extra or
+// different fails. Returns the list of problems (empty when it matches).
+async function installedDependencyMismatches(sourceRoot = SOURCE_ROOT) {
+  const readJson = async (file) => JSON.parse((await readFile(file, "utf8")).replace(/^﻿/, ""));
+  const locked = (await readJson(path.join(sourceRoot, "package-lock.json"))).packages || {};
+  let hidden;
+  try {
+    hidden = (await readJson(path.join(sourceRoot, "node_modules", ".package-lock.json"))).packages || {};
+  } catch (error) {
+    return [`node_modules/.package-lock.json cannot be read (${error?.code || error?.message || error}); run npm ci.`];
+  }
+  const problems = [];
+  const production = Object.entries(locked).filter(([key, entry]) => key.startsWith("node_modules/") && !entry.dev);
+  for (const [key, entry] of production) {
+    const installed = hidden[key];
+    if (!installed) {
+      if (!entry.optional) problems.push(`${key}: locked ${entry.version}, not installed`);
+      continue;
+    }
+    if (installed.version !== entry.version) problems.push(`${key}: locked ${entry.version}, installed ${installed.version}`);
+    if (entry.integrity && installed.integrity !== entry.integrity) problems.push(`${key}: integrity differs from package-lock.json`);
+    try {
+      const manifest = await readJson(path.join(sourceRoot, ...key.split("/"), "package.json"));
+      if (manifest.version !== entry.version) problems.push(`${key}: its package.json says ${manifest.version}, locked ${entry.version}`);
+    } catch (error) {
+      problems.push(`${key}: package.json cannot be read (${error?.code || error?.message || error})`);
+    }
+  }
+  for (const key of Object.keys(hidden)) {
+    if (key.startsWith("node_modules/") && !Object.hasOwn(locked, key)) problems.push(`${key}: installed but not in package-lock.json`);
+  }
+  return problems;
+}
+
 function gateSteps({ sourceRoot = SOURCE_ROOT, configPath = defaultConfigPath() } = {}) {
   // npm is a .cmd shim on Windows, which Node only starts through a shell.
   return [
+    {
+      name: "installed dependencies",
+      command: "(compare node_modules with package-lock.json)",
+      run: async () => {
+        const problems = await installedDependencyMismatches(sourceRoot);
+        return problems.length
+          ? { exitCode: 1, output: [`node_modules does not match package-lock.json (${problems.length}); run npm ci:`, ...problems.map((line) => `  ${line}`)].join("\n") }
+          : { exitCode: 0, output: "node_modules matches package-lock.json for every production package." };
+      },
+    },
     { name: "npm test", command: "npm test", shell: true },
     { name: "test:concurrency", command: "npm run test:concurrency", shell: true, requireCheckSummary: true },
     { name: "npm audit", command: "npm audit --omit=dev", shell: true },
@@ -62,16 +114,61 @@ function gateSteps({ sourceRoot = SOURCE_ROOT, configPath = defaultConfigPath() 
   ];
 }
 
-// opencode/.gitignore is untracked (it ignores itself), so a fresh worktree lacks it; a missing
-// entry is digested as absent here, and the release build still refuses it.
 async function sourceTreeDigest(sourceRoot = SOURCE_ROOT) {
-  const digest = await digestTree(sourceRoot, { include: SOURCE_TREE_ENTRIES, allowMissing: true, label: "Release source" });
+  const digest = await digestTree(sourceRoot, { include: SOURCE_TREE_ENTRIES, allowMissing: OPTIONAL_SOURCE_ENTRIES, label: "Release source" });
   return { treeSha256: digest.treeSha256, fileCount: digest.fileCount, entries: [...SOURCE_TREE_ENTRIES] };
+}
+
+// What a release build needs from the source tree, checked before the gate spends its
+// half hour: every publish entry (node_modules is installed fresh, so not that one) exists as a
+// real file or directory, and the plugin integrity manifest binds its config and settings
+// to this tree's opencode/opencode.jsonc and opencode/antigravity.json (build-release.js
+// refuses anything else, but only after the gate). Throws with every problem found.
+async function assertReleaseSourceComplete(sourceRoot = SOURCE_ROOT) {
+  const problems = [];
+  for (const entry of SOURCE_TREE_ENTRIES) {
+    try {
+      const details = await lstat(path.join(sourceRoot, ...entry.split("/")));
+      if (details.isSymbolicLink() || (!details.isFile() && !details.isDirectory())) problems.push(`${entry} is not a real file or directory`);
+    } catch (error) {
+      problems.push(`${entry} is missing (${error?.code || error?.message || error})`);
+    }
+  }
+  const manifestPath = path.join(sourceRoot, "opencode", "plugin-integrity-manifest.json");
+  let manifest = null;
+  try {
+    manifest = JSON.parse((await readFile(manifestPath, "utf8")).replace(/^﻿/, ""));
+  } catch (error) {
+    if (error?.code !== "ENOENT") problems.push(`opencode/plugin-integrity-manifest.json cannot be read (${error?.message || error})`);
+  }
+  if (manifest) {
+    const fold = (value) => (process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value));
+    for (const [list, basename] of [["configs", "opencode.jsonc"], ["settings", "antigravity.json"]]) {
+      const entries = Array.isArray(manifest[list]) ? manifest[list] : [];
+      const expected = path.join(sourceRoot, "opencode", basename);
+      if (entries.length !== 1) {
+        problems.push(`plugin-integrity-manifest.json ${list} must hold exactly one entry (it holds ${entries.length})`);
+      } else if (fold(String(entries[0]?.path || "")) !== fold(expected)) {
+        problems.push(`plugin-integrity-manifest.json ${list}[0].path is ${entries[0]?.path || "(empty)"}, not this tree's ${expected}`);
+      }
+    }
+  }
+  if (problems.length) {
+    throw new Error([`The source tree ${sourceRoot} cannot become a release; nothing was tested or built:`, ...problems.map((line) => `  ${line}`)].join("\n"));
+  }
 }
 
 function gitHead(sourceRoot) {
   const result = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], { encoding: "utf8", windowsHide: true });
   return result.status === 0 ? String(result.stdout || "").trim() : "";
+}
+
+function outputTail(output, lines = FAILED_OUTPUT_TAIL_LINES) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim() && !/ExperimentalWarning|--trace-warnings/.test(line))
+    .slice(-lines)
+    .map((line) => (line.length > 400 ? `${line.slice(0, 400)}...` : line));
 }
 
 // What a step's output says about skipped and counted checks.
@@ -92,9 +189,20 @@ function parseStepOutput(output) {
   return { skips, checks };
 }
 
-// Runs one step with its output streamed through to this process and kept for parsing.
-function runStepProcess(step, { cwd }) {
-  return new Promise((resolve) => {
+// Runs one step with its output streamed through to this process and kept for parsing. A step
+// with a run() function is checked in this process instead of a child.
+async function runStepProcess(step, { cwd }) {
+  if (step.run) {
+    let result;
+    try {
+      result = await step.run();
+    } catch (error) {
+      result = { exitCode: 1, output: String(error?.stack || error) };
+    }
+    process.stdout.write(`${result.output}\n`);
+    return result;
+  }
+  return await new Promise((resolve) => {
     const child = spawn(step.command, step.args || [], { cwd, shell: step.shell, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const keep = (chunk, stream) => {
@@ -157,12 +265,11 @@ async function runReleaseGate({
     };
     receipt.steps.push(record);
     receipt.skips.push(...parsed.skips.map((skip) => ({ step: step.name, ...skip })));
-    if (exitCode !== 0) {
-      receipt.failure = `${step.name} failed (exit ${exitCode}).`;
-      break;
-    }
-    if (step.requireCheckSummary && !parsed.checks) {
-      receipt.failure = `${step.name} printed no "Checks: <n> passed, skipped: <n>" line.`;
+    if (exitCode !== 0) receipt.failure = `${step.name} failed (exit ${exitCode}).`;
+    else if (step.requireCheckSummary && !parsed.checks) receipt.failure = `${step.name} printed no "Checks: <n> passed, skipped: <n>" line.`;
+    if (receipt.failure) {
+      // The end of a failed step's output, so the receipt alone says what broke.
+      record.outputTail = outputTail(output);
       break;
     }
   }
@@ -268,6 +375,7 @@ async function selfTest() {
     const steps = gateSteps({ sourceRoot: source, configPath: path.join(fixture, "config.toml") });
     assert.deepEqual(steps.map((step) => step.name), REQUIRED_STEPS);
     const outputs = {
+      "installed dependencies": "node_modules matches package-lock.json for every production package.",
       "npm test": "ok   a (1 ms)\nskip b: symlinks need Developer Mode\nok   c (2 ms) [partly skipped: symlink part]\nℹ skipped 0\n",
       "test:concurrency": "check ok   locks (10 ms)\nChecks: 14 passed, skipped: 0\n",
       "npm audit": "found 0 vulnerabilities\n",
@@ -279,8 +387,9 @@ async function selfTest() {
     const receiptPath = path.join(fixture, "receipt.json");
     const { receipt } = await runReleaseGate({ sourceRoot: source, receiptPath, steps, runStep: green, log: quiet });
     assert.equal(receipt.ok, true, receipt.failure);
-    assert.deepEqual(receipt.steps.map((step) => step.exitCode), [0, 0, 0, 0]);
-    assert.deepEqual(receipt.steps[1].checks, { passed: 14, skipped: 0 });
+    assert.deepEqual(receipt.steps.map((step) => step.exitCode), [0, 0, 0, 0, 0]);
+    assert.ok(receipt.steps.every((step) => !Object.hasOwn(step, "outputTail")), "a passing step keeps no output");
+    assert.deepEqual(receipt.steps[2].checks, { passed: 14, skipped: 0 });
     assert.deepEqual(receipt.skips.map((skip) => `${skip.step}/${skip.name}`), ["npm test/b", "npm test/c"]);
     const stored = await readGateReceipt(receiptPath);
     const { treeSha256 } = await sourceTreeDigest(source);
@@ -296,7 +405,7 @@ async function selfTest() {
     assert.throws(() => validateGateReceipt(stored, { treeSha256, now: finished + RECEIPT_MAX_AGE_MS + 1000 }), /h old/);
     assert.throws(() => validateGateReceipt(stored, { treeSha256, now: finished - RECEIPT_CLOCK_SKEW_MS - 1000 }), /in the future/);
     assert.throws(() => validateGateReceipt({ ...stored, ok: false, failure: "npm test failed (exit 1)." }, { treeSha256 }), /failed run: npm test failed/);
-    assert.throws(() => validateGateReceipt({ ...stored, steps: stored.steps.slice(0, 3) }, { treeSha256 }), /no "live health smoke" step/);
+    assert.throws(() => validateGateReceipt({ ...stored, steps: stored.steps.slice(0, 4) }, { treeSha256 }), /no "live health smoke" step/);
     assert.throws(() => validateGateReceipt({ ...stored, kind: "other" }, { treeSha256 }), /not a release-gate receipt/);
     await writeFile(path.join(fixture, "broken.json"), "{", "utf8");
     await assert.rejects(readGateReceipt(path.join(fixture, "broken.json")), /not JSON/);
@@ -311,9 +420,20 @@ async function selfTest() {
       runStep: async (step) => { ran.push(step.name); return { exitCode: step.name === "test:concurrency" ? 1 : 0, output: outputs[step.name] }; },
       log: quiet,
     });
-    assert.deepEqual(ran, ["npm test", "test:concurrency"]);
+    assert.deepEqual(ran, ["installed dependencies", "npm test", "test:concurrency"]);
     assert.equal(failing.receipt.ok, false);
     assert.match(failing.receipt.failure, /test:concurrency failed \(exit 1\)/);
+    assert.deepEqual(failing.receipt.steps[2].outputTail, ["check ok   locks (10 ms)", "Checks: 14 passed, skipped: 0"], "a failed step keeps the end of its output");
+    const longOutput = Array.from({ length: 50 }, (_, index) => `line ${index + 1}`).join("\n");
+    const tail = (await runReleaseGate({
+      sourceRoot: source,
+      receiptPath,
+      steps,
+      runStep: async (step) => ({ exitCode: step.name === "npm test" ? 2 : 0, output: step.name === "npm test" ? longOutput : outputs[step.name] }),
+      log: quiet,
+    })).receipt.steps[1].outputTail;
+    assert.equal(tail.length, FAILED_OUTPUT_TAIL_LINES);
+    assert.deepEqual([tail[0], tail.at(-1)], ["line 21", "line 50"]);
     assert.equal((await readGateReceipt(receiptPath)).ok, false);
 
     // A concurrency run that prints no check summary does not pass.
@@ -339,11 +459,69 @@ async function selfTest() {
     });
     assert.match(drifting.receipt.failure, /source tree changed while the gate ran/);
 
-    // A missing entry (a worktree without the untracked opencode/.gitignore) is digested as
-    // absent: no error, but not the digest of the tree that has it.
+    // Only opencode/.gitignore may be missing (a worktree lacks the untracked file): it is
+    // digested as absent, not as the tree that has it. Any other missing entry is refused.
     const withIgnore = (await sourceTreeDigest(source)).treeSha256;
     await rm(path.join(source, "opencode", ".gitignore"));
     assert.notEqual((await sourceTreeDigest(source)).treeSha256, withIgnore);
+    await rename(path.join(source, "tests"), path.join(fixture, "tests-away"));
+    await assert.rejects(sourceTreeDigest(source), /ENOENT/, "a missing tests/ is not digested as absent");
+    await rename(path.join(fixture, "tests-away"), path.join(source, "tests"));
+
+    // Before the gate: every publish entry must exist and the plugin manifest must bind this
+    // tree's opencode.jsonc and antigravity.json; every problem is named at once.
+    const bind = (root) => JSON.stringify({ version: 1, configs: [{ path: path.join(root, "opencode", "opencode.jsonc") }], settings: [{ path: path.join(root, "opencode", "antigravity.json") }] });
+    await writeFile(path.join(source, "opencode", ".gitignore"), "log/\n", "utf8");
+    await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bind(source), "utf8");
+    await assertReleaseSourceComplete(source);
+    await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bind(path.join(fixture, "live-tree")), "utf8");
+    await rm(path.join(source, "opencode", ".gitignore"));
+    await rm(path.join(source, "opencode", "skills"), { recursive: true });
+    await assert.rejects(assertReleaseSourceComplete(source), (error) => {
+      assert.match(error.message, /cannot become a release; nothing was tested or built/);
+      assert.match(error.message, /opencode\/skills is missing/);
+      assert.match(error.message, /opencode\/\.gitignore is missing/, "the release build needs it, so it is required here");
+      assert.match(error.message, /configs\[0\]\.path is .*live-tree.*not this tree's/);
+      assert.match(error.message, /settings\[0\]\.path is .*live-tree.*not this tree's/);
+      return true;
+    });
+    await mkdir(path.join(source, "opencode", "skills"));
+
+    // Installed dependencies must be what package-lock.json pins.
+    const deps = path.join(fixture, "deps");
+    const writeJson = async (file, value) => {
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, JSON.stringify(value), "utf8");
+    };
+    const lockPackages = {
+      "": { name: "fixture" },
+      "node_modules/prod": { version: "1.0.0", integrity: "sha512-prod" },
+      "node_modules/tool": { version: "2.0.0", integrity: "sha512-tool", dev: true },
+      "node_modules/native-other-os": { version: "3.0.0", integrity: "sha512-native", optional: true },
+    };
+    await writeJson(path.join(deps, "package-lock.json"), { lockfileVersion: 3, packages: lockPackages });
+    await writeJson(path.join(deps, "node_modules", "prod", "package.json"), { version: "1.0.0" });
+    const writeHidden = (packages) => writeJson(path.join(deps, "node_modules", ".package-lock.json"), { lockfileVersion: 3, packages });
+    await writeHidden({ "node_modules/prod": { version: "1.0.0", integrity: "sha512-prod" } });
+    assert.deepEqual(await installedDependencyMismatches(deps), [], "dev and absent optional packages are not required");
+    await writeHidden({ "node_modules/prod": { version: "1.0.1", integrity: "sha512-other" }, "node_modules/stray": { version: "9.9.9" } });
+    assert.deepEqual(await installedDependencyMismatches(deps), [
+      "node_modules/prod: locked 1.0.0, installed 1.0.1",
+      "node_modules/prod: integrity differs from package-lock.json",
+      "node_modules/stray: installed but not in package-lock.json",
+    ]);
+    await writeHidden({ "node_modules/prod": { version: "1.0.0", integrity: "sha512-prod" } });
+    await writeJson(path.join(deps, "node_modules", "prod", "package.json"), { version: "0.9.0" });
+    assert.deepEqual(await installedDependencyMismatches(deps), ["node_modules/prod: its package.json says 0.9.0, locked 1.0.0"], "a stale hidden lockfile is caught");
+    await writeHidden({});
+    assert.deepEqual(await installedDependencyMismatches(deps), ["node_modules/prod: locked 1.0.0, not installed"]);
+    await rm(path.join(deps, "node_modules", ".package-lock.json"));
+    assert.match((await installedDependencyMismatches(deps))[0], /node_modules\/\.package-lock\.json cannot be read.*run npm ci/);
+    const dependencyStep = gateSteps({ sourceRoot: deps }).find((step) => step.name === "installed dependencies");
+    const stepResult = await dependencyStep.run();
+    assert.equal(stepResult.exitCode, 1);
+    assert.match(stepResult.output, /^node_modules does not match package-lock.json \(1\); run npm ci:/);
+    assert.equal((await installedDependencyMismatches(SOURCE_ROOT)).length, 0, "this checkout's node_modules matches its lockfile");
 
     // node --test's skipped count is recorded.
     assert.deepEqual(parseStepOutput("ℹ skipped 2\n").skips, [{ name: "node --test", reason: "2 test(s) reported skipped; see the step output" }]);
@@ -384,6 +562,8 @@ export {
   RECEIPT_KIND,
   RECEIPT_MAX_AGE_MS,
   REQUIRED_STEPS,
+  assertReleaseSourceComplete,
+  installedDependencyMismatches,
   readGateReceipt,
   runReleaseGate,
   sourceTreeDigest,

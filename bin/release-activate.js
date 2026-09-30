@@ -64,7 +64,7 @@ import { isDeepStrictEqual } from "node:util";
 import { buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
-import { RECEIPT_KIND, REQUIRED_STEPS, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
+import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 requireSelfTestRun(import.meta.url);
@@ -1455,6 +1455,10 @@ async function main() {
   // --check-only never activates, so a dirty tree is only reported there.
   const treeWarnings = assertCleanSourceTree(SOURCE_ROOT, options.allowDirty || options.checkOnly);
   process.stdout.write(`${treeWarnings.length ? treeWarnings.join("\n") : "Source tree is clean."}\n`);
+  // A tree the build would refuse (a missing publish entry, a plugin manifest bound to another
+  // checkout) fails here, not after the half-hour gate.
+  await assertReleaseSourceComplete(SOURCE_ROOT);
+  process.stdout.write("Every publish entry is present and the plugin manifest is bound to this tree.\n");
 
   step(options.gateReceipt
     ? `Checking the release gate receipt ${options.gateReceipt} (the gate is not run again)`

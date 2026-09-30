@@ -10,8 +10,10 @@ const sha256File = async (filePath) => createHash("sha256").update(await readFil
 // A content digest of a directory tree: every directory and file by relative path, files by
 // SHA-256. Links and special entries are refused, so the digest names real bytes only.
 // `include` limits the walk to these relative entries (files or directories) of the root; an
-// included entry that does not exist is refused, or with `allowMissing` digested as absent.
-async function digestTree(root, { include = null, allowMissing = false, label = "Tree" } = {}) {
+// included entry that does not exist is refused, unless `allowMissing` names it: then it is
+// digested as absent.
+async function digestTree(root, { include = null, allowMissing = [], label = "Tree" } = {}) {
+  const mayBeMissing = new Set(allowMissing);
   const rootDetails = await lstat(root);
   if (rootDetails.isSymbolicLink() || !rootDetails.isDirectory()) {
     throw new Error(`${label} root must be a real directory.`);
@@ -46,7 +48,7 @@ async function digestTree(root, { include = null, allowMissing = false, label = 
       try {
         details = await lstat(absolute);
       } catch (error) {
-        if (error?.code !== "ENOENT" || !allowMissing) throw error;
+        if (error?.code !== "ENOENT" || !mayBeMissing.has(relative)) throw error;
         entries.push(`A\0${relative}\n`);
         continue;
       }
