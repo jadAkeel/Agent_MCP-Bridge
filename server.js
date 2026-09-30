@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDirectRunAudit, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
+import { detachWorktreeLinks } from "./bin/worktree-links.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -9814,6 +9815,19 @@ async function cleanupWorktreeUntimed(worktree, cleanupMode, success) {
     : null;
   const expectedBranchOid = expectedBranch?.exitCode === 0 ? expectedBranch.stdout.trim() : "";
 
+  // B-030: git would delete through a junction into its target (a source checkout's
+  // node_modules/); the links go first, and a link that cannot be detached keeps the worktree.
+  try {
+    await detachWorktreeLinks(worktree.path);
+  } catch (error) {
+    await updateRetainedWorktreeMeasurement(worktree);
+    await markWorktreeArtifactState(worktree, "cleanup_failed");
+    return {
+      cleanup: "failed",
+      errorType: "worktree_cleanup_failed",
+      error: `Could not detach links before removing the worktree: ${error?.message || error}`,
+    };
+  }
   const removed = await runCommand("git", removeArgs, worktree.repoRoot, CONFIG.gitHeavyTimeoutMs);
   if (removed.exitCode !== 0) {
     await updateRetainedWorktreeMeasurement(worktree);

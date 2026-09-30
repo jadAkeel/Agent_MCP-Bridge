@@ -73,6 +73,7 @@ Before starting:
 - Look for correctness bugs, security risks, maintainability issues, performance problems, and missing tests.
 - Prioritize real production risks.
 - Include file paths and concrete suggested fixes.
+- Before claiming that a change "would still pass every test" or that a test gap exists, search every test file for the function, class and module names (grep the whole test tree, not only the module's own test file) and name the tests that exercise the code. If you cannot rule them out, mark the finding "suspected", not confirmed.
 - Separate blocking issues from non-blocking suggestions.
 - Do not nitpick style unless it affects maintainability or consistency.
 
