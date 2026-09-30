@@ -784,6 +784,70 @@ test("9: a job whose state writes fail still stops its heartbeat, reports the re
   if (execution.result.worktree?.path) await cleanupWorktree({ ...execution.result.worktree, repoRoot: repo }, "always", true);
 });
 
+// G-11: an abandoned pipeline never integrates, and abandonment cannot slip past a reservation.
+test("G-11: an abandoned pipeline refuses a dry run and a receipt taken before; nothing is applied and it stays cancelled", async () => {
+  await resetRepo();
+  const source = await writerWorktree("g11-abandoned", { "src/a.txt": "g11 change\n" });
+  const pipelineId = "review-pipeline-g11-abandoned";
+  await persistPipelineRecord(pipelineRecord(pipelineId, { integrationQueue: [pipelineItem("job-g11", source)] }));
+  const args = { cwd: repo, pipelineId, worktreePath: source.worktree.path, allowedEdits: ["src"] };
+  const preview = textOf(await callTool("integrate_opencode_worktree", { ...args, dryRun: true }));
+  assert.match(preview, /Serial integration accepted./, preview);
+  const receipt = JSON.parse(/Preview receipt: ({.*})/.exec(preview)[1]);
+  const abandoned = textOf(await callTool("abandon_multi_agent_pipeline", { cwd: repo, pipelineId, confirmation: pipelineId, reason: "G-11 test" }));
+  assert.match(abandoned, /^Multi-agent pipeline abandoned./, abandoned);
+  const applied = textOf(await callTool("integrate_opencode_worktree", { ...args, reviewed: true, previewReceipt: receipt }));
+  assert.match(applied, /pipeline_terminal/, applied);
+  const { readFile } = await import("node:fs/promises");
+  assert.equal(await readFile(path.join(repo, "src", "a.txt"), "utf8"), "a\n", "the abandoned pipeline changed the checkout");
+  const again = textOf(await callTool("integrate_opencode_worktree", { ...args, dryRun: true }));
+  assert.match(again, /pipeline_terminal/, again);
+  const persisted = await readPersistedPipelineRecord(pipelineId, repo);
+  assert.equal(persisted.status, "cancelled");
+  assert.equal(persisted.integrationQueue[0].status, "pending", "the item is left as it was");
+  await cleanupWorktree(source.worktree, "always", true);
+});
+
+test("G-11: abandonment that races an integration reservation is refused, and the integration completes", async () => {
+  await resetRepo();
+  const source = await writerWorktree("g11-race", { "src/a.txt": "g11 race\n" });
+  const pipelineId = "review-pipeline-g11-race";
+  await persistPipelineRecord(pipelineRecord(pipelineId, { integrationQueue: [pipelineItem("job-g11-race", source)] }));
+  const args = { cwd: repo, pipelineId, worktreePath: source.worktree.path, allowedEdits: ["src"] };
+  const preview = textOf(await callTool("integrate_opencode_worktree", { ...args, dryRun: true }));
+  const receipt = JSON.parse(/Preview receipt: ({.*})/.exec(preview)[1]);
+  // Hold the reservation write open; abandonment passes its first check meanwhile and queues its write behind it.
+  let reached;
+  const reservationReached = new Promise((resolve) => { reached = resolve; });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const previousHook = selfTestHooks.pipelinePersistenceTestHook;
+  selfTestHooks.pipelinePersistenceTestHook = async (candidate) => {
+    if (candidate?.pipelineId === pipelineId && candidate.events?.at(-1)?.type === "integration_prepared") {
+      reached();
+      await gate;
+    }
+  };
+  try {
+    const applying = callTool("integrate_opencode_worktree", { ...args, reviewed: true, previewReceipt: receipt });
+    await reservationReached;
+    const abandoning = callTool("abandon_multi_agent_pipeline", { cwd: repo, pipelineId, confirmation: pipelineId, reason: "G-11 race" });
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    release();
+    const [appliedText, abandonText] = [textOf(await applying), textOf(await abandoning)];
+    assert.match(abandonText, /pipeline_integration_in_progress|pipeline_concurrent_update/, abandonText);
+    assert.match(appliedText, /Status: applied/, appliedText);
+    const persisted = await readPersistedPipelineRecord(pipelineId, repo);
+    assert.notEqual(persisted.status, "cancelled", "a refused abandonment must not cancel the pipeline");
+    assert.equal(persisted.integrationQueue[0].status, "integrated");
+  } finally {
+    release();
+    selfTestHooks.pipelinePersistenceTestHook = previousHook;
+    await resetRepo();
+    await cleanupWorktree(source.worktree, "always", true);
+  }
+});
+
 let failed = 0;
 try {
   for (const { name, fn } of tests) {

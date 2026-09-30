@@ -12704,6 +12704,14 @@ async function integratePatchWithoutSerialLock({
       journalStatus: "committed",
     };
   } catch (error) {
+    if (!patchApplied && error?.errorType === "pipeline_terminal") {
+      return {
+        ok: false,
+        errorType: "pipeline_terminal",
+        error: `${error.message} Nothing was applied; the prepared journal operation is closed without changes.`,
+        changedFiles: patch.changedFiles,
+      };
+    }
     let indexReset = null;
     let rollback = null;
     if (patchApplied && rollbackBaseline) {
@@ -16484,18 +16492,41 @@ server.tool(
     }
 
     const abandonedAt = new Date().toISOString();
-    await updatePipelineRecord(record, {
-      status: "cancelled",
-      finishedAt: abandonedAt,
-      cleanupPending: false,
-      cleanupState: "abandoned_sources_retained",
-      events: (record.events || []).concat({
-        type: "pipeline_abandoned",
-        at: abandonedAt,
-        reason,
-        retainedWorktrees: (record.integrationQueue || []).filter((item) => item.worktreePath).map((item) => item.worktreePath),
-      }),
-    });
+    try {
+      await updatePipelineRecord(record, (current) => {
+        // An integration may have reserved an item since the check above.
+        if ((current.integrationQueue || []).some((item) => item.status === "integrating")) {
+          const error = new Error("An integration reserved an item of this pipeline while it was being abandoned.");
+          error.errorType = "pipeline_integration_in_progress";
+          throw error;
+        }
+        return {
+          status: "cancelled",
+          finishedAt: abandonedAt,
+          cleanupPending: false,
+          cleanupState: "abandoned_sources_retained",
+          events: (current.events || []).concat({
+            type: "pipeline_abandoned",
+            at: abandonedAt,
+            reason,
+            retainedWorktrees: (current.integrationQueue || []).filter((item) => item.worktreePath).map((item) => item.worktreePath),
+          }),
+        };
+      });
+    } catch (error) {
+      if (!["pipeline_integration_in_progress", "pipeline_concurrent_update"].includes(error?.errorType)) throw error;
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Multi-agent pipeline abandonment rejected.",
+        errorType: error.errorType,
+        reason: error.errorType === "pipeline_integration_in_progress"
+          ? "An integration journal operation started while the pipeline was being abandoned."
+          : "The pipeline changed in another process while it was being abandoned.",
+        requestedAgent: "pipeline_coordinator",
+        actualAgent: "none",
+        lockMode: "abandonment",
+        suggestedFix: "Nothing was cancelled. Wait for the integration to finish (get_multi_agent_pipeline), then abandon again.",
+      }) }] };
+    }
     return { content: [{ type: "text", text: [
       "Multi-agent pipeline abandoned. Unintegrated worktrees were retained and no project files were deleted.",
       "",
@@ -16683,6 +16714,16 @@ server.tool(
       if (!PIPELINE_RUNS.has(pipelineId)) PIPELINE_RUNS.set(pipelineId, pipeline);
       await refreshPipelineRecord(pipeline);
       await reconcilePipelineIntegrationOperationStates(pipeline);
+      if (PIPELINE_INTEGRATION_CLOSED_STATUSES.has(pipeline.status)) {
+        return { content: [{ type: "text", text: formatRejectedExecution({
+          headline: "Pipeline integration rejected.",
+          errorType: "pipeline_terminal",
+          reason: `The pipeline is ${pipeline.status}; an abandoned, failed or completed pipeline does not integrate any more.`,
+          requestedAgent: "merge_manager",
+          actualAgent: "none",
+          suggestedFix: "Nothing was applied. To use this worktree's change anyway, integrate it without pipelineId after reviewing it, or start a new pipeline.",
+        }) }] };
+      }
       const candidates = (pipeline.integrationQueue || []).filter((item) => pipelineIntegrationItemMatches(pipeline, item, { worktreePath, branch }));
       if (candidates.length !== 1 || !["pending", "integrating"].includes(candidates[0].status)) {
         return { content: [{ type: "text", text: formatRejectedExecution({
@@ -16778,7 +16819,11 @@ server.tool(
       pipelineId,
       pipelineJobId: pipelineItem?.jobId || "",
       onIntegrationPrepared: pipeline ? async ({ operationId }) => {
-        await updatePipelineRecord(pipeline, (current) => ({
+        await updatePipelineRecord(pipeline, (current) => {
+          // Thrown before the patch is written: the prepared journal operation is recovered as
+          // a no-op by the integration's finally block.
+          if (PIPELINE_INTEGRATION_CLOSED_STATUSES.has(current.status)) throw pipelineTerminalError(current);
+          return {
           integrationQueue: (current.integrationQueue || []).map((item) => pipelineIntegrationItemMatches(current, item, { worktreePath, branch })
             ? { ...item, status: "integrating", operationId }
             : item),
@@ -16788,7 +16833,8 @@ server.tool(
             operationId,
             jobId: pipelineItem?.jobId || "",
           }),
-        }));
+          };
+        });
         pipelineItem = (pipeline.integrationQueue || []).find((item) => item.operationId === operationId) || pipelineItem;
       } : null,
       expectedSourceIdentity: pipelineItem ? {
@@ -16799,7 +16845,7 @@ server.tool(
     }));
     result.timings = { totalMs: Math.round(nowMs() - integrationStarted), phases: { ...integrationTimings } };
     if (pipelineId) {
-      if (pipeline) {
+      if (pipeline && result.errorType !== "pipeline_terminal") {
         // Computed from the record as it stands when the write runs, so a concurrent
         // integration of another item on this pipeline keeps its own item update.
         await updatePipelineRecord(pipeline, (current) => {
@@ -16822,9 +16868,10 @@ server.tool(
             };
           });
           const allIntegrated = integrationQueue.length && integrationQueue.every((item) => item.status === "integrated");
+          const reopen = integrated && allIntegrated && !PIPELINE_INTEGRATION_CLOSED_STATUSES.has(current.status);
           return {
-            status: integrated && allIntegrated ? "awaiting_finalization" : current.status,
-            finishedAt: integrated && allIntegrated ? "" : current.finishedAt,
+            status: reopen ? "awaiting_finalization" : current.status,
+            finishedAt: reopen ? "" : current.finishedAt,
             integrationQueue,
             events: (current.events || []).concat({
               type: "integration",
@@ -21822,6 +21869,19 @@ function persistPipelineRecord(record) {
     record.ownerLeaseExpiresAt = persisted.ownerLeaseExpiresAt;
     return record;
   });
+}
+
+// G-11: a pipeline in one of these states never integrates again. The check runs inside the
+// serialized, revision-checked write that reserves an item for integration, and abandonment
+// re-checks for a reserved item inside its own write, so either the cancellation or the
+// reservation wins, never both.
+const PIPELINE_INTEGRATION_CLOSED_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function pipelineTerminalError(record) {
+  const error = new Error(`Pipeline ${record?.pipelineId || "unknown"} is ${record?.status}; it does not integrate any more.`);
+  error.code = "pipeline_terminal";
+  error.errorType = "pipeline_terminal";
+  return error;
 }
 
 async function updatePipelineRecord(record, patch = {}) {
