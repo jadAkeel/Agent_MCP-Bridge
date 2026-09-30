@@ -7,6 +7,7 @@
 // Each case is named after the defect it covers (D1..D20) and runs on its own scratch repository.
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const { __selfTest } = await import("../server.js");
+const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const selfTestHooks = __selfTest.hooks;
 const {
   CONFIG,
@@ -167,9 +168,8 @@ async function removeLink(target) {
 const cases = [];
 const test = (name, body) => cases.push({ name, body });
 // A case that cannot run in this environment says so through skipTest(); it is reported as
-// "skip" and counted apart from the passes.
-class SkipTest extends Error {}
-const skipTest = (reason) => { throw new SkipTest(reason); };
+// "skip", counted apart from the passes, and fails the file unless optional (tests/skip-gate.js).
+const skipTest = (reason, options = {}) => { throw new SkipTest(reason, options); };
 
 test("D1 recovery accepts unrelated HEAD and index drift, judged on the affected paths", async () => {
   const repo = await makeRepo("d1");
@@ -685,7 +685,7 @@ test("D19 an unmeasurable worktree directory is recorded instead of failing the 
   await deny();
   try {
     const unreadable = await readdir(locked).then(() => false, () => true);
-    if (!unreadable) skipTest("this account can read a denied directory");
+    if (!unreadable) skipTest("this account can read a denied directory", { optional: true });
     await reconcileWorktreeArtifactRegistry(repo.root);
     const row = await withDb(repo, (db) => db.prepare("SELECT status, measured_bytes FROM worktree_artifacts WHERE worktree_path = ?").get(path.resolve(orphan)));
     assert.equal(row?.status, "cleanup_failed");
@@ -790,7 +790,7 @@ try {
       console.log(`ok   ${name} (${Date.now() - started} ms)`);
     } catch (error) {
       if (error instanceof SkipTest) {
-        skipped.push(name);
+        skipped.push({ name, reason: error.message, optional: error.optional });
         console.log(`skip ${name}: ${error.message}`);
         continue;
       }
@@ -804,9 +804,10 @@ try {
     await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 }).catch(() => {});
   }
 }
-if (failures.length) {
-  console.log(`\n${failures.length} of ${ran} review-integration-recovery case(s) failed.`);
+const skipGateFailed = finishSkips({ file: "tests/review-integration-recovery.js", total: ran, skips: skipped });
+if (failures.length || skipGateFailed) {
+  console.log(`\n${failures.length} of ${ran} review-integration-recovery case(s) failed${skipGateFailed ? "; the skip gate failed" : ""}.`);
   process.exitCode = 1;
 } else {
-  console.log(`\nAll ${ran - skipped.length} review-integration-recovery cases passed${skipped.length ? ` (${skipped.length} more skipped, not passed: ${skipped.join(", ")})` : ""}.`);
+  console.log(`\nAll ${ran - skipped.length} review-integration-recovery cases passed${skipped.length ? ` (${skipped.length} more skipped, not passed: ${skipped.map((skip) => skip.name).join(", ")})` : ""}.`);
 }

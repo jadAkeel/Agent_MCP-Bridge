@@ -11,6 +11,7 @@ const { detachWorktreeLinks } = await import("../bin/worktree-links.js");
 const { assert, cleanupWorktree, mkdir, mkdtemp, path, rm, runCommand, tmpdir, writeFile } = __selfTest.internals;
 const { existsSync } = await import("node:fs");
 const { symlink } = await import("node:fs/promises");
+const { SkipTest, finishSkips } = await import("./skip-gate.js");
 
 const LINK_KIND = process.platform === "win32" ? "junction" : "dir";
 const root = await mkdtemp(path.join(tmpdir(), "review-b030-"));
@@ -25,8 +26,8 @@ async function git(args, cwd = repo) {
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
-// A test that cannot run here throws SkipTest: reported as "skip" and counted apart from passes.
-class SkipTest extends Error {}
+// A test that cannot run here throws SkipTest (tests/skip-gate.js): reported as "skip", counted
+// apart from passes, and failing the file unless marked optional.
 
 async function sharedDependencies() {
   await mkdir(path.join(shared, "pkg", "lib"), { recursive: true });
@@ -75,7 +76,7 @@ test("a tracked symlink is git's own entry and is left in place", async () => {
     await symlink(shared, probe, "dir");
     await rm(probe, { force: true });
   } catch (error) {
-    if (error?.code === "EPERM") throw new SkipTest("symlinks need Developer Mode or admin on this Windows host");
+    if (error?.code === "EPERM") throw new SkipTest("symlinks need Developer Mode or admin on this Windows host", { optional: true });
     throw error;
   }
   const trackedRepo = path.join(root, "tracked-repo");
@@ -92,7 +93,7 @@ test("a tracked symlink is git's own entry and is left in place", async () => {
 });
 
 let failed = 0;
-let skipped = 0;
+const skips = [];
 try {
   await mkdir(repo, { recursive: true });
   await git(["init", "-q"]);
@@ -107,7 +108,7 @@ try {
       process.stdout.write(`ok   ${name}\n`);
     } catch (error) {
       if (error instanceof SkipTest) {
-        skipped += 1;
+        skips.push({ name, reason: error.message, optional: error.optional });
         process.stdout.write(`skip ${name}: ${error.message}\n`);
         continue;
       }
@@ -118,9 +119,10 @@ try {
 } finally {
   await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
-if (failed) {
-  process.stdout.write(`${failed} of ${tests.length} B-030 tests failed.\n`);
+const skipGateFailed = finishSkips({ file: "tests/review-b030.js", total: tests.length, skips });
+if (failed || skipGateFailed) {
+  process.stdout.write(`${failed} of ${tests.length} B-030 tests failed${skipGateFailed ? "; the skip gate failed" : ""}.\n`);
   process.exit(1);
 }
-process.stdout.write(`${tests.length - skipped} of ${tests.length} B-030 tests passed${skipped ? `, ${skipped} skipped` : ""}.\n`);
+process.stdout.write(`${tests.length - skips.length} of ${tests.length} B-030 tests passed${skips.length ? `, ${skips.length} skipped` : ""}.\n`);
 process.exit(0);

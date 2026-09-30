@@ -16,6 +16,15 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-30
 
+### Third production review pass: G-08..G-12, O-1, E-1, T-1, H3 (Claude, 2026-09-30)
+
+From `gpt61-sol-production-report-pass3.md` and the pass-3 section of `production-gate-plan.md`. One branch and worktree per item (`C:\Users\10User\bridge-<id>`, its own `npm ci`), merged with `--ff-only` after approval.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| T-1 | `tests/review-b030.js`, `tests/review-integration-recovery.js`, `tests/review-spawn.js`, `tests/review2-e.js` and `tests/review2-g.js` exited 0 when cases skipped, even all of them; `review-spawn.js` counted a partly skipped case as a plain pass; `npm test` printed no skip total. Confirmed: with no C compiler the three real-spawn cases of `review-spawn.js` skip and the old file exits 0. | Each file had its own `SkipTest` and treated every skip as harmless. | `tests/skip-gate.js`: one `SkipTest(reason, { optional })` and `finishSkips()`. A skip not marked optional fails its file; a file whose every case skipped fails whatever the marks; each file prints `skipped: <n>` with each skip marked `optional` or `REQUIRED`, partial skips included. Optional: a symlink privilege (B-030 tracked symlink, spawn #17's symlink part), an account that can read a denied directory (recovery), R-154 on Windows. Required: the fake opencode build (a C compiler on Windows) in `review-spawn.js`, `sh` in `review2-g.js`. `npm test` starts with `skip-gate.js --self-test` and `--reset` and ends with `--summary` (`Total skipped: <n> across <files>`), through a ledger in the temp dir named after the shell running the chain. `CODEX_TEST_ALLOW_REQUIRED_SKIPS=1` turns a required skip into a printed warning, for a machine that knowingly lacks the prerequisite. Checked: `REVIEW_SPAWN_COMPILERS=no-such-compiler node tests/review-spawn.js` (new knob) now exits 1 naming the 3 required skips, and exits 0 with a warning under the allow variable. | (this commit) | fixed, not deployed |
+| B-035 | 1 of 6 runs of `tests/review-spawn.js` failed at "#6 a slot wait past its own budget" with `Provider concurrency database initialization exceeded the caller deadline.` instead of the `2 of 2 slots` message. | Test timing: the case gives `acquireProviderLease` a 300 ms budget, which also has to cover opening the provider database on a loaded host. Not caused by T-1 (the case does not skip); passed in the other 5 runs and in the two full `npm test` runs of the day. | None yet. | | open |
+
 ### Concurrency stress test was broken (Claude, 2026-09-30)
 
 Branch `bridge/e2e-concurrency-reserved-name`, merged into the live tree 2026-09-30. `npm test` only syntax-checks `bin/e2e-concurrency.js`, so nothing ran it; `npm run test:release` does, so that gate had failed since 56357f3. After the fix the test passed 6 of 7 runs in the worktree (about 45 s each); the other run hit B-034.

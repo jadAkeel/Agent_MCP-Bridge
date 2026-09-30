@@ -32,6 +32,7 @@ delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS;
 
 const { __selfTest } = await import("../server.js");
+const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const hooks = __selfTest.hooks;
 const internals = __selfTest.internals;
 const { CONFIG } = internals;
@@ -42,10 +43,11 @@ hooks.stateDirectoryOverride = stateDir;
 
 const results = [];
 // A test that cannot run in this environment says so through skipTest(); it is reported as
-// "skip" and counted apart from the passes. notePartialSkip() marks a test whose remaining
-// checks could not run after its earlier ones passed.
-class SkipTest extends Error {}
-const skipTest = (reason) => { throw new SkipTest(reason); };
+// "skip" and counted apart from the passes; a required skip fails the file (tests/skip-gate.js).
+// The fake opencode is required: without a C compiler on Windows the real-spawn cases cannot
+// run, and that must not pass. notePartialSkip() marks a test whose remaining, optional checks
+// could not run after its earlier ones passed; it is counted in the skip total.
+const skipTest = (reason, options = {}) => { throw new SkipTest(reason, options); };
 let partialSkip = "";
 const notePartialSkip = (reason) => { partialSkip = reason; };
 async function test(name, body) {
@@ -57,7 +59,7 @@ async function test(name, body) {
     process.stdout.write(`ok   ${name} (${Date.now() - started} ms)${partialSkip ? ` [partly skipped: ${partialSkip}]` : ""}\n`);
   } catch (error) {
     if (error instanceof SkipTest) {
-      results.push({ name, ok: false, skipped: error.message });
+      results.push({ name, ok: false, skipped: error.message, optional: error.optional });
       process.stdout.write(`skip ${name}: ${error.message}\n`);
       return;
     }
@@ -114,7 +116,10 @@ async function buildFakeOpenCode() {
       `  fputs(${JSON.stringify(`${fakeEvents}\n`)}, stdout); fflush(stdout); return 0;`,
       "}",
     ].join("\n"), "utf8");
-    for (const compiler of ["gcc", "C:\\MinGW\\bin\\gcc.exe"]) {
+    // REVIEW_SPAWN_COMPILERS (comma-separated) replaces the list, e.g. to prove that a machine
+    // without a compiler fails the gate instead of passing on skipped cases.
+    const compilers = process.env.REVIEW_SPAWN_COMPILERS ? process.env.REVIEW_SPAWN_COMPILERS.split(",") : ["gcc", "C:\\MinGW\\bin\\gcc.exe"];
+    for (const compiler of compilers) {
       try {
         await execFileAsync(compiler, [source, "-O2", "-o", fakeOpenCodeExecutable], { cwd: fakeOpenCodeDir, windowsHide: true, timeout: 60_000 });
         return true;
@@ -743,11 +748,18 @@ hooks.stateDirectoryOverride = "";
 await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
 const skipped = results.filter((item) => item.skipped);
 const failed = results.filter((item) => !item.ok && !item.skipped);
-process.stdout.write(`\n${results.length - failed.length - skipped.length}/${results.length} review-spawn tests passed${skipped.length ? `, ${skipped.length} skipped` : ""}.\n`);
+const partlySkipped = results.filter((item) => item.ok && item.partialSkip).length;
+process.stdout.write(`\n${results.length - failed.length - skipped.length}/${results.length} review-spawn tests passed${partlySkipped ? ` (${partlySkipped} only in part)` : ""}${skipped.length ? `, ${skipped.length} skipped` : ""}.\n`);
 if (skipped.length) {
   process.stdout.write(`Skipped (not passed):\n${skipped.map((item) => `- ${item.name}: ${item.skipped}`).join("\n")}\n`);
 }
 if (failed.length) {
   process.stdout.write(`Failed:\n${failed.map((item) => `- ${item.name}`).join("\n")}\n`);
 }
-process.exit(failed.length ? 1 : 0);
+const skipGateFailed = finishSkips({
+  file: "tests/review-spawn.js",
+  total: results.length,
+  skips: skipped.map((item) => ({ name: item.name, reason: item.skipped, optional: item.optional })),
+  partial: results.filter((item) => item.ok && item.partialSkip).map((item) => ({ name: item.name, reason: item.partialSkip })),
+});
+process.exit(failed.length || skipGateFailed ? 1 : 0);
