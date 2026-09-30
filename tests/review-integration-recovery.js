@@ -166,6 +166,10 @@ async function removeLink(target) {
 
 const cases = [];
 const test = (name, body) => cases.push({ name, body });
+// A case that cannot run in this environment says so through skipTest(); it is reported as
+// "skip" and counted apart from the passes.
+class SkipTest extends Error {}
+const skipTest = (reason) => { throw new SkipTest(reason); };
 
 test("D1 recovery accepts unrelated HEAD and index drift, judged on the affected paths", async () => {
   const repo = await makeRepo("d1");
@@ -681,10 +685,7 @@ test("D19 an unmeasurable worktree directory is recorded instead of failing the 
   await deny();
   try {
     const unreadable = await readdir(locked).then(() => false, () => true);
-    if (!unreadable) {
-      console.log("  (skipped: this account can read a denied directory)");
-      return;
-    }
+    if (!unreadable) skipTest("this account can read a denied directory");
     await reconcileWorktreeArtifactRegistry(repo.root);
     const row = await withDb(repo, (db) => db.prepare("SELECT status, measured_bytes FROM worktree_artifacts WHERE worktree_path = ?").get(path.resolve(orphan)));
     assert.equal(row?.status, "cleanup_failed");
@@ -777,6 +778,7 @@ test("M3 a write job that changes .git/config or a hook fails; an untouched one 
 
 const only = process.argv.find((argument) => argument.startsWith("--only="))?.slice("--only=".length) || "";
 const failures = [];
+const skipped = [];
 let ran = 0;
 try {
   for (const { name, body } of cases) {
@@ -787,6 +789,11 @@ try {
       await body();
       console.log(`ok   ${name} (${Date.now() - started} ms)`);
     } catch (error) {
+      if (error instanceof SkipTest) {
+        skipped.push(name);
+        console.log(`skip ${name}: ${error.message}`);
+        continue;
+      }
       failures.push(name);
       console.log(`FAIL ${name}\n     ${String(error?.stack || error).split("\n").slice(0, 6).join("\n     ")}`);
     }
@@ -801,5 +808,5 @@ if (failures.length) {
   console.log(`\n${failures.length} of ${ran} review-integration-recovery case(s) failed.`);
   process.exitCode = 1;
 } else {
-  console.log(`\nAll ${ran} review-integration-recovery cases passed.`);
+  console.log(`\nAll ${ran - skipped.length} review-integration-recovery cases passed${skipped.length ? ` (${skipped.length} more skipped, not passed: ${skipped.join(", ")})` : ""}.`);
 }

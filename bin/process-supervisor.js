@@ -82,6 +82,10 @@ function processGroupState(pgid) {
   }
 }
 
+function posixTerminationConfirmed(groupAbsent, directChildClosed) {
+  return groupAbsent && directChildClosed;
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -388,23 +392,20 @@ function createSupervisor({ supervisorIdentity = "", identityValid = true } = {}
   };
 
   const terminatePosix = async (reason) => {
-    const initialState = processGroupState(payloadPid);
-    if (initialState === "absent") {
-      await waitForDirectClose();
-      complete({ reason, terminationRequested: true, treeTerminationConfirmed: true });
-      return;
+    let groupAbsent = processGroupState(payloadPid) === "absent";
+    if (!groupAbsent) {
+      signalProcessGroup("SIGTERM");
+      groupAbsent = await waitForProcessGroupAbsent(killGraceMs);
     }
-
-    signalProcessGroup("SIGTERM");
-    if (await waitForProcessGroupAbsent(killGraceMs)) {
-      await waitForDirectClose();
-      complete({ reason, terminationRequested: true, treeTerminationConfirmed: true });
-      return;
+    if (!groupAbsent) {
+      signalProcessGroup("SIGKILL");
+      groupAbsent = await waitForProcessGroupAbsent(terminationConfirmMs);
     }
-
-    signalProcessGroup("SIGKILL");
-    if (await waitForProcessGroupAbsent(terminationConfirmMs)) {
-      await waitForDirectClose();
+    // An empty process group is not enough: a descendant that left the group (setsid, its own
+    // process group) keeps the inherited stdio pipes open, so the direct child only closes once
+    // every holder is gone. Confirming without that check reported an escaped process as contained.
+    const directClosed = groupAbsent && await waitForDirectClose();
+    if (posixTerminationConfirmed(groupAbsent, directClosed)) {
       complete({ reason, terminationRequested: true, treeTerminationConfirmed: true });
       return;
     }
@@ -992,6 +993,9 @@ function selfTestTerminationVerdicts() {
   assert.equal(windowsTerminationSucceeded({ taskkill: { started: false, exitCode: null }, directChildGone: true, directChildClosed: true }), false);
   assert.equal(windowsTerminationSucceeded({ taskkill: ok, directChildGone: true, directChildClosed: false }), false,
     "taskkill exiting 0 does not prove containment while the payload's pipes are still open.");
+  assert.equal(posixTerminationConfirmed(true, true), true);
+  assert.equal(posixTerminationConfirmed(true, false), false, "An empty process group with the pipes still open means a descendant left the group.");
+  assert.equal(posixTerminationConfirmed(false, true), false);
   assert.equal(windowsTerminationBudgetMs(5_000), 25_250);
   // server.js SUPERVISOR_TERMINATION_FALLBACK_MS for the 5 s defaults.
   assert.ok(windowsTerminationBudgetMs(5_000) < 31_250, "The bridge's fallback deadline must exceed the supervisor budget.");

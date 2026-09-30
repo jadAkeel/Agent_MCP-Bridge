@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,9 +65,21 @@ async function sha256File(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
 
-async function listFiles(root, filter) {
+// A missing target directory is an empty one (the first sync creates it). A missing source is
+// an error: it used to count as empty, so --apply --remove-stale deleted every target profile.
+async function listFiles(root, filter, { required = false } = {}) {
   const files = new Map();
-  if (!existsSync(root)) return files;
+  if (required) {
+    let details;
+    try {
+      details = await stat(root);
+    } catch (error) {
+      throw new Error(`Managed runtime source directory is missing or unreadable: ${root} (${error?.code || error?.message || error})`);
+    }
+    if (!details.isDirectory()) throw new Error(`Managed runtime source is not a directory: ${root}`);
+  } else if (!existsSync(root)) {
+    return files;
+  }
   const stack = [""];
   while (stack.length) {
     const relative = stack.pop();
@@ -84,9 +96,37 @@ async function listFiles(root, filter) {
   return files;
 }
 
-async function planTree({ sourceRoot, targetRoot, filter, label }) {
-  const source = await listFiles(sourceRoot, filter);
+// Writes and deletes must never follow a link out of the target: every existing component of
+// the path, the target root and all its ancestors included, must be a real directory. Each is
+// checked with lstat (a junction reports as a link), which also catches a dangling link that
+// existsSync cannot see. A component that does not exist yet ends the walk: nothing below it
+// can be a link.
+async function assertNoLinkedComponents(target) {
+  const resolved = path.resolve(target);
+  const { root } = path.parse(resolved);
+  let cursor = root;
+  for (const segment of path.relative(root, resolved).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, segment);
+    let details;
+    try {
+      details = await lstat(cursor);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return;
+      throw error;
+    }
+    if (details.isSymbolicLink()) throw new Error(`Refusing to sync through a link or junction: ${cursor} (in ${resolved})`);
+  }
+}
+
+async function planTree({ sourceRoot, targetRoot, filter, label, removeStale = false }) {
+  const source = await listFiles(sourceRoot, filter, { required: true });
+  await assertNoLinkedComponents(targetRoot);
   const target = await listFiles(targetRoot, filter);
+  // An empty source next to a populated target is an interrupted checkout or copy, not a
+  // request to remove every profile; --remove-stale would otherwise delete them all.
+  if (removeStale && source.size === 0 && target.size > 0) {
+    throw new Error(`Refusing --remove-stale for ${label}: the source directory is empty but the target holds ${target.size} file(s): ${sourceRoot}`);
+  }
   const actions = [];
   for (const [relative, digest] of source) {
     if (!target.has(relative)) actions.push({ tree: label, relative, action: "add" });
@@ -140,8 +180,11 @@ async function applyPlan(plan, options) {
     const sourcePath = path.join(plan.sourceRoot, ...item.relative.split("/"));
     const targetPath = path.join(plan.targetRoot, ...item.relative.split("/"));
     try {
+      // Checked again per file: a link may have appeared since the plan was made.
+      await assertNoLinkedComponents(path.dirname(targetPath));
       if (item.action === "add" || item.action === "update") {
         await mkdir(path.dirname(targetPath), { recursive: true });
+        await assertNoLinkedComponents(path.dirname(targetPath));
         await copyFileAtomically(sourcePath, targetPath, options.renameOptions || {});
         results.push({ ...item, ok: (await sha256File(targetPath)) === (await sha256File(sourcePath)) });
       } else if (item.action === "stale" && options.removeStale) {
@@ -206,12 +249,14 @@ async function runSync(options) {
       targetRoot: targets.agentDir,
       filter: (relative) => !relative.includes("/") && relative.endsWith(".md"),
       label: "agents",
+      removeStale: options.removeStale,
     }),
     await planTree({
       sourceRoot: path.join(source, "skills"),
       targetRoot: targets.skillDir,
       filter: (relative) => relative.endsWith("/SKILL.md") || relative.split("/").length > 1,
       label: "skills",
+      removeStale: options.removeStale,
     }),
   ];
   const applied = options.apply ? [] : null;
@@ -335,6 +380,64 @@ async function selfTest() {
     assert.equal(failed.applied.some((item) => !item.ok && /denied/.test(item.error)), true);
     assert.equal(await readFile(path.join(agentDir, "changed.md"), "utf8"), "v3\n", "a failed replace keeps the previous complete file");
     assert.deepEqual((await readdir(agentDir)).filter((name) => name.endsWith(".tmp")), [], "no temporary file is left behind");
+
+    // R-161: a missing source subtree used to count as empty, so --apply --remove-stale deleted
+    // every target profile. It is an error now, before anything is written or removed.
+    const targetListing = async () => JSON.stringify([(await readdir(agentDir)).sort(), (await readdir(skillDir)).sort()]);
+    const listingBefore = await targetListing();
+    const bareSource = path.join(fixture, "source-without-subtrees");
+    await mkdir(bareSource, { recursive: true });
+    for (const removeStale of [false, true]) {
+      await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale }), /source directory is missing or unreadable.*agents/);
+    }
+    await mkdir(path.join(bareSource, "agents"));
+    // An existing but empty source next to a populated target (an interrupted copy) refuses
+    // --remove-stale, which would delete every target profile.
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /Refusing --remove-stale for agents: the source directory is empty/);
+    await writeFile(path.join(bareSource, "agents", "builder.md"), "builder\n", "utf8");
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /source directory is missing or unreadable.*skills/);
+    await mkdir(path.join(bareSource, "skills"));
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /Refusing --remove-stale for skills: the source directory is empty/);
+    await rm(path.join(bareSource, "skills"), { recursive: true });
+    await writeFile(path.join(bareSource, "skills"), "a file, not a directory\n", "utf8");
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /source is not a directory/);
+    assert.equal(await targetListing(), listingBefore, "a refused sync leaves every target profile in place");
+
+    // R-162: the link check skipped the target root and its ancestors, so writes and deletes
+    // followed a junction/symlink out of the runtime directory.
+    const outside = path.join(fixture, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "keep.md"), "outside file\n", "utf8");
+    const outsideListing = async () => JSON.stringify((await readdir(outside)).sort());
+    const outsideBefore = await outsideListing();
+    const linkKind = process.platform === "win32" ? "junction" : "dir";
+    const linkedRuntime = path.join(fixture, "linked-runtime");
+    await mkdir(linkedRuntime, { recursive: true });
+    const linkedRoot = path.join(linkedRuntime, "agents");
+    await symlink(outside, linkedRoot, linkKind);
+    for (const apply of [false, true]) {
+      await assert.rejects(runSync({ ...base, agentDir: linkedRoot, apply, removeStale: true }), /through a link or junction/);
+    }
+    const linkedAncestor = path.join(fixture, "linked-ancestor");
+    await symlink(outside, linkedAncestor, linkKind);
+    await assert.rejects(runSync({ ...base, agentDir: path.join(linkedAncestor, "agents"), apply: true }), /through a link or junction/);
+    await assert.rejects(runSync({ ...base, skillDir: path.join(linkedAncestor, "not", "yet", "created"), apply: true }), /through a link or junction/);
+    assert.equal(await outsideListing(), outsideBefore, "nothing was written to or deleted from the link's target");
+    // A link that appears after the plan was made (the per-file check).
+    const raced = await applyPlan(
+      { sourceRoot: path.join(source, "agents"), targetRoot: linkedRoot, actions: [{ tree: "agents", relative: "changed.md", action: "add" }, { tree: "agents", relative: "keep.md", action: "stale" }] },
+      { removeStale: true },
+    );
+    assert.deepEqual(raced.map((item) => item.ok), [false, false]);
+    assert.match(raced[0].error, /through a link or junction/);
+    assert.equal(await outsideListing(), outsideBefore);
+    // Real directories, including one that does not exist yet, still sync.
+    const fresh = await runSync({ ...base, agentDir: path.join(fixture, "fresh-runtime", "agents"), skillDir: path.join(fixture, "fresh-runtime", "skills"), apply: true });
+    assert.equal(fresh.applied.every((item) => item.ok), true, JSON.stringify(fresh.applied));
+    assert.equal(await readFile(path.join(fixture, "fresh-runtime", "agents", "changed.md"), "utf8"), "v4\n");
+    await rm(linkedRoot, { recursive: true, force: true });
+    await rm(linkedAncestor, { recursive: true, force: true });
+    assert.equal(await outsideListing(), outsideBefore, "removing the test links did not touch their target");
     process.stdout.write("Managed runtime sync self-test passed.\n");
     selfTestPassed("sync-managed-runtime");
   } finally {

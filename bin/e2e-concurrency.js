@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { isMainModule } from "./main-module.js";
 import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
 const execFileAsync = promisify(execFile);
@@ -188,12 +189,23 @@ async function waitFor(probe, message, timeoutMs = 10_000, pollMs = 50) {
   assert.fail(`${failureMessage}${lastValue === undefined ? "" : ` (last value: ${JSON.stringify(lastValue)})`}`);
 }
 
+// The checkout path goes into a generated sh script. Inside double quotes the shell still runs
+// $(...) and backticks, so a checkout named `x$(cmd)` executed cmd; single quotes make every
+// character literal, and a single quote itself becomes '\''.
+function shellSingleQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+function fakeOpenCodeShellScript(scriptPath) {
+  return `#!/bin/sh\nexec node ${shellSingleQuote(scriptPath)} --fake-opencode "$@"\n`;
+}
+
 async function compileFakeOpenCode(fixtureRoot) {
   const sourcePath = path.join(fixtureRoot, "fake-opencode.c");
   await writeFile(sourcePath, FAKE_OPENCODE_SOURCE, "utf8");
   if (process.platform !== "win32") {
     const executablePath = path.join(fixtureRoot, "fake-opencode");
-    await writeFile(executablePath, `#!/bin/sh\nexec node \"${path.resolve("bin/e2e-concurrency.js").replaceAll("\\", "\\\\")}\" --fake-opencode \"$@\"\n`, "utf8");
+    await writeFile(executablePath, fakeOpenCodeShellScript(path.resolve("bin/e2e-concurrency.js")), "utf8");
     await chmod(executablePath, 0o700);
     return executablePath;
   }
@@ -1071,8 +1083,12 @@ async function main() {
   }
 }
 
-const selectedMain = process.argv.includes("--fake-opencode") ? runFakeOpenCode : main;
-selectedMain().catch((error) => {
-  process.stderr.write(`${error?.stack || error}\n`);
-  process.exitCode = 1;
-});
+if (isMainModule(import.meta.url)) {
+  const selectedMain = process.argv.includes("--fake-opencode") ? runFakeOpenCode : main;
+  selectedMain().catch((error) => {
+    process.stderr.write(`${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
+}
+
+export { fakeOpenCodeShellScript, shellSingleQuote };

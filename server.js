@@ -9,7 +9,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -146,6 +146,10 @@ const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
 // than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
 const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
 const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
+// setTimeout and setInterval cannot represent more than 2^31-1 ms: a longer delay fires after
+// 1 ms, so a progress heartbeat interval of 2147483648 became a notification flood. Every
+// CODEX_OPENCODE_*_MS setting is a timer, lease or timeout, so readIntegerEnv caps them here.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -422,7 +426,9 @@ async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT
   let timer = null;
   try {
     return await Promise.race([
-      pending.then(() => ({ ok: true }), () => ({ ok: true })),
+      // A rejected recovery is a failure: turning it into ok let early tool calls act on
+      // unrecovered queue, pipeline and integration state.
+      pending.then(() => ({ ok: true }), (error) => ({ ok: false, failed: true, error })),
       new Promise((resolve) => {
         timer = setTimeout(() => resolve({ ok: false }), Math.max(0, Number(timeoutMs) || 0));
       }),
@@ -430,6 +436,36 @@ async function awaitBridgeStartupRecovery(timeoutMs = STARTUP_RECOVERY_TOOL_WAIT
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+// Starts startup recovery and remembers it for awaitBridgeStartupRecovery. The failure is
+// logged here but the promise stays rejected, so every tool call answers startup_recovery_failed
+// instead of running on unrecovered state. `run` is a seam for tests.
+function beginBridgeStartupRecovery(run = reconcileQueueStateAtStartup) {
+  const recovery = Promise.resolve().then(run);
+  recovery.catch((error) => {
+    logEvent("error", "state.startup_recovery_failed", {
+      errorType: error?.errorType || "startup_recovery_failed",
+      error: redactSensitiveText(error?.message || String(error)),
+    });
+  });
+  bridgeStartupRecovery = recovery;
+  return recovery;
+}
+
+function startupRecoveryFailedResult(error) {
+  return {
+    isError: true,
+    content: [{
+      type: "text",
+      text: [
+        "Bridge startup recovery failed.",
+        "errorType: startup_recovery_failed",
+        `The bridge could not recover durable queue, pipeline and integration state, so it refuses tool calls instead of acting on unrecovered state: ${redactSensitiveText(error?.message || String(error))}`,
+        "Restart the bridge. The failure is in the bridge log as state.startup_recovery_failed.",
+      ].join("\n"),
+    }],
+  };
 }
 
 function startupRecoveryPendingResult() {
@@ -453,7 +489,8 @@ server.tool = (...registration) => {
     registration[registration.length - 1] = async (...handlerArgs) => {
       const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
       try {
-        if (!(await awaitBridgeStartupRecovery()).ok) return startupRecoveryPendingResult();
+        const recovery = await awaitBridgeStartupRecovery();
+        if (!recovery.ok) return recovery.failed ? startupRecoveryFailedResult(recovery.error) : startupRecoveryPendingResult();
         return await handler(...handlerArgs);
       } finally {
         stop();
@@ -592,18 +629,25 @@ const projectAgentPolicySchema = z
   })
   .strict();
 
+// Unset or blank keeps the default (Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS=""
+// used to disable progress heartbeats). Anything else must be an integer in range: a typo
+// (PROVIDER_CONCURRENCY_LIMIT=foo) used to fall back to the default silently, like the unknown
+// choice values readChoiceEnv already rejects at startup.
+function readIntegerEnv(name, fallback, minimum) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
+  const maximum = name.endsWith("_MS") ? MAX_TIMER_MS : Number.MAX_SAFE_INTEGER;
+  const value = Number(raw);
+  if (Number.isInteger(value) && value >= minimum && value <= maximum) return value;
+  throw new Error(`${name} must be an integer from ${minimum} to ${maximum} (or unset for ${fallback}); got ${JSON.stringify(String(raw).trim())}.`);
+}
+
 function readPositiveIntEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) && value > 0 ? value : fallback;
+  return readIntegerEnv(name, fallback, 1);
 }
 
 function readNonNegativeIntEnv(name, fallback) {
-  // Blank is unset: Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS="" silently
-  // disabled progress heartbeats instead of keeping the default.
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
-  const value = Number(raw);
-  return Number.isInteger(value) && value >= 0 ? value : fallback;
+  return readIntegerEnv(name, fallback, 0);
 }
 
 function readStrictPositiveIntEnv(name, fallback) {
@@ -1033,25 +1077,32 @@ const USER_LINE_ENDING_GIT_CONFIG_KEYS = new Map([
 ]);
 const NULL_GIT_CONFIG_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
 
-async function readUserLineEndingGitConfig() {
+// These reads run at import, before the transport connects, so they count against the client's
+// 30 s MCP startup deadline. Two sequential 15 s reads could use all of it; the levels are now
+// read together under one short bound (worst case 10 s).
+const USER_GIT_CONFIG_READ_TIMEOUT_MS = 1000 * 10;
+
+async function readUserLineEndingGitConfig({ execFile = execFileAsync } = {}) {
   const values = new Map();
-  // Later levels win, as in Git: global overrides system.
-  for (const scope of ["--system", "--global"]) {
-    let stdout = "";
+  const readLevel = async (scope) => {
     try {
-      ({ stdout } = await execFileAsync("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
+      const { stdout } = await execFile("git", ["config", scope, "--includes", "--get-regexp", "^core\\.(autocrlf|eol|safecrlf|symlinks)$"], {
         cwd: tmpdir(),
         shell: false,
-        timeout: 1000 * 15,
+        timeout: USER_GIT_CONFIG_READ_TIMEOUT_MS,
         maxBuffer: 64 * 1024,
         windowsHide: true,
         env: process.env,
-      }));
+      });
+      return String(stdout || "");
     } catch (error) {
       // Exit 1 means no key is set at that level; a missing git leaves Git's defaults.
-      stdout = String(error?.stdout || "");
+      return String(error?.stdout || "");
     }
-    for (const line of String(stdout || "").split(/\r?\n/)) {
+  };
+  // Later levels win, as in Git: global overrides system, whichever read finishes first.
+  for (const stdout of await Promise.all(["--system", "--global"].map(readLevel))) {
+    for (const line of stdout.split(/\r?\n/)) {
       const match = /^(\S+)\s+(.+)$/.exec(line.trim());
       if (!match) continue;
       const key = match[1].toLowerCase();
@@ -1062,36 +1113,53 @@ async function readUserLineEndingGitConfig() {
   return values;
 }
 
-async function writeUserLineEndingGitConfigFile(values) {
+// Written lazily, on the first Git process of a state directory, never at module import:
+// tests (and embedders) import this file first and only afterwards point
+// hooks.stateDirectoryOverride at a scratch directory, so an import-time write landed in the
+// operator's real state directory. Synchronous because buildTrustedGitEnv is; the file is a
+// few bytes and is written once per state directory.
+function writeUserLineEndingGitConfigFile(values, directory) {
   if (!values.size) return NULL_GIT_CONFIG_PATH;
   const content = `[core]\n${[...values].sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `\t${key.slice("core.".length)} = ${value}\n`).join("")}`;
   // Content-addressed in the operator-private state directory, so concurrent bridge
   // processes write identical bytes and a shared temporary directory is never trusted.
-  const file = path.join(GLOBAL_BRIDGE_STATE_DIR, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
-  const current = async () => {
-    try { return await readFile(file, "utf8"); } catch { return null; }
+  const file = path.join(directory, `git-line-endings-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.gitconfig`);
+  const current = () => {
+    try { return readFileSync(file, "utf8"); } catch { return null; }
   };
   try {
-    if (await current() === content) return file;
-    await mkdir(GLOBAL_BRIDGE_STATE_DIR, { recursive: true });
+    if (current() === content) return file;
+    mkdirSync(directory, { recursive: true });
     const temporary = `${file}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
     try {
-      await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
-      await rename(temporary, file);
+      writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, file);
     } finally {
-      await rm(temporary, { force: true }).catch(() => {});
+      try { rmSync(temporary, { force: true }); } catch { /* best effort */ }
     }
   } catch {
     // Another bridge process may have renamed the same content-addressed file first.
   }
-  if (await current() === content) return file;
+  if (current() === content) return file;
   console.error(JSON.stringify({ ts: new Date().toISOString(), level: "warn", event: "git.line_ending_config_unavailable" }));
   return NULL_GIT_CONFIG_PATH;
 }
 
 const USER_LINE_ENDING_GIT_CONFIG = await readUserLineEndingGitConfig();
-const BRIDGE_GIT_GLOBAL_CONFIG_PATH = await writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG);
+// state directory -> gitconfig path (or the null config when it could not be written)
+const BRIDGE_GIT_GLOBAL_CONFIG_PATHS = new Map();
+
+function bridgeGitGlobalConfigPath() {
+  const directory = effectiveBridgeStateDirectory();
+  const known = BRIDGE_GIT_GLOBAL_CONFIG_PATHS.get(directory);
+  // A state directory that was wiped since (a scratch directory a test removed and
+  // recreated) gets the file again; Git would silently read a missing file as empty.
+  if (known !== undefined && (known === NULL_GIT_CONFIG_PATH || existsSync(known))) return known;
+  const file = writeUserLineEndingGitConfigFile(USER_LINE_ENDING_GIT_CONFIG, directory);
+  BRIDGE_GIT_GLOBAL_CONFIG_PATHS.set(directory, file);
+  return file;
+}
 
 // Enforced on every bridge Git process, as GIT_CONFIG_COUNT entries and as `-c` options.
 // log.showSignature/gpg.* keep a repository-local gpg.program from running inside bridge
@@ -1118,7 +1186,7 @@ function buildTrustedGitEnv(extra = null) {
     if (extra && extra[key] !== undefined) env[key] = extra[key];
   }
   env.GIT_CONFIG_NOSYSTEM = "1";
-  env.GIT_CONFIG_GLOBAL = BRIDGE_GIT_GLOBAL_CONFIG_PATH;
+  env.GIT_CONFIG_GLOBAL = bridgeGitGlobalConfigPath();
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
   // Paths the bridge passes to git are file names (app/[slug]/page.tsx), never patterns; as
@@ -1167,6 +1235,64 @@ function trustedGitArgs(args = []) {
   return trusted;
 }
 
+// The directory that holds the repository's shared control files (config, hooks, info/,
+// objects/): `.git` itself, or the common dir a linked worktree's `.git` pointer file leads
+// to. Found by walking up from `startDir` as Git does, without spawning a process. "" when
+// no repository is found.
+async function resolveGitCommonDirectory(startDir) {
+  let directory = path.resolve(startDir || process.cwd());
+  for (;;) {
+    const dotGit = path.join(directory, ".git");
+    let details = null;
+    try {
+      details = await stat(dotGit);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    if (details?.isDirectory()) return dotGit;
+    if (details?.isFile()) {
+      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(dotGit, "utf8"));
+      if (!pointer) return "";
+      const gitDir = path.resolve(directory, pointer[1]);
+      try {
+        return path.resolve(gitDir, (await readFile(path.join(gitDir, "commondir"), "utf8")).trim());
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        return gitDir;
+      }
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) return "";
+    directory = parent;
+  }
+}
+
+// Files under the common .git/ directory that Git honours but that no patch ever shows:
+// info/attributes sets filter, diff, merge, eol and text attributes for every path (the file
+// counterpart of the core.attributesfile key refused below), and objects/info/alternates adds
+// another directory to the object store. A line that is neither blank nor a comment makes
+// the file effective. Reported next to the config keys, under these labels.
+const GIT_CONTROL_FILES_WITH_EFFECT = [
+  ["info/attributes", ["info", "attributes"]],
+  ["objects/info/alternates", ["objects", "info", "alternates"]],
+];
+
+async function inspectGitControlFilesWithEffect(cwd) {
+  const effective = [];
+  const commonDir = await resolveGitCommonDirectory(cwd);
+  if (!commonDir) return effective;
+  for (const [label, segments] of GIT_CONTROL_FILES_WITH_EFFECT) {
+    let text = "";
+    try {
+      text = await readFile(path.join(commonDir, ...segments), "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    if (text.split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith("#"))) effective.push(label);
+  }
+  return effective;
+}
+
 async function inspectRepositoryGitControlSurface(cwd) {
   const listed = await runCommand("git", ["config", "--local", "--name-only", "--list"], cwd, 1000 * 15);
   if (listed.exitCode !== 0) {
@@ -1191,15 +1317,42 @@ async function inspectRepositoryGitControlSurface(cwd) {
       unsafeKeys.add("core.fsmonitor");
     }
   }
+  try {
+    for (const label of await inspectGitControlFilesWithEffect(cwd)) unsafeKeys.add(label);
+  } catch (error) {
+    return {
+      ok: false,
+      errorType: "git_repository_config_unreadable",
+      error: `Could not inspect the repository's .git/info/attributes and .git/objects/info/alternates: ${error?.message || String(error)}`,
+      unsafeKeys: [],
+    };
+  }
   const sortedUnsafeKeys = [...unsafeKeys].sort();
   return sortedUnsafeKeys.length
     ? {
         ok: false,
         errorType: "git_repository_config_unsafe",
-        error: `Repository-local Git configuration contains executable or credential-bearing controls: ${sortedUnsafeKeys.join(", ")}.`,
+        error: `Repository-local Git configuration contains executable, credential-bearing or content-altering controls: ${sortedUnsafeKeys.join(", ")}.`,
         unsafeKeys: sortedUnsafeKeys,
       }
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
+}
+
+// Body of a key block whose END line is missing (a truncated answer): base64 runs of 16+
+// characters, at any wrap width, separated by blank space or by real or escaped line breaks
+// (a key inside a JSON string carries the two characters \n, or \\n one level deeper, instead
+// of a newline). Every scan is sticky and bounded, so it stays linear.
+const PEM_BODY_GAP = /(?:[ \t\r\n]|\\{1,8}[rn])*/y;
+const PEM_BODY_RUN = /[A-Za-z0-9+\/=]{16,}/y;
+function pemBodyEnd(text, from) {
+  let end = from;
+  for (;;) {
+    PEM_BODY_GAP.lastIndex = end;
+    PEM_BODY_GAP.exec(text);
+    PEM_BODY_RUN.lastIndex = PEM_BODY_GAP.lastIndex;
+    if (!PEM_BODY_RUN.exec(text)) return end;
+    end = PEM_BODY_RUN.lastIndex;
+  }
 }
 
 // Private key blocks are cut in one forward pass: a lazy BEGIN...END regex rescanned the
@@ -1208,7 +1361,6 @@ async function inspectRepositoryGitControlSurface(cwd) {
 function redactPrivateKeyBlocks(text) {
   const begin = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/gi;
   const endMarker = /-----END [A-Z ]{0,40}PRIVATE KEY-----/gi;
-  const bodyLines = /(?:\r?\n[A-Za-z0-9+\/=]{16,128})+/y;
   let output = "";
   let cursor = 0;
   let endSearchExhausted = false;
@@ -1220,11 +1372,7 @@ function redactPrivateKeyBlocks(text) {
       if (end) blockEnd = endMarker.lastIndex;
       else endSearchExhausted = true;
     }
-    if (blockEnd < 0) {
-      bodyLines.lastIndex = begin.lastIndex;
-      const body = bodyLines.exec(text);
-      blockEnd = begin.lastIndex + (body ? body[0].length : 0);
-    }
+    if (blockEnd < 0) blockEnd = pemBodyEnd(text, begin.lastIndex);
     output += `${text.slice(cursor, match.index)}[private key redacted]`;
     cursor = blockEnd;
     begin.lastIndex = cursor;
@@ -1303,8 +1451,9 @@ function redactLikelySecrets(value) {
 // Git never reports edits under .git/ as changes, so a writer that rewrote .git/config
 // (core.hooksPath, an alias, a filter driver) or dropped a hook would pass every
 // changed-file check. This fingerprint covers the control files a job could use to run
-// code later: the repository config (and a linked worktree's config.worktree), every hook,
-// and a linked worktree's `.git` pointer file. Compare it before and after a write job.
+// code later or change what Git shows: the repository config (and a linked worktree's
+// config.worktree), every hook, info/attributes, objects/info/alternates, and a linked
+// worktree's `.git` pointer file. Compare it before and after a write job.
 async function gitControlSurfaceFingerprint(cwd) {
   const root = path.resolve(cwd || process.cwd());
   const entries = {};
@@ -1341,6 +1490,10 @@ async function gitControlSurfaceFingerprint(cwd) {
       await record("gitdir/config.worktree", path.join(gitDir, "config.worktree"));
     }
     await record("common/config", path.join(commonDir, "config"));
+    // Git reads both from the common dir: info/attributes can select filter/diff/merge drivers
+    // and rewrite what a diff shows; objects/info/alternates adds another object directory.
+    await record("common/info/attributes", path.join(commonDir, "info", "attributes"));
+    await record("common/objects/info/alternates", path.join(commonDir, "objects", "info", "alternates"));
     let hookNames = [];
     try {
       hookNames = (await readdir(path.join(commonDir, "hooks"))).sort();
@@ -1362,9 +1515,10 @@ function gitControlSurfaceChanges(before, after) {
   return labels.filter((label) => (before?.entries || {})[label] !== (after?.entries || {})[label]);
 }
 
-// Marks a write job failed when its .git/ control files (config, hooks, a worktree's .git
-// pointer) changed while it ran. A fingerprint that could not be taken before proves nothing
-// either way (logged, not failed); one that fails only afterwards fails closed.
+// Marks a write job failed when its .git/ control files (config, hooks, info/attributes,
+// objects/info/alternates, a worktree's .git pointer) changed while it ran. A fingerprint
+// that could not be taken before proves nothing either way (logged, not failed); one that
+// fails only afterwards fails closed.
 function applyGitControlSurfaceCheck(result, before, after, phase = "agent execution") {
   if (!before) return;
   if (!before.ok) {
@@ -1377,7 +1531,7 @@ function applyGitControlSurfaceCheck(result, before, after, phase = "agent execu
   result.errorType ||= "git_control_surface_modified";
   result.stderr = [
     result.stderr,
-    `Git control files changed during ${phase}: ${changed.join(", ")}${after?.ok ? "" : ` (${after?.error || "unreadable"})`}. Git never lists .git/ as a change, so this is checked separately; the output was retained. Inspect .git/config and .git/hooks before running git in this checkout.`,
+    `Git control files changed during ${phase}: ${changed.join(", ")}${after?.ok ? "" : ` (${after?.error || "unreadable"})`}. Git never lists .git/ as a change, so this is checked separately; the output was retained. Inspect .git/config, .git/hooks, .git/info/attributes and .git/objects/info/alternates before running git in this checkout.`,
   ].filter(Boolean).join("\n");
 }
 
@@ -1388,12 +1542,68 @@ function applyGitControlSurfaceCheck(result, before, after, phase = "agent execu
 // (An allowlist of text extensions left every other extension, and extensionless files,
 // free to arrive as unreviewed binary.) Executables and libraries are deliberately absent.
 const KNOWN_BINARY_EXTENSION = /\.(?:png|jpe?g|gif|bmp|ico|icns|webp|avif|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|7z|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|ogg|flac|webm|mov|wasm)$/i;
+// R-154: git C-quotes a path that has a quote, backslash, control character (or, without the
+// bridge's core.quotePath=false, a non-ASCII byte) in "diff --git" headers: "a/x\"y" "b/x\"y".
+// The unquoted-only header pattern did not match such a header, so its binary hunk was
+// attributed to the previous file (or to no file) and passed the gate.
+const GIT_C_QUOTE_ESCAPES = Object.freeze({ a: 0x07, b: 0x08, t: 0x09, n: 0x0a, v: 0x0b, f: 0x0c, r: 0x0d, '"': 0x22, "\\": 0x5c });
+function gitUnquotePath(body) {
+  const input = Buffer.from(body, "utf8");
+  const bytes = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const byte = input[index];
+    if (byte !== 0x5c) { bytes.push(byte); continue; }
+    const octal = input.subarray(index + 1, index + 4).toString("latin1");
+    if (/^[0-7]{3}$/.test(octal)) {
+      bytes.push(Number.parseInt(octal, 8) & 0xff);
+      index += 3;
+      continue;
+    }
+    const escaped = GIT_C_QUOTE_ESCAPES[String.fromCharCode(input[index + 1])];
+    if (escaped === undefined) { bytes.push(byte); continue; }
+    bytes.push(escaped);
+    index += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+// The post-image path of a "diff --git" header, unquoted; null when the header is not understood.
+function gitDiffHeaderNewPath(line) {
+  const rest = /^diff --git (.*)$/.exec(line)?.[1];
+  if (rest === undefined) return null;
+  const quotedAt = (text) => {
+    if (!text.startsWith('"')) return null;
+    for (let index = 1; index < text.length; index += 1) {
+      if (text[index] === "\\") index += 1;
+      else if (text[index] === '"') return { value: gitUnquotePath(text.slice(1, index)), after: text.slice(index + 1) };
+    }
+    return null;
+  };
+  let newSide;
+  const oldQuoted = quotedAt(rest);
+  if (oldQuoted) {
+    if (!oldQuoted.after.startsWith(" ")) return null;
+    newSide = oldQuoted.after.slice(1);
+  } else {
+    // An unquoted old path cannot contain a quote, so a quoted new side starts at ` "b/`.
+    newSide = /^a\/.+? ("b\/.*")$/.exec(rest)?.[1] ?? (/^a\/.+? (b\/.+)$/.exec(rest)?.[1]);
+    if (newSide === undefined) return null;
+  }
+  const newQuoted = quotedAt(newSide);
+  const value = newQuoted ? (newQuoted.after === "" ? newQuoted.value : "") : newSide;
+  return value.startsWith("b/") && value.length > 2 ? value.slice(2) : null;
+}
+
 function binaryTextFilesInPatch(patchText) {
   const files = [];
   let current = "";
   for (const line of String(patchText || "").split(/\r?\n/)) {
-    const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-    if (header) { current = header[2]; continue; }
+    if (line.startsWith("diff --git ")) {
+      // A header that cannot be parsed must not lend its binary hunk the previous file's name;
+      // the unresolved name is reported (and never matches a binary extension).
+      current = gitDiffHeaderNewPath(line) ?? `${line} (unparsed diff header)`;
+      continue;
+    }
     if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
       && !KNOWN_BINARY_EXTENSION.test(current)) {
       files.push(current);
@@ -1401,6 +1611,45 @@ function binaryTextFilesInPatch(patchText) {
     }
   }
   return files;
+}
+
+// A key marker in an added line is a key when 40+ base64 characters of body follow it,
+// however the file wraps them (OpenSSL wraps at 64, other tools at 32, 76 or not at all;
+// the first version of this gate needed one 40-character line, so a 32-column PKCS#8 key
+// passed). The body is read from the rest of the marker line (a JSON string holds the whole
+// key with escaped \n) and from the added lines below it, which may be indented, quoted or
+// followed by a comma; blank lines and RFC 1421 header fields (Proc-Type, DEK-Info) between
+// the marker and the body are skipped. Each line is scanned by at most one marker.
+const KEY_BODY_MIN_CHARS = 40;
+const KEY_BODY_LOOKAHEAD_LINES = 64;
+const KEY_BODY_LINE = /^\+[ \t]*["'`]?([A-Za-z0-9+\/=]+)(?:\\{1,8}[rn])*["'`]?[ \t]*[,;+]?[ \t]*$/;
+const KEY_BODY_SKIPPED_LINE = /^\+[ \t]*(?:(?:Proc-Type|DEK-Info):.*)?$/;
+const KEY_BODY_RUN = /[A-Za-z0-9+\/=]+/y;
+const KEY_BODY_ESCAPED_BREAKS = /(?:\\{1,8}[rn])+/y;
+function inlineKeyBodyChars(line, from) {
+  let position = from;
+  let chars = 0;
+  for (;;) {
+    KEY_BODY_ESCAPED_BREAKS.lastIndex = position;
+    if (KEY_BODY_ESCAPED_BREAKS.exec(line)) position = KEY_BODY_ESCAPED_BREAKS.lastIndex;
+    KEY_BODY_RUN.lastIndex = position;
+    const run = KEY_BODY_RUN.exec(line);
+    if (!run) return chars;
+    chars += run[0].length;
+    position = KEY_BODY_RUN.lastIndex;
+  }
+}
+function patchKeyBodyChars(lines, index) {
+  const header = PRIVATE_KEY_HEADER.exec(lines[index]);
+  let chars = inlineKeyBodyChars(lines[index], header.index + header[0].length);
+  const last = Math.min(lines.length - 1, index + KEY_BODY_LOOKAHEAD_LINES);
+  for (let next = index + 1; chars < KEY_BODY_MIN_CHARS && next <= last; next += 1) {
+    if (KEY_BODY_SKIPPED_LINE.test(lines[next])) continue;
+    const body = KEY_BODY_LINE.exec(lines[next]);
+    if (!body) break;
+    chars += body[1].length;
+  }
+  return chars;
 }
 
 function patchLikelySecretLines(patchText) {
@@ -1413,8 +1662,8 @@ function patchLikelySecretLines(patchText) {
     if (!line.startsWith("+") || /^\+\+\+ (?:b\/|\/dev\/null)/.test(line)) continue;
     const keyHeader = PRIVATE_KEY_HEADER.test(line);
     if (keyHeader) {
-      // A test comment naming the header is not a key; a following base64 body line is.
-      if (/^\+[A-Za-z0-9+\/=]{40,}\s*$/.test(lines[index + 1] || "")) hits.push(index + 1);
+      // A test comment naming the header is not a key; a key body after it is.
+      if (patchKeyBodyChars(lines, index) >= KEY_BODY_MIN_CHARS) hits.push(index + 1);
       continue;
     }
     if (LIKELY_SECRET_PATTERNS.some((pattern) => pattern.test(line))) hits.push(index + 1);
@@ -2716,7 +2965,7 @@ function providerLeaseOwnershipLossError(detail = "Durable provider-capacity own
 
 function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 0, refreshLease = null } = {}) {
   const controller = new AbortController();
-  const inertStop = Object.assign(() => {}, { signal: controller.signal, pulse: async () => false });
+  const inertStop = Object.assign(async () => {}, { signal: controller.signal, pulse: async () => false });
   if (!lease?.id) return inertStop;
   const effectiveLeaseMs = Math.max(250, Number(CONFIG.providerLeaseMs) || 250);
   const intervalMs = requestedIntervalMs > 0
@@ -2760,8 +3009,8 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
           db = await openProviderLeaseDb({ deadlineAt: Date.now() + Math.min(10000, intervalMs) });
           const result = db.prepare(`
             UPDATE provider_leases SET heartbeat_at = ?, expires_at = ?
-            WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ?
-          `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID, now);
+            WHERE lease_id = ? AND owner_instance_id = ? AND expires_at > ? AND expires_at < ?
+          `).run(now, expiresAt, lease.id, BRIDGE_INSTANCE_ID, now, Number.MAX_SAFE_INTEGER);
           renewed = Number(result.changes || 0) === 1;
         }
         if (!renewed) {
@@ -2797,10 +3046,15 @@ function startProviderLeaseHeartbeat(lease, { intervalMs: requestedIntervalMs = 
   scheduleFence();
   const timer = setInterval(pulse, intervalMs);
   timer.unref?.();
-  return Object.assign(() => {
+  // stop() settles once an in-flight renewal has finished, so a caller that awaits it can
+  // release or quarantine the lease without a late pulse writing after it. It never rejects:
+  // callers stop the heartbeat in a finally block right before that write.
+  return Object.assign(async () => {
     stopped = true;
     clearInterval(timer);
     if (fenceTimer) clearTimeout(fenceTimer);
+    const inFlight = refreshPromise;
+    if (inFlight) await inFlight.catch(() => {});
   }, { signal: controller.signal, pulse });
 }
 
@@ -3126,15 +3380,22 @@ async function providerCapacitySnapshot() {
       ownerProcessId: Number(row.owner_pid || 0),
       createdAt: new Date(Number(row.created_at)).toISOString(),
       heartbeatAt: row.heartbeat_at ? new Date(Number(row.heartbeat_at)).toISOString() : "",
-      expiresAt: new Date(Number(row.expires_at)).toISOString(),
+      expiresAt: Number(row.expires_at) === Number.MAX_SAFE_INTEGER
+        ? "quarantined (no expiry)"
+        : new Date(Number(row.expires_at)).toISOString(),
       remainingMs: Math.max(0, Number(row.expires_at) - now),
       quarantined: Number(row.expires_at) === Number.MAX_SAFE_INTEGER,
     }));
     // Leases are stored per "<key>:<provider>"; the base key's capacity said nothing about
     // them ("capacity 4, 6 leases" across two providers). Report each key on its own.
+    // Same rule as acquireProviderLease: a stored limit that differs from the config only binds
+    // while leases taken under it are held (an older bridge process); an idle key takes the
+    // configured limit on its next acquire, so "0 of 2" after a raise to 4 was wrong.
     const capacityFor = (key) => {
       const stored = capacityByKey.get(key);
-      return Number.isInteger(stored) && stored > 0 ? stored : CONFIG.providerConcurrencyLimit;
+      const configured = CONFIG.providerConcurrencyLimit;
+      if (!Number.isInteger(stored) || stored <= 0 || stored === configured) return configured;
+      return leases.some((lease) => lease.providerKey === key) ? Math.min(stored, configured) : configured;
     };
     const keyNames = [...new Set([...capacityByKey.keys(), ...leases.map((lease) => lease.providerKey)])].sort();
     const keys = keyNames.map((key) => {
@@ -5108,10 +5369,14 @@ function normalizeLockPath(value) {
     .replace(/\/+/g, "/");
   // Only "dir/**" means the whole directory. "dir/*" is one level and stays a glob:
   // stripping it turned allowedEdits ["src/cli/*"] into "src/cli", which allowed src/cli/deep/x.ts.
-  const normalized = slashNormalized
-    .replace(/\/+$/, "")
-    .replace(/\/\*\*$/, "")
-    .replace(/\/+$/, "");
+  // A plain directory name already covers its subtree, so its "/**" is dropped. With wildcards
+  // before the suffix ("**/secrets/**", "**/.git/**") the path is matched as a glob, where
+  // "**/secrets" is only a directory named secrets: dropping the suffix there let
+  // pkg/secrets/credentials.txt pass the forbidden rule. globToRegex reads the kept suffix.
+  let normalized = slashNormalized.replace(/\/+$/, "");
+  if (normalized.endsWith("/**") && !/[*?[\]{}!]/.test(normalized.slice(0, -3))) {
+    normalized = normalized.slice(0, -3).replace(/\/+$/, "");
+  }
   return normalized || (slashNormalized.startsWith("/") ? "/" : "");
 }
 
@@ -5706,7 +5971,13 @@ function globSourceToRegex(glob) {
 }
 
 function globToRegex(pattern, matchDescendants = false) {
-  const normalized = normalizeLockPath(pattern);
+  let normalized = normalizeLockPath(pattern);
+  // A glob directory pattern ("**/secrets/**") keeps its suffix through normalizeLockPath and
+  // means the directory and everything below it, whatever the caller passes for the flag.
+  if (normalized.endsWith("/**")) {
+    normalized = normalized.slice(0, -3);
+    matchDescendants = true;
+  }
   const regex = globSourceToRegex(normalized);
   return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
 }
@@ -6272,7 +6543,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   let remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6296,7 +6567,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
 
   const preSpawnPluginPolicy = forcePure ? { ok: true, mode: "pure", plugins: [] } : await verifyExternalPluginPolicy(workDir);
   if (!preSpawnPluginPolicy.ok) {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6321,7 +6592,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     try {
       isolatedRuntime = await createIsolatedOpenCodeRuntime();
     } catch (error) {
-      stopProviderLeaseHeartbeat();
+      await stopProviderLeaseHeartbeat();
       await releaseProviderLease(providerLease.lease);
       return {
         stdout: "",
@@ -6358,7 +6629,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   });
   if (finalPreSpawnMetadataError) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6382,7 +6653,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const attestedProviderKey = providerKeyForMetadata(configuredMetadata);
   if (attestedProviderKey !== providerKey) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6408,7 +6679,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   remainingRunMs = timeoutMs - (nowMs() - runStarted);
   if (remainingRunMs <= 0) {
     const cleanup = isolatedRuntime ? await wipeIsolatedOpenCodeRuntime(isolatedRuntime.root) : { ok: true, error: "" };
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     await releaseProviderLease(providerLease.lease);
     return {
       stdout: "",
@@ -6452,7 +6723,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
   } finally {
-    stopProviderLeaseHeartbeat();
+    await stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
       providerQuarantine = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
       if (!providerQuarantine.ok) {
@@ -10225,7 +10496,7 @@ function applyPatchFile(...args) {
   return integrationTimed("apply", () => applyPatchFileUntimed(...args));
 }
 
-async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], signal = null }) {
+async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], baselineSnapshot = null, signal = null }) {
   const base = cwd || process.cwd();
   const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-apply-index-"));
   const indexFile = path.join(scratch, "index");
@@ -10280,6 +10551,29 @@ async function applyPatchFileUntimed({ cwd, patchFile, targetHead, files = [], s
       return { exitCode: present.exitCode, stdout: "", stderr: present.stderr || "Could not list the isolated integration index.", worktreeWritten: false };
     }
     const presentPaths = new Set(normalizeLockPathList(String(present.stdout || "").split("\0")));
+    // R-151: the target checks run before the journal and this function's index work, so an
+    // editor write to a patched path since then would be overwritten by the force checkout
+    // below. Re-read the exact bytes of every patched path right before the first delete or
+    // force checkout, and fail closed without touching a file that no longer matches. Reading
+    // the bytes is not an identity capture: the tree-wide rehash is not repeated here.
+    if (baselineSnapshot) {
+      let mismatches;
+      try {
+        mismatches = snapshotMismatches(baselineSnapshot, await exactIntegrationFileSnapshot(base, patchPaths), patchPaths);
+      } catch {
+        // A path that can no longer be read as a bounded file is not the reviewed one either.
+        mismatches = patchPaths;
+      }
+      if (mismatches.length) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Target paths changed immediately before the patch write: ${mismatches.slice(0, 10).join(", ")}. The working tree was not modified.`,
+          worktreeWritten: false,
+          externalChanges: mismatches,
+        };
+      }
+    }
     // Deletions first, so a patch that turns a file into a directory (or back) can check out.
     for (const file of patchPaths.filter((candidate) => !presentPaths.has(candidate))) {
       const target = path.resolve(base, file);
@@ -10632,7 +10926,7 @@ async function captureGitHead(cwd) {
   return result.stdout.trim();
 }
 
-function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget }) {
+function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget, cleanupAfterSuccess }) {
   return {
     cwd: path.resolve(cwd || process.cwd()),
     worktreePath: worktreePath ? path.resolve(worktreePath) : "",
@@ -10643,6 +10937,7 @@ function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, for
     serialOnly: normalizeLockPathList(serialOnly).sort(),
     validationCommand: String(validationCommand || "").trim(),
     allowDirtyTarget: Boolean(allowDirtyTarget),
+    cleanupAfterSuccess: Boolean(cleanupAfterSuccess),
   };
 }
 
@@ -11027,6 +11322,7 @@ async function integratePatchWithoutSerialLock({
   validationPolicyTrust = null,
   dryRun = false,
   allowDirtyTarget = false,
+  cleanupAfterSuccess = false,
   acceptFlaggedSecretLines = false,
   acceptBinaryHunks = false,
   reviewed = false,
@@ -11109,6 +11405,7 @@ async function integratePatchWithoutSerialLock({
     serialOnly,
     validationCommand,
     allowDirtyTarget,
+    cleanupAfterSuccess,
   });
   const contractSha256 = integrationContractSha256(contract);
   const currentPreviewIdentity = {
@@ -11498,10 +11795,25 @@ async function integratePatchWithoutSerialLock({
       patchFile,
       targetHead: previewReceipt.targetHead,
       files: patch.changedFiles,
+      baselineSnapshot: preApplyExactSnapshot,
       signal,
     });
     if (signal?.aborted) return ownershipLostResult("during patch application");
     if (applied.exitCode !== 0) {
+      if (applied.worktreeWritten === false && applied.externalChanges?.length) {
+        await transitionIntegrationOperation(targetCwd, integrationOperationId, "applying", "recovered_noop", {
+          outcome: "target_changed_before_patch_write",
+          paths: applied.externalChanges,
+        }, integrationAuthority);
+        integrationOperationCommitted = true;
+        return {
+          ok: false,
+          errorType: "integration_preview_stale",
+          error: "Target paths changed immediately before patch write. The patch was not applied and the source was retained.",
+          changedFiles: patch.changedFiles,
+          unexpectedTargetChanges: applied.externalChanges,
+        };
+      }
       const indexReset = await isolatedIndexPreservationEvidence({ cwd: targetCwd, files: patch.changedFiles, baselineSnapshot: preApplyIndexSnapshot });
       let changedSincePreApply = patch.changedFiles;
       try {
@@ -12128,10 +12440,10 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       WHERE job_id = ? AND status = ? AND revision = ?
         AND (owner_generation = ? OR (owner_generation IS NULL AND ? = ''))
         AND (lease_expires_at IS NULL OR lease_expires_at = '' OR julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?)
-        AND NOT EXISTS (
+        AND (owner_instance_id = ? OR NOT EXISTS (
           SELECT 1 FROM bridge_instances
           WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
-        )
+        ))
     `);
 
     for (const row of rows) {
@@ -12168,7 +12480,13 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
           ? db.prepare("SELECT heartbeat_at, lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(row.owner_instance_id)
           : null;
         const instanceLease = Date.parse(instance?.lease_expires_at || "");
-        if (Number.isFinite(instanceLease) && instanceLease > now) continue;
+        // A live owner instance covers its jobs, but only another instance is trusted to be
+        // running them: QUEUE_JOBS (checked above) is this process's own worker list. A job
+        // this instance owns and no longer tracks (its worker was abandoned, e.g. every
+        // terminal write failed) was left behind while the instance lease stayed fresh for
+        // other work (a parent pipeline, other jobs), so shielding it would keep it, and
+        // its parent pipeline, running forever.
+        if (Number.isFinite(instanceLease) && instanceLease > now && row.owner_instance_id !== BRIDGE_INSTANCE_ID) continue;
         // Once both durable owner leases have expired, PID liveness cannot prove
         // ownership: operating systems reuse PIDs after crashes. Reconcile the
         // record without killing any process; retain child identity as evidence.
@@ -12201,6 +12519,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
         row.owner_generation || "",
         row.owner_generation || "",
         finishedAt,
+        BRIDGE_INSTANCE_ID,
         finishedAt
       );
       if (Number(changed.changes || 0) > 0) {
@@ -13374,6 +13693,7 @@ async function acquireHardLock({
   const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin, editsCheckout: lockEditsCheckout };
 
   let committed = false;
+  let commitAttempted = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     if (normalizedLockType !== "read" && !recoveryAuthority) {
@@ -13421,6 +13741,7 @@ async function acquireHardLock({
     // rows) reported the acquire as rejected while the lock rows stayed committed with a
     // token nobody had, orphaning the lock for its whole TTL.
     const activeLocks = listLocksFromDb(db, now);
+    commitAttempted = true;
     db.exec("COMMIT");
     committed = true;
 
@@ -13448,6 +13769,22 @@ async function acquireHardLock({
         db.exec("ROLLBACK");
       } catch {
         // Ignore rollback errors after failed begin/commit.
+      }
+    }
+    // COMMIT can report an error after its rows are durable, and anything that throws after it
+    // lands here too. This acquire is reported as failed and nobody holds the token, so a row
+    // that did commit would stay locked for the whole TTL (up to a day). Remove what this call
+    // inserted, identified by its own run id and fresh token, so a failed acquire never leaves
+    // a lock. The DELETE is a no-op when the transaction rolled back.
+    if (commitAttempted) {
+      try {
+        db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(runId, tokenSha256);
+        db.prepare("UPDATE runs SET status = 'released', finished_at = ? WHERE run_id = ? AND status = 'running'").run(Date.now(), runId);
+      } catch (cleanupError) {
+        logEvent("error", "lock.acquire_cleanup_failed", {
+          lockId: runId,
+          error: cleanupError?.message || String(cleanupError),
+        });
       }
     }
     return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
@@ -13520,15 +13857,36 @@ async function quarantineHardLock(lock, containment = "") {
     const now = Date.now();
     const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
     db.exec("BEGIN IMMEDIATE");
-    const quarantined = db.prepare(`
+    db.prepare(`
       UPDATE locks SET expires_at = ?
-      WHERE run_id = ? AND token = ? AND expires_at > ?
-    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256, now);
-    if (Number(quarantined.changes || 0) < 1) {
+      WHERE run_id = ? AND token = ?
+    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256);
+    // Expired rows may already have been pruned, including only some of the
+    // original paths. Restore the complete scope before another writer starts.
+    const heldPaths = new Set(db.prepare("SELECT normalized_path FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
+      .all(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER).map((row) => row.normalized_path));
+    if (!heldPaths.size && (!Array.isArray(lock.paths) || !lock.paths.length)) {
       db.exec("ROLLBACK");
       return { ok: false };
     }
-    db.prepare("UPDATE runs SET status = 'quarantined', finished_at = NULL, containment = ? WHERE run_id = ?").run(String(containment || ""), lock.id);
+    if (Array.isArray(lock.paths) && lock.paths.some((lockPath) => !heldPaths.has(lockPath))) {
+      const insert = db.prepare(`
+        INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const lockPath of lock.paths) {
+        if (heldPaths.has(lockPath)) continue;
+        insert.run(lockPath, lock.agent || lock.owner || "opencode", lock.origin || "internal", lock.id,
+          tokenSha256, lock.lockType || lock.lockMode || "write", Number.MAX_SAFE_INTEGER,
+          Number(lock.createdAt) || now, lock.cwd, `sha256:${lock.taskSha256 || ""}`, lock.editsCheckout === false ? 0 : 1);
+      }
+    }
+    db.prepare(`
+      INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at, containment)
+      VALUES (?, ?, 'quarantined', ?, ?, NULL, ?)
+      ON CONFLICT(run_id) DO UPDATE SET status = 'quarantined', finished_at = NULL, containment = excluded.containment
+    `).run(lock.id, lock.agent || lock.owner || "opencode", lock.lockType || lock.lockMode || "write",
+      Number(lock.createdAt) || now, String(containment || ""));
     db.exec("COMMIT");
     lock.expiresAt = Number.MAX_SAFE_INTEGER;
     return { ok: true };
@@ -14162,6 +14520,11 @@ server.tool(
       ...directRunAudit.records.filter((run) => run.status === "started"),
       ...newestFirst(directRunAudit.records.filter((run) => run.status !== "started"), "startedAt").slice(0, DIAGNOSE_DETAIL_LIMIT),
     ];
+    // Pipelines follow the same rule (R-138): every unfinished one plus the newest finished ones.
+    const pipelineFinished = (pipeline) => ["completed", "failed", "cancelled"].includes(pipeline.status);
+    let finishedPipelinesShown = 0;
+    const detailPipelines = newestFirst(pipelines, "createdAt")
+      .filter((pipeline) => !pipelineFinished(pipeline) || (finishedPipelinesShown += 1) <= DIAGNOSE_DETAIL_LIMIT);
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
@@ -14174,7 +14537,7 @@ server.tool(
         failedDirectRuns: directRunAudit.records.filter((run) => ["failed", "rejected", "abandoned"].includes(run.status)).length,
         unfinishedDirectRuns: directRunAudit.records.filter((run) => run.status === "started").length,
         pipelines: pipelines.length,
-        nonterminalPipelines: pipelines.filter((item) => !["completed", "failed", "cancelled"].includes(item.status)).length,
+        nonterminalPipelines: pipelines.filter((item) => !pipelineFinished(item)).length,
         locks: locks.length,
         unresolvedIntegrationOperations: integrationOperations.unresolvedCount ?? "unavailable",
         retainedWorktrees: Array.isArray(retainedWorktrees) ? retainedWorktrees.filter((item) => item.present && !item.inFlight).length : "unavailable",
@@ -14188,11 +14551,11 @@ server.tool(
         jobs: "queued_jobs_only",
         directRuns: directRunAudit.coverage,
         retainedWorktrees: "every bridge-created worktree still registered (queued, direct and parallel jobs); owner says which",
-        detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs and direct runs; counts in summary cover all`,
+        detail: `every unfinished item plus the ${DIAGNOSE_DETAIL_LIMIT} most recent finished jobs, direct runs and pipelines; counts in summary cover all`,
       },
       jobs: detailJobs.map((job) => diagnoseJobView(job)),
       retainedWorktrees,
-      pipelines: pipelines.map((pipeline) => ({
+      pipelines: detailPipelines.map((pipeline) => ({
         pipelineId: pipeline.pipelineId,
         status: pipeline.status,
         ownerInstanceId: pipeline.ownerInstanceId || "",
@@ -15648,8 +16011,9 @@ server.tool(
   {
     cwd: z.string().min(1),
     status: z.enum(["planned", "running", "awaiting_integration", "awaiting_finalization", "finalizing", "integrating", "cleanup_pending", "cleanup_failed", "completed", "failed", "cancelled"]).optional(),
+    limit: z.number().int().positive().max(200).optional().describe("Newest pipelines to show; default 20. The count line always covers every pipeline."),
   },
-  async ({ cwd = "", status = "" }) => {
+  async ({ cwd = "", status = "", limit = 20 }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
     const records = (effectiveQueueMode() === "sqlite"
       ? await listPersistedPipelineRecords(projectRoot || cwd, status)
@@ -15658,13 +16022,14 @@ server.tool(
         .map((record) => pipelineRecordSnapshot(record))
         .filter((record) => !status || record.status === status)
     ).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const shown = records.slice(0, limit);
     return {
       content: [
         {
           type: "text",
           text: [
-            `Pipelines: ${records.length}`,
-            JSON.stringify(records, null, 2),
+            `Pipelines: ${records.length}${shown.length < records.length ? ` (showing the newest ${shown.length})` : ""}`,
+            JSON.stringify(shown, null, 2),
           ].join("\n"),
         },
       ],
@@ -17293,7 +17658,8 @@ async function executeOpenCodeJob(requestedJob, {
   let lockReleaseOutcome = null;
   const releaseAcquiredLock = async () => {
     if (lockReleaseOutcome) return lockReleaseOutcome;
-    stopLockHeartbeat();
+    // Wait for an in-flight renewal: it must not run after the release or quarantine below.
+    await stopLockHeartbeat();
     if (!acquiredLock) {
       lockReleaseOutcome = { needed: false, released: false, text: "not needed" };
       return lockReleaseOutcome;
@@ -18225,8 +18591,12 @@ async function decryptQueuePrivateDetails(envelope, jobId) {
 function enforceQueueResultEvidence(record) {
   const persistedResultText = redactSensitiveText(record.resultText || "");
   const completedWithoutFinal = record.status === "completed" && !persistedResultText.trim();
+  // A writer whose verified worktree diff was empty (noChanges) legitimately has no changed
+  // files or patch hash: the empty worktree is removed and there is nothing to integrate.
+  // Failing it here made a successful "nothing needed" run fail its pipeline.
   const completedWriteWithoutEvidence = record.status === "completed"
     && record.mode === "write"
+    && !record.noChanges
     && !(record.changedFiles || []).length
     && !record.worktreePatchSha256;
   if (completedWithoutFinal || completedWriteWithoutEvidence) {
@@ -24545,6 +24915,10 @@ export const __selfTest = {
     readOnlyWorkspaceDrift,
     reconcilePipelineIntegrationOperationStates,
     trackedTargetStateSha256,
+    // tests/review2-a.js
+    beginBridgeStartupRecovery,
+    readPositiveIntEnv,
+    readUserLineEndingGitConfig,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -24623,15 +24997,11 @@ if (!BRIDGE_RUN_AS_MAIN) {
   }
   // Connect first so the client's MCP startup timeout never waits on recovery; tool calls
   // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
-  bridgeStartupRecovery = reconcileQueueStateAtStartup().catch((error) => {
-    logEvent("error", "state.startup_recovery_failed", {
-      errorType: error?.errorType || "startup_recovery_failed",
-      error: redactSensitiveText(error?.message || String(error)),
-    });
-  });
+  beginBridgeStartupRecovery();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  await bridgeStartupRecovery;
+  // A failed recovery is already logged and answered per tool call; it must not end the process.
+  await bridgeStartupRecovery.catch(() => {});
   void reclaimProvenGoneProviderQuarantines({ force: true });
   void sweepStaleIndexScratchDirs();
 }

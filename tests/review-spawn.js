@@ -41,13 +41,26 @@ await mkdir(stateDir, { recursive: true });
 hooks.stateDirectoryOverride = stateDir;
 
 const results = [];
+// A test that cannot run in this environment says so through skipTest(); it is reported as
+// "skip" and counted apart from the passes. notePartialSkip() marks a test whose remaining
+// checks could not run after its earlier ones passed.
+class SkipTest extends Error {}
+const skipTest = (reason) => { throw new SkipTest(reason); };
+let partialSkip = "";
+const notePartialSkip = (reason) => { partialSkip = reason; };
 async function test(name, body) {
   const started = Date.now();
+  partialSkip = "";
   try {
     await body();
-    results.push({ name, ok: true });
-    process.stdout.write(`ok   ${name} (${Date.now() - started} ms)\n`);
+    results.push({ name, ok: true, partialSkip });
+    process.stdout.write(`ok   ${name} (${Date.now() - started} ms)${partialSkip ? ` [partly skipped: ${partialSkip}]` : ""}\n`);
   } catch (error) {
+    if (error instanceof SkipTest) {
+      results.push({ name, ok: false, skipped: error.message });
+      process.stdout.write(`skip ${name}: ${error.message}\n`);
+      return;
+    }
     results.push({ name, ok: false, error });
     process.stdout.write(`FAIL ${name}\n     ${String(error?.stack || error).split("\n").slice(0, 6).join("\n     ")}\n`);
   }
@@ -171,7 +184,7 @@ await test("#1 opencode run receives --model=/--variant= as single tokens and a 
   assert.ok(String(args.at(-1)).includes("--attach=http://host:4096 do it"), "the prompt text itself is preserved");
 });
 await test("#1 end to end: the spawned opencode sees the pinned model and variant as single tokens", async () => {
-  if (!fakeOpenCodeReady) return console.log(`     skipped: ${fakeOpenCodeSkipReason}`);
+  if (!fakeOpenCodeReady) skipTest(fakeOpenCodeSkipReason);
   const result = await need("runOpenCode")(fixtureAgentName, "-starts with a dash", workCwd, false, 20_000, { agentMetadata: fixtureMetadata() });
   assert.equal(result.errorType, null, `${result.errorType}: ${result.stderr}`);
   const argv = await lastFakeRunArgs();
@@ -182,7 +195,7 @@ await test("#1 end to end: the spawned opencode sees the pinned model and varian
 
 // #2 provider slot taken on the provider the run will actually use
 await test("#2 a model override leases the overridden provider's slot", async () => {
-  if (!fakeOpenCodeReady) return console.log(`     skipped: ${fakeOpenCodeSkipReason}`);
+  if (!fakeOpenCodeReady) skipTest(fakeOpenCodeSkipReason);
   const requirement = { provider: "google", model: "antigravity-gemini-3.8-flash", variant: "high" };
   const googleKey = `${CONFIG.providerConcurrencyKey}:google`;
   hooks.selfTestModelOverrideAllowlist = ["google/antigravity-gemini-3.8-flash@high"];
@@ -296,7 +309,7 @@ await test("#6 a slot wait past its own budget fails as provider_slot_wait_timeo
   }
 });
 await test("#6 the run timeout starts when the slot is granted", async () => {
-  if (!fakeOpenCodeReady) return console.log(`     skipped: ${fakeOpenCodeSkipReason}`);
+  if (!fakeOpenCodeReady) skipTest(fakeOpenCodeSkipReason);
   const key = `${CONFIG.providerConcurrencyKey}:opencode`;
   const held = await fillProviderKey(key);
   // Free one slot after 1.5 s (inside CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=2000). The fake run
@@ -565,7 +578,10 @@ await test("#17 PATH entries that are files do not break resolution; symlinked b
   try {
     await symlink(process.execPath, linkName, "file");
   } catch (error) {
-    if (["EPERM", "EACCES"].includes(error?.code)) return console.log("     symlink part skipped: no symlink privilege");
+    if (["EPERM", "EACCES"].includes(error?.code)) {
+      notePartialSkip("symlink part: no symlink privilege");
+      return;
+    }
     throw error;
   }
   try {
@@ -592,6 +608,32 @@ await test("#18 the capacity snapshot reports each provider key with its own cap
     await need("releaseProviderLease")(lease.lease);
   }
   assert.equal(need("providerKeyLikePattern")("a_b%c\\d"), "a\\_b\\%c\\\\d:%");
+});
+
+// #18b a stored limit from before a raise binds only while leases taken under it are held
+await test("#18b an idle key with an old stored limit reports the configured capacity", async () => {
+  const key = `${CONFIG.providerConcurrencyKey}:review-stale-capacity`;
+  const setStored = async (capacity) => {
+    const db = await need("openProviderLeaseDb")({ deadlineAt: Date.now() + 5000 });
+    try {
+      db.prepare("INSERT INTO provider_capacities (provider_key, capacity, updated_at) VALUES (?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET capacity = excluded.capacity").run(key, capacity, Date.now());
+    } finally {
+      need("closeDb")(db);
+    }
+  };
+  const lower = Math.max(1, CONFIG.providerConcurrencyLimit - 1);
+  const entryFor = async () => (await need("providerCapacitySnapshot")()).keys.find((item) => item.providerKey === key);
+  await setStored(CONFIG.providerConcurrencyLimit + 5);
+  assert.equal((await entryFor()).capacity, CONFIG.providerConcurrencyLimit, "an idle key shows the limit its next acquire will use");
+  const lease = await need("acquireProviderLease")({ providerKey: key, timeoutMs: 5000 });
+  try {
+    await setStored(lower);
+    const held = await entryFor();
+    assert.equal(held.leases, 1);
+    assert.equal(held.capacity, Math.min(lower, CONFIG.providerConcurrencyLimit), "while leases are held the stricter stored limit binds");
+  } finally {
+    await need("releaseProviderLease")(lease.lease);
+  }
 });
 
 // #19 DEPENDENCY_REQUIRED heading
@@ -699,8 +741,12 @@ await test("#28 agent timeouts are bounded below the supervisor timer limit", as
 // ---------------------------------------------------------------------------
 hooks.stateDirectoryOverride = "";
 await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
-const failed = results.filter((item) => !item.ok);
-process.stdout.write(`\n${results.length - failed.length}/${results.length} review-spawn tests passed.\n`);
+const skipped = results.filter((item) => item.skipped);
+const failed = results.filter((item) => !item.ok && !item.skipped);
+process.stdout.write(`\n${results.length - failed.length - skipped.length}/${results.length} review-spawn tests passed${skipped.length ? `, ${skipped.length} skipped` : ""}.\n`);
+if (skipped.length) {
+  process.stdout.write(`Skipped (not passed):\n${skipped.map((item) => `- ${item.name}: ${item.skipped}`).join("\n")}\n`);
+}
 if (failed.length) {
   process.stdout.write(`Failed:\n${failed.map((item) => `- ${item.name}`).join("\n")}\n`);
 }
