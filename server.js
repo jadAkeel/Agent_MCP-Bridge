@@ -2682,6 +2682,26 @@ async function validationCommandPreflightError(validationCommand, { dryRun = fal
   return prepared.ok ? null : { errorType: prepared.errorType, error: prepared.error, command };
 }
 
+// A validation command other than bridge Git (npm test, pytest, node scripts) runs under the
+// process-tree supervisor: a timeout, a cancellation or the bridge's death ends the whole tree,
+// not only the direct child, so no leftover test process keeps writing the checkout after the
+// bridge rolled it back and released its lock. Bridge Git (git diff --check) spawns nothing that
+// outlives it and stays on the plain runner, which is much cheaper per call.
+async function runValidationProcess(executablePath, args, cwd, timeoutMs, env, { signal = null } = {}) {
+  const executable = path.basename(executablePath).toLowerCase().replace(/.(exe|cmd|bat|ps1)$/i, "");
+  if (executable === "git") return runCommand(executablePath, args, cwd, timeoutMs, env, { signal });
+  const supervised = await runSpawnCommand(executablePath, args, cwd, timeoutMs, env, { signal });
+  return {
+    stdout: supervised.stdout || "",
+    stderr: supervised.stderr || "",
+    exitCode: supervised.timedOut ? "timeout" : supervised.exitCode,
+    // The supervisor could not confirm the tree is gone: something may still write the checkout.
+    processTreeUnconfirmed: supervised.terminationErrorType === "process_tree_termination_unconfirmed"
+      || supervised.terminationErrorType === "process_supervisor_watchdog_expired",
+    terminationErrorType: supervised.terminationErrorType || "",
+  };
+}
+
 function runValidationGate(...args) {
   return integrationTimed("validation", () => runValidationGateUntimed(...args));
 }
@@ -2775,14 +2795,14 @@ async function runValidationGateUntimed({ command, cwd, dryRun = false, timeoutM
       whitespaceConfig = ["-c", `core.whitespace=${existing ? `${existing},` : ""}cr-at-eol`];
     }
   }
-  let result = await runCommand(prepared.executablePath, [...whitespaceConfig, ...prepared.args], cwd || process.cwd(), timeoutMs, buildValidationEnv(), { signal });
+  let result = await runValidationProcess(prepared.executablePath, [...whitespaceConfig, ...prepared.args], cwd || process.cwd(), timeoutMs, buildValidationEnv(), { signal });
   const isUnstagedDiffCheck = executable === "git"
     && prepared.args[0] === "diff"
     && prepared.args.slice(1).includes("--check")
     && !prepared.args.slice(1).some((argument) => argument === "--cached" || argument === "--staged");
   if (result.exitCode === 0 && isUnstagedDiffCheck) {
     const remainingTimeoutMs = Math.max(1, timeoutMs - (nowMs() - started));
-    const stagedResult = await runCommand(prepared.executablePath, [
+    const stagedResult = await runValidationProcess(prepared.executablePath, [
       ...whitespaceConfig,
       "diff",
       "--cached",
@@ -2790,6 +2810,7 @@ async function runValidationGateUntimed({ command, cwd, dryRun = false, timeoutM
     ], cwd || process.cwd(), remainingTimeoutMs, buildValidationEnv(), { signal });
     result = {
       exitCode: stagedResult.exitCode,
+      processTreeUnconfirmed: Boolean(result.processTreeUnconfirmed || stagedResult.processTreeUnconfirmed),
       stdout: [result.stdout, stagedResult.stdout].filter(Boolean).join("\n"),
       stderr: [result.stderr, stagedResult.stderr].filter(Boolean).join("\n"),
     };
@@ -2801,7 +2822,10 @@ async function runValidationGateUntimed({ command, cwd, dryRun = false, timeoutM
     durationMs: nowMs() - started,
     stdout: truncateText(redactSensitiveText(result.stdout || ""), 6000),
     stderr: truncateText(redactSensitiveText(result.stderr || ""), 6000),
-    errorType: result.exitCode === 0 ? null : "validation_command_failed",
+    errorType: result.processTreeUnconfirmed
+      ? "validation_process_tree_unconfirmed"
+      : result.exitCode === 0 ? null : "validation_command_failed",
+    ...(result.processTreeUnconfirmed ? { processTreeUnconfirmed: true } : {}),
   };
 }
 
@@ -12526,6 +12550,24 @@ async function integratePatchWithoutSerialLock({
     }
     let validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec, signal });
     if (signal?.aborted) return ownershipLostResult("during validation");
+    if (validationGate.processTreeUnconfirmed) {
+      // Rolling back now could be overwritten by a validation process that is still running, and
+      // releasing the lock would let the next writer in. Quarantine: writers stay blocked until
+      // an operator has checked that the process tree is gone (resolve_integration_quarantine).
+      await quarantineIntegrationOperation(targetCwd, integrationOperationId, ["validating"], "validation_process_unconfirmed", integrationAuthority, {
+        error: "The validation command's process tree could not be confirmed terminated.",
+      });
+      integrationOperationCommitted = true;
+      return {
+        ok: false,
+        errorType: "validation_process_tree_unconfirmed",
+        error: "The validation command timed out or was stopped, and the bridge could not confirm that every process it started has ended. Nothing was rolled back, because a surviving process could still write the checkout; the integration operation is quarantined and writers of this repository are blocked.",
+        suggestedFix: "Check that no process started by the validation command is still running (Task Manager or Get-Process), then close the quarantine with resolve_integration_quarantine: verify_restored after putting the affected paths back, or ask the user to run accept_current from bin/pipeline-admin.js.",
+        changedFiles: patch.changedFiles,
+        operationId: integrationOperationId,
+        validationGate,
+      };
+    }
     const afterValidation = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const postValidationIndex = await captureGitIndexIdentity(targetCwd);
     const validationIndexChanged = !postValidationIndex.ok || postValidationIndex.indexSha256 !== preApplyFullIndexSha256;
