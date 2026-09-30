@@ -141,6 +141,19 @@ test("G-05: both redactors remove every gate shape (direct stdout and the greedy
   assert.equal(redactLikelySecrets(ordinary), ordinary);
 });
 
+test("G-05: a long run of blanks after an env value stays linear in every redactor", async () => {
+  // The env-value pattern once ended in \s*;?\s*, which backtracked quadratically: 32,000
+  // spaces took about 5 s in redactSensitiveText, and it runs on whole patches and logs.
+  const input = `private_key=abcdefg1${" ".repeat(100_000)}x`;
+  for (const [name, redact] of [["redactSensitiveText", redactSensitiveText], ["redactLikelySecrets", redactLikelySecrets]]) {
+    const started = performance.now();
+    redact(input);
+    const elapsedMs = performance.now() - started;
+    assert.ok(elapsedMs < 1000, `${name} took ${Math.round(elapsedMs)} ms on 100,000 blanks`);
+  }
+  assert.equal(redactLikelySecrets("DB_PASSWORD=S3cr3tValue1 ; # note").includes("S3cr3tValue1"), false, "a trailing ; and comment still match");
+});
+
 test("G-05: a log event carries none of the shapes", async () => {
   assert.equal(CONFIG.logLevel, "error");
   const originalError = console.error;

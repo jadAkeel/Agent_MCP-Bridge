@@ -22,7 +22,7 @@ test("resolve-quarantine: modes, the required reason and the confirmation the to
   assert.equal(verify.mode, "verify_restored");
   const verifyCall = toolCall(verify);
   assert.equal(verifyCall.name, "resolve_integration_quarantine");
-  assert.equal(verifyCall.arguments.via, "cli");
+  assert.deepEqual([verifyCall.arguments.via, verifyCall.arguments.operator], [undefined, undefined], "the bridge sets who and how, not the caller");
   assert.equal(verifyCall.arguments.confirmation, undefined, "verify_restored needs no confirmation");
   const accept = toolCall(parseArguments(["resolve-quarantine", "integration-1", "--cwd", cwd, "--accept-current", "--reason", "inspected src/a.ts"]));
   assert.deepEqual([accept.arguments.mode, accept.arguments.reason, accept.arguments.confirmation], ["accept_current", "inspected src/a.ts", "integration-1"]);

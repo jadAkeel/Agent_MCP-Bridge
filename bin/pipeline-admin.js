@@ -11,7 +11,7 @@
 // resolve-quarantine calls resolve_integration_quarantine (G-01); see "A quarantine that does
 // not clear" in docs/USER_GUIDE.md. Every command takes --config <absolute config.toml>.
 
-import { homedir, userInfo } from "node:os";
+import { homedir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -81,8 +81,6 @@ function toolCall(options) {
       arguments: { cwd: options.cwd, pipelineId: options.pipelineId, confirmation: options.confirmation, reason: options.reason },
     };
   }
-  let operator = "unknown";
-  try { operator = userInfo().username || operator; } catch { /* Keep "unknown". */ }
   return {
     name: "resolve_integration_quarantine",
     arguments: {
@@ -92,8 +90,6 @@ function toolCall(options) {
       ...(options.reason ? { reason: options.reason } : {}),
       // Naming the operation id and --accept-current on the command line is the confirmation.
       ...(options.mode === "accept_current" ? { confirmation: options.operationId } : {}),
-      operator,
-      via: "cli",
     },
   };
 }
@@ -119,7 +115,9 @@ async function main() {
     command: entry.command,
     args: entry.args,
     cwd: options.cwd,
-    env: { ...process.env, ...entry.env },
+    // The bridge started here serves a person at a terminal: it may run accept_current and
+    // records the resolution as via "cli", with the OS user as the operator.
+    env: { ...process.env, ...entry.env, CODEX_OPENCODE_OPERATOR_CLI: "1" },
     stderr: "pipe",
   });
   try {

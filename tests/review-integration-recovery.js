@@ -62,6 +62,19 @@ const {
   writeFile,
 } = __selfTest.internals;
 const { readdir, rmdir, unlink } = await import("node:fs/promises");
+const { userInfo } = await import("node:os");
+// The bridge bin/pipeline-admin.js starts for an operator; only it may run accept_current.
+async function asOperatorCli(action) {
+  const previous = process.env.CODEX_OPENCODE_OPERATOR_CLI;
+  process.env.CODEX_OPENCODE_OPERATOR_CLI = "1";
+  try {
+    return await action();
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_OPENCODE_OPERATOR_CLI;
+    else process.env.CODEX_OPENCODE_OPERATOR_CLI = previous;
+  }
+}
+const OS_OPERATOR = (() => { try { return userInfo().username || "unknown"; } catch { return "unknown"; } })();
 
 const initialStateDirectoryOverride = selfTestHooks.stateDirectoryOverride;
 const stateDir = await mkdtemp(path.join(tmpdir(), "codex-opencode-ri2-state-"));
@@ -878,17 +891,21 @@ test("G-01 (d) accept_current needs a reason and the confirmation, and is refuse
   assert.match(blankReason, /Error type: integration_quarantine_reason_required/);
   const noConfirmation = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected" });
   assert.match(noConfirmation, /Error type: integration_quarantine_confirmation_mismatch/);
+  // An MCP client (an agent) cannot accept on its own, and cannot claim to be the CLI.
+  const fromAgent = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected", confirmation: operationId, via: "cli", operator: "someone" });
+  assert.match(fromAgent, /Error type: integration_quarantine_accept_requires_operator/);
+  assert.match(fromAgent, /pipeline-admin.js resolve-quarantine/);
   const reader = await acquireHardLock({ owner: "codex", agent: "reviewer", cwd: repo.root, lockType: "read", paths: ["src"] });
   assert.equal(reader.ok, true, JSON.stringify(reader));
-  const busy = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected", confirmation: operationId });
+  const busy = await asOperatorCli(() => callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected", confirmation: operationId }));
   assert.match(busy, /Error type: integration_quarantine_resolution_busy/);
   await releaseHardLock(reader.lock.id, reader.lock.token, [], repo.root);
   assert.deepEqual(await journalRow(repo, operationId), before, "every refusal leaves the operation as it was");
 
   const reason = "Inspected src/a.txt: the edit is mine and stays; the patch is not wanted.";
-  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason, confirmation: operationId, operator: "g01-test-operator" });
+  const text = await asOperatorCli(() => callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason, confirmation: operationId }));
   assert.match(text, /Closed as: resolved_by_operator/);
-  assert.match(text, /Resolved by: g01-test-operator/);
+  assert.ok(text.includes(`Resolved by: ${OS_OPERATOR}`), text);
   const closed = await operationResult(repo, operationId);
   assert.equal(closed.status, "resolved_by_operator");
   assert.equal(closed.result.operatorReason, reason);
@@ -897,7 +914,7 @@ test("G-01 (d) accept_current needs a reason and the confirmation, and is refuse
   assert.equal(await repo.read("src/a.txt"), "someone else's edit\n", "accept_current never writes the checkout");
   assert.deepEqual(await journalFiles(repo, operationId), files, "(e) journal rows and pre-images survive");
   const view = (await integrationJournalDiagnosis(repo.root)).recentTerminal.find((item) => item.operationId === operationId);
-  assert.deepEqual([view.status, view.reason, view.resolvedBy, view.operatorReason], ["resolved_by_operator", "affected_path_drift", "g01-test-operator", reason]);
+  assert.deepEqual([view.status, view.reason, view.resolvedBy, view.operatorReason], ["resolved_by_operator", "affected_path_drift", OS_OPERATOR, reason]);
   const writer = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/b.txt"] });
   assert.equal(writer.ok, true, JSON.stringify(writer));
   await releaseHardLock(writer.lock.id, writer.lock.token, [], repo.root);
@@ -919,7 +936,7 @@ test("G-01 unreadable evidence cannot be verified, only accepted; another quaran
   assert.equal((await operationResult(repo, operationId)).status, "quarantined");
 
   // Resolving the first leaves writers blocked by the second.
-  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "evidence corrupt; checkout inspected", confirmation: operationId });
+  const text = await asOperatorCli(() => callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "evidence corrupt; checkout inspected", confirmation: operationId }));
   assert.match(text, /Closed as: resolved_by_operator/);
   assert.match(text, new RegExp(`Writers unblocked: no, still blocked by ${second}`));
   assert.equal((await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/c.txt"] })).errorType, "integration_recovery_pending");

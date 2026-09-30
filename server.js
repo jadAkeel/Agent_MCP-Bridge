@@ -351,6 +351,9 @@ const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new RepositoryRootSet();
 // resolved_by_operator close a quarantine through resolve_integration_quarantine (G-01).
 const INTEGRATION_RESOLVED_STATUSES = Object.freeze(["committed", "rolled_back", "recovered_noop", "recovered_verified", "resolved_by_operator"]);
 const INTEGRATION_RESOLVED_SQL = INTEGRATION_RESOLVED_STATUSES.map((status) => `'${status}'`).join(", ");
+// Set to "1" only by bin/pipeline-admin.js for the bridge it starts; never in a client's MCP entry.
+// It is what lets resolve_integration_quarantine accept_current run (an operator at a terminal).
+const OPERATOR_CLI_ENV = "CODEX_OPENCODE_OPERATOR_CLI";
 const PRIVATE_STATE_VACUUMED_DB_PATHS = new Set();
 const INTEGRATION_PREVIEW_TTL_MS = 1000 * 60 * 60;
 const REPOSITORY_SCOPE_LOCK_PATH = ".";
@@ -1343,7 +1346,7 @@ async function inspectRepositoryOperationState(cwd) {
     ok: false,
     errorType: "target_operation_in_progress",
     error: `The repository has ${described.join(" and ")}. The bridge does not apply patches to, or start writers from, a repository in the middle of a Git operation; allowDirtyTarget does not change this. Finish or abort the operation, then retry.`,
-    suggestedFix: "Finish or abort the operation in the repository (git merge --continue/--abort, git rebase --continue/--abort, git cherry-pick --continue/--abort, git revert --continue/--abort, git bisect reset; resolve and stage every conflicted file), then retry.",
+    suggestedFix: "Finish or abort the operation in the repository (git merge --continue/--abort, git rebase --continue/--abort, git cherry-pick --continue/--abort (or --quit for a leftover sequencer), git revert --continue/--abort/--quit, git bisect reset; resolve and stage every conflicted file), then retry.",
     operationState: found.map((entry) => entry.name),
     unmergedPaths: unmergedPaths.slice(0, 50),
     conflictingPaths: unmergedPaths.slice(0, 50),
@@ -1471,8 +1474,10 @@ const LIKELY_SECRET_PATTERNS = [
   // invalid_token); the value needs a letter and a digit, so "test-password" passes.
   /(?<![A-Za-z0-9])(?:authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|password|passwd|secret|client[-_]?secret|credential)["']?\s*[:=]\s*(["'])(?=[^"'\s]{0,256}[0-9])(?=[^"'\s]{0,256}[A-Za-z])[^"'\s]{8,256}\1/i,
   // Unquoted .env / YAML value that is the whole rest of the line (DB_PASSWORD=..., password:
-  // ...). No dots in the value, so attribute access such as settings.API_KEY passes.
-  /(?:^\+?|\s)(?:export\s+)?[A-Za-z0-9_]{0,40}(?:password|passwd|secret|api_?key|access_?key|private_?key|auth_?token|access_?token|refresh_?token|credential)[A-Za-z0-9_]{0,40}\s*[:=]\s*(?=[^\s"'#]{0,256}[0-9])(?=[^\s"'#]{0,256}[A-Za-z])[^\s"'#(){}\[\].$,;]{8,256}\s*;?\s*(?:#.{0,256})?$/im,
+  // ...). No dots in the value, so attribute access such as settings.API_KEY passes. The tail
+  // is [ \t]* rather than \s*;?\s*: two adjacent \s* backtrack quadratically on a long run of
+  // blanks, and every redactor applies this pattern to whole patches and logs (G-05 review).
+  /(?:^\+?|\s)(?:export\s+)?[A-Za-z0-9_]{0,40}(?:password|passwd|secret|api_?key|access_?key|private_?key|auth_?token|access_?token|refresh_?token|credential)[A-Za-z0-9_]{0,40}\s*[:=]\s*(?=[^\s"'#]{0,256}[0-9])(?=[^\s"'#]{0,256}[A-Za-z])[^\s"'#(){}\[\].$,;]{8,256}[ \t]*(?:;[ \t]*)?(?:#.{0,256})?$/im,
 ];
 
 // Agent answers quote code back to the coordinator. The greedy log redaction turned
@@ -11231,7 +11236,7 @@ async function integratePatchSerially(options) {
           : null,
         conflictingPaths: [],
         suggestedFix: operationStatus === "quarantined"
-          ? "Run diagnose_opencode_bridge for this repository: its integrationOperations section shows the quarantined operation, its reason and affected paths. A target_head_or_index_drift quarantine is re-checked and closed automatically once those paths and their index entries are back at their pre-integration state. For any other reason use resolve_integration_quarantine (or `node bin/pipeline-admin.js resolve-quarantine <operationId>`): mode verify_restored after you put the affected paths back (it names any path still wrong and changes nothing), or mode accept_current with a reason once you have inspected the checkout and accept it as it is. See \"A quarantine that does not clear\" in docs/USER_GUIDE.md."
+          ? "Run diagnose_opencode_bridge for this repository: its integrationOperations section shows the quarantined operation, its reason and affected paths. A target_head_or_index_drift quarantine is re-checked and closed automatically once those paths and their index entries are back at their pre-integration state. For any other reason use resolve_integration_quarantine (or `node bin/pipeline-admin.js resolve-quarantine <operationId>`): mode verify_restored after you put the affected paths back (it names any path still wrong and changes nothing), or, once the user has inspected the checkout and accepts it as it is, ask them to run `node bin/pipeline-admin.js resolve-quarantine <operationId> --cwd <repository> --accept-current --reason \"...\"` (accept_current is operator-only, not an MCP mode). See \"A quarantine that does not clear\" in docs/USER_GUIDE.md."
           : "Run diagnose_opencode_bridge for this repository and read its integrationOperations section; the deferred recovery pass retries operations whose evidence was temporarily unavailable. Waiting for other jobs does not clear this.",
       };
     }
@@ -11454,6 +11459,15 @@ async function resolveIntegrationQuarantine({ cwd, operationId, mode, reason = "
   }
   if (mode === "accept_current" && confirmation !== operationId) {
     return reject("integration_quarantine_confirmation_mismatch", "accept_current needs confirmation set to the exact operation id.", "Repeat with confirmation equal to operationId.");
+  }
+  // accept_current releases the lock that protects the checkout on a person's word alone, so an
+  // MCP client (an agent) cannot give it; verify_restored proves the state and stays open to it.
+  if (mode === "accept_current" && via !== "cli") {
+    return reject(
+      "integration_quarantine_accept_requires_operator",
+      "accept_current is available only from the operator command line, not to an MCP client.",
+      `Ask the user to inspect the checkout and, if they accept it as it is, run: node bin/pipeline-admin.js resolve-quarantine ${operationId} --cwd <repository> --accept-current --reason "<what was inspected and why>". If the affected paths can be put back instead, do that and use mode verify_restored.`,
+    );
   }
   const requestedCwd = path.resolve(cwd || process.cwd());
   const top = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
@@ -16276,11 +16290,12 @@ server.tool(
     mode: z.enum(INTEGRATION_QUARANTINE_RESOLUTION_MODES),
     reason: z.string().max(500).optional().describe("Required for accept_current: what was inspected and why the current state is accepted."),
     confirmation: z.string().optional().describe("Required for accept_current: must exactly equal operationId."),
-    operator: z.string().max(200).optional().describe("Who resolves it; defaults to the OS user running the bridge."),
-    via: z.enum(["mcp", "cli"]).optional().describe("Set by bin/pipeline-admin.js; leave unset."),
   },
-  async ({ cwd, operationId, mode, reason = "", confirmation = "", operator = "", via = "mcp" }) => {
-    const result = await resolveIntegrationQuarantine({ cwd, operationId, mode, reason, confirmation, operator, via });
+  async ({ cwd, operationId, mode, reason = "", confirmation = "" }) => {
+    // Who and how are set here, never by the caller: the operator is the OS user running this
+    // bridge, and "cli" only for the bridge bin/pipeline-admin.js starts for a person at a terminal.
+    const via = process.env[OPERATOR_CLI_ENV] === "1" ? "cli" : "mcp";
+    const result = await resolveIntegrationQuarantine({ cwd, operationId, mode, reason, confirmation, via });
     return { content: [{ type: "text", text: formatIntegrationQuarantineResolution(result) }] };
   }
 );
@@ -18119,11 +18134,11 @@ async function executeOpenCodeJob(requestedJob, {
                   durationMs: nowMs() - toolStarted,
                   lockedPaths: lockPlan.lockedPaths,
                   allowedEdits: lockPlan.allowedEdits,
-                  conflictingPaths: dirtyDetails.conflictingPaths,
+                  conflictingPaths: worktreeResult.conflictingPaths || dirtyDetails.conflictingPaths,
                   dirtyFiles: dirtyDetails.dirtyFiles,
                   overlappingFiles: dirtyDetails.overlappingFiles,
                   disjointFiles: dirtyDetails.disjointFiles,
-                  suggestedFix: "Create/select a clean reproducible checkpoint, choose a safe worktree root, and ensure this cwd is a Git repository with git available.",
+                  suggestedFix: worktreeResult.suggestedFix || "Create/select a clean reproducible checkpoint, choose a safe worktree root, and ensure this cwd is a Git repository with git available.",
                 }),
               },
             ],
@@ -21606,7 +21621,7 @@ async function reconcilePipelineIntegrationOperationStates(record, { persist = t
     // recovered_verified proved the pre-state like recovered_noop. resolved_by_operator proves
     // nothing about the patch, so its item stays quarantined; abandon the pipeline to retire it.
     else if (["rolled_back", "recovered_noop", "recovered_verified"].includes(operation.status)) status = "pending";
-    else if (operation.status === "quarantined") status = "quarantined";
+    else if (["quarantined", "resolved_by_operator"].includes(operation.status)) status = "quarantined";
     if (status !== item.status) statuses.set(item.operationId, { from: item.status, to: status });
   }
   if (!statuses.size) return record;
@@ -23474,11 +23489,11 @@ server.tool(
                 durationMs: nowMs() - toolStarted,
                 lockedPaths: lockPlan.lockedPaths,
                 allowedEdits: lockPlan.allowedEdits,
-                conflictingPaths: dirtyDetails.conflictingPaths,
+                conflictingPaths: worktreeResult.conflictingPaths || dirtyDetails.conflictingPaths,
                 dirtyFiles: dirtyDetails.dirtyFiles,
                 overlappingFiles: dirtyDetails.overlappingFiles,
                 disjointFiles: dirtyDetails.disjointFiles,
-                suggestedFix: "Create/select a clean reproducible checkpoint, choose a safe worktree root, and ensure this cwd is a Git repository with git available.",
+                suggestedFix: worktreeResult.suggestedFix || "Create/select a clean reproducible checkpoint, choose a safe worktree root, and ensure this cwd is a Git repository with git available.",
               }),
             },
           ],

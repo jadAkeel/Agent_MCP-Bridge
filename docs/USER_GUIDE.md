@@ -356,6 +356,8 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 
 **Step 2: wait for the ones that clear themselves.** Two reasons clear on their own, within a few minutes and after every bridge restart, once the affected paths and their index entries are back at their old state: `target_head_or_index_drift` and `repository_state_drift`. For those, undo any staging of the affected paths (`git restore --staged <path>`) and wait.
 
+**Before the first resolve after an upgrade or a rollback: restart every bridge.** Restart Codex and Claude Code (and any other client) so no bridge process still runs a version older than the one with `resolve_integration_quarantine`. An older bridge does not know the two closed statuses: its recovery pass treats them as unknown and quarantines the operation again (`journal_status_unknown`), overwriting the recorded resolution. For the same reason, rolling back to a release older than this one re-blocks every repository whose quarantine was resolved.
+
 **Step 3: resolve the others.** Run the commands below from the bridge repository; `--cwd` is the absolute path of the blocked repository. They start the bridge from the `opencode` entry in `~/.codex/config.toml`. Pick one of two modes. Both refuse to run while any job holds a lock in the repository, so let running jobs finish first (`list_opencode_jobs`). Neither mode deletes a journal row, a pre-image, the key or a database. Both record who resolved it, when and in which mode.
 
 - **The old state is what you want** (the patch should not stay, and you have put the files back): first make each affected path exactly what it was before the integration. Usually that is the committed version (`git checkout -- <path>`); if the file had uncommitted edits before, put those back too. Then run:
@@ -372,7 +374,7 @@ When something fails, the bridge returns an error type. Copy it and look it up h
   node bin/pipeline-admin.js resolve-quarantine <operationId> --cwd <repository> --accept-current --reason "<what you inspected and why you keep it>"
   ```
 
-  (MCP: `mode: "accept_current"`, `reason`, and `confirmation` equal to the operation id). It closes the operation as `resolved_by_operator` and records your reason and the current state of each affected path. It does not change any file. Afterwards, you own the checkout's state: review `git diff` and commit or revert as usual.
+  This mode exists only on this command line: an MCP client (Codex, Claude, any agent) that asks for `accept_current` is refused with `integration_quarantine_accept_requires_operator`, so a person has to look first. It closes the operation as `resolved_by_operator` and records your reason, your OS user name and the current state of each affected path. It does not change the affected files. Afterwards, you own the checkout's state: review `git diff` and commit or revert as usual.
 
 The command prints `Writers unblocked: yes`, or names another operation that still blocks the repository. Resolve that one the same way.
 
