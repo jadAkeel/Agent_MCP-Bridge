@@ -25,6 +25,8 @@ async function git(args, cwd = repo) {
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+// A test that cannot run here throws SkipTest: reported as "skip" and counted apart from passes.
+class SkipTest extends Error {}
 
 async function sharedDependencies() {
   await mkdir(path.join(shared, "pkg", "lib"), { recursive: true });
@@ -73,10 +75,7 @@ test("a tracked symlink is git's own entry and is left in place", async () => {
     await symlink(shared, probe, "dir");
     await rm(probe, { force: true });
   } catch (error) {
-    if (error?.code === "EPERM") {
-      process.stdout.write("skip (symlinks need Developer Mode or admin on this Windows host)\n");
-      return;
-    }
+    if (error?.code === "EPERM") throw new SkipTest("symlinks need Developer Mode or admin on this Windows host");
     throw error;
   }
   const trackedRepo = path.join(root, "tracked-repo");
@@ -93,6 +92,7 @@ test("a tracked symlink is git's own entry and is left in place", async () => {
 });
 
 let failed = 0;
+let skipped = 0;
 try {
   await mkdir(repo, { recursive: true });
   await git(["init", "-q"]);
@@ -106,6 +106,11 @@ try {
       await fn();
       process.stdout.write(`ok   ${name}\n`);
     } catch (error) {
+      if (error instanceof SkipTest) {
+        skipped += 1;
+        process.stdout.write(`skip ${name}: ${error.message}\n`);
+        continue;
+      }
       failed += 1;
       process.stdout.write(`FAIL ${name}\n${error?.stack || error}\n`);
     }
@@ -117,5 +122,5 @@ if (failed) {
   process.stdout.write(`${failed} of ${tests.length} B-030 tests failed.\n`);
   process.exit(1);
 }
-process.stdout.write(`All ${tests.length} B-030 tests passed.\n`);
+process.stdout.write(`${tests.length - skipped} of ${tests.length} B-030 tests passed${skipped ? `, ${skipped} skipped` : ""}.\n`);
 process.exit(0);
