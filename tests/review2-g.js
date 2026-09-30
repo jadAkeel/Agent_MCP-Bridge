@@ -16,6 +16,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile, copy
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { SkipTest, finishSkips } from "./skip-gate.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(process.env.REVIEW2_G_ROOT || path.join(HERE, ".."));
@@ -43,8 +44,9 @@ async function withDependencies(directory) {
   await symlink(DEPENDENCIES, path.join(directory, "node_modules"), LINK_KIND);
 }
 const tests = [];
-// A test that cannot run here throws SkipTest: reported as "skip" and counted apart from passes.
-class SkipTest extends Error {}
+// A test that cannot run here throws SkipTest (tests/skip-gate.js): reported as "skip", counted
+// apart from passes, and failing the file unless marked optional. sh is required: the concurrency
+// test's fake opencode is an sh script.
 const only = process.env.REVIEW2_G_ONLY || "";
 const test = (name, fn) => { if (!only || name.includes(only)) tests.push({ name, fn }); };
 
@@ -328,7 +330,7 @@ test("R-166 the profile smoke runs orchestrator, reviewer and tester, each with 
 // ----------------------------------------------------------------
 
 let failed = 0;
-let skipped = 0;
+const skips = [];
 try {
   for (const { name, fn } of tests) {
     try {
@@ -336,7 +338,7 @@ try {
       process.stdout.write(`ok   ${name}\n`);
     } catch (error) {
       if (error instanceof SkipTest) {
-        skipped += 1;
+        skips.push({ name, reason: error.message, optional: error.optional });
         process.stdout.write(`skip ${name}: ${error.message}\n`);
         continue;
       }
@@ -352,9 +354,10 @@ try {
     await rm(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
   }
 }
-if (failed) {
-  process.stdout.write(`${failed} of ${tests.length} review2-g regression tests failed.\n`);
+const skipGateFailed = finishSkips({ file: "tests/review2-g.js", total: tests.length, skips });
+if (failed || skipGateFailed) {
+  process.stdout.write(`${failed} of ${tests.length} review2-g regression tests failed${skipGateFailed ? "; the skip gate failed" : ""}.\n`);
   process.exit(1);
 }
-process.stdout.write(`${tests.length - skipped} of ${tests.length} review2-g regression tests passed${skipped ? `, ${skipped} skipped` : ""}.\n`);
+process.stdout.write(`${tests.length - skips.length} of ${tests.length} review2-g regression tests passed${skips.length ? `, ${skips.length} skipped` : ""}.\n`);
 process.exit(0);

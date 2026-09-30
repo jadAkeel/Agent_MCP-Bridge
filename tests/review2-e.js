@@ -21,6 +21,7 @@ process.env.GIT_CONFIG_NOSYSTEM = "1";
 process.env.CODEX_OPENCODE_STATE_DIR = path.join(fixture, "state");
 process.env.XDG_CACHE_HOME = path.join(fixture, "cache");
 const { __selfTest } = await import("../server.js");
+const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const { inventory, applyReport } = await import("../bin/bridge-gc.js");
 const { integratePatchSerially, binaryTextFilesInPatch } = __selfTest.internals;
 
@@ -53,15 +54,17 @@ function repoWithFeatureBranch(name) {
 
 const failures = [];
 const skips = [];
-// A test that cannot run here throws SkipTest: reported as "skip", never as a pass.
-class SkipTest extends Error {}
+let total = 0;
+// A test that cannot run here throws SkipTest (tests/skip-gate.js): reported as "skip", never as
+// a pass, and failing the file unless marked optional.
 async function test(name, run) {
+  total += 1;
   try {
     await run();
     console.log(`ok - ${name}`);
   } catch (error) {
     if (error instanceof SkipTest) {
-      skips.push(name);
+      skips.push({ name, reason: error.message, optional: error.optional });
       console.log(`skip - ${name}: ${error.message}`);
       return;
     }
@@ -212,7 +215,7 @@ try {
   await test("R-154 a binary hunk for a quoted path is rejected in the integration preview", async () => {
     // Git for Windows refuses a quote in a path (git apply: invalid path), which fails the preview
     // before the binary gate; the header parser above is the coverage there.
-    if (process.platform === "win32") throw new SkipTest("Git for Windows refuses a quote in a path");
+    if (process.platform === "win32") throw new SkipTest("Git for Windows refuses a quote in a path", { optional: true });
     const root = repo("r154");
     const base = git(root, "rev-parse", "HEAD").trim();
     const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: root, input: Buffer.from("bin\0ary\n") }).toString().trim();
@@ -249,8 +252,9 @@ try {
   rmSync(fixture, { recursive: true, force: true });
 }
 
-if (failures.length) {
-  console.log(`review2-e: ${failures.length} failed: ${failures.join("; ")}`);
+const skipGateFailed = finishSkips({ file: "tests/review2-e.js", total, skips });
+if (failures.length || skipGateFailed) {
+  console.log(`review2-e: ${failures.length} failed: ${failures.join("; ")}${skipGateFailed ? "; the skip gate failed" : ""}`);
   process.exit(1);
 }
-console.log(`review2-e: R-151 through R-155 passed${skips.length ? ` (${skips.length} skipped: ${skips.join("; ")})` : ""}`);
+console.log(`review2-e: R-151 through R-155 passed${skips.length ? ` (${skips.length} skipped: ${skips.map((skip) => skip.name).join("; ")})` : ""}`);
