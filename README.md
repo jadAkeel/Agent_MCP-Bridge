@@ -40,6 +40,7 @@ Run these from this repository.
 
 ## Documentation
 
+- [docs/ONBOARDING.md](docs/ONBOARDING.md): a new operator's setup, from prerequisites to a first reviewed change, restarts and rollback.
 - [docs/USER_GUIDE.md](docs/USER_GUIDE.md): how it works, daily use, troubleshooting, releases.
 - [docs/REFERENCE.md](docs/REFERENCE.md): Scope Contract rules, tool behavior, and every configuration variable.
 - [docs/archive/](docs/archive/): historical audits and design notes. They are not current.
