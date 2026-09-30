@@ -15,7 +15,7 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createDirectRunAudit, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
+import { createDirectRunAudit, directRunMetrics, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { detachWorktreeLinks } from "./bin/worktree-links.js";
 
@@ -6728,8 +6728,11 @@ function logOpenCodeResult(agent, result, lockPlan = null) {
   });
 }
 
-function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
-  return [
+// The three blocks of a job result: the bridge preamble (everything before the agent's report),
+// the agent's final response, and the stderr summary. formatSingleResult joins them unchanged;
+// callers that shorten a result cut between the blocks, never inside the report.
+function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
+  const preamble = [
     `Requested agent: ${resolution.requestedAgent}`,
     `Requested agent mode: ${resolution.requestedAgentMode || "unknown"}`,
     `Actual agent used: ${resolution.actualAgent || "none"}`,
@@ -6810,12 +6813,123 @@ function formatSingleResult({ resolution, result, cwd, lockPlan = null }) {
     "",
     `Tool outcomes: ${result?.toolOutcomes?.length ? result.toolOutcomes.map((item) => `${item.tool}:${item.status}`).join(", ") : "none"}`,
     "",
-    "Assistant final response:",
-    result?.stdout || "",
-    "",
-    "STDERR summary:",
-    summarizeStderr(result?.stderr),
   ].join("\n");
+  return {
+    preamble,
+    report: ["Assistant final response:", result?.stdout || ""].join("\n"),
+    stderr: ["", "STDERR summary:", summarizeStderr(result?.stderr)].join("\n"),
+  };
+}
+
+function formatSingleResult(args) {
+  const { preamble, report, stderr } = formatSingleResultParts(args);
+  return [preamble, report, stderr].join("\n");
+}
+
+const COMPACT_FILE_LIST_LIMIT = 40;
+
+function compactFileList(files) {
+  const list = Array.isArray(files) ? files : [];
+  return list.length > COMPACT_FILE_LIST_LIMIT
+    ? `${list.slice(0, COMPACT_FILE_LIST_LIMIT).join(", ")} (+${list.length - COMPACT_FILE_LIST_LIMIT} more)`
+    : list.join(", ");
+}
+
+// L-025: what a caller decides on, without the bridge preamble (lock and scope echo, model
+// evidence, phase timing split, tool outcomes), which stays behind `detail: true`. Facts are
+// printed when they are the point (agent, outcome, timing, usage, changed files) or when they are
+// abnormal (provider warnings, fallbacks, unverified model, truncation, denials, failures): a
+// normal value is left out, an abnormal one never is.
+function compactJobLines({ resolution, result, unsafeFiles = [] }) {
+  const metrics = directRunMetrics(result || {});
+  const errorType = result?.errorType || (unsafeFiles.length ? "changed_file_validation_error" : "");
+  const spawned = Number(result?.childStartedAtMs) > 0;
+  const status = errorType ? (spawned ? "failed" : "rejected") : result?.dryRun ? "dry_run" : "completed";
+  const ran = resolution.actualAgent && resolution.actualAgent !== resolution.requestedAgent ? ` (ran as ${resolution.actualAgent})` : "";
+  const timing = [
+    ["agentRunMs", metrics.agentRunMs],
+    ["startupMs", metrics.startupMs],
+    ["providerWaitMs", metrics.providerWaitMs],
+    ["totalMs", result?.phaseTimings?.totalMs],
+  ].filter(([, value]) => value !== null && value !== undefined).map(([name, value]) => `${name}=${value}`);
+  const model = [result?.configuredProvider, result?.configuredModel].filter(Boolean).join("/");
+  return [
+    `Agent: ${resolution.requestedAgent}${ran}`,
+    resolution.fallbackUsed ? `Fallback used: yes${resolution.fallbackReason ? ` (${resolution.fallbackReason})` : ""}` : null,
+    resolution.proxyUsed ? `Subagent proxy used: yes${resolution.proxyReason ? ` (${resolution.proxyReason})` : ""}` : null,
+    `Status: ${status}${errorType ? `; error type: ${errorType}` : ""}`,
+    model ? `Model: ${model}${result?.configuredVariant ? ` (variant ${result.configuredVariant})` : ""}` : null,
+    result?.modelSelection === "operator_allowlist_override"
+      ? `Model selection: operator_allowlist_override (managed profile model ${result.profileProvider}/${result.profileModel})`
+      : null,
+    timing.length ? `Timing: ${timing.join(" ")}` : null,
+    `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
+    result?.providerWarningType ? `Provider warning type: ${result.providerWarningType}` : null,
+    result?.providerErrorType ? `Provider error type: ${result.providerErrorType}` : null,
+    result?.recoveredTransientProviderError ? "Recovered transient provider error: yes" : null,
+    result?.providerRetryWarningCount ? `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result.providerRetryWarningCount}` : null,
+    result?.openCodeFallbackDetected ? "OpenCode native fallback detected: yes" : null,
+    result?.openCodeApiErrorDetected ? "OpenCode API error detected: yes" : null,
+    !result?.dryRun && !result?.modelAttested ? "Runtime model verification: unverified" : null,
+    result?.runtimeModelConflict ? "Runtime model identities conflict: yes" : null,
+    result?.streamIntegrity && result.streamIntegrity !== "valid" ? `Event stream integrity: ${result.streamIntegrity}` : null,
+    result?.permissionDeniedCount ? `Permission denials observed: ${result.permissionDeniedCount}` : null,
+    result?.modelFallbackUsed ? `Builder model fallback: ${result.modelFallbackFrom} -> ${result.modelFallbackTo}; reason: ${result.modelFallbackReason}` : null,
+    !result?.dryRun && result && !result.assistantFinalResponseDetected ? "Assistant final response detected: no" : null,
+    result?.assistantResponseTruncated ? "Assistant response truncated: yes" : null,
+    result?.rawOutputTruncated ? "Raw process output truncated: yes" : null,
+    result?.timedOut ? `Timed out: yes (timeout ms ${result.timeoutMs ?? "not specified"})` : null,
+    result?.readOnlyUnavailable ? "Read-only unavailable: yes" : null,
+    result?.retryAttempt ? `Retry attempts used: ${result.retryAttempt} of ${result.maxRetries ?? 0}` : null,
+    result && result.exitCode !== 0 && result.exitCode !== undefined ? `Exit code: ${result.exitCode}` : null,
+    result?.dependencyRequest ? `Dependency request: ${JSON.stringify(result.dependencyRequest)}` : null,
+    result?.dependencyRequestError ? `Dependency request error: ${result.dependencyRequestError}` : null,
+    formatReadOnlyHeadMove(result?.readOnlyHeadMove),
+    `Files changed: ${result?.changedFiles?.length ? compactFileList(result.changedFiles) : "none detected"}`,
+  ].filter(Boolean);
+}
+
+// L-025/L-026: fits a job result into `limit` characters by cutting the least useful text first.
+// The parts are the lines above the agent's report (`head`), the report and what follows it
+// (`tail`: stderr summary, worktree review, verification lines). When the whole does not fit:
+// 1. a long head is replaced by `headStandIn` (its content is returned as `movedHead` so the caller
+//    can keep it as detail), 2. only then the END of the report is cut, and said so. The report is
+//    never cut in the middle, and a cut report is the only thing reported as truncated.
+function fitJobResultText({ head, headStandIn = "", report, tail = "" }, limit = CONFIG.queueResultMaxChars) {
+  const join = (...parts) => parts.filter(Boolean).join("\n");
+  const whole = join(head, report, tail);
+  const fitted = (text, extra = {}) => ({ text, chars: whole.length, reportTruncated: false, movedHead: "", ...extra });
+  if (whole.length <= limit) return fitted(whole);
+  let usedHead = head;
+  let movedHead = "";
+  if (headStandIn) {
+    usedHead = join(headStandIn, "Bridge preamble: shortened to fit the result limit; the full preamble is in the detail text (get_opencode_job with detail: true).");
+    movedHead = head;
+    const shortened = join(usedHead, report, tail);
+    if (shortened.length <= limit) return fitted(shortened, { movedHead });
+  }
+  const marker = (omitted) => `\n... [the agent's report was cut here: ${omitted} of ${report.length} characters omitted at its end; the result is limited to ${limit} characters (CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS)] ...`;
+  const room = limit - usedHead.length - tail.length - 2 - marker(report.length).length;
+  if (room < 200) {
+    // The lines around the report alone fill the limit; nothing sensible is left to protect.
+    return fitted(truncateResultText(join(usedHead, report, tail), limit), { reportTruncated: true, movedHead });
+  }
+  return fitted(join(usedHead, `${report.slice(0, room)}${marker(report.length - room)}`, tail), { reportTruncated: true, movedHead });
+}
+
+// The stored text is redacted before it is measured: redaction can lengthen a line, and a text
+// fitted first and redacted when it is persisted could land over the limit and be cut anywhere.
+function fitRedactedJobResult(parts, limit = CONFIG.queueResultMaxChars) {
+  return fitJobResultText({
+    head: redactSensitiveText(parts.head),
+    headStandIn: redactSensitiveText(parts.headStandIn || ""),
+    report: redactSensitiveText(parts.report),
+    tail: redactSensitiveText(parts.tail || ""),
+  }, limit);
+}
+
+function patchPreviewOmittedLine(chars) {
+  return `Worktree patch preview: omitted from this view (${chars} characters stored). integrate_opencode_worktree with dryRun: true shows the patch; get_opencode_job with detail: true returns the stored preview.`;
 }
 
 function conflictPathsFromConflict(conflict) {
@@ -13088,6 +13202,11 @@ function directRunAuditStore() {
     retentionDays: CONFIG.auditRetentionDays,
     instanceId: BRIDGE_INSTANCE_ID,
     processId: process.pid,
+    // L-025: a run's result text is kept like a queue job's, encrypted with the queue's key and
+    // bound to the run id, and capped by the same setting.
+    sealText: (text, runId) => encryptIntegrationJournalBytes(Buffer.from(text, "utf8"), `direct-run-result\0${runId}`),
+    openText: async (sealed, runId) => (await decryptIntegrationJournalBytes(sealed, `direct-run-result\0${runId}`)).toString("utf8"),
+    maxResultChars: CONFIG.queueResultMaxChars,
   });
 }
 
@@ -14569,7 +14688,7 @@ function retainedWorktreeView(artifact, { queueJob = null, run = null } = {}) {
   };
 }
 
-function directRunView(run, artifacts = []) {
+function directRunView(run, artifacts = [], { detail = false } = {}) {
   const usage = run.usageSteps === null || run.usageSteps === undefined ? null : {
     steps: run.usageSteps,
     inputCount: run.inputCount,
@@ -14579,6 +14698,25 @@ function directRunView(run, artifacts = []) {
     cacheWriteCount: run.cacheWriteCount,
     cost: run.cost,
   };
+  // L-025: the result text stored under the Run id (redacted, sealed on disk, capped like a queue
+  // result); a run from before this, or one whose text could not be sealed, has none.
+  const stored = run.result && !run.result.unreadable ? run.result : null;
+  const resultView = stored
+    ? {
+      resultText: stored.text,
+      resultTextChars: stored.chars,
+      resultTextTruncated: stored.reportTruncated,
+      resultDetailTextChars: stored.detailText.length,
+      ...(detail ? { resultDetailText: stored.detailText, resultDetailTextTruncated: stored.detailTruncated } : {}),
+    }
+    : {};
+  const resultNote = stored
+    ? `The result text stored under this Run id is in resultText${stored.detailText ? (detail ? " and resultDetailText" : "; pass detail: true for resultDetailText (a writer's patch preview, a parallel job's bridge preamble)") : ""}.`
+    : run.result?.unreadable
+    ? "A result text was stored for this run but could not be opened (its encryption key changed or the record is damaged)."
+    : run.status === "started"
+    ? "The run has not finished (or its bridge stopped before recording the outcome); its result text is stored when it does."
+    : "No result text was stored for this run (it ran before results were kept, or the audit could not store it).";
   return {
     kind: run.kind === "parallel" ? "parallel_run" : "direct_run",
     runId: run.runId,
@@ -14595,7 +14733,8 @@ function directRunView(run, artifacts = []) {
     usage,
     configuredModel: run.configuredModel || "",
     worktrees: artifacts.map((artifact) => retainedWorktreeView(artifact, { run })),
-    note: `Not a queue job: the result text was returned by the ${run.kind === "parallel" ? "run_opencode_parallel" : "run_opencode_agent"} call and is not stored; this run cannot be cancelled or replayed. A worktree listed here is retained work.`,
+    ...resultView,
+    note: `Not a queue job: this ${run.kind === "parallel" ? "run_opencode_parallel" : "run_opencode_agent"} run cannot be cancelled or replayed. ${resultNote} A worktree listed here is retained work.`,
   };
 }
 
@@ -14639,7 +14778,7 @@ const ESSENTIAL_QUEUE_JOB_FIELDS = [
   "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
   "providerRetryWarningCount", "usage", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
-  "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText",
+  "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
 ];
 
 // The fields a caller polling or reading one job acts on; `detail: true` returns the full record.
@@ -14648,9 +14787,10 @@ function essentialQueueJobView(snapshot) {
   for (const field of ESSENTIAL_QUEUE_JOB_FIELDS) {
     const value = snapshot?.[field];
     if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) continue;
+    if (field === "resultDetailTextChars" && !value) continue;
     view[field] = value;
   }
-  view.omitted = "Pass detail: true for the scope contract, hashes, lease, owner and containment fields.";
+  view.omitted = "Pass detail: true for the scope contract, hashes, lease, owner and containment fields, and for the stored worktree patch preview (resultDetailText); the result text leaves the patch out (integrate_opencode_worktree with dryRun: true shows it too).";
   return view;
 }
 
@@ -14683,11 +14823,11 @@ function compactQueueJobLines(records) {
 
 server.tool(
   "get_opencode_job",
-  "Get one OpenCode job by id: a queued job (with result text), or a run_opencode_agent / run_opencode_parallel Run id (status, timing, usage and retained worktree).",
+  "Get one OpenCode job by id: a queued job (with result text), or a run_opencode_agent / run_opencode_parallel Run id (status, timing, usage, retained worktree and the stored result text).",
   {
     jobId: z.string(),
     cwd: z.string().min(1).describe("Canonical repository path for project-scoped job lookup."),
-    detail: z.boolean().optional().describe("Full record (scope contract, hashes, lease, owner and containment fields). Default: status, timing, changed files, worktree and result text."),
+    detail: z.boolean().optional().describe("Full record (scope contract, hashes, lease, owner and containment fields) plus the stored detail text: a writer's worktree patch preview, a parallel job's bridge preamble. Default: status, timing, changed files, worktree and result text (without the patch preview)."),
   },
   async ({ jobId, cwd = "", detail = false }) => {
     const projectRoot = cwd ? await resolveProjectStateRoot(cwd) : "";
@@ -14702,12 +14842,12 @@ server.tool(
     if (!snapshot) {
       const lookupRoot = projectRoot || await resolveProjectStateRoot(process.cwd());
       const [run, artifacts] = await Promise.all([
-        directRunAuditStore().get(lookupRoot, jobId),
+        directRunAuditStore().get(lookupRoot, jobId, { includeResult: true }),
         listRetainedWorktreeArtifacts(lookupRoot, { jobId }).catch(() => []),
       ]);
       if (run || artifacts.length) {
         const view = run
-          ? directRunView(run, artifacts)
+          ? directRunView(run, artifacts, { detail })
           : {
             kind: "worktree_only",
             runId: jobId,
@@ -17672,16 +17812,22 @@ async function executeOpenCodeJob(requestedJob, {
     const finalResponseViolation = !dryRun && !result.assistantFinalResponseDetected
       ? ["", "OpenCode final response verification:", "Rejected. OpenCode did not emit a non-empty terminal assistant text event."].join("\n")
       : ["", "OpenCode final response verification:", dryRun ? "Skipped for dry run." : "Accepted. A terminal assistant response was detected."].join("\n");
-    const worktreeReview = worktree
+    // L-026: the patch preview is the largest part of a writer's result and the integration dry
+    // run shows the same patch, so the stored text leaves it out (a pointer line says how to get
+    // it) and keeps it apart as detail; the direct response still carries it.
+    const patchPreview = worktreeDiff?.patchPreview || "";
+    const worktreeReviewWith = (patchLine) => (worktree
       ? [
           "",
           "Worktree review:",
           formatWorktreeSummary(worktree, worktreeCleanup),
           `Worktree changed files: ${(worktreeDiff?.changedFiles || []).length ? worktreeDiff.changedFiles.join(", ") : "none detected"}`,
           worktreeDiff?.diffStat ? `Worktree diff stat:\n${worktreeDiff.diffStat}` : "Worktree diff stat: none",
-          worktreeDiff?.patchPreview ? `Worktree patch preview:\n${worktreeDiff.patchPreview}` : "Worktree patch preview: none",
+          patchLine,
         ].join("\n")
-      : ["", "Worktree review:", "Worktree: not used"].join("\n");
+      : ["", "Worktree review:", "Worktree: not used"].join("\n"));
+    const worktreeReview = worktreeReviewWith(patchPreview ? `Worktree patch preview:\n${patchPreview}` : "Worktree patch preview: none");
+    const worktreeReviewWithoutPatch = worktreeReviewWith(patchPreview ? patchPreviewOmittedLine(patchPreview.length) : "Worktree patch preview: none");
 
     // The job's work is done; the lock is released before the report so the report can say
     // whether it really was.
@@ -17690,25 +17836,52 @@ async function executeOpenCodeJob(requestedJob, {
     result.lockRelease = { needed: lockRelease.needed, released: lockRelease.released };
     phaseClock.mark("report");
     result.phaseTimings = phaseClock.summary(result);
+    const lockLines = [`Temporary lock acquired: ${hardLockSummary(acquiredLock)}`, `Temporary lock released: ${lockRelease.text}`];
+    const singleParts = formatSingleResultParts({ resolution, result, cwd: executionCwd, lockPlan });
+    const driftLine = formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift);
+    const validationGateText = formatValidationGateResult(validationGate);
+    // Stored view (queue result text, run audit): the same text without the patch preview, fitted
+    // to the result limit report-first. The lock lines are safety evidence, so they stay in the
+    // shortened stand-in for the preamble.
+    const fitted = fitRedactedJobResult({
+      head: [...lockLines, singleParts.preamble].join("\n"),
+      headStandIn: [...lockLines, ...compactJobLines({ resolution, result, unsafeFiles: validation.disallowedFiles })].join("\n"),
+      report: singleParts.report,
+      tail: [
+        singleParts.stderr,
+        driftLine,
+        worktreeReviewWithoutPatch,
+        nativeFallbackViolation,
+        apiErrorViolation,
+        finalResponseViolation,
+        validationGateText,
+        lockViolation,
+      ].filter((line) => line !== null).join("\n"),
+    });
     return {
       response: {
         content: [
           {
             type: "text",
             text: [
-              `Temporary lock acquired: ${hardLockSummary(acquiredLock)}`,
-              `Temporary lock released: ${lockRelease.text}`,
-              formatSingleResult({ resolution, result, cwd: executionCwd, lockPlan }),
-              formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
+              ...lockLines,
+              [singleParts.preamble, singleParts.report, singleParts.stderr].join("\n"),
+              driftLine,
               worktreeReview,
               nativeFallbackViolation,
               apiErrorViolation,
               finalResponseViolation,
-              formatValidationGateResult(validationGate),
+              validationGateText,
               lockViolation,
             ].filter((line) => line !== null).join("\n"),
           },
         ],
+      },
+      resultRecord: {
+        text: fitted.text,
+        detailText: [fitted.movedHead, patchPreview ? `Worktree patch preview:\n${patchPreview}` : ""].filter(Boolean).join("\n\n"),
+        chars: fitted.chars,
+        reportTruncated: fitted.reportTruncated,
       },
       result,
       lockPlan,
@@ -17820,8 +17993,12 @@ function queueAgentTiming(record, now = Date.now()) {
 
 function queueRecordSnapshot(record, includeResult = true) {
   const persistedResultText = redactSensitiveText(record.resultText || "");
-  const essentialResultTruncated = record.status === "completed"
-    && persistedResultText.length > CONFIG.queueResultMaxChars;
+  const persistedDetailText = redactSensitiveText(record.resultDetailText || "");
+  // Truncated means the agent's report was cut (or an unstructured text exceeded the limit); a
+  // patch preview the bridge kept apart is not a truncation.
+  const resultCut = Boolean(record.resultReportTruncated) || Boolean(record.resultTextTruncated)
+    || persistedResultText.length > CONFIG.queueResultMaxChars;
+  const essentialResultTruncated = record.status === "completed" && resultCut;
   return sanitizePersistedValue({
     jobId: record.jobId,
     parentJobId: record.parentJobId || "",
@@ -17894,19 +18071,42 @@ function queueRecordSnapshot(record, includeResult = true) {
     orphanChildProcessAlive: Boolean(record.orphanChildProcessAlive),
     revision: record.revision || 0,
     resultText: includeResult ? truncateResultText(persistedResultText, CONFIG.queueResultMaxChars) : "",
-    resultTextChars: includeResult ? persistedResultText.length : 0,
+    resultTextChars: includeResult ? Math.max(persistedResultText.length, Number(record.resultFullChars) || 0, Number(record.resultTextChars) || 0) : 0,
     resultTextSha256: includeResult ? createHash("sha256").update(persistedResultText).digest("hex") : "",
-    resultTextTruncated: includeResult ? persistedResultText.length > CONFIG.queueResultMaxChars : false,
+    resultTextTruncated: includeResult ? resultCut : false,
+    resultDetailText: includeResult ? truncateText(persistedDetailText, CONFIG.queueResultMaxChars) : "",
+    resultDetailTextChars: includeResult ? persistedDetailText.length : 0,
   });
+}
+
+// L-025/L-026: the queue keeps the runner's report-priority result (`resultText`, without the
+// worktree patch preview) and the detail apart (`resultDetailText`: the patch preview, and the
+// bridge preamble when it had to be shortened). Executions that carry no resultRecord (a
+// rejection, a test hook) keep their response text as before.
+function queueResultFields(execution) {
+  const stored = execution?.resultRecord;
+  if (stored && typeof stored.text === "string") {
+    return {
+      resultText: stored.text,
+      resultDetailText: stored.detailText || "",
+      resultReportTruncated: Boolean(stored.reportTruncated),
+      resultFullChars: Number(stored.chars) || 0,
+    };
+  }
+  return { resultText: execution?.response?.content?.[0]?.text || "", resultDetailText: "", resultReportTruncated: false, resultFullChars: 0 };
 }
 
 function queuePrivateDetails(record) {
   const resultText = redactSensitiveText(record.resultText || "");
+  const resultDetailText = redactSensitiveText(record.resultDetailText || "");
   const details = sanitizePersistedValue({
     resultText: truncateResultText(resultText, CONFIG.queueResultMaxChars),
-    resultTextChars: resultText.length,
+    // A record read back keeps the original length and the truncation it was stored with.
+    resultTextChars: Math.max(resultText.length, Number(record.resultFullChars) || 0, Number(record.resultTextChars) || 0),
     resultTextSha256: createHash("sha256").update(resultText).digest("hex"),
-    resultTextTruncated: resultText.length > CONFIG.queueResultMaxChars,
+    resultTextTruncated: Boolean(record.resultReportTruncated) || Boolean(record.resultTextTruncated) || resultText.length > CONFIG.queueResultMaxChars,
+    resultDetailText: truncateText(resultDetailText, CONFIG.queueResultMaxChars),
+    resultDetailTextChars: resultDetailText.length,
     errorReason: truncateText(String(record.errorReason || ""), 12000),
     validationResult: record.validationResult || null,
     sanitizedWorkspaceVerification: record.sanitizedWorkspaceVerification || null,
@@ -17920,6 +18120,8 @@ function queuePrivateDetails(record) {
     resultTextChars: details.resultTextChars || 0,
     resultTextSha256: details.resultTextSha256 || "",
     resultTextTruncated: Boolean(details.resultTextTruncated),
+    resultDetailText: details.resultDetailText || "",
+    resultDetailTextChars: details.resultDetailTextChars || 0,
     errorReason: details.errorReason || "",
     validationResult: {
       truncated: true,
@@ -17960,6 +18162,7 @@ function queueRecordDurableSummary(record) {
   const hasRawTask = Object.prototype.hasOwnProperty.call(record || {}, "task");
   const hasRawPrivateDetails = [
     "resultText",
+    "resultDetailText",
     "errorReason",
     "validationResult",
     "sanitizedWorkspaceVerification",
@@ -17970,6 +18173,7 @@ function queueRecordDurableSummary(record) {
   const privateDetails = queuePrivateDetails(record);
   const privateJson = JSON.stringify(privateDetails);
   delete summary.resultText;
+  delete summary.resultDetailText;
   delete summary.errorReason;
   delete summary.validationResult;
   delete summary.sanitizedWorkspaceVerification;
@@ -17978,6 +18182,7 @@ function queueRecordDurableSummary(record) {
   summary.resultTextChars = Number(privateDetails.resultTextChars || 0);
   summary.resultTextSha256 = privateDetails.resultTextSha256 || "";
   summary.resultTextTruncated = Boolean(privateDetails.resultTextTruncated);
+  summary.resultDetailTextChars = Number(privateDetails.resultDetailTextChars || 0);
   summary.errorReasonChars = String(privateDetails.errorReason || "").length;
   summary.errorReasonSha256 = createHash("sha256").update(String(privateDetails.errorReason || "")).digest("hex");
   summary.validationResultSha256 = createHash("sha256")
@@ -17991,6 +18196,7 @@ function queueRecordDurableSummary(record) {
     summary.resultTextChars = Number(record.resultTextChars || 0);
     summary.resultTextSha256 = String(record.resultTextSha256 || "");
     summary.resultTextTruncated = Boolean(record.resultTextTruncated);
+    summary.resultDetailTextChars = Number(record.resultDetailTextChars || 0);
     summary.errorReasonChars = Number(record.errorReasonChars || 0);
     summary.errorReasonSha256 = String(record.errorReasonSha256 || "");
     summary.validationResultSha256 = String(record.validationResultSha256 || "");
@@ -18031,7 +18237,9 @@ function enforceQueueResultEvidence(record) {
         ? "A completed job must include a non-empty verified final response."
         : "A completed write job must include changed-file or patch evidence.",
     });
-  } else if (record.status === "completed" && persistedResultText.length > CONFIG.queueResultMaxChars) {
+  } else if (record.status === "completed" && (record.resultReportTruncated || persistedResultText.length > CONFIG.queueResultMaxChars)) {
+    // Only a cut report (or an unstructured text over the limit) is truncated output; the patch
+    // preview kept apart in resultDetailText is not.
     record.completionOutcome = "completed_with_truncated_output";
   }
   return record;
@@ -18081,6 +18289,11 @@ function applyDurableCancellationOutcome(record, requestedAt = "") {
     errorType: "agent_cancelled",
     errorReason: DURABLE_CANCELLATION_REASON,
     resultText: "",
+    resultDetailText: "",
+    resultReportTruncated: false,
+    resultFullChars: 0,
+    resultTextChars: 0,
+    resultTextTruncated: false,
     validationResult: null,
     sanitizedWorkspaceVerification: null,
     actualModelEvidence: "",
@@ -19762,7 +19975,7 @@ async function startQueueRecord(record) {
           actualModel: execution.result?.actualModel || "",
           actualModelEvidence: execution.result?.actualModelEvidence || "",
           dependencyRequest: execution.result?.dependencyRequest || null,
-          resultText: execution.response?.content?.[0]?.text || "",
+          ...queueResultFields(execution),
           worktreePath: execution.worktree?.path || "",
           worktreeBranch: execution.worktree?.branch || "",
           worktreeBaseCommit: execution.worktree?.baseCommit || "",
@@ -19783,7 +19996,7 @@ async function startQueueRecord(record) {
           leaseExpiresAt: "",
           errorType: refusal.errorType,
           errorReason: refusal.errorReason,
-          resultText: execution.response?.content?.[0]?.text || "",
+          ...queueResultFields(execution),
           childProcessId: 0,
           childProcessStartedAt: "",
         };
@@ -19813,7 +20026,7 @@ async function startQueueRecord(record) {
         actualModel: execution.result?.actualModel || "",
         actualModelEvidence: execution.result?.actualModelEvidence || "",
         dependencyRequest: execution.result?.dependencyRequest || null,
-        resultText: execution.response?.content?.[0]?.text || "",
+        ...queueResultFields(execution),
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
@@ -22251,11 +22464,18 @@ function parallelExecutionOverlapEvidence(results) {
   return { ranConcurrently: pairs.length > 0, pairs };
 }
 
+function labelParallelRunId(text, runId) {
+  return String(text || "").replace(/^JOB (\d+)/, (label) => `${label}\nRun id: ${runId} (get_opencode_job finds it; not cancellable like a queue job)`);
+}
+
 server.tool(
   "run_opencode_parallel",
-  "Run multiple OpenCode agents in parallel. Use only for safe independent tasks.",
-  { jobs: z.array(z.object(jobInputShape)).min(1) },
-  async ({ jobs }) => {
+  "Run multiple OpenCode agents in parallel. Use only for safe independent tasks. Each job's block is compact (Run id, outcome, timing, token usage, changed files, worktree, warnings, then the agent's report) and its result text is stored under the Run id: get_opencode_job returns it again if this response is lost.",
+  {
+    jobs: z.array(z.object(jobInputShape)).min(1),
+    detail: z.boolean().optional().describe("Append each job's bridge detail (lock and scope echo, model evidence, phase timing split, tool outcomes) to its block. Default: compact blocks; get_opencode_job with detail: true returns the same detail later."),
+  },
+  async ({ jobs, detail = false }) => {
     jobs = await Promise.all(jobs.map((job) => normalizeJobCwd(job)));
     const toolStarted = nowMs();
     // Provider capacity is checked per provider key once every route is attested (below),
@@ -22911,6 +23131,19 @@ server.tool(
             diffStat: worktreeDiff?.diffStat || "",
           };
         }
+        // L-025: the block is compact: everything a caller decides on comes before the report,
+        // and the long bridge preamble is `detailText` (stored with the run, shown on request).
+        const singleParts = formatSingleResultParts({ resolution, result, cwd: executionCwd, lockPlan });
+        const head = [
+          `JOB ${index + 1}`,
+          ...compactJobLines({ resolution, result, unsafeFiles }),
+          formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
+          worktree ? formatWorktreeSummary(worktree, worktreeCleanup) : null,
+          worktreeDiff?.diffStat ? `Worktree diff stat:\n${worktreeDiff.diffStat}` : null,
+          validationGate.status === "skipped" ? null : formatValidationGateResult(validationGate),
+          `Unsafe changed files: ${unsafeFiles.length ? compactFileList(unsafeFiles) : "none detected"}`,
+        ].filter(Boolean).join("\n");
+        const tail = String(result.stderr || "").trim() ? singleParts.stderr.replace(/^\n/, "") : "";
         return {
           index,
           lockPlan,
@@ -22919,21 +23152,9 @@ server.tool(
           worktreeCleanup,
           startedAtMs: jobStartedAtMs,
           finishedAtMs: nowMs(),
-          text: [
-          `JOB ${index + 1}`,
-          `Temporary lock acquired: ${hardLockSummary(acquiredLocks[index])}`,
-          formatSingleResult({
-            resolution,
-            result,
-            cwd: executionCwd,
-            lockPlan,
-          }),
-          formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift),
-          formatWorktreeSummary(worktree, worktreeCleanup),
-          worktreeDiff?.diffStat ? `Worktree diff stat:\n${worktreeDiff.diffStat}` : null,
-          formatValidationGateResult(validationGate),
-          `Unsafe changed files: ${unsafeFiles.length ? unsafeFiles.join(", ") : "none detected"}`,
-          ].filter(Boolean).join("\n"),
+          parts: { head, report: singleParts.report, tail },
+          text: [head, singleParts.report, tail].filter(Boolean).join("\n"),
+          detailText: [`Temporary lock acquired: ${hardLockSummary(acquiredLocks[index])}`, singleParts.preamble.trimEnd()].join("\n"),
         };
         });
       const settled = await settleIndependentParallelJobs(executionPromises);
@@ -22958,16 +23179,29 @@ server.tool(
           suggestedFix: "Inspect the retained sibling worktrees and retry through the queue/pipeline if cancellation or durable status is required.",
         })}`,
       }));
+      // Every block names its Run id (rejection blocks too: the JOB label is what the report keys
+      // it on) before the text is stored under that id.
+      results.forEach((entry, position) => {
+        const runId = parallelRunIds[Number.isInteger(entry.index) ? entry.index : position];
+        if (!runId) return;
+        entry.text = labelParallelRunId(entry.text, runId);
+        if (entry.parts) entry.parts = { ...entry.parts, head: labelParallelRunId(entry.parts.head, runId) };
+      });
       const parallelAudits = await Promise.all(results.map((entry, position) => {
         const index = Number.isInteger(entry.index) ? entry.index : position;
+        // L-025: the result is stored under the Run id, report-first when it must be shortened.
+        const fitted = entry.parts ? fitRedactedJobResult(entry.parts) : null;
         return parallelAudit.finish(parallelAuditHandles[index], {
           execution: { result: entry.result || {} },
           childStarted: parallelChildSpawned[index],
           errorType: entry.result?.errorType || (entry.unsafeFiles?.length ? "changed_file_validation_error" : ""),
+          stored: fitted
+            ? { text: fitted.text, detailText: entry.detailText || "", chars: fitted.chars, reportTruncated: fitted.reportTruncated }
+            : { text: entry.text, detailText: entry.detailText || "" },
         });
       }));
       results.forEach((entry, position) => {
-        entry.text = [entry.text, parallelAudit.notice(parallelAudits[position])].filter(Boolean).join("\n");
+        entry.auditNotice = parallelAudit.notice(parallelAudits[position]);
       });
       for (const cwdKey of cwdKeys) {
         if (!parallelSnapshottedCwds.has(cwdKey)) continue;
@@ -23115,10 +23349,11 @@ server.tool(
             verification,
             rollbackVerification,
             worktreeCleanupVerification,
-            ...results.map((result, position) => {
-              const runId = parallelRunIds[Number.isInteger(result.index) ? result.index : position];
-              return runId ? String(result.text || "").replace(/^JOB (\d+)/, (label) => `${label}\nRun id: ${runId} (get_opencode_job finds it; not cancellable like a queue job)`) : result.text;
-            }),
+            ...results.map((entry) => [
+              entry.text,
+              detail && entry.detailText ? `Bridge detail (get_opencode_job with detail: true returns it later):\n${entry.detailText}` : null,
+              entry.auditNotice,
+            ].filter(Boolean).join("\n")),
           ].join("\n\n====================\n\n"),
         },
       ],
@@ -23987,6 +24222,10 @@ export const __selfTest = {
     formatOpenCodeUsage,
     formatPhaseTimings,
     formatSingleResult,
+    formatSingleResultParts,
+    compactJobLines,
+    fitJobResultText,
+    queueResultFields,
     integrationTimingStorage,
     listRetainedWorktreeArtifacts,
     BRIDGE_INSTANCE_ID,

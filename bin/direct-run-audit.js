@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 
 // Added after the first release: parallel runs (B-018), the job id that names a run's worktree
-// (B-020), and numeric timing/usage metadata (B-022, B-024). Still no request, response, error
-// message or output column.
+// (B-020), numeric timing/usage metadata (B-022, B-024) and the run's result text (L-025). Still
+// no request or error message column, and no plaintext output column: the result text is stored
+// redacted and sealed by the caller.
 const AUDIT_METRIC_COLUMNS = [
   ["kind", "TEXT NOT NULL DEFAULT 'direct'"],
   ["job_id", "TEXT NOT NULL DEFAULT ''"],
@@ -21,6 +22,11 @@ const AUDIT_METRIC_COLUMNS = [
   // closed instead of staying "started" forever.
   ["owner_instance_id", "TEXT NOT NULL DEFAULT ''"],
   ["owner_process_id", "INTEGER"],
+  // L-025: the sealed result payload (default text and the text `detail: true` adds, together
+  // capped at maxResultChars) and the character count before capping, so a lost tool response
+  // can be read again by Run id.
+  ["result_sealed", "TEXT"],
+  ["result_chars", "INTEGER"],
 ];
 
 // A start record without an owner process (written before B-029) is abandoned after this long;
@@ -105,10 +111,50 @@ const RECORD_SELECT = `SELECT run_id AS runId, project_key AS projectKey, kind, 
 
 const viewRecord = (record) => ({ ...record, modelEvidencePresent: Boolean(record.modelEvidencePresent) });
 
-// This table deliberately has no serialized request, response, error message, or output column.
+// L-025: what a run keeps of its result. `text` is the default view; `detailText` is what
+// `detail: true` adds (a parallel job's bridge preamble, a writer's patch preview). Both are
+// redacted and together capped: the default text has priority, the detail gets what is left.
+function cappedResult(stored, redact, maxChars) {
+  const cutMarker = (kept, total) => `\n... [${total - kept} of ${total} characters cut at the end; the stored result is limited to ${maxChars} characters] ...`;
+  let text = redact(String(stored?.text ?? ""));
+  let detailText = redact(String(stored?.detailText ?? ""));
+  const chars = present(stored?.chars) ? Math.trunc(Number(stored.chars)) : text.length + detailText.length;
+  let reportTruncated = Boolean(stored?.reportTruncated);
+  let detailTruncated = Boolean(stored?.detailTruncated);
+  if (text.length > maxChars) {
+    const total = text.length;
+    const keep = Math.max(0, maxChars - cutMarker(0, total).length);
+    text = `${text.slice(0, keep)}${cutMarker(keep, total)}`;
+    reportTruncated = true;
+  }
+  const room = maxChars - text.length;
+  if (detailText.length > room) {
+    const total = detailText.length;
+    // A stub of a few characters says nothing; drop the detail instead.
+    const keep = room - cutMarker(0, total).length;
+    detailText = keep >= 200 ? `${detailText.slice(0, keep)}${cutMarker(keep, total)}` : "";
+    detailTruncated = true;
+  }
+  return { view: { v: 1, text, detailText, reportTruncated, detailTruncated }, chars };
+}
+
+// A stored result from the execution: the runner's own (report-priority) record when it has one,
+// otherwise the response text as it was returned.
+function storedFromExecution(execution) {
+  if (execution?.resultRecord && typeof execution.resultRecord.text === "string") return execution.resultRecord;
+  const text = (execution?.response?.content || [])
+    .map((item) => (typeof item?.text === "string" ? item.text : ""))
+    .filter(Boolean)
+    .join("\n");
+  return text ? { text } : null;
+}
+
+// This table deliberately has no request or error message column, and its output column holds only
+// sealed text: without sealText the result is not stored at all.
 export function createDirectRunAudit({
   openDb, closeDb, resolveProjectRoot, redact, retentionDays = 90, maxRows = 1000,
   instanceId = "", processId = process.pid, processAlive = defaultProcessAlive, legacyAbandonAfterMs = LEGACY_ABANDON_AFTER_MS,
+  sealText = null, openText = null, maxResultChars = 24000,
 }) {
   if (!Number.isInteger(maxRows) || maxRows < 1 || !Number.isFinite(retentionDays) || retentionDays <= 0) {
     throw new Error("Direct run audit retention must have positive bounds.");
@@ -167,13 +213,15 @@ export function createDirectRunAudit({
           const updated = db.prepare(`UPDATE opencode_direct_runs SET status = ?, error_type = ?, finished_at = ?,
             duration_ms = ?, configured_model = ?, model_evidence_present = ?, agent_run_ms = ?, startup_ms = ?,
             provider_wait_ms = ?, usage_steps = ?, tokens_input = ?, tokens_output = ?, tokens_reasoning = ?,
-            tokens_cache_read = ?, tokens_cache_write = ?, cost = ?, provider_retry_warnings = ? WHERE run_id = ?`)
+            tokens_cache_read = ?, tokens_cache_write = ?, cost = ?, provider_retry_warnings = ?,
+            result_sealed = ?, result_chars = ? WHERE run_id = ?`)
             .run(record.status, record.errorType, record.finishedAt, record.durationMs,
               record.configuredModel, record.modelEvidencePresent ? 1 : 0,
               metrics.agentRunMs ?? null, metrics.startupMs ?? null, metrics.providerWaitMs ?? null,
               metrics.usageSteps ?? null, metrics.inputCount ?? null, metrics.outputCount ?? null,
               metrics.reasoningCount ?? null, metrics.cacheReadCount ?? null, metrics.cacheWriteCount ?? null,
-              metrics.cost ?? null, metrics.providerRetryWarnings ?? null, record.runId);
+              metrics.cost ?? null, metrics.providerRetryWarnings ?? null,
+              record.resultSealed || null, record.resultChars ?? null, record.runId);
           // An abandoned record is only ever one whose owner looked dead; the owner finishing
           // after all is the better evidence.
           if (Number(updated.changes) !== 1) throw new Error("Direct run audit record is missing.");
@@ -185,6 +233,23 @@ export function createDirectRunAudit({
       }
     } finally {
       closeDb(db);
+    }
+  };
+  const readResult = async (db, runId) => {
+    if (typeof openText !== "function") return null;
+    const row = db.prepare("SELECT result_sealed AS sealed, result_chars AS chars FROM opencode_direct_runs WHERE run_id = ?").get(runId);
+    if (!row?.sealed) return null;
+    try {
+      const payload = JSON.parse(await openText(row.sealed, runId));
+      return {
+        text: String(payload.text ?? ""),
+        detailText: String(payload.detailText ?? ""),
+        chars: Number(row.chars) || 0,
+        reportTruncated: Boolean(payload.reportTruncated),
+        detailTruncated: Boolean(payload.detailTruncated),
+      };
+    } catch {
+      return { unreadable: true };
     }
   };
   const auditNotice = (audit) => `Direct run audit: ${audit.runId}; ${audit.persisted
@@ -214,7 +279,9 @@ export function createDirectRunAudit({
       }
       return { job, record, audit, projectKey, startMs };
     },
-    async finish(handle, { execution, executionThrew = false, childStarted = false, errorType = "" } = {}) {
+    // `stored` is the result to keep ({ text, detailText, chars, reportTruncated }); a run that
+    // does not pass one keeps the execution's own resultRecord or its response text.
+    async finish(handle, { execution, executionThrew = false, childStarted = false, errorType = "", stored = null } = {}) {
       const { job, record, audit, projectKey, startMs } = handle;
       const result = execution?.result || {};
       record.errorType = identifier(errorType || (executionThrew ? "direct_run_exception" : result.errorType
@@ -228,6 +295,20 @@ export function createDirectRunAudit({
         ? [result.configuredProvider, result.configuredModel].filter(Boolean).join("/") : "");
       record.modelEvidencePresent = Boolean(result.runtimeObservedProvider && result.runtimeObservedModel);
       record.metrics = directRunMetrics(result);
+      record.resultSealed = "";
+      record.resultChars = null;
+      const toStore = stored || storedFromExecution(execution);
+      if (audit.startedPersisted && toStore && typeof sealText === "function") {
+        try {
+          const capped = cappedResult(toStore, redact, maxResultChars);
+          record.resultSealed = await sealText(JSON.stringify(capped.view), record.runId);
+          record.resultChars = capped.chars;
+        } catch {
+          // The result text is best-effort: the metadata record is what the audit guarantees.
+          record.resultSealed = "";
+          record.resultChars = null;
+        }
+      }
       if (audit.startedPersisted) {
         try {
           await write(projectKey, record, false);
@@ -268,7 +349,9 @@ export function createDirectRunAudit({
     },
     notice: auditNotice,
     // One run by its id: a direct run id, a parallel Run id, or the job id its worktree was named after.
-    async get(cwd, runId) {
+    // includeResult adds `result` (the stored text; null when none was kept, { unreadable: true }
+    // when it cannot be opened); the sealed text never appears in a snapshot.
+    async get(cwd, runId, { includeResult = false } = {}) {
       const id = String(runId || "");
       if (!id) return null;
       let db;
@@ -276,7 +359,10 @@ export function createDirectRunAudit({
         db = await openDb(await resolveProjectRoot(cwd));
         const record = db.prepare(`${RECORD_SELECT} WHERE run_id = ? OR (job_id = ? AND job_id <> '')
           ORDER BY started_at DESC LIMIT 1`).get(id, id);
-        return record ? viewRecord(record) : null;
+        if (!record) return null;
+        const view = viewRecord(record);
+        if (includeResult) view.result = await readResult(db, record.runId);
+        return view;
       } catch {
         return null;
       } finally {
@@ -286,7 +372,8 @@ export function createDirectRunAudit({
     async snapshot(cwd) {
       const coverage = {
         available: false,
-        storage: "per_project_sqlite_metadata_only",
+        storage: "per_project_sqlite",
+        resultText: typeof sealText === "function" ? `sealed, redacted, at most ${maxResultChars} characters per run` : "not stored",
         maxRows,
         retentionDays,
         includes: ["direct_handler_success", "direct_handler_failure", "direct_handler_rejection", "dry_run", "parallel_jobs"],

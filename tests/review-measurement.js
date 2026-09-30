@@ -176,7 +176,8 @@ test("B-024/B-025: the phase clock partitions the job and the queue reports the 
 test("B-018/B-020/B-021: parallel jobs are audited, their worktrees are in diagnose, get_opencode_job finds the Run id", async () => {
   installRuntime({ onRun: async ({ cwd }) => writeFile(path.join(cwd, "src", "a.txt"), "parallel edit\n", "utf8") });
   const job = { agent: "builder", task: "Edit src/a.txt.", cwd: repo, write: true, lockMode: "strict", lockedPaths: ["src/a.txt"], allowedEdits: ["src/a.txt"], scopeContract: writeScope(["src/a.txt"]) };
-  const text = textOf(await callTool("run_opencode_parallel", { jobs: [job] }));
+  // L-025: the phase timing split is bridge detail (tests/review-l025.js covers the compact default).
+  const text = textOf(await callTool("run_opencode_parallel", { jobs: [job], detail: true }));
   const runId = /JOB 1\nRun id: (\S+) \(get_opencode_job finds it/.exec(text)?.[1];
   assert.ok(runId, text);
   assert.match(text, new RegExp(`Direct run audit: ${runId}; terminal metadata persisted`));

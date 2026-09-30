@@ -194,3 +194,117 @@ test("B-029: start records whose bridge process is gone are closed as abandoned;
   check.close();
   assert.deepEqual({ ...row }, { instance: "this-bridge", pid: process.pid });
 });
+
+// L-025: the run's result text is kept sealed (never plaintext), redacted and capped.
+const sealed = {
+  sealText: async (text, runId) => `sealed:${runId}:${Buffer.from(text, "utf8").toString("base64")}`,
+  openText: async (envelope, runId) => {
+    const prefix = `sealed:${runId}:`;
+    if (!envelope.startsWith(prefix)) throw new Error("wrong run id");
+    return Buffer.from(envelope.slice(prefix.length), "base64").toString("utf8");
+  },
+};
+
+test("L-025: a run's result text is stored sealed and redacted, and read back by run id", async (t) => {
+  const { audit, root, dbPath } = await fixture(t, sealed);
+  const job = { cwd: root, agent: "reviewer" };
+  const succeeded = await audit.run(job, async () => ({
+    response: { content: [{ type: "text", text: "fallback text that must not win" }] },
+    result: {},
+    resultRecord: { text: "REPORT with sk-canaryreport and a tail", detailText: "PATCH sk-canarypatch", chars: 4321, reportTruncated: false },
+  }));
+  const runId = succeeded._meta.directRunAudit.runId;
+  assert.equal(succeeded._meta.directRunAudit.persisted, true);
+  const record = await audit.get(root, runId, { includeResult: true });
+  assert.deepEqual(record.result, {
+    text: "REPORT with [REDACTED] and a tail",
+    detailText: "PATCH [REDACTED]",
+    chars: 4321,
+    reportTruncated: false,
+    detailTruncated: false,
+  });
+  // Without includeResult neither the text nor its envelope is returned; a snapshot never has them.
+  assert.equal((await audit.get(root, runId)).result, undefined);
+  assert.equal(JSON.stringify(await audit.snapshot(root)).includes("REPORT"), false);
+  const bytes = (await readFile(dbPath)).toString("latin1");
+  assert.equal(bytes.includes("REPORT"), false, "the report is not in the database in plaintext");
+  assert.equal(bytes.includes("sk-canary"), false);
+
+  // A run that names no record keeps its response text, which is what a rejection has.
+  const rejected = await audit.run(job, async () => ({ response: { content: [{ type: "text", text: "Execution rejected: no git" }] }, result: { errorType: "git_state_required" } }));
+  const kept = await audit.get(root, rejected._meta.directRunAudit.runId, { includeResult: true });
+  assert.equal(kept.status, "rejected");
+  assert.equal(kept.result.text, "Execution rejected: no git");
+  assert.equal(kept.result.detailText, "");
+});
+
+test("L-025: the stored result is capped, the default text first and the detail with what is left", async (t) => {
+  const { audit, root } = await fixture(t, { ...sealed, maxResultChars: 400 });
+  const store = async (stored) => {
+    const handle = await audit.start({ cwd: root, agent: "builder" }, { runId: `capped-${Math.random().toString(36).slice(2, 8)}` });
+    await audit.finish(handle, { execution: { result: {} }, stored });
+    return (await audit.get(root, handle.record.runId, { includeResult: true })).result;
+  };
+  const both = await store({ text: "T".repeat(100), detailText: "D".repeat(1000), chars: 1100 });
+  assert.equal(both.text.length, 100);
+  assert.ok(both.detailText.length <= 300 && both.detailText.length >= 200 && both.detailText.startsWith("DDDD"), `detail ${both.detailText.length}`);
+  assert.match(both.detailText, /characters cut at the end/);
+  assert.equal(both.detailTruncated, true);
+  assert.equal(both.reportTruncated, false, "cutting the detail does not make the report truncated");
+  assert.equal(both.chars, 1100);
+
+  const long = await store({ text: "R".repeat(900), detailText: "patch" });
+  assert.ok(long.text.length <= 400, `text ${long.text.length}`);
+  assert.ok(long.text.startsWith("RRRR") && /\[\d+ of 900 characters cut at the end/.test(long.text), "the text is cut at its end and says so");
+  assert.equal(long.reportTruncated, true);
+  assert.equal(long.detailText, "", "no room is left for the detail");
+  assert.equal(long.detailTruncated, true);
+  assert.equal(long.chars, 905);
+
+  // The runner may already have flagged the report as cut.
+  assert.equal((await store({ text: "short", reportTruncated: true })).reportTruncated, true);
+});
+
+test("L-025: without a seal function nothing is stored, and a failing seal or open never fails the audit", async (t) => {
+  const plain = await fixture(t);
+  const ran = await plain.audit.run({ cwd: plain.root, agent: "reviewer" }, async () => ({ response: { content: [{ type: "text", text: "output" }] }, result: {} }));
+  assert.equal(ran._meta.directRunAudit.persisted, true);
+  assert.equal((await plain.audit.get(plain.root, ran._meta.directRunAudit.runId, { includeResult: true })).result, null);
+  assert.equal((await plain.audit.snapshot(plain.root)).coverage.resultText, "not stored");
+
+  const failing = await fixture(t, { sealText: async () => { throw new Error("no key sk-canarykey"); }, openText: sealed.openText });
+  const result = await failing.audit.run({ cwd: failing.root, agent: "reviewer" }, async () => ({ response: { content: [{ type: "text", text: "output" }] }, result: {} }));
+  assert.equal(result._meta.directRunAudit.persisted, true, "the metadata record does not depend on the text");
+  assert.equal((await failing.audit.get(failing.root, result._meta.directRunAudit.runId, { includeResult: true })).result, null);
+
+  const good = await fixture(t, sealed);
+  const stored = await good.audit.run({ cwd: good.root, agent: "reviewer" }, async () => ({ response: { content: [{ type: "text", text: "output" }] }, result: {} }));
+  const unreadable = createDirectRunAudit({ ...good.options, openText: async () => { throw new Error("key changed"); } });
+  assert.deepEqual((await unreadable.get(good.root, stored._meta.directRunAudit.runId, { includeResult: true })).result, { unreadable: true });
+  assert.match((await good.audit.snapshot(good.root)).coverage.resultText, /^sealed, redacted, at most \d+ characters per run$/);
+});
+
+test("L-025: a table from before the result columns is migrated, and older rows read as having no result", async (t) => {
+  const { root, dbPath } = await fixture(t);
+  const legacyOpen = async () => {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE IF NOT EXISTS opencode_direct_runs (
+      run_id TEXT PRIMARY KEY, project_key TEXT NOT NULL, status TEXT NOT NULL, error_type TEXT NOT NULL DEFAULT '',
+      started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER, agent TEXT NOT NULL,
+      configured_model TEXT NOT NULL DEFAULT '', model_evidence_present INTEGER NOT NULL DEFAULT 0)`);
+    return db;
+  };
+  const legacy = await legacyOpen();
+  legacy.prepare("INSERT INTO opencode_direct_runs (run_id, project_key, status, started_at, finished_at, agent) VALUES ('old-run', ?, 'completed', '2026-09-01T00:00:00.000Z', '2026-09-01T00:01:00.000Z', 'reviewer')").run(root);
+  legacy.close();
+  const audit = createDirectRunAudit({
+    openDb: async () => { const db = await legacyOpen(); ensureDirectRunAuditSchema(db); return db; },
+    closeDb: (db) => db.close(), resolveProjectRoot: async () => root, redact: (text) => text, ...sealed,
+  });
+  const old = await audit.get(root, "old-run", { includeResult: true });
+  assert.equal(old.status, "completed");
+  assert.equal(old.result, null);
+  const handle = await audit.start({ cwd: root, agent: "builder" }, { runId: "new-run" });
+  assert.equal((await audit.finish(handle, { execution: { result: {} }, stored: { text: "after the migration" } })).persisted, true);
+  assert.equal((await audit.get(root, "new-run", { includeResult: true })).result.text, "after the migration");
+});

@@ -860,7 +860,9 @@ async function main() {
     const nonReplayableSnapshot = await waitForQueueStatus(clientB, repo, nonReplayableJobId, ["not_resumable"]);
     assert.equal(nonReplayableSnapshot.errorType, "queue_job_not_resumable");
 
+    // L-025: blocks are compact by default; detail: true adds the bridge preamble these checks read.
     const dryParallel = await callTool(clientB, "run_opencode_parallel", {
+      detail: true,
       jobs: [
         { agent: "reviewer", task: "FAKE_DRY_ONE", cwd: repo, dryRun: true, write: false, lockMode: "off" },
         { agent: "tester", task: "FAKE_DRY_TWO", cwd: repo, dryRun: true, write: false, lockMode: "off" },
@@ -869,12 +871,14 @@ async function main() {
     assert.match(dryParallel, /Parallel group status:\s*completed/i);
     for (const index of [1, 2]) {
       const block = parallelJobBlock(dryParallel, index);
+      assert.match(block, /Status:\s*dry_run/i, `Dry parallel job ${index} did not return a terminal success result.`);
       assert.match(block, /Error type:\s*none/i, `Dry parallel job ${index} did not return a terminal success result.`);
       assert.match(block, /Exit code:\s*0/i, `Dry parallel job ${index} omitted its terminal exit status.`);
     }
     assert.doesNotMatch(dryParallel, /(?:Queue job ID|Job ID):/i, "Direct parallel execution must not fabricate durable queue job ids.");
 
     const independentTimeout = await callTool(clientB, "run_opencode_parallel", {
+      detail: true,
       jobs: [
         { agent: "reviewer", task: "FAKE_TIMEOUT: terminate only this job.", cwd: repo, write: false, lockMode: "off", timeoutMs: 150 },
         { agent: "tester", task: "FAKE_INDEPENDENT_SUCCESS", cwd: repo, write: false, lockMode: "off", timeoutMs: 5000 },
