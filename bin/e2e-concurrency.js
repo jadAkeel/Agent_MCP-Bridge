@@ -654,20 +654,29 @@ async function main() {
     assert.equal(Boolean(lowerCaseWriter.credentials), !caseInsensitiveFixture, "Filesystem case behavior must determine cross-process lock identity.");
     await Promise.all([release(clientA, repo, upperCaseWriter), release(clientB, repo, lowerCaseWriter)]);
 
+    // The bridge reserves these agent names for its own locks; a manual lock may not use them.
+    for (const reservedAgent of ["merge_manager", "integration_recovery", "pipeline_finalizer"]) {
+      const reserved = await acquire(clientB, { cwd: repo, agent: reservedAgent, lockType: "serial_integration", paths: ["docs"] });
+      assert.equal(reserved.credentials, null, `The reserved agent name ${reservedAgent} must be rejected.`);
+      assert.match(reserved.text, /reserved for the bridge's internal locks/, `${reservedAgent} was rejected for another reason.`);
+    }
+
     const relativeWriterAgain = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src"] });
     assert.ok(relativeWriterAgain.credentials);
     const disjointIntegration = await acquire(clientB, {
       cwd: repo,
-      agent: "merge_manager",
+      agent: "integration_agent",
       lockType: "serial_integration",
       paths: ["docs"],
     });
     assert.equal(disjointIntegration.credentials, null, "Serial integration must wait for every repository writer.");
+    // Denied by the writer on src, not for another reason (a reserved agent name once passed this check).
+    assert.match(disjointIntegration.text, /Write lock conflict/, "Serial integration was denied for a reason other than the writer.");
     await release(clientA, repo, relativeWriterAgain);
 
     const serialIntegration = await acquire(clientA, {
       cwd: repo,
-      agent: "merge_manager",
+      agent: "integration_agent",
       lockType: "serial_integration",
       paths: ["src/a"],
     });
