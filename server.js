@@ -12549,25 +12549,38 @@ async function integratePatchWithoutSerialLock({
       await beforeValidationHook({ targetCwd, patch, appliedFiles });
     }
     let validationGate = await runValidationGate({ command: validationCommand, cwd: targetCwd, trustedSpec: validationTrustedSpec, signal });
-    if (signal?.aborted) return ownershipLostResult("during validation");
+    // Checked before the abort return: an aborted integration whose validation tree may still run
+    // must not be left as a plain validating operation that a later recovery pass rolls back.
     if (validationGate.processTreeUnconfirmed) {
       // Rolling back now could be overwritten by a validation process that is still running, and
       // releasing the lock would let the next writer in. Quarantine: writers stay blocked until
       // an operator has checked that the process tree is gone (resolve_integration_quarantine).
-      await quarantineIntegrationOperation(targetCwd, integrationOperationId, ["validating"], "validation_process_unconfirmed", integrationAuthority, {
-        error: "The validation command's process tree could not be confirmed terminated.",
-      });
+      let quarantined = false;
+      for (let attempt = 0; attempt < 4 && !quarantined; attempt += 1) {
+        if (attempt) await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        quarantined = await quarantineIntegrationOperation(targetCwd, integrationOperationId, ["validating"], "validation_process_unconfirmed", integrationAuthority, {
+          error: "The validation command's process tree could not be confirmed terminated.",
+        });
+      }
+      if (!quarantined) {
+        // No durable record: block writers in this bridge process at least, and say so.
+        INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(targetCwd);
+        logEvent("error", "integration.validation_containment_unrecorded", { operationId: integrationOperationId });
+      }
       integrationOperationCommitted = true;
       return {
         ok: false,
         errorType: "validation_process_tree_unconfirmed",
-        error: "The validation command timed out or was stopped, and the bridge could not confirm that every process it started has ended. Nothing was rolled back, because a surviving process could still write the checkout; the integration operation is quarantined and writers of this repository are blocked.",
+        error: quarantined
+          ? "The validation command timed out or was stopped, and the bridge could not confirm that every process it started has ended. Nothing was rolled back, because a surviving process could still write the checkout; the integration operation is quarantined and writers of this repository are blocked."
+          : "The validation command timed out or was stopped, and the bridge could not confirm that every process it started has ended. Nothing was rolled back. The quarantine could NOT be written to the state database, so only this bridge process blocks writers of this repository; do not restart the clients until the validation processes are gone.",
         suggestedFix: "Check that no process started by the validation command is still running (Task Manager or Get-Process), then close the quarantine with resolve_integration_quarantine: verify_restored after putting the affected paths back, or ask the user to run accept_current from bin/pipeline-admin.js.",
         changedFiles: patch.changedFiles,
         operationId: integrationOperationId,
         validationGate,
       };
     }
+    if (signal?.aborted) return ownershipLostResult("during validation");
     const afterValidation = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const postValidationIndex = await captureGitIndexIdentity(targetCwd);
     const validationIndexChanged = !postValidationIndex.ok || postValidationIndex.indexSha256 !== preApplyFullIndexSha256;
@@ -16536,6 +16549,12 @@ server.tool(
     const abandonedAt = new Date().toISOString();
     try {
       await updatePipelineRecord(record, (current) => {
+        // Finalization removes source worktrees that abandonment promises to retain.
+        if (["finalizing", "cleanup_pending"].includes(current.status)) {
+          const error = new Error("The pipeline is being finalized.");
+          error.errorType = "pipeline_finalization_in_progress";
+          throw error;
+        }
         // An integration may have reserved an item since the check above.
         if ((current.integrationQueue || []).some((item) => item.status === "integrating")) {
           const error = new Error("An integration reserved an item of this pipeline while it was being abandoned.");
@@ -16556,17 +16575,19 @@ server.tool(
         };
       });
     } catch (error) {
-      if (!["pipeline_integration_in_progress", "pipeline_concurrent_update"].includes(error?.errorType)) throw error;
+      if (!["pipeline_integration_in_progress", "pipeline_concurrent_update", "pipeline_finalization_in_progress"].includes(error?.errorType)) throw error;
       return { content: [{ type: "text", text: formatRejectedExecution({
         headline: "Multi-agent pipeline abandonment rejected.",
         errorType: error.errorType,
         reason: error.errorType === "pipeline_integration_in_progress"
           ? "An integration journal operation started while the pipeline was being abandoned."
-          : "The pipeline changed in another process while it was being abandoned.",
+          : error.errorType === "pipeline_finalization_in_progress"
+            ? "The pipeline is being finalized; abandoning it now would let finalization remove the source worktrees abandonment retains."
+            : "The pipeline changed in another process while it was being abandoned.",
         requestedAgent: "pipeline_coordinator",
         actualAgent: "none",
         lockMode: "abandonment",
-        suggestedFix: "Nothing was cancelled. Wait for the integration to finish (get_multi_agent_pipeline), then abandon again.",
+        suggestedFix: "Nothing was cancelled. Wait for the integration or finalization to finish (get_multi_agent_pipeline), then abandon again if it is still needed.",
       }) }] };
     }
     return { content: [{ type: "text", text: [
@@ -22248,9 +22269,13 @@ async function refreshPipelineRecord(record, { persist = true } = {}) {
   // A crash between the journal commit and the pipeline update leaves an item integrating
   // although its operation committed; the journal decides before the status is derived.
   await reconcilePipelineIntegrationOperationStates(record, { persist });
+  // The entry check above can be stale by the time a write runs (abandonment may have committed
+  // meanwhile), so each write re-checks against the record as it stands then (G-11 review).
+  const frozen = (current) => ["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"].includes(current.status);
+  const guarded = (patch) => (current) => (frozen(current) ? {} : (typeof patch === "function" ? patch(current) : patch));
   const applyPatch = persist
-    ? (patch) => updatePipelineRecord(record, patch)
-    : async (patch) => Object.assign(record, typeof patch === "function" ? patch(record) : patch);
+    ? (patch) => updatePipelineRecord(record, guarded(patch))
+    : async (patch) => Object.assign(record, guarded(patch)(record));
   let queueSnapshots = [];
   if (effectiveQueueMode() === "sqlite") {
     const children = await readPersistedPipelineChildren(record);
@@ -22394,7 +22419,7 @@ const PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES = new Set([
 
 async function deferPipelineFinalization(record, { type, errorType, error, patch = {} }) {
   const at = new Date().toISOString();
-  await updatePipelineRecord(record, (current) => ({
+  await updatePipelineRecord(record, (current) => PIPELINE_INTEGRATION_CLOSED_STATUSES.has(current.status) ? {} : ({
     ...patch,
     status: "awaiting_finalization",
     finishedAt: "",
@@ -22972,7 +22997,15 @@ async function finalizePipelineRecordWhileLocked(record, { skipReviewers = false
     };
   }
 
-  await updatePipelineRecord(record, { status: "finalizing", events });
+  try {
+    await updatePipelineRecord(record, (current) => {
+      if (PIPELINE_INTEGRATION_CLOSED_STATUSES.has(current.status)) throw pipelineTerminalError(current);
+      return { status: "finalizing", events };
+    });
+  } catch (error) {
+    if (error?.errorType !== "pipeline_terminal") throw error;
+    return { ok: false, errorType: "pipeline_terminal", error: `${error.message} Nothing was finalized and no source worktree was removed.`, record };
+  }
   const sanitizedBeforeFinalGates = record.sanitizedWorkspace && !dryRun
     ? await verifySanitizedWorkspace(record.sanitizedWorkspace, "pipeline_before_final_gates")
     : null;
