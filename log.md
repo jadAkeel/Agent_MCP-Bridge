@@ -16,6 +16,14 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-30
 
+### Third production review pass: G-08..G-12, O-1, E-1, T-1, H3 (Claude, 2026-09-30)
+
+From `gpt61-sol-production-report-pass3.md` and the pass-3 section of `production-gate-plan.md`. One branch and worktree per item (`C:\Users\10User\bridge-<id>`, its own `npm ci`), merged with `--ff-only` after approval.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| G-09 | (Pass-3 finding, "confirm first".) A sparse or skip-worktree target could turn files absent from disk into deletions in a writer's patch, because `seedIndexFromRealIndex` refuses such indexes and the capture falls back to `read-tree <base>` + `git add -A`. | Refuted on Git 2.39.1 with real writer jobs and integration dry runs: `git worktree add` copies the target's sparse settings into the bridge worktree (cone, non-cone, sparse index, `extensions.worktreeConfig`), `read-tree` into the temporary index applies them and sets skip-worktree, and `git add -A` leaves skip-worktree entries alone; a manual skip-worktree bit is not copied, so the worktree has the file on disk. In every case the dry run's changed files were only the agent's edit. With a file the agent force-adds on an ignored path, the B-027 check still refuses with `integration_source_unrepresentable` naming only that file. | No server change. `tests/review3-g09.js` (7 cases) keeps the check for other Git versions and prints the Git version it ran with. | (this commit) | refuted, test added |
+
 ### Concurrency stress test was broken (Claude, 2026-09-30)
 
 Branch `bridge/e2e-concurrency-reserved-name`, merged into the live tree 2026-09-30. `npm test` only syntax-checks `bin/e2e-concurrency.js`, so nothing ran it; `npm run test:release` does, so that gate had failed since 56357f3. After the fix the test passed 6 of 7 runs in the worktree (about 45 s each); the other run hit B-034.
