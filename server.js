@@ -1293,6 +1293,59 @@ async function inspectGitControlFilesWithEffect(cwd) {
   return effective;
 }
 
+// G-10: a merge, rebase, cherry-pick, revert or bisect that is still in progress, or an index with
+// unmerged entries. Applying onto such a target, or starting a writer from it, mixes the
+// agent's change into an operation the operator has not finished, and rollback can no longer
+// tell whose state it restores. allowDirtyTarget does not admit it. --git-path resolves each
+// name for linked worktrees, whose operation state lives in .git/worktrees/<name>/.
+const GIT_OPERATION_STATE_PATHS = [
+  ["MERGE_HEAD", "merge"],
+  ["REBASE_HEAD", "rebase"],
+  ["rebase-merge", "rebase"],
+  ["rebase-apply", "rebase or am"],
+  ["CHERRY_PICK_HEAD", "cherry-pick"],
+  ["REVERT_HEAD", "revert"],
+  ["sequencer", "cherry-pick or revert sequence"],
+  ["BISECT_LOG", "bisect"],
+];
+
+async function inspectRepositoryOperationState(cwd) {
+  const args = ["rev-parse", ...GIT_OPERATION_STATE_PATHS.flatMap(([name]) => ["--git-path", name])];
+  const [located, unmerged] = await Promise.all([
+    runCommand("git", args, cwd, 1000 * 15, buildValidationEnv({ GIT_OPTIONAL_LOCKS: "0" })),
+    runGitReadOnlyCommand(["ls-files", "--unmerged", "-z"], cwd, 1000 * 30),
+  ]);
+  const lines = String(located.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (located.exitCode !== 0 || lines.length !== GIT_OPERATION_STATE_PATHS.length || unmerged.exitCode !== 0) {
+    return {
+      ok: false,
+      errorType: "target_operation_state_unreadable",
+      error: `Could not check the repository for an unfinished merge, rebase, cherry-pick, revert or bisect: ${located.stderr || unmerged.stderr || "git rev-parse --git-path returned an unexpected answer"}`,
+      suggestedFix: "Check that git works in this repository (git status), then retry.",
+    };
+  }
+  const found = [];
+  GIT_OPERATION_STATE_PATHS.forEach(([name, operation], index) => {
+    if (existsSync(path.resolve(cwd, lines[index]))) found.push({ name, operation });
+  });
+  const unmergedPaths = [...new Set(splitNulSeparated(unmerged.stdout).map((entry) => entry.replace(/^[^\t]*\t/, "")))];
+  if (!found.length && !unmergedPaths.length) return { ok: true };
+  const operations = [...new Set(found.map((entry) => entry.operation))];
+  const described = [
+    ...(operations.length ? [`a ${operations.join(", ")} in progress (${found.map((entry) => entry.name).join(", ")})`] : []),
+    ...(unmergedPaths.length ? [`${unmergedPaths.length} unmerged index path(s): ${unmergedPaths.slice(0, 10).join(", ")}${unmergedPaths.length > 10 ? ", ..." : ""}`] : []),
+  ];
+  return {
+    ok: false,
+    errorType: "target_operation_in_progress",
+    error: `The repository has ${described.join(" and ")}. The bridge does not apply patches to, or start writers from, a repository in the middle of a Git operation; allowDirtyTarget does not change this. Finish or abort the operation, then retry.`,
+    suggestedFix: "Finish or abort the operation in the repository (git merge --continue/--abort, git rebase --continue/--abort, git cherry-pick --continue/--abort, git revert --continue/--abort, git bisect reset; resolve and stage every conflicted file), then retry.",
+    operationState: found.map((entry) => entry.name),
+    unmergedPaths: unmergedPaths.slice(0, 50),
+    conflictingPaths: unmergedPaths.slice(0, 50),
+  };
+}
+
 async function inspectRepositoryGitControlSurface(cwd) {
   const listed = await runCommand("git", ["config", "--local", "--name-only", "--list"], cwd, 1000 * 15);
   if (listed.exitCode !== 0) {
@@ -9693,6 +9746,8 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
   const repoRoot = path.resolve(repoRootResult.stdout.trim());
   const gitControlSurface = await inspectRepositoryGitControlSurface(repoRoot);
   if (!gitControlSurface.ok) return gitControlSurface;
+  const operationState = await inspectRepositoryOperationState(repoRoot);
+  if (!operationState.ok) return operationState;
   const checkpointState = await inspectSourceCheckpointState(repoRoot, { lockedPaths, allowedEdits, scopeContract });
   if (!checkpointState.ok) {
     return checkpointState;
@@ -11354,6 +11409,9 @@ async function integratePatchWithoutSerialLock({
       error: signal.reason?.message || "The serial integration lease was lost before target inspection.",
     };
   }
+  // G-10: checked before either capture so a dry run never issues a receipt for such a target.
+  const operationState = await inspectRepositoryOperationState(targetCwd);
+  if (!operationState.ok) return operationState;
 
   // B-026: the target identity and the source patch each rehash a whole tree (12-19 s on a
   // 22,708-file repository). They read different trees and neither writes, so they run together;
@@ -11753,6 +11811,12 @@ async function integratePatchWithoutSerialLock({
           ownershipMismatches: unresolvedFiles,
         },
       };
+    }
+    // G-10: an operation started after the dry run (git merge --no-commit -s ours leaves no
+    // status or index change) is refused here, before any byte of the target is written.
+    const preApplyOperationState = await inspectRepositoryOperationState(targetCwd);
+    if (!preApplyOperationState.ok) {
+      return { ...preApplyOperationState, error: `${preApplyOperationState.error} The patch was not applied and the source was retained.`, changedFiles: patch.changedFiles };
     }
     if (signal?.aborted) {
       return {
@@ -24664,6 +24728,7 @@ export const __selfTest = {
     applyModelOverrideToMetadata,
     applyPatchFile,
     inspectRepositoryGitControlSurface,
+    inspectRepositoryOperationState,
     replaceRollbackLeaf,
     writeTemporaryPatchFile,
     assert,
