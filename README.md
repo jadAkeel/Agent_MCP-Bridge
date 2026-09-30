@@ -28,8 +28,9 @@ Run these from this repository.
 | `npm run smoke:live` | Start the bridge like Codex does and run one tiny real job |
 | `npm run gc` / `npm run gc:apply` | List or remove leftover worktrees and dead databases |
 | `npm run tui` | Terminal dashboard for pipelines and jobs |
-| `npm run release:activate` | Test, build, activate, and verify a new release in one step |
-| `npm test` | Full self-test gate |
+| `npm run release:activate` | Run the release gate, build, activate, and verify a new release in one step |
+| `npm test` | Full self-test suite |
+| `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
 ## Requirements
 

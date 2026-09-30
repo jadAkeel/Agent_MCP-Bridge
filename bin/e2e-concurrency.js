@@ -552,10 +552,36 @@ async function runFakeOpenCode() {
   process.stdout.write(`${JSON.stringify({ type: "text", part: { type: "text", text: "offline fake completed", time: { end: 1 } } })}\n`);
 }
 
+// G-04: one line per check with its duration, and a closing count that the release gate
+// records. A check that cannot run here must call skip() with its reason, never pass silently.
+function createCheckLog(write = (line) => process.stdout.write(`${line}\n`)) {
+  let last = Date.now();
+  let passed = 0;
+  let skipped = 0;
+  return {
+    pass(name) {
+      const now = Date.now();
+      write(`check ok   ${name} (${now - last} ms)`);
+      last = now;
+      passed += 1;
+    },
+    skip(name, reason) {
+      write(`skip ${name}: ${reason}`);
+      last = Date.now();
+      skipped += 1;
+    },
+    summary() {
+      write(`Checks: ${passed} passed, skipped: ${skipped}`);
+    },
+  };
+}
+
 async function main() {
+  const checks = createCheckLog();
   const parserFixture = "Concurrent execution pairs: JOB 1 + JOB 2\n\nJOB 1\nError type: agent_timeout\n\nJOB 2\nResult: success\n";
   assert.match(parallelJobBlock(parserFixture, 1), /^JOB 1\r?\nError type: agent_timeout/m);
   assert.doesNotMatch(parallelJobBlock(parserFixture, 1), /Result: success/);
+  checks.pass("parallel result parser separates job blocks");
 
   const tempBase = path.resolve(tmpdir());
   const fixtureRoot = await mkdtemp(path.join(tempBase, "codex-opencode-concurrency-"));
@@ -605,6 +631,7 @@ async function main() {
       connectClient("concurrency-a", stateDir, { fakeOpenCode, worktreeRoot, extraEnv: fakeManagedEnv }),
       connectClient("concurrency-b", stateDir, { fakeOpenCode, worktreeRoot, extraEnv: fakeManagedEnv }),
     ]);
+    checks.pass("two bridges start together on a cold state directory");
 
     const [readerA, readerB] = await Promise.all([
       acquire(clientA, { cwd: repo, agent: "reviewer", lockType: "read", paths: ["src"] }),
@@ -617,6 +644,7 @@ async function main() {
     const writerBlockedByReaders = await acquire(clientB, { cwd: repo, agent: "builder", lockType: "write", paths: ["src"] });
     assert.equal(writerBlockedByReaders.credentials, null, "A writer must not pass active readers.");
     await Promise.all([release(clientA, repo, readerA), release(clientB, repo, readerB)]);
+    checks.pass("shared readers acquire together; a writer waits for them");
 
     const relativeWriter = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src"] });
     assert.ok(relativeWriter.credentials);
@@ -628,6 +656,7 @@ async function main() {
     });
     assert.equal(absoluteWriter.credentials, null, "Absolute and relative forms of the same path must conflict.");
     await release(clientA, repo, relativeWriter);
+    checks.pass("absolute and relative spellings of a path conflict");
 
     const canonicalAliasWriter = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src/file.js"] });
     assert.ok(canonicalAliasWriter.credentials);
@@ -639,6 +668,7 @@ async function main() {
     assert.equal(traversalAliasWriter.credentials, null);
     assert.match(traversalAliasWriter.text, /parent traversal/i);
     await release(clientA, repo, canonicalAliasWriter);
+    checks.pass("file path aliases conflict; parent traversal is refused");
 
     const directoryAliasWriter = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src"] });
     assert.ok(directoryAliasWriter.credentials);
@@ -648,6 +678,7 @@ async function main() {
     assert.equal(directoryTraversalWriter.credentials, null);
     assert.match(directoryTraversalWriter.text, /parent traversal/i);
     await release(clientA, repo, directoryAliasWriter);
+    checks.pass("directory path aliases conflict");
 
     const caseInsensitiveFixture = await access(path.join(repo, "SRC", "seed.txt")).then(() => true, () => false);
     const upperCaseWriter = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src/User.ts"] });
@@ -655,6 +686,7 @@ async function main() {
     assert.ok(upperCaseWriter.credentials);
     assert.equal(Boolean(lowerCaseWriter.credentials), !caseInsensitiveFixture, "Filesystem case behavior must determine cross-process lock identity.");
     await Promise.all([release(clientA, repo, upperCaseWriter), release(clientB, repo, lowerCaseWriter)]);
+    checks.pass(`lock identity follows filesystem case (${caseInsensitiveFixture ? "case-insensitive" : "case-sensitive"} here)`);
 
     // The bridge reserves these agent names for its own locks; a manual lock may not use them.
     for (const reservedAgent of ["merge_manager", "integration_recovery", "pipeline_finalizer"]) {
@@ -662,6 +694,7 @@ async function main() {
       assert.equal(reserved.credentials, null, `The reserved agent name ${reservedAgent} must be rejected.`);
       assert.match(reserved.text, /reserved for the bridge's internal locks/, `${reservedAgent} was rejected for another reason.`);
     }
+    checks.pass("reserved internal agent names are refused");
 
     const relativeWriterAgain = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: ["src"] });
     assert.ok(relativeWriterAgain.credentials);
@@ -675,6 +708,7 @@ async function main() {
     // Denied by the writer on src, not for another reason (a reserved agent name once passed this check).
     assert.match(disjointIntegration.text, /Write lock conflict/, "Serial integration was denied for a reason other than the writer.");
     await release(clientA, repo, relativeWriterAgain);
+    checks.pass("serial integration waits for every repository writer");
 
     const serialIntegration = await acquire(clientA, {
       cwd: repo,
@@ -691,6 +725,7 @@ async function main() {
     });
     assert.equal(disjointWriter.credentials, null, "A repository writer must wait for serial integration.");
     await release(clientA, repo, serialIntegration);
+    checks.pass("a repository writer waits for serial integration");
 
     for (let index = 0; index < 20; index += 1) {
       const pathName = `src/overlap-${index}`;
@@ -701,6 +736,7 @@ async function main() {
       assert.equal(pair.filter((lock) => Boolean(lock.credentials)).length, 1, `Round ${index}: exactly one overlapping writer must win.`);
       await Promise.all([release(clientA, repo, pair[0]), release(clientB, repo, pair[1])]);
     }
+    checks.pass("20 overlapping writer races: exactly one wins each");
 
     for (let index = 0; index < 10; index += 1) {
       const pair = await Promise.all([
@@ -716,6 +752,7 @@ async function main() {
 
     const remaining = await callTool(clientA, "list_agent_locks", { cwd: repo });
     assert.match(remaining, /No active temporary locks\./i);
+    checks.pass("10 disjoint writer pairs run concurrently; no lock is left");
 
     const activeReadPath = "src/read-consistency.txt";
     const parallelReaders = await Promise.all([
@@ -733,6 +770,7 @@ async function main() {
     const disjointWriterDuringNormalRead = await callTool(clientB, "run_opencode_agent", directWriteJob(repo, "src/disjoint-read-control.txt", "FAKE_INDEPENDENT_SUCCESS"));
     assert.doesNotMatch(disjointWriterDuringNormalRead, /(?:Error type|errorType):\s*(?:write|read)_lock_conflict/i, disjointWriterDuringNormalRead);
     await activeReader;
+    checks.pass("read jobs share a path; a writer on it is refused, a disjoint one is not");
 
     const activeWriterForReader = callTool(clientA, "run_opencode_agent", directWriteJob(repo, activeReadPath, "FAKE_TIMEOUT: hold the writer lease against a reader."));
     await waitFor(async () => {
@@ -742,6 +780,7 @@ async function main() {
     const readerBlockedByNormalWriter = await callTool(clientB, "run_opencode_agent", directReadJob(repo, activeReadPath, "FAKE_INDEPENDENT_SUCCESS"));
     assert.match(readerBlockedByNormalWriter, /(?:Error type|errorType):\s*read_lock_conflict/i, readerBlockedByNormalWriter);
     await activeWriterForReader;
+    checks.pass("a read job on a path a writer holds is refused");
     const automaticConflictPath = "src/automatic-conflict.txt";
     const activeAutomaticWriter = callTool(
       clientA,
@@ -760,6 +799,7 @@ async function main() {
     assert.match(automaticConflict, /(?:Error type|errorType):\s*write_lock_conflict/i, automaticConflict);
     assert.doesNotMatch(automaticConflict, /manual_lock_misuse|Manual lock already exists/i, automaticConflict);
     await activeAutomaticWriter;
+    checks.pass("automatic writer locks conflict across processes");
 
     const manualConflictPath = "src/manual-conflict.txt";
     const manualLock = await acquire(clientA, { cwd: repo, agent: "builder", lockType: "write", paths: [manualConflictPath] });
@@ -772,6 +812,7 @@ async function main() {
     assert.match(manualConflict, /(?:Error type|errorType):\s*manual_lock_misuse/i, manualConflict);
     assert.match(manualConflict, /Manual lock already exists/i, manualConflict);
     await release(clientA, repo, manualLock);
+    checks.pass("a manual lock refuses an automatic writer as manual_lock_misuse");
 
     const dbPath = await projectDbPath(stateDir);
     const instanceRows = withDatabase(dbPath, (db) => db.prepare(
@@ -779,6 +820,7 @@ async function main() {
     ).all());
     assert.ok(instanceRows.some((row) => Number(row.process_id) === clientA.bridgePid), "The cold-start database omitted bridge A's lease row.");
     assert.ok(instanceRows.some((row) => Number(row.process_id) === clientB.bridgePid), "The cold-start database omitted bridge B's lease row.");
+    checks.pass("the cold-start database holds both bridges' instance leases");
 
     const ownedPipelineText = await callTool(clientA, "create_multi_agent_pipeline", {
       name: "cross-process-owner-boundary",
@@ -802,6 +844,7 @@ async function main() {
       "SELECT revision FROM opencode_pipelines WHERE pipeline_id = ?"
     ).get(ownedPipelineId)?.revision || 0));
     assert.equal(pipelineRevisionAfterForeignCalls, pipelineRevisionBeforeForeignRead, "Foreign pipeline reads/finalization must not mutate the creator-owned record.");
+    checks.pass("a foreign bridge reads but cannot finalize or change an owned pipeline");
 
     const activeEnqueue = await callTool(clientA, "enqueue_opencode_job", {
       ...directWriteJob(repo, "src/orphan-worktree.txt", "FAKE_QUEUE_CRASH: remain active until the owning bridge is crashed."),
@@ -832,6 +875,7 @@ async function main() {
     assert.equal(renewedSnapshot.status, "running", `The offline queue fixture exited before its heartbeat was observed: ${JSON.stringify(renewedSnapshot)}`);
     assert.notEqual(renewedSnapshot.heartbeatAt, firstHeartbeat, `The active owner did not renew the queue heartbeat: ${JSON.stringify(renewedSnapshot)}`);
     assert.ok(Date.parse(renewedSnapshot.leaseExpiresAt) > Date.now(), "The active queue heartbeat must keep the owner lease in the future.");
+    checks.pass("a queued writer runs in its own worktree and renews its heartbeat");
 
     const pendingEnqueue = await callTool(clientA, "enqueue_opencode_job", {
       agent: "tester",
@@ -847,10 +891,12 @@ async function main() {
     const cancellation = await callTool(clientB, "cancel_opencode_job", { cwd: repo, jobId: cancelledJobId });
     assert.match(cancellation, /cancelled .*before execution|cancellation requested/i);
     assert.equal((await waitForQueueStatus(clientB, repo, cancelledJobId, ["cancelled"])).status, "cancelled");
+    checks.pass("a pending job is cancelled cross-process before it starts");
 
     const liveRecovery = await callTool(clientB, "inspect_opencode_queue_recovery", { cwd: repo, reconcileExpired: true });
     assert.match(liveRecovery, /Reconciled records:\s*none/i, "A foreign active job with a current heartbeat must not be reconciled.");
     assert.equal((await getQueueSnapshot(clientB, repo, activeJobId)).status, "running", "A live foreign job was falsely reconciled.");
+    checks.pass("a live foreign job with a current heartbeat is not reconciled");
 
     const crashedOwnerInstance = renewedSnapshot.ownerInstanceId;
     await crashBridge(clientA);
@@ -859,6 +905,7 @@ async function main() {
       const row = db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(crashedOwnerInstance);
       return row && Date.parse(row.lease_expires_at || "") <= Date.now();
     }), "The crashed bridge owner's lease did not expire.", 10_000);
+    checks.pass("a crashed owner's instance lease expires");
     const interruptedSnapshot = await waitForQueueStatus(clientB, repo, activeJobId, ["interrupted"], 10_000);
     assert.equal(interruptedSnapshot.errorType, "queue_job_interrupted");
     assert.equal(interruptedSnapshot.ownerInstanceId, crashedOwnerInstance);
@@ -867,6 +914,7 @@ async function main() {
     withDatabase(dbPath, (db) => db.prepare("UPDATE locks SET expires_at = ? WHERE normalized_path = ?").run(Date.now() - 1, "src/orphan-worktree.txt"));
     await callTool(clientB, "list_agent_locks", { cwd: repo });
     assert.equal((await getQueueSnapshot(clientB, repo, cancelledJobId)).status, "cancelled", "Cancellation must remain terminal after owner recovery.");
+    checks.pass("takeover: the other bridge marks the orphan interrupted, its output stays isolated");
 
     const oldTimestamp = new Date(Date.now() - 60_000).toISOString();
     const nonReplayableJobId = "pending-non-replayable-concurrency";
@@ -882,6 +930,7 @@ async function main() {
     await callTool(clientB, "inspect_opencode_queue_recovery", { cwd: repo, reconcileExpired: true });
     const nonReplayableSnapshot = await waitForQueueStatus(clientB, repo, nonReplayableJobId, ["not_resumable"]);
     assert.equal(nonReplayableSnapshot.errorType, "queue_job_not_resumable");
+    checks.pass("an expired non-replayable record becomes not_resumable");
 
     // L-025: blocks are compact by default; detail: true adds the bridge preamble these checks read.
     const dryParallel = await callTool(clientB, "run_opencode_parallel", {
@@ -899,6 +948,7 @@ async function main() {
       assert.match(block, /Exit code:\s*0/i, `Dry parallel job ${index} omitted its terminal exit status.`);
     }
     assert.doesNotMatch(dryParallel, /(?:Queue job ID|Job ID):/i, "Direct parallel execution must not fabricate durable queue job ids.");
+    checks.pass("dry-run parallel jobs complete without queue ids");
 
     const independentTimeout = await callTool(clientB, "run_opencode_parallel", {
       detail: true,
@@ -913,6 +963,7 @@ async function main() {
     assert.match(independentSibling, /Error type:\s*none/i, "One timed-out job must not cancel an independent sibling.");
     assert.match(independentSibling, /Assistant final response detected:\s*yes/i);
     assert.doesNotMatch(independentTimeout, /(?:Queue job ID|Job ID):/i, "Direct timeout handling must not fabricate queue job ids.");
+    checks.pass("one timed-out parallel job leaves its sibling alone");
 
     const partialWriters = await callTool(clientB, "run_opencode_parallel", {
       jobs: [
@@ -970,6 +1021,7 @@ async function main() {
     assert.ok(retainedContents.some((item) => item.failure === "failed worktree output retained\n"), "The partial-failure worktree was not retained intact.");
     await assert.rejects(access(path.join(repo, "src", "success.txt")), undefined, "Parallel writer output must remain isolated from the main checkout.");
     await assert.rejects(access(path.join(repo, "src", "failure.txt")), undefined, "Failed writer output must remain isolated from the main checkout.");
+    checks.pass("partial parallel writers retain both worktrees, the checkout untouched");
 
     const metadataCounterPath = path.join(fixtureRoot, "metadata-counter.txt");
     const runSentinelPath = path.join(fixtureRoot, "unexpected-run-sentinel.txt");
@@ -999,6 +1051,7 @@ async function main() {
     await assert.rejects(access(runSentinelPath), undefined, "The fake OpenCode run command executed after final metadata drift was detected.");
     await clientC.close();
     clientC = null;
+    checks.pass("agent metadata drift at the pre-spawn read fails closed");
 
     const providerHoldMs = 700;
     const providerWorkers = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
@@ -1027,6 +1080,7 @@ async function main() {
     ));
     assert.ok(maxProviderOverlap <= 2, `Cross-process provider concurrency exceeded the configured account limit: ${maxProviderOverlap}`);
     assert.ok(providerIntervals.some((item) => item.waitedMs >= Math.floor(providerHoldMs / 2)), "At least one provider worker should wait for shared cross-process capacity.");
+    checks.pass("provider capacity holds across 4 processes (limit 2)");
     // A client that keeps an older bridge alive keeps its old limit. A newer bridge with a
     // different limit must wait under the stricter one, never fail the job.
     const mixedEnv = (limit) => ({
@@ -1060,6 +1114,7 @@ async function main() {
       assert.ok(JSON.parse(line).acquiredAt >= strictAcquired.acquiredAt + mixedHoldMs - 50,
         "A limit-3 worker ran beside an active limit-1 lease; the stricter limit must hold while its leases are active.");
     }
+    checks.pass("the stricter provider limit holds among mixed-limit bridges");
 
     // A containment quarantine whose recorded processes are all gone must free its slot;
     // before this it held capacity forever.
@@ -1079,11 +1134,14 @@ async function main() {
     withDatabase(path.join(stateDir, "provider-concurrency.sqlite"), (db) => {
       assert.equal(db.prepare("SELECT COUNT(*) AS n FROM provider_leases WHERE lease_id = 'stale-quarantine'").get().n, 0);
     });
+    checks.pass("a containment quarantine of dead processes frees its slot");
 
     assertDatabaseHealthy(dbPath, "Project state database after cross-process stress");
     const providerDatabasePath = path.join(stateDir, "provider-concurrency.sqlite");
     await access(providerDatabasePath);
     assertDatabaseHealthy(providerDatabasePath, "Provider lease database after cross-process stress");
+    checks.pass("both databases pass integrity checks");
+    checks.summary();
     process.stdout.write("Cross-process MCP concurrency stress passed.\n");
   } finally {
     await Promise.all([clientA?.close().catch(() => {}), clientB?.close().catch(() => {}), clientC?.close().catch(() => {})]);
