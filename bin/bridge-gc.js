@@ -216,7 +216,7 @@ function inspectProjectDatabase(dbPath, { busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_M
       if (Number(row?.count || 0) > 0) activeReasons.push(`${row.count} live bridge instance lease(s)`);
     }
     if (hasTable(db, "integration_operations") && tableColumns(db, "integration_operations").has("status")) {
-      const row = db.prepare("SELECT COUNT(*) AS count FROM integration_operations WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')").get();
+      const row = db.prepare("SELECT COUNT(*) AS count FROM integration_operations WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop', 'recovered_verified', 'resolved_by_operator')").get();
       if (Number(row?.count || 0) > 0) activeReasons.push(`${row.count} unresolved integration operation(s)`);
     }
     const registry = new Map();

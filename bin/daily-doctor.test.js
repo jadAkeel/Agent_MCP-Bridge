@@ -133,3 +133,35 @@ test("no Claude Code config is only a warning; an unreadable Codex config is a f
     f.cleanup();
   }
 });
+
+test("an integration quarantine older than the threshold fails the doctor and names the runbook", async () => {
+  const f = fixture();
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    mkdirSync(path.join(f.env.CODEX_OPENCODE_STATE_DIR, "projects"));
+    const db = new DatabaseSync(path.join(f.env.CODEX_OPENCODE_STATE_DIR, "projects", "fixture.sqlite"));
+    db.exec("CREATE TABLE integration_operations (operation_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, owner_instance_id TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT, updated_at TEXT NOT NULL)");
+    db.prepare("INSERT INTO integration_operations VALUES (?, ?, ?, ?, ?, ?)")
+      .run("integration-old", "C:/repo", "gone", "quarantined", JSON.stringify({ reason: "affected_path_drift" }), new Date(Date.now() - 45 * 60_000).toISOString());
+    db.close();
+    const report = await f.run();
+    assert.equal(report.ok, false);
+    const quarantine = report.failures.filter((item) => item.check === "integration-quarantine");
+    assert.equal(quarantine.length, 1, formatReport(report));
+    assert.match(quarantine[0].message, /integration-old in C:\/repo has been quarantined for 4[5-6] min \(reason affected_path_drift\)/);
+    assert.match(quarantine[0].message, /resolve_integration_quarantine; runbook: .*USER_GUIDE\.md#a-quarantine-that-does-not-clear$/);
+    assert.equal(report.state.quarantinedIntegrationOperations, 1);
+    const lenient = await runDailyDoctor({ configPath: path.join(f.root, "config.toml"), cwd: path.join(f.root, "tree"), claudeConfigPath: path.join(f.root, ".claude.json"), quarantineMaxAgeMinutes: 60 });
+    assert.equal(lenient.failures.filter((item) => item.check === "integration-quarantine").length, 0);
+    assert.ok(lenient.warnings.some((warning) => /integration-old/.test(warning)), "a younger quarantine is still a warning");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("--quarantine-max-age-min takes whole minutes", async () => {
+  const { parseArguments } = await import("./daily-doctor.js");
+  assert.equal(parseArguments(["--quarantine-max-age-min", "5"]).quarantineMaxAgeMinutes, 5);
+  assert.equal(parseArguments([]).quarantineMaxAgeMinutes, 30);
+  assert.throws(() => parseArguments(["--quarantine-max-age-min", "x"]), /whole number of minutes/);
+});

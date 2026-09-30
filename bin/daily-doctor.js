@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { auditHasFailures, auditStateDirectory } from "./state-audit.js";
 import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
@@ -14,6 +15,24 @@ import { isMainModule } from "./main-module.js";
 const execFileAsync = promisify(execFile);
 const SERVER_NAME = "opencode";
 const SYNC_HINT = "run npm run release:activate -- --sync-clients";
+// G-01: a quarantined integration blocks every writer of its repository until someone resolves
+// it; one older than this fails the doctor and names the runbook.
+const DEFAULT_QUARANTINE_MAX_AGE_MINUTES = 30;
+const QUARANTINE_RUNBOOK = `${path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "docs", "USER_GUIDE.md")}#a-quarantine-that-does-not-clear`;
+
+function quarantineFindings(state, maxAgeMinutes, now = Date.now()) {
+  const failures = [];
+  const warnings = [];
+  for (const database of state.databases || []) {
+    for (const item of database.quarantinedIntegrationOperations || []) {
+      const ageMinutes = Math.max(0, Math.floor((now - Date.parse(item.updatedAt || "")) / 60_000)) || 0;
+      const message = `Integration operation ${item.id}${item.cwd ? ` in ${item.cwd}` : ""} has been quarantined for ${ageMinutes} min (reason ${item.reason || "unknown"}); every writer of that repository is blocked. Resolve it with resolve_integration_quarantine; runbook: ${QUARANTINE_RUNBOOK}`;
+      if (ageMinutes >= maxAgeMinutes) failures.push({ check: "integration-quarantine", message });
+      else warnings.push(message);
+    }
+  }
+  return { failures, warnings };
+}
 
 function defaultClaudeConfigPath(env = process.env) {
   const configDir = String(env.CLAUDE_CONFIG_DIR || "").trim();
@@ -26,11 +45,17 @@ function parseArguments(argv) {
     claudeConfigPath: defaultClaudeConfigPath(),
     cwd: process.cwd(),
     json: false,
+    quarantineMaxAgeMinutes: DEFAULT_QUARANTINE_MAX_AGE_MINUTES,
   };
   const valued = { "--config": "configPath", "--cwd": "cwd", "--claude-config": "claudeConfigPath" };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (valued[argument]) {
+    if (argument === "--quarantine-max-age-min") {
+      const value = Number(argv[index + 1]);
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error("--quarantine-max-age-min requires a whole number of minutes (0 or more).");
+      options.quarantineMaxAgeMinutes = value;
+      index += 1;
+    } else if (valued[argument]) {
       const value = String(argv[index + 1] || "").trim();
       if (!value || value.startsWith("--")) throw new Error(`${argument} requires an absolute path.`);
       options[valued[argument]] = value;
@@ -38,7 +63,7 @@ function parseArguments(argv) {
     } else if (argument === "--json") {
       options.json = true;
     } else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node bin/daily-doctor.js [--config <absolute-config.toml>] [--claude-config <absolute .claude.json>] [--cwd <absolute-git-repository>] [--json]\n");
+      process.stdout.write("Usage: node bin/daily-doctor.js [--config <absolute-config.toml>] [--claude-config <absolute .claude.json>] [--cwd <absolute-git-repository>] [--quarantine-max-age-min 30] [--json]\n");
       process.exit(0);
     } else {
       throw new Error(`Unknown argument: ${argument}`);
@@ -165,7 +190,7 @@ async function claudeEntryComparison(entry, claudeConfigPath) {
   return { failures, warnings: [] };
 }
 
-async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaudeConfigPath(), stateDir: stateDirOverride = "" }) {
+async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaudeConfigPath(), stateDir: stateDirOverride = "", quarantineMaxAgeMinutes = DEFAULT_QUARANTINE_MAX_AGE_MINUTES }) {
   const startedAt = Date.now();
   const failures = [];
   const warnings = [];
@@ -196,6 +221,9 @@ async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaud
   const stateDir = path.resolve(String(stateDirOverride || entry?.env.CODEX_OPENCODE_STATE_DIR || path.join(homedir(), ".codex", "codex-opencode-mcp")));
   const state = await auditStateDirectory(stateDir);
   const stateHealthy = !auditHasFailures(state, true);
+  const quarantines = quarantineFindings(state, quarantineMaxAgeMinutes);
+  failures.push(...quarantines.failures);
+  warnings.push(...quarantines.warnings);
   const housekeeping = await gcInventory(stateDir, { apply: false, includeRetained: false, olderThanDays: 7, pruneDatabases: true, deleteBranches: false });
   if (String(entry?.env.CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE || "").trim().toLowerCase() === "true") {
     warnings.push("CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=true: OpenCode 1.17.13 emits no runtime provider/model identity, so every real agent run ends with opencode_model_evidence_required. Set it to false and use per-job modelRequirement.requireRuntimeEvidence when exact identity matters.");
@@ -260,4 +288,4 @@ if (isMainModule(import.meta.url)) {
   });
 }
 
-export { claudeEntryComparison, formatReport, gitSnapshot, integrityPinFailures, parseArguments, runDailyDoctor };
+export { claudeEntryComparison, formatReport, gitSnapshot, integrityPinFailures, parseArguments, quarantineFindings, runDailyDoctor };

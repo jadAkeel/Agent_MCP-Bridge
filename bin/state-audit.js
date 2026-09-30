@@ -13,7 +13,8 @@ const ACTIVE_QUEUE_STATUSES = ["held", "pending", "planned", "blocked", "running
 // Statuses a bridge only sets while it owns the job, together with a lease (server.js sets
 // status = 'running' and lease_expires_at in the same claim). Queued statuses carry none.
 const CLAIMED_QUEUE_STATUSES = ["running", "validating", "reviewing", "testing"];
-const TERMINAL_INTEGRATION_STATUSES = ["committed", "rolled_back", "recovered_noop"];
+// Same set as INTEGRATION_RESOLVED_STATUSES in server.js.
+const TERMINAL_INTEGRATION_STATUSES = ["committed", "rolled_back", "recovered_noop", "recovered_verified", "resolved_by_operator"];
 
 function parseArguments(argv) {
   const options = { stateDir: "", json: false, strict: false, selfTest: false };
@@ -140,6 +141,22 @@ function unresolvedIntegrationOperations(db) {
   `).all(...TERMINAL_INTEGRATION_STATUSES, ...(liveOwner ? [new Date().toISOString()] : []));
 }
 
+// Every quarantined integration operation, whoever owns it: each blocks the repository's
+// writers until resolved (resolve_integration_quarantine). updated_at is when the quarantine
+// was written. The daily doctor fails on one older than its threshold.
+function quarantinedIntegrationOperations(db) {
+  const columns = tableColumns(db, "integration_operations");
+  if (!["operation_id", "status", "updated_at"].every((column) => columns.has(column))) return [];
+  return db.prepare(`
+    SELECT operation_id AS id${columns.has("cwd") ? ", cwd" : ""}, updated_at AS updatedAt${columns.has("result_json") ? ", result_json AS resultJson" : ""}
+    FROM integration_operations WHERE status = 'quarantined' ORDER BY updated_at, operation_id
+  `).all().map(({ resultJson, ...row }) => {
+    let reason = "";
+    try { reason = JSON.parse(resultJson || "{}").reason || ""; } catch { /* Shown as unknown. */ }
+    return { ...row, reason };
+  });
+}
+
 function inspectDatabase(dbPath) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -153,6 +170,7 @@ function inspectDatabase(dbPath) {
       : [];
     const activeJobsWithoutLease = hasTable(db, "opencode_jobs") ? claimedJobsWithoutLease(db) : [];
     const unresolvedIntegrations = hasTable(db, "integration_operations") ? unresolvedIntegrationOperations(db) : [];
+    const quarantinedIntegrations = hasTable(db, "integration_operations") ? quarantinedIntegrationOperations(db) : [];
     return {
       path: dbPath,
       integrity,
@@ -161,6 +179,7 @@ function inspectDatabase(dbPath) {
       activeExpiredPipelines,
       activeJobsWithoutLease,
       unresolvedIntegrationOperations: unresolvedIntegrations,
+      quarantinedIntegrationOperations: quarantinedIntegrations,
     };
   } finally {
     db.close();
@@ -191,6 +210,7 @@ async function auditStateDirectory(stateDir) {
       expiredActivePipelines: expiredPipelineCount,
       activeJobsWithoutLease: leaselessJobCount,
       unresolvedIntegrationOperations: unresolvedIntegrationCount,
+      quarantinedIntegrationOperations: databases.reduce((total, item) => total + item.quarantinedIntegrationOperations.length, 0),
       skippedEntries: discovered.skipped.length,
     },
   };

@@ -10,7 +10,7 @@ import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -347,6 +347,10 @@ class RepositoryRootSet extends Set {
   delete(root) { return super.delete(RepositoryRootSet.key(root)); }
 }
 const INTEGRATION_RECOVERY_BLOCKED_ROOTS = new RepositoryRootSet();
+// Integration journal statuses that no longer block writers. recovered_verified and
+// resolved_by_operator close a quarantine through resolve_integration_quarantine (G-01).
+const INTEGRATION_RESOLVED_STATUSES = Object.freeze(["committed", "rolled_back", "recovered_noop", "recovered_verified", "resolved_by_operator"]);
+const INTEGRATION_RESOLVED_SQL = INTEGRATION_RESOLVED_STATUSES.map((status) => `'${status}'`).join(", ");
 const PRIVATE_STATE_VACUUMED_DB_PATHS = new Set();
 const INTEGRATION_PREVIEW_TTL_MS = 1000 * 60 * 60;
 const REPOSITORY_SCOPE_LOCK_PATH = ".";
@@ -8550,7 +8554,7 @@ async function prepareIntegrationOperation({
   }
 }
 
-const INTEGRATION_JOURNAL_TERMINAL = new Set(["committed", "rolled_back", "recovered_noop", "quarantined"]);
+const INTEGRATION_JOURNAL_TERMINAL = new Set([...INTEGRATION_RESOLVED_STATUSES, "quarantined"]);
 
 async function transitionIntegrationOperation(cwd, operationId, expectedStatuses, status, result = {}, authority = null) {
   const allowed = [...new Set((Array.isArray(expectedStatuses) ? expectedStatuses : [expectedStatuses]).filter(Boolean))];
@@ -9037,7 +9041,7 @@ async function recoverIntegrationOperationsWhileLocked(cwd, { operationId = "", 
     operations = db.prepare(`
       SELECT * FROM integration_operations
       WHERE cwd = ? ${filter}
-        AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        AND status NOT IN (${INTEGRATION_RESOLVED_SQL})
       ORDER BY created_at, operation_id
     `).all(...args);
     const ids = operations.map((row) => row.operation_id);
@@ -9149,7 +9153,7 @@ function integrationOperationDiagnosisView(row) {
   return {
     operationId: row.operation_id,
     status: row.status,
-    reason: result.reason || "",
+    reason: result.reason || result.quarantineReason || "",
     outcome: result.outcome || "",
     error: result.error || "",
     affectedPaths: affectedPaths.slice(0, 20),
@@ -9158,11 +9162,17 @@ function integrationOperationDiagnosisView(row) {
     pipelineId: row.pipeline_id || "",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // A quarantine is written with the transition, so updated_at is when it began.
+    ...(row.status === "quarantined" ? {
+      quarantinedMinutes: Math.max(0, Math.floor((Date.now() - Date.parse(row.updated_at || "")) / 60_000)) || 0,
+      resolveWith: "resolve_integration_quarantine (verify_restored | accept_current)",
+    } : {}),
+    ...(["recovered_verified", "resolved_by_operator"].includes(row.status) ? { resolvedBy: result.resolvedBy || "", operatorReason: result.operatorReason || "" } : {}),
   };
 }
 
 // The integration journal as diagnose_opencode_bridge shows it: every unresolved operation
-// (these block writers; quarantined ones until inspected) up to the limit, the most recent
+// (these block writers; quarantined ones until resolved) up to the limit, the most recent
 // finished ones, and the roots the in-memory recovery pass currently blocks.
 async function integrationJournalDiagnosis(cwd, { limit = 20 } = {}) {
   const canonicalCwd = path.resolve(cwd || process.cwd());
@@ -9171,16 +9181,16 @@ async function integrationJournalDiagnosis(cwd, { limit = 20 } = {}) {
     const columns = "operation_id, cwd, pipeline_id, status, affected_paths_json, result_json, created_at, updated_at";
     const unresolvedCount = Number(db.prepare(`
       SELECT COUNT(*) AS count FROM integration_operations
-      WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      WHERE cwd = ? AND status NOT IN (${INTEGRATION_RESOLVED_SQL})
     `).get(canonicalCwd)?.count || 0);
     const unresolved = db.prepare(`
       SELECT ${columns} FROM integration_operations
-      WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+      WHERE cwd = ? AND status NOT IN (${INTEGRATION_RESOLVED_SQL})
       ORDER BY updated_at DESC, operation_id LIMIT ?
     `).all(canonicalCwd, limit);
     const recent = db.prepare(`
       SELECT ${columns} FROM integration_operations
-      WHERE cwd = ? AND status IN ('committed', 'rolled_back', 'recovered_noop')
+      WHERE cwd = ? AND status IN (${INTEGRATION_RESOLVED_SQL})
       ORDER BY updated_at DESC, operation_id LIMIT ?
     `).all(canonicalCwd, limit);
     return {
@@ -11161,7 +11171,7 @@ async function integratePatchSerially(options) {
           : null,
         conflictingPaths: [],
         suggestedFix: operationStatus === "quarantined"
-          ? "Run diagnose_opencode_bridge for this repository: its integrationOperations section shows the quarantined operation, its reason and affected paths. A target_head_or_index_drift quarantine is re-checked and closed automatically once those paths and their index entries are back at their pre-integration state; any other reason needs the recorded operation inspected."
+          ? "Run diagnose_opencode_bridge for this repository: its integrationOperations section shows the quarantined operation, its reason and affected paths. A target_head_or_index_drift quarantine is re-checked and closed automatically once those paths and their index entries are back at their pre-integration state. For any other reason use resolve_integration_quarantine (or `node bin/pipeline-admin.js resolve-quarantine <operationId>`): mode verify_restored after you put the affected paths back (it names any path still wrong and changes nothing), or mode accept_current with a reason once you have inspected the checkout and accept it as it is. See \"A quarantine that does not clear\" in docs/USER_GUIDE.md."
           : "Run diagnose_opencode_bridge for this repository and read its integrationOperations section; the deferred recovery pass retries operations whose evidence was temporarily unavailable. Waiting for other jobs does not clear this.",
       };
     }
@@ -11200,7 +11210,7 @@ async function integratePatchSerially(options) {
             errorType: recovery.errorType || "integration_recovery_quarantined",
             error: "A prior integration has ambiguous durable recovery evidence. The repository is quarantined from further bridge mutation until the recorded operation is inspected.",
             operationIds: recovery.operationIds || [],
-            suggestedFix: "Run diagnose_opencode_bridge for this repository and read its integrationOperations section for the quarantined operation and its reason.",
+            suggestedFix: "Run diagnose_opencode_bridge for this repository and read its integrationOperations section for the quarantined operation and its reason; resolve_integration_quarantine closes it (see \"A quarantine that does not clear\" in docs/USER_GUIDE.md).",
           };
     if (recovery.recovered?.length) result.recoveredIntegrationOperations = recovery.recovered;
     if (stopIntegrationHeartbeat.signal.aborted && result.ok && result.journalStatus !== "committed") {
@@ -11307,6 +11317,247 @@ async function recoverIntegrationRepositorySerially(cwd) {
       });
     }
   }
+}
+
+// G-01: the supported way out of a quarantine that recovery does not clear on its own
+// (affected_path_drift, rollback_restore_failed, journal_status_unknown, unreadable or
+// inconsistent evidence). The MCP tool resolve_integration_quarantine and
+// `bin/pipeline-admin.js resolve-quarantine` both end here. It runs under the repository-wide
+// serial recovery lock, so it is refused while any job holds a lock in the repository, and it
+// never deletes a journal row, a pre-image, the key or a database.
+//   verify_restored: the operator put the affected paths back. HEAD, their index entries and
+//     their exact bytes must be the recorded pre-integration state; the operation is closed
+//     recovered_verified. Otherwise every mismatch is named and nothing changes.
+//   accept_current: the operator inspected the checkout and accepts it as it is. The operation
+//     is closed resolved_by_operator with who, when and why, and the current state of each path.
+const INTEGRATION_QUARANTINE_RESOLUTION_MODES = Object.freeze(["verify_restored", "accept_current"]);
+
+async function verifyQuarantinedOperationRestored(cwd, operation, fileRows) {
+  let paths = [];
+  try { paths = normalizeLockPathList(JSON.parse(operation.affected_paths_json || "[]")); } catch { /* Checked below. */ }
+  if (!paths.length
+    || fileRows.length !== paths.length
+    || fileRows.some((row, ordinal) => row.ordinal !== ordinal || row.path !== paths[ordinal])) {
+    return { ok: false, evidenceProblem: "The journal's affected paths and its file rows do not match, so the pre-integration state cannot be verified." };
+  }
+  const evidence = [];
+  try {
+    for (const row of fileRows) evidence.push(await readIntegrationJournalFileEvidence(operation, row));
+  } catch (error) {
+    if (integrationRecoveryErrorIsTransient(error)) return { ok: false, unavailable: true, error: integrationRecoveryErrorText(error) };
+    return { ok: false, evidenceProblem: `The recorded pre-integration evidence cannot be read (${integrationRecoveryErrorText(error)}), so nothing can be compared with it.` };
+  }
+  const baseline = await integrationRecoveryBaseline(cwd, operation, fileRows, paths);
+  if (!baseline.ok && !baseline.proven) return { ok: false, unavailable: true, error: baseline.error };
+  let snapshot;
+  try {
+    snapshot = await exactIntegrationFileSnapshot(cwd, paths);
+  } catch (error) {
+    if (error?.errorType !== "snapshot_safety_limit_exceeded") return { ok: false, unavailable: true, error: integrationRecoveryErrorText(error) };
+    snapshot = new Map(paths.map((file) => [file, `unreadable: ${integrationRecoveryErrorText(error)}`]));
+  }
+  // Fingerprints read "missing", "link:<target>" or "file:<mode>:<sha256 of the bytes>".
+  const mismatches = evidence
+    .filter((item) => snapshot.get(item.path) !== item.preFingerprint)
+    .map((item) => ({ path: item.path, expected: item.preFingerprint, current: snapshot.get(item.path) ?? "missing" }));
+  const drift = baseline.ok ? {} : baseline.details || {};
+  return {
+    ok: baseline.ok && !mismatches.length,
+    evidence: baseline.ok ? baseline.evidence : drift.evidence || "",
+    headMoved: Boolean(baseline.ok ? baseline.headMoved : drift.headMoved),
+    mismatches,
+    indexMismatches: drift.indexMismatches || [],
+    committedChanges: drift.committedChanges || [],
+    ...(drift.recordedHeadMissing ? { recordedHeadMissing: true } : {}),
+    ...(drift.evidence === "whole_index" ? { wholeIndexChanged: Boolean(drift.indexChanged) } : {}),
+  };
+}
+
+function integrationQuarantineOperator(operator) {
+  const given = String(operator || "").trim();
+  if (given) return truncateText(given, 200);
+  try {
+    return userInfo().username || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function resolveIntegrationQuarantine({ cwd, operationId, mode, reason = "", confirmation = "", operator = "", via = "mcp" }) {
+  const reject = (errorType, error, suggestedFix, details = {}) => ({ ok: false, errorType, error, suggestedFix, ...details });
+  if (!INTEGRATION_QUARANTINE_RESOLUTION_MODES.includes(mode)) {
+    return reject("integration_quarantine_mode_invalid", `Unknown mode "${mode}".`, "Use mode verify_restored or accept_current.");
+  }
+  const operatorReason = String(reason || "").trim();
+  if (mode === "accept_current" && !operatorReason) {
+    return reject("integration_quarantine_reason_required", "accept_current needs a reason: what was inspected and why the checkout is accepted as it is.", "Repeat with reason set, for example \"Inspected src/a.ts; the drift is my own edit, keeping it.\"");
+  }
+  if (mode === "accept_current" && confirmation !== operationId) {
+    return reject("integration_quarantine_confirmation_mismatch", "accept_current needs confirmation set to the exact operation id.", "Repeat with confirmation equal to operationId.");
+  }
+  const requestedCwd = path.resolve(cwd || process.cwd());
+  const top = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
+  if (top.exitCode !== 0 || !top.stdout.trim()) {
+    return reject("integration_target_invalid", top.stderr || "cwd is not inside a Git repository.", "Pass the repository the quarantine is in, as diagnose_opencode_bridge shows it.");
+  }
+  const targetCwd = path.resolve(top.stdout.trim());
+  const readOperation = async () => {
+    const db = await openLockDb(targetCwd);
+    try {
+      const operation = db.prepare("SELECT * FROM integration_operations WHERE operation_id = ? AND cwd = ?").get(operationId, targetCwd);
+      const files = operation
+        ? db.prepare("SELECT * FROM integration_operation_files WHERE operation_id = ? ORDER BY ordinal").all(operationId)
+        : [];
+      return { operation, files };
+    } finally {
+      closeDb(db);
+    }
+  };
+  const notQuarantined = (operation) => (operation
+    ? reject("integration_operation_not_quarantined", `Operation ${operationId} is ${operation.status}, not quarantined.`, INTEGRATION_RESOLVED_STATUSES.includes(operation.status)
+      ? "Nothing to resolve; it no longer blocks writers."
+      : "Recovery handles an operation that is not quarantined; run diagnose_opencode_bridge and wait for the deferred recovery pass.")
+    : reject("integration_operation_not_found", `No integration operation ${operationId} in ${targetCwd}.`, "Copy the operation id from the integrationOperations section of diagnose_opencode_bridge for this repository."));
+  const first = await readOperation();
+  if (first.operation?.status !== "quarantined") return notQuarantined(first.operation);
+
+  const lockTtlMs = Math.max(DEFAULT_LOCK_TTL_MS, CONFIG.validationCommandTimeoutMs + 1000 * 60 * 10);
+  const lockResult = await acquireHardLock({
+    owner: "codex",
+    agent: "integration_recovery",
+    task: `Resolve integration quarantine ${operationId} (${mode})`,
+    cwd: targetCwd,
+    lockType: "serial_integration",
+    paths: [REPOSITORY_SCOPE_LOCK_PATH],
+    repositoryScope: true,
+    integrationRecoveryAuthority: true,
+    ttlMs: lockTtlMs,
+  });
+  if (!lockResult.ok) {
+    return reject(
+      "integration_quarantine_resolution_busy",
+      `Another job or recovery holds a lock in this repository, so nothing may be resolved now (${lockResult.error || lockResult.errorType || "lock refused"}).`,
+      "Wait until list_opencode_jobs and list_agent_locks show nothing running in this repository, then repeat."
+    );
+  }
+  const stopHeartbeat = startHardLockHeartbeat(lockResult.lock, lockTtlMs);
+  const authority = { lock: lockResult.lock, ownerGeneration: randomBytes(16).toString("hex"), allowTakeover: true };
+  try {
+    const { operation, files } = await readOperation();
+    if (operation?.status !== "quarantined") return notQuarantined(operation);
+    const quarantine = integrationOperationResult(operation);
+    const resolvedAt = new Date().toISOString();
+    const record = {
+      quarantineReason: quarantine.reason || "",
+      quarantine,
+      quarantinedAt: operation.updated_at,
+      resolvedAt,
+      resolvedBy: integrationQuarantineOperator(operator),
+      via: via === "cli" ? "cli" : "mcp",
+    };
+    let status;
+    if (mode === "verify_restored") {
+      const check = await verifyQuarantinedOperationRestored(targetCwd, operation, files);
+      if (check.unavailable) {
+        return reject("integration_quarantine_evidence_unavailable", `The state could not be read right now (${check.error}); nothing was changed.`, "Close editors or scanners holding the files, then repeat.");
+      }
+      if (check.evidenceProblem) {
+        return reject("integration_quarantine_unverifiable", `${check.evidenceProblem} Nothing was changed.`, "verify_restored cannot close this operation. Inspect the affected paths yourself, then use accept_current with a reason.");
+      }
+      if (!check.ok) {
+        const hints = [
+          ...(check.mismatches.length ? ["Put each listed path back to the expected state (the file as it was just before the integration started; if that was the committed version, `git checkout -- <path>` restores it)."] : []),
+          ...(check.indexMismatches.length ? ["Unstage the listed index paths (`git restore --staged <path>`)."] : []),
+          ...(check.committedChanges.length || check.recordedHeadMissing ? ["A commit since the integration started touched these paths, so their pre-state cannot be proven; inspect them and use accept_current with a reason."] : []),
+          ...(check.wholeIndexChanged !== undefined ? ["This operation has only whole-index evidence: HEAD and the whole index must be back at their recorded state, or use accept_current."] : []),
+        ];
+        return reject(
+          "integration_quarantine_not_restored",
+          "The affected paths are not at their recorded pre-integration state; nothing was changed.",
+          hints.join(" ") || "Inspect the affected paths, or use accept_current with a reason.",
+          { mismatches: check.mismatches, indexMismatches: check.indexMismatches, committedChanges: check.committedChanges, headMoved: check.headMoved }
+        );
+      }
+      status = "recovered_verified";
+      await transitionIntegrationOperation(targetCwd, operationId, "quarantined", status, {
+        ...record,
+        outcome: "operator_verified_restored",
+        evidence: check.evidence,
+        headMoved: check.headMoved,
+      }, authority);
+    } else {
+      let paths = [];
+      try { paths = normalizeLockPathList(JSON.parse(operation.affected_paths_json || "[]")); } catch { /* Recorded as unavailable. */ }
+      let acceptedState;
+      try {
+        acceptedState = Object.fromEntries(await exactIntegrationFileSnapshot(targetCwd, paths));
+      } catch (error) {
+        acceptedState = { unavailable: integrationRecoveryErrorText(error) };
+      }
+      status = "resolved_by_operator";
+      await transitionIntegrationOperation(targetCwd, operationId, "quarantined", status, {
+        ...record,
+        outcome: "operator_accepted_current_state",
+        operatorReason: truncateText(operatorReason, 500),
+        acceptedState,
+      }, authority);
+    }
+    logEvent("warn", "integration.quarantine_resolved", { operationId, status, quarantineReason: record.quarantineReason, via: record.via });
+    // Other unresolved operations of this repository are recovered (or stay blocked) as the
+    // deferred pass would; the writer block follows what that proves.
+    const recovery = await recoverIntegrationOperationsWhileLocked(targetCwd, { integrationLock: lockResult.lock });
+    if (recovery.ok) INTEGRATION_RECOVERY_BLOCKED_ROOTS.delete(targetCwd);
+    else INTEGRATION_RECOVERY_BLOCKED_ROOTS.add(targetCwd);
+    return {
+      ok: true,
+      operationId,
+      status,
+      cwd: targetCwd,
+      quarantineReason: record.quarantineReason,
+      resolvedBy: record.resolvedBy,
+      resolvedAt,
+      writersUnblocked: recovery.ok,
+      stillBlockedBy: recovery.ok ? [] : recovery.operationIds || [],
+    };
+  } finally {
+    try {
+      await stopHeartbeat();
+      const released = await releaseHardLock(lockResult.lock.id, lockResult.lock.token, lockResult.lock.paths, lockResult.lock.cwd);
+      if (!released.ok) logEvent("warn", "integration.recovery_lock_release_failed", { lockId: lockResult.lock.id, errorType: "integration_recovery_lock_release_failed" });
+    } catch (error) {
+      logEvent("warn", "integration.recovery_lock_release_failed", { lockId: lockResult.lock.id, error: error?.message || String(error) });
+    }
+  }
+}
+
+function integrationQuarantineStatusLine(journal) {
+  if (!journal || journal.error) return `Integration quarantines: unavailable (${journal?.error || "no journal"})`;
+  const quarantined = (journal.unresolved || []).filter((item) => item.status === "quarantined");
+  if (!quarantined.length) return "Integration quarantines: none";
+  const oldest = quarantined.reduce((left, right) => (right.quarantinedMinutes > left.quarantinedMinutes ? right : left));
+  return `Integration quarantines: ${quarantined.length} (oldest ${oldest.quarantinedMinutes} min: ${oldest.operationId}, reason ${oldest.reason || "unknown"}); writers are blocked; resolve with resolve_integration_quarantine`;
+}
+
+function formatIntegrationQuarantineResolution(result) {
+  if (result.ok) {
+    return [
+      "Integration quarantine resolved.",
+      `Operation: ${result.operationId}`,
+      `Closed as: ${result.status}`,
+      `Quarantine reason was: ${result.quarantineReason || "unknown"}`,
+      `Resolved by: ${result.resolvedBy} at ${result.resolvedAt}`,
+      `Writers unblocked: ${result.writersUnblocked ? "yes" : `no, still blocked by ${result.stillBlockedBy.join(", ") || "an unresolved operation"} (see diagnose_opencode_bridge)`}`,
+      "Journal rows and pre-images are kept.",
+    ].join("\n");
+  }
+  const { ok, errorType, error, suggestedFix, ...details } = result;
+  return [
+    "Integration quarantine resolution rejected.",
+    `Error type: ${errorType}`,
+    `Reason: ${error}`,
+    `Suggested fix: ${suggestedFix}`,
+    ...(Object.keys(details).length ? ["", JSON.stringify(details, null, 2)] : []),
+  ].join("\n");
 }
 
 async function integratePatchWithoutSerialLock({
@@ -12928,6 +13179,9 @@ function prunePersistedState(db, dbPath) {
           WHERE CAST(child.value AS TEXT) = job.job_id
       )
     `).run(...terminalStatuses, queueCutoff);
+    // Retention prunes only the bridge's own closures. An operation closed through
+    // resolve_integration_quarantine (recovered_verified, resolved_by_operator) keeps its rows
+    // and pre-images as the audit trail of that decision.
     db.prepare(`
       DELETE FROM integration_operation_files
       WHERE operation_id IN (
@@ -13700,7 +13954,7 @@ async function acquireHardLock({
       const unresolvedIntegration = db.prepare(`
         SELECT operation_id, status
         FROM integration_operations
-        WHERE cwd = ? AND status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        WHERE cwd = ? AND status NOT IN (${INTEGRATION_RESOLVED_SQL})
         ORDER BY updated_at, operation_id
         LIMIT 1
       `).get(path.resolve(projectRoot));
@@ -14368,6 +14622,9 @@ server.tool(
       providerCapacitySnapshot(),
     ]);
     const sourceFreshness = await bridgeSourceFreshness();
+    const journal = await resolveProjectStateRoot(cwd || process.cwd())
+      .then((root) => integrationJournalDiagnosis(root, { limit: 20 }))
+      .catch((error) => ({ error: error?.message || String(error) }));
     if (!pluginPolicy.ok) {
       return { content: [{ type: "text", text: `OpenCode MCP bridge status: attention required.\n\nPlugin policy: rejected\nReason: ${pluginPolicy.error}` }] };
     }
@@ -14450,6 +14707,7 @@ server.tool(
             `Agent discovery exit code: ${agentDiscovery.result.exitCode}`,
             `Available agents: ${availableAgents.length ? availableAgents.join(", ") : "none discovered"}`,
             `Missing required managed agents: ${missingRequiredAgents.length ? missingRequiredAgents.join(", ") : "none"}`,
+            integrationQuarantineStatusLine(journal),
             "",
             `Worktree mode: ${CONFIG.worktreeMode}`,
             `Worktree root: ${CONFIG.worktreeRoot}`,
@@ -15933,6 +16191,24 @@ server.tool(
       "",
       JSON.stringify(pipelineRecordSnapshot(record), null, 2),
     ].join("\n") }] };
+  }
+);
+
+server.tool(
+  "resolve_integration_quarantine",
+  "Close a quarantined integration journal operation that recovery does not clear on its own. verify_restored closes it only when HEAD, the index entries and the bytes of every affected path are back at the recorded pre-integration state; accept_current records that an operator inspected the checkout and accepts it as it is (needs reason and confirmation). Refused while any job holds a lock in the repository; journal rows and pre-images are kept.",
+  {
+    cwd: z.string().min(1).describe("The repository the quarantine is in."),
+    operationId: z.string().min(1).describe("From the integrationOperations section of diagnose_opencode_bridge."),
+    mode: z.enum(INTEGRATION_QUARANTINE_RESOLUTION_MODES),
+    reason: z.string().max(500).optional().describe("Required for accept_current: what was inspected and why the current state is accepted."),
+    confirmation: z.string().optional().describe("Required for accept_current: must exactly equal operationId."),
+    operator: z.string().max(200).optional().describe("Who resolves it; defaults to the OS user running the bridge."),
+    via: z.enum(["mcp", "cli"]).optional().describe("Set by bin/pipeline-admin.js; leave unset."),
+  },
+  async ({ cwd, operationId, mode, reason = "", confirmation = "", operator = "", via = "mcp" }) => {
+    const result = await resolveIntegrationQuarantine({ cwd, operationId, mode, reason, confirmation, operator, via });
+    return { content: [{ type: "text", text: formatIntegrationQuarantineResolution(result) }] };
   }
 );
 
@@ -19423,7 +19699,7 @@ async function findQueueRecordRepositoryBlock(record, cwdKey = path.resolve(reco
       const comparableRoot = normalizeFilesystemCase(path.resolve(cwdKey));
       const operation = db.prepare(`
         SELECT operation_id, cwd, status FROM integration_operations
-        WHERE status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        WHERE status NOT IN (${INTEGRATION_RESOLVED_SQL})
         ORDER BY updated_at, operation_id
       `).all().find((row) => normalizeFilesystemCase(path.resolve(row.cwd || "")) === comparableRoot);
       if (operation) {
@@ -19435,7 +19711,7 @@ async function findQueueRecordRepositoryBlock(record, cwdKey = path.resolve(reco
           source: "integration",
           errorType: "integration_recovery_pending",
           reason: operation.status === "quarantined"
-            ? `Waiting for quarantined integration operation ${operation.operation_id} of this repository to be recovered; see diagnose_opencode_bridge.`
+            ? `Waiting for quarantined integration operation ${operation.operation_id} of this repository to be recovered; see diagnose_opencode_bridge, and resolve_integration_quarantine if it does not clear.`
             : `Waiting for integration operation ${operation.operation_id} (${operation.status}) of this repository to finish.`,
         };
       }
@@ -21253,7 +21529,9 @@ async function reconcilePipelineIntegrationOperationStates(record, { persist = t
     let status = item.status;
     if (!operationMatchesItem) status = "quarantined";
     else if (operation.status === "committed") status = "integrated";
-    else if (["rolled_back", "recovered_noop"].includes(operation.status)) status = "pending";
+    // recovered_verified proved the pre-state like recovered_noop. resolved_by_operator proves
+    // nothing about the patch, so its item stays quarantined; abandon the pipeline to retire it.
+    else if (["rolled_back", "recovered_noop", "recovered_verified"].includes(operation.status)) status = "pending";
     else if (operation.status === "quarantined") status = "quarantined";
     if (status !== item.status) statuses.set(item.operationId, { from: item.status, to: status });
   }
@@ -24276,7 +24554,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
                  WHERE instance.instance_id = operation.owner_instance_id AND instance.lease_expires_at > ?
                ) AS owner_live
         FROM integration_operations AS operation
-        WHERE operation.status NOT IN ('committed', 'rolled_back', 'recovered_noop')
+        WHERE operation.status NOT IN (${INTEGRATION_RESOLVED_SQL})
       `).all(new Date(scanAt).toISOString())) {
         dbPending = true;
         if (!row.cwd) continue;
@@ -24584,6 +24862,9 @@ async function runProviderLeaseWorker() {
 // variables through the live accessors in __selfTest.hooks.
 export const __selfTest = {
   internals: {
+    INTEGRATION_RESOLVED_STATUSES,
+    integrationQuarantineStatusLine,
+    resolveIntegrationQuarantine,
     agentMetadataCacheKey,
     seedIndexFromRealIndex,
     createPhaseClock,

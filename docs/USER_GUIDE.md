@@ -337,6 +337,7 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | Tool call times out after 60 s, or Codex gives up on a long job that is still running | The Codex MCP entry is missing its timeouts, or `tool_timeout_sec` is below the longest job the bridge allows. | Set `startup_timeout_sec = 120` and `tool_timeout_sec` to the bound in [section 14](#timeouts): `3000` with the built-in timeouts. `npm run release:activate -- --sync-clients` prints the exact value. |
 | Codex acts like the old bridge | The session started before an update. | Restart Codex. |
 | Stuck job / lock | A crash left state behind. | Run `npm run doctor -- --cwd <project>`, then ask Codex to run `diagnose_opencode_bridge`. |
+| `integration_recovery_pending` with "quarantined", or `Failure [integration-quarantine]` from the doctor | An interrupted integration left a state the bridge could not explain; every writer of that repository waits. | Follow [A quarantine that does not clear](#a-quarantine-that-does-not-clear). |
 
 **The general recovery recipe:**
 
@@ -344,6 +345,40 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 2. `npm run smoke:live`
 3. Restart Codex.
 4. If it still fails, read the error type and use the table above.
+
+### A quarantine that does not clear
+
+**What it is.** Before the bridge applies a reviewed patch to your checkout, it writes a journal entry with the exact bytes of every file the patch touches. If the bridge dies in the middle, it uses that record to undo the patch. When it finds something it cannot explain, for example a file that is neither the old version nor the patched one, it **quarantines** the operation instead of guessing. While the quarantine lasts, every writer in that repository is refused with `integration_recovery_pending`. Readers still work.
+
+**How you notice.** Writers fail with `integration_recovery_pending` and the message says "quarantined". `get_opencode_bridge_status` shows `Integration quarantines: 1 (oldest <n> min: <operation id>, reason <reason>)`. `npm run doctor` fails with `Failure [integration-quarantine]` once a quarantine is older than 30 minutes (`--quarantine-max-age-min <n>` changes that).
+
+**Step 1: look at it.** Ask Codex (or Claude) to run `diagnose_opencode_bridge` for the repository and read `integrationOperations.unresolved`. Note the `operationId`, the `reason`, the `affectedPaths` and `quarantinedMinutes`. Then look at those paths in the checkout: `git status`, `git diff -- <path>`.
+
+**Step 2: wait for the ones that clear themselves.** Two reasons clear on their own, within a few minutes and after every bridge restart, once the affected paths and their index entries are back at their old state: `target_head_or_index_drift` and `repository_state_drift`. For those, undo any staging of the affected paths (`git restore --staged <path>`) and wait.
+
+**Step 3: resolve the others.** Run the commands below from the bridge repository; `--cwd` is the absolute path of the blocked repository. They start the bridge from the `opencode` entry in `~/.codex/config.toml`. Pick one of two modes. Both refuse to run while any job holds a lock in the repository, so let running jobs finish first (`list_opencode_jobs`). Neither mode deletes a journal row, a pre-image, the key or a database. Both record who resolved it, when and in which mode.
+
+- **The old state is what you want** (the patch should not stay, and you have put the files back): first make each affected path exactly what it was before the integration. Usually that is the committed version (`git checkout -- <path>`); if the file had uncommitted edits before, put those back too. Then run:
+
+  ```bash
+  node bin/pipeline-admin.js resolve-quarantine <operationId> --cwd <repository> --verify-restored
+  ```
+
+  (or the MCP tool `resolve_integration_quarantine` with `mode: "verify_restored"`). It closes the operation as `recovered_verified` only if HEAD, the index entries and the exact bytes of every affected path match the journal. Otherwise it lists each path that is still wrong, with the expected and current hash, and changes nothing. Fix those paths and run it again.
+
+- **The checkout as it is now is what you want** (you inspected it: the drift is your own edit, or the patch is half applied and you will fix it by hand, or the journal's evidence is unreadable, `journal_evidence_unreadable`): run
+
+  ```bash
+  node bin/pipeline-admin.js resolve-quarantine <operationId> --cwd <repository> --accept-current --reason "<what you inspected and why you keep it>"
+  ```
+
+  (MCP: `mode: "accept_current"`, `reason`, and `confirmation` equal to the operation id). It closes the operation as `resolved_by_operator` and records your reason and the current state of each affected path. It does not change any file. Afterwards, you own the checkout's state: review `git diff` and commit or revert as usual.
+
+The command prints `Writers unblocked: yes`, or names another operation that still blocks the repository. Resolve that one the same way.
+
+**If the operation belonged to a pipeline.** After `verify_restored` the pipeline can integrate that job again. After `accept_current` the pipeline item stays `quarantined`: retire the pipeline with `npm run pipeline:abandon -- --cwd <repository> --pipeline <id> --confirm <id>` (it keeps every worktree).
+
+**Never do this.** Do not delete the state database, journal rows or the encryption key. Do not edit `integration_operations` by hand. Do not use `accept_current` without looking at the affected paths. All of these lose the only record of what the patch changed, and the next integration could overwrite someone's work.
 
 ---
 
@@ -422,6 +457,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `finalize_multi_agent_pipeline` | Final validation and reviewer/tester gates. |
 | | `abandon_multi_agent_pipeline` | Retire an obsolete pipeline. Never deletes unintegrated work. |
 | Integration | `integrate_opencode_worktree` | Dry-run preview, then receipt-bound apply. |
+| | `resolve_integration_quarantine` | Close a quarantine recovery cannot clear: `verify_restored` or `accept_current`. See [A quarantine that does not clear](#a-quarantine-that-does-not-clear). |
 | Locks (manual) | `acquire_agent_lock` / `release_agent_lock` / `list_agent_locks` | Exceptional debugging only. |
 | Sanitized data | `verify_sanitized_workspace` | Verifies a hash-pinned, read-only data workspace. |
 
