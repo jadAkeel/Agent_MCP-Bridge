@@ -414,7 +414,9 @@ async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extra
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
       CODEX_OPENCODE_QUEUE_HEARTBEAT_MS: "100",
       CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS: "1000",
-      CODEX_OPENCODE_QUEUE_LEASE_MS: "500",
+      // 20 heartbeats per lease. With 500 ms, a busy host that delayed the owner's heartbeat by
+      // half a second let the other bridge take over a live pipeline (B-034).
+      CODEX_OPENCODE_QUEUE_LEASE_MS: "2000",
       CODEX_OPENCODE_QUEUE_STALE_AFTER_MS: "300",
       CODEX_OPENCODE_QUEUE_READONLY_RETRIES: "0",
       CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES: "0",
@@ -856,8 +858,8 @@ async function main() {
     await waitFor(() => withDatabase(dbPath, (db) => {
       const row = db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(crashedOwnerInstance);
       return row && Date.parse(row.lease_expires_at || "") <= Date.now();
-    }), "The crashed bridge owner's lease did not expire.", 5000);
-    const interruptedSnapshot = await waitForQueueStatus(clientB, repo, activeJobId, ["interrupted"], 5000);
+    }), "The crashed bridge owner's lease did not expire.", 10_000);
+    const interruptedSnapshot = await waitForQueueStatus(clientB, repo, activeJobId, ["interrupted"], 10_000);
     assert.equal(interruptedSnapshot.errorType, "queue_job_interrupted");
     assert.equal(interruptedSnapshot.ownerInstanceId, crashedOwnerInstance);
     await assert.rejects(access(path.join(repo, "src", "orphan-worktree.txt")), undefined, "An interrupted orphan writer must remain isolated from the target checkout.");
