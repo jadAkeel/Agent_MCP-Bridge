@@ -16,6 +16,14 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-30
 
+### Production review, second pass (Claude, 2026-09-30)
+
+Findings from `gpt61-sol-production-report-pass2.md` (G-05..G-07, D-1..D-5, H2-1..H2-7), one branch and worktree each (`C:\Users\10User\bridge-<id>`, its own `npm ci`). The first-pass items G-01..G-04 are handled in another session.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| G-05 | Credential shapes the integration preview gate flags (AWS `AKIA...`, `npm_...`, Stripe `sk_live_`/`pk_test_`, Slack webhook URLs, `scheme://user:password@host`) survived in logs, diagnose output, stored queue and direct-run results and the stored worktree patch preview; a dry run accepted with `acceptFlaggedSecretLines: true` printed them in its patch preview. The review named four shapes; the test found Stripe keys as a fifth. | Two independent pattern lists: `LIKELY_SECRET_PATTERNS` (the gate, and `redactLikelySecrets` for agent answers) and the list inside `redactSensitiveText` (logs, `sanitizePersistedValue`, `sanitizeLogValue`, the direct-run audit, `collectWorktreeDiff`), which had no rule for those shapes. | `redactSensitiveText` keeps its broad key-name and short-token rules (`BROAD_LOG_REDACTIONS`) and then applies every `LIKELY_SECRET_PATTERNS` shape (the same global variants `redactLikelySecrets` uses), so one list drives detection and both redactors. An accepted flagged dry run prints the patch with those values masked (`redactLikelySecrets`) and says which patch lines it masked; the receipt still covers the full patch SHA-256. The gate and its false-positive protections are unchanged. New `tests/review-g05-secrets.js` (in `npm test`): one sample per gate pattern (a pattern without a sample fails the test) through `redactLikelySecrets`, `redactSensitiveText`, `sanitizePersistedValue`, a `logEvent` line, a direct run's live patch preview and stored result/preview, a queued job's stored result and error, `diagnose_opencode_bridge`, `collectWorktreeDiff` and the rejected, accepted and stat dry runs. 5 of 6 cases fail on the old code. | `7ef99cc` | fixed, not deployed |
+
 ### Concurrency stress test was broken (Claude, 2026-09-30)
 
 Branch `bridge/e2e-concurrency-reserved-name`, merged into the live tree 2026-09-30. `npm test` only syntax-checks `bin/e2e-concurrency.js`, so nothing ran it; `npm run test:release` does, so that gate had failed since 56357f3. After the fix the test passed 6 of 7 runs in the worktree (about 45 s each); the other run hit B-034.
