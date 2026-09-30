@@ -5543,6 +5543,205 @@ function realPathBoundaryReason(rawPath, cwd) {
   return "";
 }
 
+// G-08: a ':' anywhere but a leading drive ("C:/...") names a stream or a drive-relative path on
+// win32. Elsewhere ':' is an ordinary file-name character.
+function windowsStreamSyntax(normalized, platform = process.platform) {
+  if (platform !== "win32") return false;
+  const withoutDrive = String(normalized || "").replace(/^[A-Za-z]:(?:\/|$)/, "");
+  return withoutDrive.includes(":");
+}
+
+// G-08: Git reports neither the bytes of an NTFS alternate data stream nor what a write through a
+// symlink or junction reaches, so the post-write scope check (Git's changed paths) cannot see
+// either. Before a writer runs, the bridge records every link (with its resolved target) and, on
+// win32, every alternate stream under the writable scope; after the run it compares. A link or
+// stream that appeared or changed, or a scope it can no longer read, fails the job closed.
+const WRITABLE_SCOPE_MAX_ENTRIES = 200000;
+// cmd.exe refuses command lines over 8191 characters, after %VAR% expansion.
+const STREAM_LISTING_MAX_COMMAND_CHARS = 7000;
+
+function writableScopeRoots(cwd, lockPlan) {
+  const root = path.resolve(cwd);
+  const roots = new Set();
+  for (const value of normalizeLockPathList([
+    ...(lockPlan?.allowedEdits || []),
+    ...(lockPlan?.scopeContract?.scope?.write || []),
+    ...(lockPlan?.scopeContract?.allowedEdits || []),
+  ])) {
+    const wildcardIndex = value.search(/[*?[\]{}!]/);
+    // "src/*.ts" walks src; "**/x" walks the whole checkout.
+    const staticValue = wildcardIndex === -1 ? value : value.slice(0, wildcardIndex).replace(/[^/]*$/, "").replace(/\/+$/, "");
+    const candidate = path.resolve(root, staticValue || ".");
+    if (candidate === root || isPathInside(root, candidate)) roots.add(candidate);
+  }
+  // A root inside another root is walked with it.
+  const sorted = [...roots].sort((left, right) => left.length - right.length);
+  return sorted.filter((candidate, index) => !sorted.slice(0, index).some((outer) => isPathInside(outer, candidate)));
+}
+
+function writableScopeRelative(root, absolute) {
+  return path.relative(root, absolute).split(path.sep).join("/") || ".";
+}
+
+// One `dir /r /a` per chunk of directories lists the named streams of every entry of each
+// directory and of the directory itself ("."). Paths reach cmd.exe through environment variables,
+// so no character of a path ("%", "&", "^", non-ASCII) is parsed by cmd; /u makes the output
+// UTF-16. Each block starts with a header that ends with the directory path exactly as given.
+async function listAlternateDataStreams(directories, root) {
+  const cmd = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+  const streams = new Map();
+  let chunk = [];
+  let chunkChars = 0;
+  const flush = async () => {
+    if (!chunk.length) return;
+    const env = { ...process.env };
+    const refs = chunk.map((directory, index) => {
+      env[`CODEX_STREAM_DIR_${index}`] = directory;
+      return `"%CODEX_STREAM_DIR_${index}%"`;
+    });
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile(cmd, [`/u /d /v:off /c dir /r /a ${refs.join(" ")}`], {
+        env, windowsVerbatimArguments: true, windowsHide: true, encoding: "buffer", maxBuffer: 1024 * 1024 * 256, timeout: 1000 * 120,
+      }, (error, out, err) => {
+        if (error) {
+          error.message = `${error.message}${err?.length ? `: ${Buffer.from(err).toString("utf16le").trim()}` : ""}`;
+          reject(error);
+        } else {
+          resolve({ stdout: out });
+        }
+      });
+    });
+    const byHeader = new Map(chunk.map((directory) => [directory.toLowerCase(), directory]));
+    let current = "";
+    for (const line of Buffer.from(stdout).toString("utf16le").split(/\r?\n/)) {
+      const trimmed = line.trimEnd();
+      const header = [...byHeader.keys()].find((key) => trimmed.toLowerCase().endsWith(` ${key}`));
+      if (header && !/:\$DATA$/.test(trimmed)) {
+        current = byHeader.get(header);
+        continue;
+      }
+      const match = /^\s*\S+\s(.*):\$DATA$/.exec(trimmed);
+      if (!match || !current) continue;
+      const nameAndStream = match[1];
+      const separator = nameAndStream.lastIndexOf(":");
+      const name = nameAndStream.slice(0, separator);
+      if (name === "..") continue;
+      const owner = name === "." ? current : path.join(current, name);
+      const key = `${writableScopeRelative(root, owner)}:${nameAndStream.slice(separator + 1)}`;
+      streams.set(key, trimmed.trim());
+    }
+    chunk = [];
+    chunkChars = 0;
+  };
+  for (const directory of directories) {
+    if (chunkChars + directory.length + 3 > STREAM_LISTING_MAX_COMMAND_CHARS) await flush();
+    chunk.push(directory);
+    chunkChars += directory.length + 3;
+  }
+  await flush();
+  return streams;
+}
+
+async function captureWritableScopeFilesystemState(cwd, lockPlan, { platform = process.platform } = {}) {
+  const root = path.resolve(cwd);
+  const links = new Map();
+  const directories = [];
+  let entries = 0;
+  try {
+    const realRoot = await realpath(root);
+    const stack = [];
+    for (const scopeRoot of writableScopeRoots(root, lockPlan)) {
+      // The path down to a scope root is checked by realPathBoundaryReason; a link there is
+      // already refused. A root that does not exist yet has nothing in it to record.
+      let details;
+      try {
+        details = await lstat(scopeRoot);
+      } catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") continue;
+        throw error;
+      }
+      stack.push({ absolute: scopeRoot, details });
+    }
+    while (stack.length) {
+      const { absolute, details } = stack.pop();
+      entries += 1;
+      if (entries > WRITABLE_SCOPE_MAX_ENTRIES) {
+        return {
+          ok: false,
+          errorType: "writable_scope_unverifiable",
+          error: `The writable scope has more than ${WRITABLE_SCOPE_MAX_ENTRIES} entries, so the bridge cannot record its links and alternate data streams. Narrow allowedEdits.`,
+        };
+      }
+      if (details.isSymbolicLink()) {
+        let target = "";
+        try {
+          target = await realpath(absolute);
+        } catch (error) {
+          target = `unresolvable:${error?.code || "error"}`;
+        }
+        links.set(writableScopeRelative(root, absolute), { target, inside: !target.startsWith("unresolvable:") && (target === realRoot || isPathInside(realRoot, target)) });
+        continue;
+      }
+      if (!details.isDirectory()) continue;
+      directories.push(absolute);
+      for (const entry of await readdir(absolute)) {
+        const child = path.join(absolute, entry);
+        let childDetails;
+        try {
+          childDetails = await lstat(child);
+        } catch (error) {
+          if (error?.code === "ENOENT") continue;
+          throw error;
+        }
+        stack.push({ absolute: child, details: childDetails });
+      }
+    }
+    const streams = platform === "win32" && directories.length ? await listAlternateDataStreams(directories, root) : new Map();
+    return { ok: true, links, streams, entries };
+  } catch (error) {
+    return {
+      ok: false,
+      errorType: "writable_scope_unverifiable",
+      error: `Could not read the writable scope to record its links and alternate data streams: ${error?.message || String(error)}`,
+    };
+  }
+}
+
+// Compares the state recorded before the agent ran with the state after it. Returns null when
+// nothing appeared or changed; otherwise the errorType, a message with the next step, and the
+// paths involved (reported as unsafe files so the output is retained, never integrated).
+function writableScopeFilesystemViolation(before, after) {
+  if (!before) return null;
+  if (!before.ok || !after?.ok) {
+    const failed = !before.ok ? before : after;
+    return {
+      errorType: "writable_scope_unverifiable",
+      error: `${failed?.error || "The writable scope could not be read after the run."} The output was retained and cannot be reported as successful; check the scope's permissions and re-run the writer.`,
+      paths: [],
+    };
+  }
+  const newLinks = [...after.links].filter(([key, value]) => !before.links.has(key) || before.links.get(key).target !== value.target);
+  const unresolvable = [...after.links].filter(([, value]) => value.target.startsWith("unresolvable:"));
+  if (newLinks.length || unresolvable.length) {
+    const paths = normalizeLockPathList([...newLinks, ...unresolvable].map(([key]) => key));
+    return {
+      errorType: "reparse_point_created_during_execution",
+      error: `The run created, retargeted or left unresolvable a symbolic link or junction in the writable scope: ${[...newLinks, ...unresolvable].slice(0, 20).map(([key, value]) => `${key} -> ${value.target}`).join("; ")}. Writes through a link are invisible to Git and may have reached files outside the repository. The output was retained for inspection; check the link targets, remove the links, and re-run the writer.`,
+      paths,
+    };
+  }
+  const newStreams = [...after.streams].filter(([key, line]) => before.streams.get(key) !== line);
+  if (newStreams.length) {
+    const paths = normalizeLockPathList(newStreams.map(([key]) => key.slice(0, key.lastIndexOf(":"))));
+    return {
+      errorType: "alternate_data_stream_written",
+      error: `The run wrote NTFS alternate data streams that Git never reports: ${newStreams.slice(0, 20).map(([key]) => key).join("; ")}. Their bytes are not part of the patch and are not checked against the Scope Contract. The output was retained for inspection; remove the streams (PowerShell: Remove-Item -LiteralPath <file> -Stream <name>) and re-run the writer.`,
+      paths,
+    };
+  }
+  return null;
+}
+
 function unsafePathReason(paths, cwd = "") {
   const root = cwd ? path.resolve(cwd) : "";
   for (const rawPath of normalizeList(paths)) {
@@ -5556,6 +5755,10 @@ function unsafePathReason(paths, cwd = "") {
 
     if (/[\0\r\n]/.test(raw)) {
       return `Unsafe path ${label} contains control characters.`;
+    }
+
+    if (windowsStreamSyntax(normalized)) {
+      return `Unsafe path ${label} contains ':' inside a path segment. On Windows that names an NTFS alternate data stream (file.txt:stream, file::$DATA), whose bytes Git never reports, or a drive-relative path (C:file). Use a plain file or directory path.`;
     }
 
     if (normalized === "~" || normalized.startsWith("~/")) {
@@ -17118,6 +17321,22 @@ function directExecutionLockConflictDetails(lockResult, { queueConflict = false,
 
 function validateScopeContract(job, lockPlan) {
   const scopeContract = lockPlan.scopeContract;
+  // G-08: stream syntax in any path input is refused before any scope rule compares paths.
+  const streamPath = [
+    ...scopeContractPathInputs(scopeContract),
+    ...(lockPlan.lockedPaths || []),
+    ...(lockPlan.allowedEdits || []),
+    ...(lockPlan.forbiddenEdits || []),
+    ...(lockPlan.sharedFiles || []),
+    ...(lockPlan.serialOnly || []),
+  ].find((value) => windowsStreamSyntax(normalizeLockPath(value)));
+  if (streamPath !== undefined) {
+    return {
+      errorType: "scope_path_unsafe",
+      error: `Unsafe path input: ${unsafePathReason([streamPath])}`,
+      suggestedFix: "Name plain files or directories; the bridge cannot scope-check NTFS alternate data streams or drive-relative paths.",
+    };
+  }
   if (!scopeContract) {
     if (lockPlan.lockType === "write" || job.write === true) {
       return {
@@ -18261,6 +18480,27 @@ async function executeOpenCodeJob(requestedJob, {
     const beforeFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
     const gitControlBefore = dryRun || manifestProtected || lockPlan.lockType === "read" ? null : await gitControlSurfaceFingerprint(executionCwd);
     const executionHeadBefore = dryRun || manifestProtected ? "" : await captureGitHead(executionCwd);
+    const scopeFilesystemBefore = dryRun || manifestProtected || lockPlan.lockType !== "write"
+      ? null
+      : await captureWritableScopeFilesystemState(executionCwd, lockPlan);
+    if (scopeFilesystemBefore && !scopeFilesystemBefore.ok) {
+      return {
+        response: { content: [{ type: "text", text: formatRejectedExecution({
+          headline: "The writable scope could not be recorded before execution.",
+          errorType: scopeFilesystemBefore.errorType,
+          reason: scopeFilesystemBefore.error,
+          requestedAgent: resolution.requestedAgent,
+          actualAgent: resolution.actualAgent,
+          lockMode: lockPlan.lockMode,
+          durationMs: nowMs() - toolStarted,
+          suggestedFix: "Narrow allowedEdits to the files the job needs, or fix the permissions of the scope, and retry. No agent was started.",
+        }) }] },
+        result: { errorType: scopeFilesystemBefore.errorType, changedFiles: [] },
+        lockPlan,
+        resolution,
+        worktree,
+      };
+    }
     phaseClock.mark("preAgentSnapshot");
     const persistExecutionSupervisorAuthority = async (spawnIdentity) => {
       const childAuthority = typeof onChildSpawn === "function"
@@ -18360,6 +18600,15 @@ async function executeOpenCodeJob(requestedJob, {
       validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(result.changedFiles));
       result.errorType ||= "unsafe_path_after_execution";
       result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
+    }
+    const scopeFilesystemViolation = scopeFilesystemBefore
+      ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
+      : null;
+    if (scopeFilesystemViolation) {
+      validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(scopeFilesystemViolation.paths));
+      result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
+      result.errorType ||= scopeFilesystemViolation.errorType;
+      result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
     }
     phaseClock.mark("postAgentChecks");
     const validationGate = manifestProtected
@@ -23699,6 +23948,31 @@ server.tool(
         const readerSnapshotOptions = readerEditsDenied ? { includeIgnored: false } : {};
         const beforeFiles = job.dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
         const gitControlBefore = job.dryRun || manifestProtected || lockPlan.lockType === "read" ? null : await gitControlSurfaceFingerprint(executionCwd);
+        const scopeFilesystemBefore = job.dryRun || manifestProtected || lockPlan.lockType !== "write"
+          ? null
+          : await captureWritableScopeFilesystemState(executionCwd, lockPlan);
+        if (scopeFilesystemBefore && !scopeFilesystemBefore.ok) {
+          return {
+            index,
+            lockPlan,
+            result: { changedFiles: [], exitCode: "not_run", errorType: scopeFilesystemBefore.errorType },
+            startedAtMs: jobStartedAtMs,
+            finishedAtMs: nowMs(),
+            text: [
+              `JOB ${index + 1}`,
+              formatRejectedExecution({
+                headline: "The writable scope could not be recorded before execution.",
+                errorType: scopeFilesystemBefore.errorType,
+                reason: scopeFilesystemBefore.error,
+                requestedAgent: resolution.requestedAgent,
+                actualAgent: resolution.actualAgent,
+                lockMode: lockPlan.lockMode,
+                durationMs: nowMs() - toolStarted,
+                suggestedFix: "Narrow allowedEdits to the files the job needs, or fix the permissions of the scope, and retry. No agent was started.",
+              }),
+            ].join("\n"),
+          };
+        }
         const delegation = {
           scope: job.delegation?.scope,
           lockMode: lockPlan.lockMode,
@@ -23786,6 +24060,15 @@ server.tool(
           result.errorType ||= "unsafe_path_after_execution";
           result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
         }
+        const scopeFilesystemViolation = scopeFilesystemBefore
+          ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
+          : null;
+        if (scopeFilesystemViolation) {
+          unsafeFiles = normalizeLockPathList(unsafeFiles.concat(scopeFilesystemViolation.paths));
+          result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
+          result.errorType ||= scopeFilesystemViolation.errorType;
+          result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
+        }
         const validationGate = !unsafeFiles.length && !result.errorType
           ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun: job.dryRun || false, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: groupController.signal })
           : {
@@ -23814,7 +24097,7 @@ server.tool(
         if (validationMutationFiles.length) {
           result.changedFiles = normalizeLockPathList(result.changedFiles.concat(validationMutationFiles));
           const postValidation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: true });
-          unsafeFiles = normalizeLockPathList(postValidation.disallowedFiles.concat(validationMutationFiles));
+          unsafeFiles = normalizeLockPathList(postValidation.disallowedFiles.concat(validationMutationFiles, result.unsafeFilesystemPaths || []));
           result.validationMutationFiles = validationMutationFiles;
           result.errorType ||= "validation_mutated_workspace";
           result.stderr = [result.stderr, `Validation changed workspace paths after agent execution: ${validationMutationFiles.join(", ")}. The changes were retained as unattributed external state.`].filter(Boolean).join("\n");
@@ -25035,6 +25318,9 @@ export const __selfTest = {
     applyPatchFile,
     inspectRepositoryGitControlSurface,
     inspectRepositoryOperationState,
+    captureWritableScopeFilesystemState,
+    writableScopeFilesystemViolation,
+    windowsStreamSyntax,
     replaceRollbackLeaf,
     writeTemporaryPatchFile,
     assert,
