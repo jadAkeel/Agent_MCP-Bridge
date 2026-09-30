@@ -64,6 +64,14 @@ Four features the same run asked for, on branch `bridge/queue-features` (worktre
 
 ## 2026-09-30
 
+### Operations log for daily use (Claude, 2026-09-30)
+
+Branch `bridge/ops-log` (worktree `C:\Users\10User\bridge-blockers`) on top of `7e508c7`.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-039 | In daily use nothing kept the bridge's warnings and errors: they went to stderr, which only the MCP client sees, so a failure from the middle of a migration could not be found or counted afterwards, and OpenCode's own database could grow until every run failed (5 GB, 4 GB WAL) without any warning. | `logEvent` wrote to stderr only; no check looked at `opencode.db`. | New `bin/ops-log.js`: `logEvent` also appends every warn and error event (already redacted by `sanitizeLogValue`) to `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl`, independent of `CODEX_OPENCODE_LOG_LEVEL`; 30-day retention, 20 MB per day, never throws; off with `CODEX_OPENCODE_OPS_LOG=off`, and a self-test writes it only under its own state directory. `npm run incidents` groups the lines by event and errorType (errors first, recurring at 3 or more or any error) and prints draft `log.md` rows; it and `npm run doctor` warn when `opencode.db` is over 2 GB or its WAL over 512 MB, and the doctor counts recurring incidents of the last 7 days. `node bin/ops-log.js --self-test` is in `npm test`. USER_GUIDE section 10 and REFERENCE document it. Only the self-test was run; the full suite is the owner's to run. | (this commit) | fixed, not deployed |
+
 ### Production review (gpt-6.1-sol high, HEAD 92154c7): two release blockers (Claude, 2026-09-30)
 
 A read-only review asked only for launch-blocking problems returned three, all checked in the code. Two are fixed here, on branch `bridge/prod-blockers` (worktree `C:\Users\10User\bridge-blockers`, its own `npm ci`). The third (no clone-portable release and no versioned rollback: B-037 plus the mutable-checkout part of G-03) blocks handing the bridge to other developers, not the owner's own use, and stays open. The review judged G-02, G-06, G-07, G-12 and the old-bridge restart rule not launch-blocking. Found on the way: OpenCode's own database (`~/.local/share/opencode/opencode.db`, 5 GB with a 4 GB WAL) failed every write ("Failed query: insert into project"), so every OpenCode run, the bridge's workers included, failed at start; the owner deleted it and runs work again. Nothing in the bridge watches that file yet.

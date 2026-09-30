@@ -11,6 +11,7 @@ import { auditHasFailures, auditStateDirectory } from "./state-audit.js";
 import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { inventory as gcInventory } from "./bridge-gc.js";
 import { isMainModule } from "./main-module.js";
+import { opencodeDatabaseHealth, readOpsLog, summarizeIncidents } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER_NAME = "opencode";
@@ -233,6 +234,13 @@ async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaud
   }
   if (housekeeping.summary.removableWorktrees || housekeeping.summary.removableDatabases || housekeeping.summary.staleRegistryRows) {
     warnings.push(`Housekeeping: ${housekeeping.summary.removableWorktrees} orphan/stale worktree(s), ${housekeeping.summary.removableDatabases} dead project database(s), ${housekeeping.summary.staleRegistryRows} stale registry row(s) can be removed with npm run gc:apply.`);
+  }
+  // OpenCode's own database runs every worker; grown too large it failed every run (2026-09-30).
+  for (const warning of opencodeDatabaseHealth(entry?.env || process.env).warnings) warnings.push(warning);
+  // Recurring problems from the operations log (bin/ops-log.js), last 7 days.
+  const recurringIncidents = summarizeIncidents(readOpsLog(stateDir, { days: 7 }).lines).filter((group) => group.recurring);
+  if (recurringIncidents.length) {
+    warnings.push(`Operations log: ${recurringIncidents.length} recurring problem(s) in the last 7 days (${recurringIncidents.slice(0, 3).map((group) => `${group.event}${group.errorType ? ` [${group.errorType}]` : ""} ${group.count}x`).join("; ")}). Run npm run incidents for details and draft log.md rows.`);
   }
   const retainedForReview = housekeeping.worktrees.filter((item) => item.classification === "retained_for_review").length;
   if (retainedForReview) {

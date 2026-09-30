@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { createDirectRunAudit, directRunMetrics, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { detachWorktreeLinks } from "./bin/worktree-links.js";
+import { appendOpsLogLine } from "./bin/ops-log.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1938,16 +1939,28 @@ function sanitizeLogValue(value, depth = 0) {
 function logEvent(level, event, data = {}) {
   const configuredLevel = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.warn;
   const eventLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
-  if (configuredLevel < eventLevel) {
+  const toStderr = configuredLevel >= eventLevel;
+  const toOpsLog = eventLevel <= LOG_LEVELS.warn && opsLogEnabled();
+  if (!toStderr && !toOpsLog) {
     return;
   }
-
-  console.error(JSON.stringify({
+  const record = {
     ts: new Date().toISOString(),
     level,
     event,
     ...sanitizeLogValue(data),
-  }));
+  };
+  if (toStderr) console.error(JSON.stringify(record));
+  // Warn and error events also go to <state-dir>/logs/bridge-<day>.jsonl (bin/ops-log.js):
+  // stderr reaches only the MCP client, so a failure during a migration was otherwise lost.
+  if (toOpsLog) appendOpsLogLine(effectiveBridgeStateDirectory(), record);
+}
+
+// CODEX_OPENCODE_OPS_LOG=off turns the file off. A self-test writes it only under its own state
+// directory override, never into the operator's.
+function opsLogEnabled() {
+  if (String(process.env.CODEX_OPENCODE_OPS_LOG || "").trim().toLowerCase() === "off") return false;
+  return !process.argv.includes("--self-test") || Boolean(stateDirectoryOverride);
 }
 
 // encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
