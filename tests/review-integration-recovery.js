@@ -776,6 +776,165 @@ test("M3 a write job that changes .git/config or a hook fails; an untouched one 
   assert.equal(unavailable.errorType, undefined, "no baseline proves nothing");
 });
 
+// G-01: resolve_integration_quarantine, the supported way out of a quarantine recovery does not
+// clear on its own. Each case asserts the journal rows and pre-images survive (e).
+const journalFiles = (repo, operationId) => withDb(repo, (db) => db.prepare(
+  "SELECT ordinal, path, pre_sha256, pre_encrypted, post_sha256 FROM integration_operation_files WHERE operation_id = ? ORDER BY ordinal"
+).all(operationId).map((row) => ({ ...row, pre_encrypted: Buffer.from(row.pre_encrypted || []).toString("hex") })));
+const journalRow = (repo, operationId) => withDb(repo, (db) => db.prepare("SELECT status, revision, result_json FROM integration_operations WHERE operation_id = ?").get(operationId));
+
+async function affectedPathDriftQuarantine(label) {
+  const repo = await makeRepo(label);
+  await commitFiles(repo, { "src/a.txt": "pre\n", "src/b.txt": "b\n" }, "base");
+  const operationId = await crashedOperation(repo, "src/a.txt", "post\n");
+  await repo.write("src/a.txt", "someone else's edit\n");
+  const recovery = await recoverIntegrationOperationsWhileLocked(repo.root, { operationId });
+  assert.equal(recovery.ok, false, JSON.stringify(recovery));
+  const quarantined = await operationResult(repo, operationId);
+  assert.deepEqual([quarantined.status, quarantined.result.reason], ["quarantined", "affected_path_drift"]);
+  return { repo, operationId, files: await journalFiles(repo, operationId) };
+}
+
+test("G-01 (a) unrelated drift still clears on its own; the tool then has nothing to resolve", async () => {
+  const repo = await makeRepo("g01-a");
+  await commitFiles(repo, { "src/a.txt": "pre\n", "unrelated.md": "u1\n" }, "base");
+  const operationId = await crashedOperation(repo, "src/a.txt", "post\n", { applied: false });
+  await quarantineIntegrationOperation(repo.root, operationId, "applying", "target_head_or_index_drift");
+  await commitFiles(repo, { "other.txt": "other\n" }, "unrelated commit");
+  assert.equal((await recoverIntegrationOperationsWhileLocked(repo.root)).ok, true);
+  assert.equal((await operationResult(repo, operationId)).status, "recovered_noop");
+  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "verify_restored" });
+  assert.match(text, /Error type: integration_operation_not_quarantined/);
+  assert.match(text, /no longer blocks writers/);
+});
+
+test("G-01 (b) affected_path_drift blocks a writer; after the operator restores the file verify_restored closes it and the writer proceeds", async () => {
+  const { repo, operationId, files } = await affectedPathDriftQuarantine("g01-b");
+  const blocked = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/b.txt"] });
+  assert.equal(blocked.errorType, "integration_recovery_pending", JSON.stringify(blocked));
+  await repo.write("src/a.txt", "pre\n");
+  assert.equal((await recoverIntegrationOperationsWhileLocked(repo.root)).ok, false, "restoring the file alone does not clear this reason");
+  assert.equal((await operationResult(repo, operationId)).status, "quarantined");
+
+  // The status line shows the quarantine and its age.
+  const journal = await integrationJournalDiagnosis(repo.root);
+  assert.equal(journal.unresolved[0].quarantinedMinutes, 0);
+  assert.match(__selfTest.internals.integrationQuarantineStatusLine(journal), /^Integration quarantines: 1 \(oldest 0 min: integration-.*reason affected_path_drift\); writers are blocked; resolve with resolve_integration_quarantine$/);
+
+  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "verify_restored" });
+  assert.match(text, /^Integration quarantine resolved\./);
+  assert.match(text, /Closed as: recovered_verified/);
+  assert.match(text, /Quarantine reason was: affected_path_drift/);
+  assert.match(text, /Writers unblocked: yes/);
+  const closed = await operationResult(repo, operationId);
+  assert.equal(closed.status, "recovered_verified");
+  assert.equal(closed.result.outcome, "operator_verified_restored");
+  assert.equal(closed.result.quarantineReason, "affected_path_drift");
+  assert.equal(closed.result.quarantine.reason, "affected_path_drift", "the quarantine record is kept inside the resolution");
+  assert.equal(closed.result.via, "mcp");
+  assert.ok(closed.result.resolvedBy && closed.result.resolvedAt);
+  assert.deepEqual(await journalFiles(repo, operationId), files, "(e) journal rows and pre-images survive");
+  assert.equal(__selfTest.internals.integrationQuarantineStatusLine(await integrationJournalDiagnosis(repo.root)), "Integration quarantines: none");
+
+  const writer = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/b.txt"] });
+  assert.equal(writer.ok, true, JSON.stringify(writer));
+  await releaseHardLock(writer.lock.id, writer.lock.token, [], repo.root);
+  assert.equal(await repo.read("src/a.txt"), "pre\n", "resolution never writes the checkout");
+});
+
+test("G-01 (c) verify_restored on a path still wrong, or a staged one, names it and changes nothing", async () => {
+  const { repo, operationId, files } = await affectedPathDriftQuarantine("g01-c");
+  const before = await journalRow(repo, operationId);
+  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "verify_restored" });
+  assert.match(text, /^Integration quarantine resolution rejected\./);
+  assert.match(text, /Error type: integration_quarantine_not_restored/);
+  assert.match(text, /nothing was changed/);
+  const details = JSON.parse(text.slice(text.indexOf("{")));
+  assert.equal(details.mismatches.length, 1);
+  assert.equal(details.mismatches[0].path, "src/a.txt");
+  assert.match(details.mismatches[0].expected, /^file:\d+:[a-f0-9]{64}$/, "the expected state names its hash");
+  assert.notEqual(details.mismatches[0].current, details.mismatches[0].expected);
+  assert.deepEqual(await journalRow(repo, operationId), before, "status, revision and record are unchanged");
+  assert.equal(await repo.read("src/a.txt"), "someone else's edit\n");
+
+  // Restored bytes but a staged index entry: still refused, and the index path is named.
+  await repo.write("src/a.txt", "staged\n");
+  await repo.git("add", "src/a.txt");
+  await repo.write("src/a.txt", "pre\n");
+  const staged = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "verify_restored" });
+  assert.match(staged, /Error type: integration_quarantine_not_restored/);
+  assert.deepEqual(JSON.parse(staged.slice(staged.indexOf("{"))).indexMismatches, ["src/a.txt"]);
+  assert.match(staged, /git restore --staged/);
+  assert.deepEqual(await journalRow(repo, operationId), before);
+  assert.deepEqual(await journalFiles(repo, operationId), files, "(e) journal rows and pre-images survive");
+});
+
+test("G-01 (d) accept_current needs a reason and the confirmation, and is refused while a job holds a lock", async () => {
+  const { repo, operationId, files } = await affectedPathDriftQuarantine("g01-d");
+  const before = await journalRow(repo, operationId);
+  const noReason = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", confirmation: operationId });
+  assert.match(noReason, /Error type: integration_quarantine_reason_required/);
+  const blankReason = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "   ", confirmation: operationId });
+  assert.match(blankReason, /Error type: integration_quarantine_reason_required/);
+  const noConfirmation = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected" });
+  assert.match(noConfirmation, /Error type: integration_quarantine_confirmation_mismatch/);
+  const reader = await acquireHardLock({ owner: "codex", agent: "reviewer", cwd: repo.root, lockType: "read", paths: ["src"] });
+  assert.equal(reader.ok, true, JSON.stringify(reader));
+  const busy = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "inspected", confirmation: operationId });
+  assert.match(busy, /Error type: integration_quarantine_resolution_busy/);
+  await releaseHardLock(reader.lock.id, reader.lock.token, [], repo.root);
+  assert.deepEqual(await journalRow(repo, operationId), before, "every refusal leaves the operation as it was");
+
+  const reason = "Inspected src/a.txt: the edit is mine and stays; the patch is not wanted.";
+  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason, confirmation: operationId, operator: "g01-test-operator" });
+  assert.match(text, /Closed as: resolved_by_operator/);
+  assert.match(text, /Resolved by: g01-test-operator/);
+  const closed = await operationResult(repo, operationId);
+  assert.equal(closed.status, "resolved_by_operator");
+  assert.equal(closed.result.operatorReason, reason);
+  assert.equal(closed.result.quarantineReason, "affected_path_drift");
+  assert.match(closed.result.acceptedState["src/a.txt"], /^file:\d+:[a-f0-9]{64}$/, "the accepted state of each path is recorded");
+  assert.equal(await repo.read("src/a.txt"), "someone else's edit\n", "accept_current never writes the checkout");
+  assert.deepEqual(await journalFiles(repo, operationId), files, "(e) journal rows and pre-images survive");
+  const view = (await integrationJournalDiagnosis(repo.root)).recentTerminal.find((item) => item.operationId === operationId);
+  assert.deepEqual([view.status, view.reason, view.resolvedBy, view.operatorReason], ["resolved_by_operator", "affected_path_drift", "g01-test-operator", reason]);
+  const writer = await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/b.txt"] });
+  assert.equal(writer.ok, true, JSON.stringify(writer));
+  await releaseHardLock(writer.lock.id, writer.lock.token, [], repo.root);
+});
+
+test("G-01 unreadable evidence cannot be verified, only accepted; another quarantine keeps writers blocked", async () => {
+  const repo = await makeRepo("g01-evidence");
+  await commitFiles(repo, { "src/a.txt": "pre\n", "src/b.txt": "b\n" }, "base");
+  // Both operations exist before either is quarantined (a quarantine refuses new operations).
+  const operationId = await crashedOperation(repo, "src/a.txt", "post\n", { applied: false });
+  const second = await crashedOperation(repo, "src/b.txt", "post b\n");
+  await quarantineIntegrationOperation(repo.root, operationId, "applying", "journal_evidence_unreadable");
+  await quarantineIntegrationOperation(repo.root, second, "applying", "rollback_restore_failed");
+  const files = await journalFiles(repo, operationId);
+  await withDb(repo, (db) => db.prepare("UPDATE integration_operation_files SET pre_sha256 = ? WHERE operation_id = ?").run("0".repeat(64), operationId));
+  const unverifiable = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "verify_restored" });
+  assert.match(unverifiable, /Error type: integration_quarantine_unverifiable/);
+  assert.match(unverifiable, /use accept_current/);
+  assert.equal((await operationResult(repo, operationId)).status, "quarantined");
+
+  // Resolving the first leaves writers blocked by the second.
+  const text = await callTool("resolve_integration_quarantine", { cwd: repo.root, operationId, mode: "accept_current", reason: "evidence corrupt; checkout inspected", confirmation: operationId });
+  assert.match(text, /Closed as: resolved_by_operator/);
+  assert.match(text, new RegExp(`Writers unblocked: no, still blocked by ${second}`));
+  assert.equal((await acquireHardLock({ owner: "codex", agent: "builder", cwd: repo.root, lockType: "write", paths: ["src/c.txt"] })).errorType, "integration_recovery_pending");
+  const kept = await journalFiles(repo, operationId);
+  assert.equal(kept.length, files.length, "(e) the corrupt rows are kept too");
+  assert.equal(kept[0].pre_encrypted, files[0].pre_encrypted);
+  assert.equal(kept[0].pre_sha256, "0".repeat(64), "nothing repairs or rewrites the evidence");
+});
+
+test("G-01 the two new statuses are terminal everywhere writers are checked", async () => {
+  assert.deepEqual([...__selfTest.internals.INTEGRATION_RESOLVED_STATUSES].sort(), ["committed", "recovered_noop", "recovered_verified", "resolved_by_operator", "rolled_back"]);
+  const unknown = await callTool("resolve_integration_quarantine", { cwd: (await makeRepo("g01-unknown")).root, operationId: "integration-missing", mode: "verify_restored" });
+  assert.match(unknown, /Error type: integration_operation_not_found/);
+});
+
 const only = process.argv.find((argument) => argument.startsWith("--only="))?.slice("--only=".length) || "";
 const failures = [];
 const skipped = [];
