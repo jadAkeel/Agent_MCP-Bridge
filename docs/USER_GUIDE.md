@@ -361,8 +361,8 @@ npm run release:activate
 
 It does the whole release in order and stops at the first failure:
 
-1. Runs `npm test`. If it fails, nothing is built.
-2. Builds a new folder next to the active release, for example `server-daily-20260924-3`.
+1. Checks that the tree can become a release at all: every published file and folder exists (including the untracked `opencode/.gitignore`) and `opencode/plugin-integrity-manifest.json` points at this tree's `opencode.jsonc` and `antigravity.json`. A worktree fails this. Then it runs the release gate, the same as `npm run test:release` (see [below](#before-pushing-source-changes)). If anything fails, nothing is built.
+2. Builds a new folder next to the active release, for example `server-daily-20260924-3`, checks that the source tree is still the one the gate tested, and stores the gate's receipt next to it as `server-daily-20260924-3.gate-receipt.json`.
 3. Writes a candidate config with the new path and hash and checks it in a fresh bridge process.
 4. Backs up `~/.codex/config.toml` as `config.toml.rollback-<time>`, then swaps in the new config.
 5. Runs the health smoke against the live config. If it fails, it restores the backup automatically.
@@ -370,7 +370,7 @@ It does the whole release in order and stops at the first failure:
 
 Then **restart Codex** so new sessions use the new bridge.
 
-Useful options: `--check-only` builds and health-checks a candidate without activating it. `--skip-tests` skips step 1 right after a green `npm test`.
+Useful options: `--check-only` builds and health-checks a candidate without activating it. To skip step 1 right after a green `npm run test:release`, pass its receipt: `npm run release:activate -- --skip-tests --gate-receipt .release-gate/receipt.json`. Activation refuses `--skip-tests` without a receipt, a receipt of a failed run, a receipt of a different source tree (any change to `server.js`, `bin/`, `tests/`, `package*.json` or the shipped agent and skill profiles since the gate ran), and a receipt older than 24 hours.
 
 Agent and skill profiles ship inside the release. When the release starts, it copies them into the runtime folder named by `CODEX_OPENCODE_AGENT_DIR` and `CODEX_OPENCODE_SKILL_DIR`. It only adds and updates files, never deletes. `npm run sync:runtime` still exists for a manual dry run.
 
@@ -386,7 +386,9 @@ Agent and skill profiles ship inside the release. When the release starts, it co
 npm run test:release
 ```
 
-This runs `npm test`, the concurrency test, and `npm audit --omit=dev`.
+This is the release gate (`bin/release-gate.js`). It runs, in order and stopping at the first failure: a check that `node_modules` holds exactly what `package-lock.json` pins for every production package (version and integrity in `node_modules/.package-lock.json`, and each package's own `package.json`; run `npm ci` if it fails), `npm test`, the concurrency test, `npm audit --omit=dev` (needs the npm registry), and a health smoke that starts this tree's `server.js` with the environment of the `opencode` entry in `~/.codex/config.toml` (`--config <file>` names another). It then writes `.release-gate/receipt.json`: the source-tree digest, the git HEAD, the time, every step's exit code and duration, and for a failed step the last 30 lines of its output.
+
+The end of the output lists each step, the concurrency test's check count, and `skipped: <n>` with the name and reason of every skipped test. A skip is not a pass: read the reasons before you release. The only expected skip on this machine is the tracked-symlink case in `tests/review-b030.js` when Windows cannot create symlinks (no Developer Mode). If a file of the source tree changes while the gate runs, the receipt is marked failed.
 
 ### Current state on this machine
 
@@ -498,6 +500,7 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 | `bin/sync-managed-runtime.js` | Agent/skill copy used at startup; `npm run sync:runtime` for a manual dry run |
 | `bin/release-activate.js` | `npm run release:activate` |
 | `bin/build-release.js` | Release builder used by `release:activate` |
+| `bin/release-gate.js` | `npm run test:release`; the gate and receipt `release:activate` requires |
 | `bin/fresh-healthcheck.js` | Fresh-process health check used during activation. |
 | `bin/tui.js` | `npm run tui` dashboard. |
 | `bin/e2e*.js` | Live and concurrency end-to-end tests. |
@@ -512,10 +515,10 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 | Command | Use |
 | --- | --- |
 | `npm run test:quick` | Fast loop while editing. |
-| `npm test` | Production gate. |
-| `npm run test:concurrency` | Multi-process stress, with no model calls. |
+| `npm test` | Full self-test suite. |
+| `npm run test:concurrency` | Multi-process stress, with no model calls. Prints one line per check with its duration and `Checks: <n> passed, skipped: <n>`. |
 | `npm run test:e2e` | Live end-to-end with real models. Slower and uses your quota. |
-| `npm run test:release` | `npm test`, the concurrency test, and a dependency audit. |
+| `npm run test:release` | Release gate: `npm test`, the concurrency test, a dependency audit and a health smoke; writes the receipt `release:activate` checks. |
 
 ---
 

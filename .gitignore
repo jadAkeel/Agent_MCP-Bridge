@@ -25,3 +25,6 @@ temp/
 
 .DS_Store
 Thumbs.db
+
+# Release gate receipts (bin/release-gate.js)
+.release-gate/

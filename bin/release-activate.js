@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
-// One-command release: test, build a new immutable release folder, point the Codex
-// MCP entry at it with the new server hash, prove a fresh bridge is healthy, and
+// One-command release: pass the release gate, build a new immutable release folder, point
+// the Codex MCP entry at it with the new server hash, prove a fresh bridge is healthy, and
 // roll the config back automatically if the post-activation health check fails.
 //
-//   npm run release:activate                 full run
+//   npm run release:activate                 full run; runs the release gate (bin/release-gate.js,
+//                                            the same as `npm run test:release`) first
 //   npm run release:activate -- --check-only build and health-check a candidate, do not activate
-//   npm run release:activate -- --skip-tests skip `npm test` (use only right after a green run)
+//   npm run release:activate -- --skip-tests --gate-receipt <file>
+//                                            do not run the gate again; <file> must be the receipt
+//                                            of a green `npm run test:release` of exactly this
+//                                            source tree, at most 24 h old (--gate-receipt alone
+//                                            does the same; --skip-tests alone is refused)
 //   npm run release:activate -- --prune      also delete releases/backups beyond the kept set
 //   npm run release:activate -- --inspect    show the active release, releases still in use, and
 //                                            what --prune would delete; builds nothing
@@ -23,6 +28,10 @@
 //   --skip-claude-code      do not re-register the entry with Claude Code
 //   --claude-config <file>  Claude Code user config (default $CLAUDE_CONFIG_DIR/.claude.json,
 //                           else ~/.claude.json)
+//
+// The gate's receipt is stored next to the release folder as <release>.gate-receipt.json, and
+// the source tree is digested again after the build: a tree that changed since the gate ran
+// is not activated.
 //
 // Old releases and config backups are only listed unless --prune is passed. Only folders
 // named server-* that contain release-manifest.json count as releases. The kept set is
@@ -55,6 +64,7 @@ import { isDeepStrictEqual } from "node:util";
 import { buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 requireSelfTestRun(import.meta.url);
@@ -64,6 +74,7 @@ const RELEASE_MANIFEST = "release-manifest.json";
 // Files a release copies from the source tree (build-release.js LEGACY_PUBLISH_ENTRIES).
 const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "opencode", "tests", "package.json", "package-lock.json"];
 const RENAME_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000];
+const SKIP_TESTS_NEEDS_RECEIPT = "--skip-tests needs --gate-receipt <file>: the receipt of a green `npm run test:release` of this source tree (written to .release-gate/receipt.json), at most 24 h old. Nothing was built or activated.";
 
 function defaultClaudeConfigPath(env = process.env) {
   const configDir = String(env.CLAUDE_CONFIG_DIR || "").trim();
@@ -84,12 +95,14 @@ function parseArguments(argv) {
     releasesRoot: "",
     claudeConfigPath: defaultClaudeConfigPath(),
     healthCwd: SOURCE_ROOT,
+    gateReceipt: "",
   };
   const valued = {
     "--config": "configPath",
     "--health-cwd": "healthCwd",
     "--releases-root": "releasesRoot",
     "--claude-config": "claudeConfigPath",
+    "--gate-receipt": "gateReceipt",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -107,10 +120,11 @@ function parseArguments(argv) {
     else if (argument === "--skip-claude-code") options.skipClaudeCode = true;
     else if (argument === "--self-test") options.selfTest = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node bin/release-activate.js [--check-only] [--skip-tests] [--prune] [--inspect] [--sync-clients] [--allow-dirty] [--skip-claude-code] [--self-test] [--config <config.toml>] [--releases-root <dir>] [--claude-config <.claude.json>] [--health-cwd <git checkout>]\n");
+      process.stdout.write("Usage: node bin/release-activate.js [--check-only] [--skip-tests --gate-receipt <receipt.json>] [--prune] [--inspect] [--sync-clients] [--allow-dirty] [--skip-claude-code] [--self-test] [--config <config.toml>] [--releases-root <dir>] [--claude-config <.claude.json>] [--health-cwd <git checkout>]\n");
       process.exit(0);
     } else throw new Error(`Unknown argument: ${argument}`);
   }
+  if (options.skipTests && !options.gateReceipt) throw new Error(SKIP_TESTS_NEEDS_RECEIPT);
   return options;
 }
 
@@ -145,10 +159,30 @@ function pathIsAtOrInside(candidate, directory) {
   return child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`);
 }
 
-function runNpmTest() {
-  // npm is a .cmd shim on Windows, which Node only starts through a shell.
-  const result = spawnSync("npm test", { cwd: SOURCE_ROOT, stdio: "inherit", shell: true, windowsHide: true });
-  if (result.status !== 0) throw new Error(`npm test failed (exit ${result.status}); nothing was built or activated.`);
+// G-04: activation needs a green release gate of exactly the tree it builds. By default the
+// gate runs here; --skip-tests is accepted only with --gate-receipt naming a green receipt of
+// this tree, at most 24 h old (`npm run test:release` writes one).
+async function passReleaseGate({ skipTests = false, gateReceipt = "", configPath }, {
+  sourceRoot = SOURCE_ROOT,
+  runGate = runReleaseGate,
+  digest = sourceTreeDigest,
+  now = Date.now,
+} = {}) {
+  if (skipTests && !gateReceipt) throw new Error(SKIP_TESTS_NEEDS_RECEIPT);
+  const { receipt, receiptPath } = gateReceipt
+    ? { receipt: await readGateReceipt(gateReceipt), receiptPath: gateReceipt }
+    : await runGate({ sourceRoot, configPath });
+  const { treeSha256 } = await digest(sourceRoot);
+  try {
+    validateGateReceipt(receipt, { treeSha256, now: now() });
+  } catch (error) {
+    throw new Error(`${error.message} Nothing was built or activated.`);
+  }
+  return { receipt, receiptPath, treeSha256 };
+}
+
+function gateReceiptPathFor(releaseDirectory) {
+  return `${path.resolve(releaseDirectory)}.gate-receipt.json`;
 }
 
 function isReleaseDirectory(directory) {
@@ -807,7 +841,10 @@ async function housekeeping({ releasesRoot, keepReleases, configPath, prune, inU
     process.stdout.write("Re-run with --prune to delete these.\n");
     return { removedReleases: [], removedBackups: [] };
   }
-  for (const item of staleReleases) await rm(item.full, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  for (const item of staleReleases) {
+    await rm(item.full, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await rm(gateReceiptPathFor(item.full), { force: true });
+  }
   for (const item of staleBackups) await rm(item.full, { force: true });
   return { removedReleases: staleReleases.map((item) => item.full), removedBackups: staleBackups.map((item) => item.full) };
 }
@@ -1299,6 +1336,68 @@ async function selfTestClaudeSync(fixture) {
   assert.equal(claudeCodeCommand({ platform: process.platform, env: {}, home, exists: () => false, onPath: () => [] }), null);
 }
 
+// G-04: activation runs the release gate unless a green receipt of this exact tree is given.
+async function selfTestReleaseGate(fixture) {
+  const treeSha256 = "a".repeat(64);
+  const finishedAt = new Date().toISOString();
+  const green = {
+    kind: RECEIPT_KIND,
+    version: 1,
+    ok: true,
+    sourceTree: { treeSha256 },
+    finishedAt,
+    steps: REQUIRED_STEPS.map((name) => ({ name, exitCode: 0 })),
+    skips: [],
+  };
+  const digest = async () => ({ treeSha256 });
+  let gateRuns = 0;
+  const runGate = async () => { gateRuns += 1; return { receipt: green, receiptPath: "(gate run)" }; };
+  const writeReceipt = async (name, receipt) => {
+    const file = path.join(fixture, name);
+    await writeFile(file, JSON.stringify(receipt), "utf8");
+    return file;
+  };
+  const gate = (options, deps = {}) => passReleaseGate({ configPath: "unused", ...options }, { runGate, digest, ...deps });
+
+  // --skip-tests with no receipt is refused before anything runs, already by the argument parser.
+  assert.throws(() => parseArguments(["--skip-tests"]), /--skip-tests needs --gate-receipt <file>/);
+  assert.equal(parseArguments(["--skip-tests", "--gate-receipt", "receipt.json"]).gateReceipt, path.resolve("receipt.json"));
+  await assert.rejects(gate({ skipTests: true }), /--skip-tests needs --gate-receipt <file>.*Nothing was built or activated/s);
+  assert.equal(gateRuns, 0);
+
+  // A receipt of another tree, an old one, a failed one: refused, and the gate is not run.
+  const otherTree = await writeReceipt("other-tree.json", { ...green, sourceTree: { treeSha256: "b".repeat(64) } });
+  await assert.rejects(gate({ skipTests: true, gateReceipt: otherTree }), /another source tree \(receipt bbbbbbbbbbbb, candidate aaaaaaaaaaaa\).*Nothing was built/s);
+  const old = await writeReceipt("old.json", { ...green, finishedAt: new Date(Date.now() - 25 * 3_600_000).toISOString() });
+  await assert.rejects(gate({ skipTests: true, gateReceipt: old }), /25 h old \(limit 24 h\)/);
+  const failed = await writeReceipt("failed.json", { ...green, ok: false, failure: "test:concurrency failed (exit 1)." });
+  await assert.rejects(gate({ gateReceipt: failed }), /failed run: test:concurrency failed/);
+  await assert.rejects(gate({ skipTests: true, gateReceipt: path.join(fixture, "no-such-receipt.json") }), /Cannot read the gate receipt/);
+  assert.equal(gateRuns, 0);
+
+  // A green receipt of this tree is accepted without running the gate (with or without --skip-tests).
+  const good = await writeReceipt("good.json", green);
+  assert.equal((await gate({ skipTests: true, gateReceipt: good })).treeSha256, treeSha256);
+  assert.equal((await gate({ gateReceipt: good })).receiptPath, good);
+  assert.equal(gateRuns, 0);
+
+  // By default the gate runs, and its receipt must still be green and match the tree.
+  assert.equal((await gate({})).receiptPath, "(gate run)");
+  assert.equal(gateRuns, 1);
+  await assert.rejects(gate({}, { runGate: async () => ({ receipt: { ...green, ok: false, failure: "npm test failed (exit 1)." }, receiptPath: "x" }) }), /failed run: npm test failed/);
+  await assert.rejects(gate({}, { digest: async () => ({ treeSha256: "c".repeat(64) }) }), /another source tree/);
+
+  // --prune removes a stale release's receipt with it.
+  const releasesRoot = path.join(fixture, "gate-releases");
+  const stale = path.join(releasesRoot, "server-daily-20000101");
+  await mkdir(stale, { recursive: true });
+  await writeFile(path.join(stale, RELEASE_MANIFEST), "{}\n", "utf8");
+  await writeFile(gateReceiptPathFor(stale), "{}\n", "utf8");
+  const pruned = await housekeeping({ releasesRoot, keepReleases: [], configPath: path.join(fixture, "gate-config", "config.toml"), prune: true, inUse: { ok: true, releases: new Set() } });
+  assert.deepEqual(pruned.removedReleases, [stale]);
+  assert.equal(existsSync(gateReceiptPathFor(stale)), false, "a pruned release's gate receipt is removed with it");
+}
+
 async function selfTest() {
   selfTestRewrite();
   const fixture = await mkdtemp(path.join(tmpdir(), "release-activate-self-test-"));
@@ -1310,6 +1409,7 @@ async function selfTest() {
     await selfTestCleanTree(fixture);
     await selfTestCheckedBuild(fixture);
     await selfTestClaudeSync(fixture);
+    await selfTestReleaseGate(fixture);
   } finally {
     await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
@@ -1355,13 +1455,16 @@ async function main() {
   // --check-only never activates, so a dirty tree is only reported there.
   const treeWarnings = assertCleanSourceTree(SOURCE_ROOT, options.allowDirty || options.checkOnly);
   process.stdout.write(`${treeWarnings.length ? treeWarnings.join("\n") : "Source tree is clean."}\n`);
+  // A tree the build would refuse (a missing publish entry, a plugin manifest bound to another
+  // checkout) fails here, not after the half-hour gate.
+  await assertReleaseSourceComplete(SOURCE_ROOT);
+  process.stdout.write("Every publish entry is present and the plugin manifest is bound to this tree.\n");
 
-  if (options.skipTests) {
-    step("Skipping npm test (--skip-tests)");
-  } else {
-    step("Running npm test");
-    runNpmTest();
-  }
+  step(options.gateReceipt
+    ? `Checking the release gate receipt ${options.gateReceipt} (the gate is not run again)`
+    : "Running the release gate (npm run test:release)");
+  const gate = await passReleaseGate(options);
+  process.stdout.write(`Release gate passed ${gate.receipt.finishedAt} for source tree ${short(gate.treeSha256)} (receipt ${gate.receiptPath}; ${gate.receipt.skips?.length || 0} skipped).\n`);
 
   const destination = await nextReleaseDirectory(releasesRoot);
   step(`Building release ${destination}`);
@@ -1372,9 +1475,17 @@ async function main() {
 
   const candidateDir = await mkdtemp(path.join(tmpdir(), "release-activate-"));
   const candidateConfig = path.join(candidateDir, "config.toml");
+  const receiptCopy = gateReceiptPathFor(destination);
   let activated = false;
   let liveConfigWritten = false;
   try {
+    const { treeSha256: builtTree } = await sourceTreeDigest(SOURCE_ROOT);
+    if (builtTree !== gate.treeSha256) {
+      throw new Error(`The source tree changed after the release gate ran (${short(gate.treeSha256)} -> ${short(builtTree)}); nothing was activated. Run the gate again.`);
+    }
+    await writeFile(receiptCopy, `${JSON.stringify(gate.receipt, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    process.stdout.write(`Gate receipt: ${receiptCopy}\n`);
+
     const pluginManifestSha256 = await pluginManifestSha256For(activeEntry);
     const originalConfig = await readFile(options.configPath, "utf8");
     const { text: candidateText, pluginManifestPinned } = rewriteConfig(originalConfig, { serverPath, serverSha256, pluginManifestSha256 });
@@ -1440,6 +1551,7 @@ async function main() {
     // is the point.
     if (!activated && !options.checkOnly) {
       process.stdout.write(`${await cleanupUnactivatedRelease({ configPath: options.configPath, destination, liveConfigWritten })}\n`);
+      if (!existsSync(destination)) await rm(receiptCopy, { force: true }).catch(() => {});
     }
   }
 }

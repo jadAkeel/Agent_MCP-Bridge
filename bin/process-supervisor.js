@@ -1131,7 +1131,9 @@ async function runSelfTest() {
       env: { ...process.env, PROCESS_SUPERVISOR_SELF_TEST: "1" },
       timeoutMs: 120_000,
       killGraceMs: 100,
-      terminationConfirmMs: 3_000,
+      // The bridge's own budget. The Windows descendant snapshot (PowerShell Get-CimInstance)
+      // takes 2.3-2.7 s on a loaded host, so 3 s failed the gate with snapshotOk: false (B-036).
+      terminationConfirmMs: DEFAULT_TERMINATION_CONFIRM_MS,
     });
     const descendantExit = await waitForEvent(descendantHarness, "exit", () => true, 30_000);
     grandchildPid = Number(await readFile(grandchildMarker, "utf8"));

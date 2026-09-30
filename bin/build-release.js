@@ -525,4 +525,4 @@ if (isMainModule(import.meta.url)) {
   });
 }
 
-export { buildRelease, installProductionDependencies, listExactFiles, normalizePublishEntries, prepareUnlinkedDestinationParent, resolveNpmCli };
+export { LEGACY_PUBLISH_ENTRIES, buildRelease, installProductionDependencies, listExactFiles, normalizePublishEntries, prepareUnlinkedDestinationParent, resolveNpmCli };
