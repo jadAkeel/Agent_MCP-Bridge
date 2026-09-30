@@ -5645,58 +5645,77 @@ async function listAlternateDataStreams(directories, root) {
 async function captureWritableScopeFilesystemState(cwd, lockPlan, { platform = process.platform } = {}) {
   const root = path.resolve(cwd);
   const links = new Map();
-  const directories = [];
+  const directories = new Set();
   let entries = 0;
+  const lstatIfPresent = async (target) => {
+    try {
+      return await lstat(target);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+      throw error;
+    }
+  };
+  // Git's own directory is not agent output (and a worktree's .git is a file).
+  const childrenOf = async (directory) => {
+    const names = (await readdir(directory)).filter((name) => name !== ".git");
+    const details = await Promise.all(names.map((name) => lstatIfPresent(path.join(directory, name))));
+    return names.map((name, index) => ({ absolute: path.join(directory, name), details: details[index] })).filter((child) => child.details);
+  };
   try {
     const realRoot = await realpath(root);
+    const recordLink = async (absolute) => {
+      let target = "";
+      try {
+        target = await realpath(absolute);
+      } catch (error) {
+        target = `unresolvable:${error?.code || "error"}`;
+      }
+      links.set(writableScopeRelative(root, absolute), { target, inside: !target.startsWith("unresolvable:") && (target === realRoot || isPathInside(realRoot, target)) });
+    };
+    const tooMany = () => ({
+      ok: false,
+      errorType: "writable_scope_unverifiable",
+      error: `The writable scope has more than ${WRITABLE_SCOPE_MAX_ENTRIES} entries, so the bridge cannot record its links and alternate data streams. Narrow allowedEdits.`,
+    });
     const stack = [];
+    // A scope entry that is a file, or one the job will create, is not walked, but a stream on
+    // it or a link placed beside it is just as invisible to Git. Its parent directory is listed
+    // without descending: its streams and its direct links (G-08 review: a contract naming only
+    // files, the documented shape, was never checked).
+    const shallow = new Set();
     for (const scopeRoot of writableScopeRoots(root, lockPlan)) {
       // The path down to a scope root is checked by realPathBoundaryReason; a link there is
-      // already refused. A root that does not exist yet has nothing in it to record.
-      let details;
-      try {
-        details = await lstat(scopeRoot);
-      } catch (error) {
-        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") continue;
-        throw error;
+      // already refused.
+      const details = await lstatIfPresent(scopeRoot);
+      if (details?.isDirectory()) {
+        stack.push({ absolute: scopeRoot, details });
+        continue;
       }
-      stack.push({ absolute: scopeRoot, details });
+      const parent = path.dirname(scopeRoot);
+      if (parent === root || isPathInside(root, parent)) shallow.add(parent);
+    }
+    for (const parent of shallow) {
+      if (!(await lstatIfPresent(parent))?.isDirectory()) continue;
+      directories.add(parent);
+      for (const child of await childrenOf(parent)) {
+        entries += 1;
+        if (entries > WRITABLE_SCOPE_MAX_ENTRIES) return tooMany();
+        if (child.details.isSymbolicLink()) await recordLink(child.absolute);
+      }
     }
     while (stack.length) {
       const { absolute, details } = stack.pop();
       entries += 1;
-      if (entries > WRITABLE_SCOPE_MAX_ENTRIES) {
-        return {
-          ok: false,
-          errorType: "writable_scope_unverifiable",
-          error: `The writable scope has more than ${WRITABLE_SCOPE_MAX_ENTRIES} entries, so the bridge cannot record its links and alternate data streams. Narrow allowedEdits.`,
-        };
-      }
+      if (entries > WRITABLE_SCOPE_MAX_ENTRIES) return tooMany();
       if (details.isSymbolicLink()) {
-        let target = "";
-        try {
-          target = await realpath(absolute);
-        } catch (error) {
-          target = `unresolvable:${error?.code || "error"}`;
-        }
-        links.set(writableScopeRelative(root, absolute), { target, inside: !target.startsWith("unresolvable:") && (target === realRoot || isPathInside(realRoot, target)) });
+        await recordLink(absolute);
         continue;
       }
       if (!details.isDirectory()) continue;
-      directories.push(absolute);
-      for (const entry of await readdir(absolute)) {
-        const child = path.join(absolute, entry);
-        let childDetails;
-        try {
-          childDetails = await lstat(child);
-        } catch (error) {
-          if (error?.code === "ENOENT") continue;
-          throw error;
-        }
-        stack.push({ absolute: child, details: childDetails });
-      }
+      directories.add(absolute);
+      stack.push(...await childrenOf(absolute));
     }
-    const streams = platform === "win32" && directories.length ? await listAlternateDataStreams(directories, root) : new Map();
+    const streams = platform === "win32" && directories.size ? await listAlternateDataStreams([...directories], root) : new Map();
     return { ok: true, links, streams, entries };
   } catch (error) {
     return {
@@ -5720,13 +5739,14 @@ function writableScopeFilesystemViolation(before, after) {
       paths: [],
     };
   }
+  // A link that appeared, or whose target changed (including one that became unresolvable).
+  // A dangling link that was already there, unchanged, is not the run's doing (G-08 review).
   const newLinks = [...after.links].filter(([key, value]) => !before.links.has(key) || before.links.get(key).target !== value.target);
-  const unresolvable = [...after.links].filter(([, value]) => value.target.startsWith("unresolvable:"));
-  if (newLinks.length || unresolvable.length) {
-    const paths = normalizeLockPathList([...newLinks, ...unresolvable].map(([key]) => key));
+  if (newLinks.length) {
+    const paths = normalizeLockPathList(newLinks.map(([key]) => key));
     return {
       errorType: "reparse_point_created_during_execution",
-      error: `The run created, retargeted or left unresolvable a symbolic link or junction in the writable scope: ${[...newLinks, ...unresolvable].slice(0, 20).map(([key, value]) => `${key} -> ${value.target}`).join("; ")}. Writes through a link are invisible to Git and may have reached files outside the repository. The output was retained for inspection; check the link targets, remove the links, and re-run the writer.`,
+      error: `The run created, retargeted or left unresolvable a symbolic link or junction in the writable scope: ${newLinks.slice(0, 20).map(([key, value]) => `${key} -> ${value.target}`).join("; ")}. Writes through a link are invisible to Git and may have reached files outside the repository. The output was retained for inspection; check the link targets, remove the links, and re-run the writer.`,
       paths,
     };
   }
@@ -18484,6 +18504,8 @@ async function executeOpenCodeJob(requestedJob, {
       ? null
       : await captureWritableScopeFilesystemState(executionCwd, lockPlan);
     if (scopeFilesystemBefore && !scopeFilesystemBefore.ok) {
+      // No agent ran, so the worktree is empty: keeping it only filled the retained-worktree cap.
+      if (worktree) await cleanupWorktree(worktree, "always", true).catch(() => null);
       return {
         response: { content: [{ type: "text", text: formatRejectedExecution({
           headline: "The writable scope could not be recorded before execution.",
@@ -18498,7 +18520,7 @@ async function executeOpenCodeJob(requestedJob, {
         result: { errorType: scopeFilesystemBefore.errorType, changedFiles: [] },
         lockPlan,
         resolution,
-        worktree,
+        worktree: null,
       };
     }
     phaseClock.mark("preAgentSnapshot");
@@ -23952,6 +23974,11 @@ server.tool(
           ? null
           : await captureWritableScopeFilesystemState(executionCwd, lockPlan);
         if (scopeFilesystemBefore && !scopeFilesystemBefore.ok) {
+          // No agent ran, so the worktree is empty: keeping it only filled the retained-worktree cap.
+          if (parallelWorktrees[index]) {
+            await cleanupWorktree(parallelWorktrees[index], "always", true).catch(() => null);
+            parallelWorktrees[index] = null;
+          }
           return {
             index,
             lockPlan,

@@ -202,6 +202,47 @@ try {
     await removeRetained(repo);
   }, { windowsOnly: true });
 
+  await check("a contract naming only files is checked too: a stream on the allowed file, on a new file, and a link beside it", async () => {
+    // The documented job shape names files (allowedEdits: ["src/a.txt"]); such a scope was never walked.
+    for (const [label, paths, onRun, expected] of [
+      ["stream on the file", ["src/a.txt"], (cwd) => {
+        writeFileSync(path.join(cwd, "src", "a.txt"), "changed\n");
+        writeFileSync(path.join(cwd, "src", "a.txt:hidden"), "stream bytes\n");
+      }, "alternate_data_stream_written"],
+      ["stream on a new file", ["src/new.txt"], (cwd) => {
+        writeFileSync(path.join(cwd, "src", "new.txt"), "new\n");
+        writeFileSync(path.join(cwd, "src", "new.txt:hidden"), "stream bytes\n");
+      }, "alternate_data_stream_written"],
+      ["junction beside the file", ["src/a.txt"], async (cwd) => {
+        writeFileSync(path.join(cwd, "src", "a.txt"), "changed\n");
+        await symlink(outside, path.join(cwd, "src", "escape"), LINK_KIND);
+      }, "reparse_point_created_during_execution"],
+    ]) {
+      const repo = await makeRepo();
+      const { text, errorType } = await runWriter(repo, onRun, { paths });
+      assert.equal(errorType, expected, `${label}: ${text.slice(0, 3000)}`);
+      assert.equal((await listRetainedWorktreeArtifacts(repo)).length, 1, `${label}: the output is retained for inspection`);
+      await removeRetained(repo);
+    }
+    const repo = await makeRepo();
+    const { text, errorType } = await runWriter(repo, (cwd) => writeFileSync(path.join(cwd, "src", "a.txt"), "changed\n"), { paths: ["src/a.txt"] });
+    assert.equal(errorType, "none", `a plain edit of a named file still passes: ${text.slice(0, 2000)}`);
+    await removeRetained(repo);
+  }, { windowsOnly: true });
+
+  await check("a dangling link that was already there, unchanged, is not held against the job", async () => {
+    const repo = await makeRepo();
+    const plan = { allowedEdits: ["src"], scopeContract: null };
+    const doomed = path.join(fixtureRoot, `stale-${repoCounter}`);
+    await mkdir(doomed);
+    await symlink(doomed, path.join(repo, "src", "stale-link"), LINK_KIND);
+    await rm(doomed, { recursive: true, force: true });
+    const before = await captureWritableScopeFilesystemState(repo, plan);
+    assert.match(before.links.get("src/stale-link")?.target || "", /^unresolvable:/);
+    await writeFile(path.join(repo, "src", "a.txt"), "edited\n");
+    assert.equal(writableScopeFilesystemViolation(before, await captureWritableScopeFilesystemState(repo, plan)), null);
+  });
+
   await check("a stream written by a parallel writer fails that job", async () => {
     const repo = await makeRepo();
     const { text, errorType } = await runWriter(repo, (cwd) => {

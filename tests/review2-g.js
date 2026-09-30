@@ -245,9 +245,26 @@ test("R-164 the TUI never prints control sequences from job text", async () => {
 
 // ---------------------------------------------------------------- R-165
 
+// sh is on PATH in Git Bash but not in PowerShell or cmd; Git for Windows always ships one, so
+// look beside git before giving up (a required skip would fail npm test outside Git Bash).
+function findShell() {
+  const works = (command) => { const probe = spawnSync(command, ["-c", "exit 0"], { windowsHide: true }); return !probe.error && probe.status === 0; };
+  if (works("sh")) return "sh";
+  if (process.platform !== "win32") return "";
+  const execPath = spawnSync("git", ["--exec-path"], { encoding: "utf8", windowsHide: true }).stdout?.trim() || "";
+  // <git-root>/mingw64/libexec/git-core -> <git-root>
+  const gitRoot = execPath ? path.resolve(execPath, "..", "..", "..") : "";
+  for (const candidate of gitRoot ? [path.join(gitRoot, "usr", "bin", "sh.exe"), path.join(gitRoot, "bin", "sh.exe")] : []) {
+    if (works(candidate)) return candidate;
+  }
+  return "";
+}
+
 test("R-165 the generated fake-opencode sh script does not interpret $() or backticks in the checkout path", async () => {
-  const sh = spawnSync("sh", ["-c", "exit 0"], { windowsHide: true });
-  if (sh.error || sh.status !== 0) throw new SkipTest("sh is not available");
+  const sh = findShell();
+  if (!sh) throw new SkipTest("sh is not available (not on PATH, and no Git for Windows sh.exe beside git)");
+  // Git's sh.exe finds touch and friends only with its own folder on PATH.
+  const shEnv = sh === "sh" ? process.env : { ...process.env, PATH: `${path.dirname(sh)}${path.delimiter}${process.env.PATH || ""}` };
   const { fakeOpenCodeShellScript } = await import(binUrl("e2e-concurrency.js"));
   assert.equal(typeof fakeOpenCodeShellScript, "function", "e2e-concurrency.js does not expose the script generator");
   const directory = await fixture("sh");
@@ -258,7 +275,7 @@ test("R-165 the generated fake-opencode sh script does not interpret $() or back
   await writeFile(target, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n", "utf8");
   const scriptPath = path.join(directory, "fake-opencode");
   await writeFile(scriptPath, fakeOpenCodeShellScript(target), "utf8");
-  const run = spawnSync("sh", [scriptPath, "run", "two words"], { cwd: directory, encoding: "utf8", windowsHide: true });
+  const run = spawnSync(sh, [scriptPath, "run", "two words"], { cwd: directory, encoding: "utf8", windowsHide: true, env: shEnv });
   assert.equal(run.status, 0, `${run.stderr}${run.stdout}`);
   assert.deepEqual(JSON.parse(run.stdout), ["--fake-opencode", "run", "two words"]);
   assert.deepEqual((await readdir(directory)).filter((name) => name.startsWith("INJECTED")), [], "the shell executed a command substitution from the path");
@@ -268,7 +285,7 @@ test("R-165 the generated fake-opencode sh script does not interpret $() or back
   const legacyDir = await fixture("sh-legacy");
   const legacyPath = path.join(legacyDir, "fake-opencode-legacy");
   await writeFile(legacyPath, `#!/bin/sh\nexec node "${target.split(backslash).join(backslash + backslash)}" --fake-opencode "$@"\n`, "utf8");
-  spawnSync("sh", [legacyPath], { cwd: legacyDir, encoding: "utf8", windowsHide: true });
+  spawnSync(sh, [legacyPath], { cwd: legacyDir, encoding: "utf8", windowsHide: true, env: shEnv });
   assert.ok((await readdir(legacyDir)).includes("INJECTED_SUBST"), "the control did not reproduce the injection, so this test proves nothing here");
 });
 

@@ -66,7 +66,7 @@ other checkout (log.md B-030). Run `npm ci` in every checkout and worktree.
 privilege, an account that cannot be denied a directory) print `optional` and pass. Required
 ones fail `npm test`: `tests/review-spawn.js` needs a C compiler (`gcc` on `PATH` or
 `C:\MinGW\bin\gcc.exe`) to build its fake OpenCode on Windows, and `tests/review2-g.js` needs
-`sh` (Git for Windows ships one). Install them, or set `CODEX_TEST_ALLOW_REQUIRED_SKIPS=1`
+`sh` (on `PATH`, or the one Git for Windows ships, which the test finds beside `git`, so PowerShell and cmd work too). Install them, or set `CODEX_TEST_ALLOW_REQUIRED_SKIPS=1`
 knowingly for one run.
 
 ## 3. The OpenCode runtime folder

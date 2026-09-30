@@ -17,6 +17,7 @@ import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule } from "../bin/main-module.js";
 
 export class SkipTest extends Error {
   // optional: the case may skip without failing the gate (say why in the reason).
@@ -76,7 +77,7 @@ function summary() {
   process.stdout.write(`Total skipped: ${total} across ${rows.length} reporting test file(s)${detail.length ? ` (${detail.join(", ")})` : ""}${required ? `; ${required} required skip(s) allowed by CODEX_TEST_ALLOW_REQUIRED_SKIPS=1` : ""}.\n`);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes("--reset")) writeFileSync(ledgerPath(), "");
   else if (process.argv.includes("--summary")) summary();
   else if (process.argv.includes("--self-test")) {
