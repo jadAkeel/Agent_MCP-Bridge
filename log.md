@@ -16,6 +16,15 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-30
 
+### Concurrency stress test was broken (Claude, 2026-09-30)
+
+Branch `bridge/e2e-concurrency-reserved-name` (worktree `C:\Users\10User\bridge-e2e`). `npm test` only syntax-checks `bin/e2e-concurrency.js`, so nothing ran it; `npm run test:release` does, so that gate had failed since 56357f3. After the fix the test passed 6 of 7 runs in the worktree (about 45 s each); the other run hit B-034.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-033 | `npm run test:concurrency` failed at `assert.ok(serialIntegration.credentials)`, and the assertion before it ("Serial integration must wait for every repository writer") passed for the wrong reason. | Stale test, not a lock bug. 56357f3 (2026-09-29) made `acquire_agent_lock` reject the agent names `merge_manager`, `integration_recovery` and `pipeline_finalizer` as reserved for the bridge's internal locks; the test still used `merge_manager`, so both requests were refused by name before the lock logic ran. Found by bisecting: 727ca74 passes, 56357f3 fails. | The test uses `integration_agent`, checks that the writer denial is a `Write lock conflict`, and checks that all three reserved names are refused as reserved. No server change. | 7cf5957 | fixed, not deployed |
+| B-034 | 1 of 7 runs of the stress test failed at the foreign-owner finalize check (`pipeline_foreign_owner` expected). | Test timing: the test runs both bridges with a 500 ms queue lease and a 100 ms heartbeat. When the loaded host delays the owner's heartbeat past 500 ms, the second bridge may take over the pipeline, which `claimPersistedPipeline` allows by design once the owner's lease has lapsed. | Open: give the test's owner a longer lease for this check, or retry it once. | - | open |
+
 ### Compact parallel results, stored run results, no patch preview in job results (Claude, 2026-09-30)
 
 From the charGPT migration log: L-025 (a 4-reviewer `run_opencode_parallel` returned 86,633 characters and stored none of them) and L-026 (`get_opencode_job` for a finished writer returned 25k characters, cut the middle of the report and read as a failure). Branch `bridge/l025-compact-results` (worktree `C:\Users\10User\bridge-l025`, its own `node_modules`). Tests: `tests/review-l025.js` (7 cases, all fail on the old code) and four cases in `bin/direct-run-audit.test.js`. Measured in that test with four reviewers of 9000-character reports: the parallel result is 48,882 characters before and 39,445 after (the reports are the rest; the preamble was about 2.3k per job in the fixture, more with real lock and scope lists), and `get_opencode_job` for a queued writer with a 9000-character report and a long patch is 26,201 characters before and 15,846 after. Not deployed: needs the usual approval, `release-activate.js --sync-clients` and a client restart; `~/.claude/CLAUDE.md` is a copy of `claude/CLAUDE.md` and was not touched.
