@@ -512,12 +512,13 @@ function assertCleanSourceTree(repoDir, allowDirty = false) {
 // git-ignored, so no status check can vouch for it: the release installs it fresh from
 // package-lock.json instead of copying the working tree's.
 async function buildCheckedRelease({ destination, sourceRoot = SOURCE_ROOT, allowDirty = false, ...buildOptions }) {
+  // The re-check and the fresh install come last so no caller option can switch them off.
   return buildRelease({
+    ...buildOptions,
     sourceRoot,
     destination,
     installDependencies: true,
     afterStagingHook: async () => { assertCleanSourceTree(sourceRoot, allowDirty); },
-    ...buildOptions,
   });
 }
 

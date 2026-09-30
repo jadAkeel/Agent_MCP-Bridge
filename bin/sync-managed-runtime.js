@@ -118,10 +118,15 @@ async function assertNoLinkedComponents(target) {
   }
 }
 
-async function planTree({ sourceRoot, targetRoot, filter, label }) {
+async function planTree({ sourceRoot, targetRoot, filter, label, removeStale = false }) {
   const source = await listFiles(sourceRoot, filter, { required: true });
   await assertNoLinkedComponents(targetRoot);
   const target = await listFiles(targetRoot, filter);
+  // An empty source next to a populated target is an interrupted checkout or copy, not a
+  // request to remove every profile; --remove-stale would otherwise delete them all.
+  if (removeStale && source.size === 0 && target.size > 0) {
+    throw new Error(`Refusing --remove-stale for ${label}: the source directory is empty but the target holds ${target.size} file(s): ${sourceRoot}`);
+  }
   const actions = [];
   for (const [relative, digest] of source) {
     if (!target.has(relative)) actions.push({ tree: label, relative, action: "add" });
@@ -244,12 +249,14 @@ async function runSync(options) {
       targetRoot: targets.agentDir,
       filter: (relative) => !relative.includes("/") && relative.endsWith(".md"),
       label: "agents",
+      removeStale: options.removeStale,
     }),
     await planTree({
       sourceRoot: path.join(source, "skills"),
       targetRoot: targets.skillDir,
       filter: (relative) => relative.endsWith("/SKILL.md") || relative.split("/").length > 1,
       label: "skills",
+      removeStale: options.removeStale,
     }),
   ];
   const applied = options.apply ? [] : null;
@@ -384,7 +391,14 @@ async function selfTest() {
       await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale }), /source directory is missing or unreadable.*agents/);
     }
     await mkdir(path.join(bareSource, "agents"));
+    // An existing but empty source next to a populated target (an interrupted copy) refuses
+    // --remove-stale, which would delete every target profile.
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /Refusing --remove-stale for agents: the source directory is empty/);
+    await writeFile(path.join(bareSource, "agents", "builder.md"), "builder\n", "utf8");
     await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /source directory is missing or unreadable.*skills/);
+    await mkdir(path.join(bareSource, "skills"));
+    await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /Refusing --remove-stale for skills: the source directory is empty/);
+    await rm(path.join(bareSource, "skills"), { recursive: true });
     await writeFile(path.join(bareSource, "skills"), "a file, not a directory\n", "utf8");
     await assert.rejects(runSync({ ...base, source: bareSource, apply: true, removeStale: true }), /source is not a directory/);
     assert.equal(await targetListing(), listingBefore, "a refused sync leaves every target profile in place");

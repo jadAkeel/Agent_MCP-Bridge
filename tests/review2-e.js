@@ -52,11 +52,19 @@ function repoWithFeatureBranch(name) {
 }
 
 const failures = [];
+const skips = [];
+// A test that cannot run here throws SkipTest: reported as "skip", never as a pass.
+class SkipTest extends Error {}
 async function test(name, run) {
   try {
     await run();
     console.log(`ok - ${name}`);
   } catch (error) {
+    if (error instanceof SkipTest) {
+      skips.push(name);
+      console.log(`skip - ${name}: ${error.message}`);
+      return;
+    }
     failures.push(name);
     console.log(`not ok - ${name}\n${String(error?.stack || error).split("\n").map((line) => `    ${line}`).join("\n")}`);
   }
@@ -204,10 +212,7 @@ try {
   await test("R-154 a binary hunk for a quoted path is rejected in the integration preview", async () => {
     // Git for Windows refuses a quote in a path (git apply: invalid path), which fails the preview
     // before the binary gate; the header parser above is the coverage there.
-    if (process.platform === "win32") {
-      console.log("    (skipped on win32)");
-      return;
-    }
+    if (process.platform === "win32") throw new SkipTest("Git for Windows refuses a quote in a path");
     const root = repo("r154");
     const base = git(root, "rev-parse", "HEAD").trim();
     const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: root, input: Buffer.from("bin\0ary\n") }).toString().trim();
@@ -248,4 +253,4 @@ if (failures.length) {
   console.log(`review2-e: ${failures.length} failed: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("review2-e: R-151 through R-155 passed");
+console.log(`review2-e: R-151 through R-155 passed${skips.length ? ` (${skips.length} skipped: ${skips.join("; ")})` : ""}`);

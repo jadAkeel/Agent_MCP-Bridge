@@ -207,7 +207,7 @@ async function installProductionDependencies(directory, { env = process.env, npm
   }
   const result = spawnSync(process.execPath, [
     npmCli, "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline", "--prefix", directory,
-  ], { cwd: directory, env, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024 });
+  ], { cwd: directory, env, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 10 * 60 * 1000 });
   if (result.error || result.status !== 0) {
     const output = `${result.stderr || ""}${result.stdout || ""}`.trim().split(/\r?\n/).slice(-15).join("\n");
     throw new Error(`npm ci failed (${result.error?.message || `exit ${result.status}`}); nothing was published.${output ? `\n${output}` : ""}`);

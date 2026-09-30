@@ -5164,6 +5164,8 @@ async function runSelfTests() {
       worktreePath: cleanupRaceWorktree.path,
       allowedEdits: ["src/allowed.txt"],
       validationCommand: "git diff --check",
+      // R-155: the receipt binds cleanupAfterSuccess, so the dry run names it like the apply.
+      cleanupAfterSuccess: true,
       dryRun: true,
     });
     assert.equal(cleanupRacePreview.ok, true, JSON.stringify(cleanupRacePreview, null, 2));

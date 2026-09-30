@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile, copyFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -43,6 +43,8 @@ async function withDependencies(directory) {
   await symlink(DEPENDENCIES, path.join(directory, "node_modules"), LINK_KIND);
 }
 const tests = [];
+// A test that cannot run here throws SkipTest: reported as "skip" and counted apart from passes.
+class SkipTest extends Error {}
 const only = process.env.REVIEW2_G_ONLY || "";
 const test = (name, fn) => { if (!only || name.includes(only)) tests.push({ name, fn }); };
 
@@ -72,7 +74,8 @@ test("R-161 a source without agents/skills is an error and --remove-stale delete
   await assert.rejects(runSync({ ...options, source: bare }), /missing or unreadable/);
   assert.equal(await readFile(path.join(agentDir, "existing.md"), "utf8"), "existing\n", "the existing target profile was deleted");
   await mkdir(path.join(bare, "agents"));
-  await assert.rejects(runSync({ ...options, source: bare }), /missing or unreadable/, "a missing skills subtree is an error too");
+  // The empty agents/ is refused first (it would let --remove-stale delete existing.md).
+  await assert.rejects(runSync({ ...options, source: bare }), /source directory is empty|missing or unreadable/, "an empty agents or missing skills subtree is an error too");
   assert.equal(existsSync(path.join(agentDir, "existing.md")), true);
 });
 
@@ -242,10 +245,7 @@ test("R-164 the TUI never prints control sequences from job text", async () => {
 
 test("R-165 the generated fake-opencode sh script does not interpret $() or backticks in the checkout path", async () => {
   const sh = spawnSync("sh", ["-c", "exit 0"], { windowsHide: true });
-  if (sh.error || sh.status !== 0) {
-    process.stdout.write("     (sh not available: skipped)\n");
-    return;
-  }
+  if (sh.error || sh.status !== 0) throw new SkipTest("sh is not available");
   const { fakeOpenCodeShellScript } = await import(binUrl("e2e-concurrency.js"));
   assert.equal(typeof fakeOpenCodeShellScript, "function", "e2e-concurrency.js does not expose the script generator");
   const directory = await fixture("sh");
@@ -328,18 +328,27 @@ test("R-166 the profile smoke runs orchestrator, reviewer and tester, each with 
 // ----------------------------------------------------------------
 
 let failed = 0;
+let skipped = 0;
 try {
   for (const { name, fn } of tests) {
     try {
       await fn();
       process.stdout.write(`ok   ${name}\n`);
     } catch (error) {
+      if (error instanceof SkipTest) {
+        skipped += 1;
+        process.stdout.write(`skip ${name}: ${error.message}\n`);
+        continue;
+      }
       failed += 1;
       process.stdout.write(`FAIL ${name}\n${error?.stack || error}\n`);
     }
   }
 } finally {
   for (const directory of fixtures) {
+    // The node_modules junction into this checkout goes first (B-030): a later recursive
+    // delete by a tool that follows junctions must find no link to follow.
+    await unlink(path.join(directory, "node_modules")).catch(() => {});
     await rm(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
   }
 }
@@ -347,5 +356,5 @@ if (failed) {
   process.stdout.write(`${failed} of ${tests.length} review2-g regression tests failed.\n`);
   process.exit(1);
 }
-process.stdout.write(`All ${tests.length} review2-g regression tests passed.\n`);
+process.stdout.write(`${tests.length - skipped} of ${tests.length} review2-g regression tests passed${skipped ? `, ${skipped} skipped` : ""}.\n`);
 process.exit(0);

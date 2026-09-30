@@ -16,6 +16,61 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-09-29
 
+### Second review (review2): R-134..R-174 (Codex review, finished by Claude, 2026-09-29)
+
+A Codex session reviewed the whole bridge again in nine areas (41 findings, verified by a second pass), created one worktree per area and started implementers for areas C, E and G; the user stopped it at 18:23 with nothing committed. Claude finished it the same evening: every area was redone on top of the current code (`6dd33de` + `9be1b87`) in its own worktree, each confirmed finding got a regression test that fails without the fix (`tests/review2-a.js` .. `tests/review2-i.js`, now in `npm test`), each diff was reviewed, and the branches were merged into `bridge/final-fixes`. The uncommitted C/E/G work was kept as patches (`~/.codex/review2-patches-backup-20260929`) and reviewed, not taken as is.
+
+| ID | Problem | Fix | Commit | Status |
+|---|---|---|---|---|
+| R-134 | A rejected startup recovery was turned into `{ok:true}`, so early tool calls ran on unrecovered state. | Tool calls answer `startup_recovery_failed` until the bridge restarts; the failure is still logged. | `dc31f6d` | fixed |
+| R-135 | Two sequential 15 s `git config` reads at import could use the whole 30 s MCP startup deadline. | Read together under one 10 s bound. | `dc31f6d` | fixed |
+| R-136 | `node bin/state-audit --self-test` (no `.js`) skipped main and exited 0. | Main-module detection resolves the extensionless path like Node. | `dc31f6d` | fixed |
+| R-137 | Invalid numeric env values fell back to the default silently; a `_MS` value above 2^31-1 overflowed timers. | An invalid value (not a number, 0 for a positive setting, or a `_MS` value above 2147483647) stops the bridge at startup with the variable named. | `dc31f6d` | fixed |
+| R-138 | Pipeline lists and diagnose returned every pipeline. | `list_multi_agent_pipelines` `limit` (default 20); diagnose keeps every open pipeline plus the 25 newest finished. | `dc31f6d` | fixed |
+| R-139 | Plugin trees are not in the attestation-cache fingerprint (30 min stale window). | - | - | rejected: documented TTL within the same-user boundary |
+| R-140 | `git` allowlist and command resolve through the same PATH. | - | - | rejected: needs same-user file mutation |
+| R-141 | A PEM block with escaped `\n` and no END line kept its body after redaction; bodies past 128 characters leaked. | Unterminated escaped-newline bodies are redacted at any width. | `43a487a` | fixed |
+| R-142 | The patch secret gate needed a 40-character next line, so a key wrapped at 32 columns got a receipt. | Key-body characters after the marker are counted across lines (and inside one JSON line). | `43a487a` | fixed |
+| R-143 | The git control-surface fingerprint omitted `.git/info/attributes` and `objects/info/alternates`. | Both are fingerprinted, and a repository with an effective entry in either is refused like `core.attributesfile`. | `43a487a` | fixed |
+| R-144 | A late provider-lease heartbeat overwrote the quarantine. | `stop()` awaits the in-flight pulse; renewal skips quarantined rows; every stop call is awaited. | `cee3230` | fixed |
+| R-145 | An expired write lock could not be quarantined. | Quarantine marks, and re-inserts pruned, rows of the run regardless of expiry. | `cee3230` | fixed |
+| R-146 | POSIX termination reported `treeTerminationConfirmed` while a detached child held the pipe. | Confirmed only when the group is empty and the pipes closed. | `cee3230` | fixed |
+| R-147 | No durable quarantine if the bridge dies and the supervisor kill fails. | - | - | open (plausible; not a small fix) |
+| R-148 | The capacity snapshot threw on a quarantined lease's expiry. | Shown as `quarantined (no expiry)`. | `cee3230` | fixed |
+| R-149 | `**/secrets/**` was normalized to `**/secrets`, so `pkg/secrets/credentials.txt` was allowed (same for `**/.git/**`). | A `/**` suffix after a glob prefix is kept and matches any depth. | `d833988` | fixed |
+| R-150 | A failure after COMMIT in `acquireHardLock` left the lock for its TTL. | The catch removes the rows this call inserted once COMMIT was attempted. | `d833988` | fixed |
+| R-151 | A concurrent edit after the final target check was overwritten by `checkout-index -f`. | Exact bytes of every patched path are re-read right before the first write; a mismatch closes the operation `recovered_noop` and fails `integration_preview_stale`. | `97a2bd6` | fixed |
+| R-152 | `bridge-gc` did not re-check activity and dirt before `worktree remove --force`. | Re-checked right before each removal. | `97a2bd6` | fixed |
+| R-153 | `bridge-gc` ignored ignored files, so a worktree holding only ignored output was removed. | Ignored entries count as dirt (kept unless `--force-dirty`). | `97a2bd6` | fixed |
+| R-154 | A quoted `diff --git "a/…" "b/…"` header bypassed the binary-hunk gate. | Quoted headers are unquoted; an unparseable header is reported. | `97a2bd6` | fixed |
+| R-155 | The preview receipt did not bind `cleanupAfterSuccess`. | Bound in the contract hash. | `97a2bd6` | fixed |
+| R-156 | A completed writer with `noChanges` became `failed` and failed its pipeline. | `noChanges` counts as evidence. | `64fcd4b` | fixed |
+| R-157 | A child whose terminal writes all failed stayed `running` forever behind the pipeline's instance lease. | A fresh instance lease shields only another instance's jobs; this instance's untracked lapsed jobs are reconciled. | `64fcd4b` | fixed |
+| R-158 | `state-audit --strict` did not check `finalizing` pipelines. | Included. | `64fcd4b` | fixed |
+| R-159 | A crash between `mcp remove` and `mcp add-json` deleted the Claude entry. | The entry is saved to a recovery file first and restored by the next run. | `fa4daab` | fixed |
+| R-160 | Config writes and rollbacks did not check for a concurrent edit. | Compare-before-rename for both. | `fa4daab` | fixed |
+| R-161 | A missing source subtree counted as empty, so `--apply --remove-stale` deleted every profile. | A missing source directory is an error. | `fa4daab` | fixed |
+| R-162 | Runtime sync followed a junction at the target root or an ancestor. | Every existing component of the target path is `lstat`-checked. | `fa4daab` | fixed |
+| R-163 | The release clean check ran before the build and ignored the published `node_modules`. | `node_modules` is installed fresh from the lockfile (no shell, `--ignore-scripts`); the clean check runs again after staging. | `fa4daab` | fixed |
+| R-164 | The TUI printed ANSI/OSC control bytes from job text. | Control characters are printed as `?`. | `fa4daab` | fixed |
+| R-165 | A generated `sh` wrapper double-quoted the checkout path. | Single-quoted. | `fa4daab` | fixed |
+| R-166 | The profile smoke tested only the orchestrator. | Orchestrator, reviewer and tester. | `fa4daab` | fixed |
+| R-167 | The docs said a scope contract's `read` list restricts reads. | Documented as guidance; sanitized workspace for isolation. | `871f99b` | fixed |
+| R-168 | Recommended client timeouts (1500/3000 s) were below the real bound. | The bound is documented (3000 s default, 5100 s with the live builder/validation timeouts). | `871f99b` | fixed |
+| R-169 | The docs said an override without `@variant` keeps the profile's variant. | Corrected: no variant. | `871f99b` | fixed |
+| R-170 | "Recommended" vs default source-dirt policy. | - | - | rejected |
+| R-171 | "Cleanup is opt-in" was wrong. | Documented the default and `cleanupAfterSuccess: false`. | `871f99b` | fixed |
+| R-172 | Undocumented env vars; example config showed 12000 / 2 slots. | Every variable listed with its default; example values updated. `CODEX_OPENCODE_WORKTREE_CLEANUP` is documented as a no-op. | `871f99b` | fixed |
+| R-173 | Importing `server.js` wrote a gitconfig into the real state directory. | Written lazily on first use, in the effective (overridable) state directory. | `4769386` | fixed |
+| R-174 | `npm test` skipped `tests/pipeline-*.js`. | Added, with every `tests/review2-*.js`. | `5ca700b` | fixed |
+| B-031 | After the provider limit was raised 2 -> 4, status showed an idle key as "0 of 2". | A stored limit that differs binds only while leases taken under it are held. Recovered from uncommitted work of another session in the `bridge-fixes` worktree. | `9be1b87` | fixed |
+
+Also: tests that skipped silently now report `skip` (`5b55ba9`).
+
+Behaviour changes: an invalid numeric env value stops the bridge at startup; a failed startup recovery refuses every tool call until a restart; `list_multi_agent_pipelines` shows the newest 20 by default; a repository with an effective `.git/info/attributes` or any `objects/info/alternates` is refused (none of the operator's repositories has either); the secret gate flags more key-like text (`acceptFlaggedSecretLines` still applies); nested `secrets/` and `.git/` paths are forbidden; `bridge-gc` keeps worktrees with ignored output unless `--force-dirty`; a release build needs the npm cache or registry; the profile smoke needs `MCP_SMOKE_REVIEWER_MODEL` / `MCP_SMOKE_TESTER_MODEL` where those models differ.
+
+Limits left on purpose: R-147; a millisecond gap between the R-151 byte check and `checkout-index`; the gap between `mcp remove` and `mcp add-json` is recoverable, not closed; an empty (not missing) source directory still empties the targets under `--remove-stale`; `state-audit --strict` still does not check `planned` / `awaiting_finalization`; after R-157 reconciles a child, this bridge's in-memory pipeline entry stays `running` until restart (reads use the database).
+
 ### Measurement follow-up: fixes for B-018 and B-020..B-026 (Claude, 2026-09-29)
 
 Branch `bridge/measurement-fixes` (worktree `C:\Users\10User\bridge-measure`), commit c14aa7d. Tests: `tests/review-measurement.js` (12 cases, one per finding) and a migration case in `bin/direct-run-audit.test.js`; on the final code `npm test`, `test:events`, `test:builder-fallback` and `tests/pipeline-*.js` pass. A second reviewer read the diff: no weakened tamper/drift/TOCTOU check; its findings (parallel audit status for unsafe files and spawned-then-thrown jobs, in-flight worktrees offered for removal, `afterAgentMs` with retries, source check order at cleanup) are fixed in the same commit. Not deployed: deploying needs the user's approval (merge into the live tree, `node bin/release-activate.js --sync-clients`, restart both clients).
