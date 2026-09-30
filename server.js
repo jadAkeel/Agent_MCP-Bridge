@@ -1380,24 +1380,6 @@ function redactPrivateKeyBlocks(text) {
   return output + text.slice(cursor);
 }
 
-function redactSensitiveText(value) {
-  let text = redactPrivateKeyBlocks(String(value || ""));
-  const replacements = [
-    [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
-    [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
-    [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}/g, "[jwt redacted]"],
-    [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
-    [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
-    [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
-    [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
-    [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
-  ];
-  for (const [pattern, replacement] of replacements) {
-    text = text.replace(pattern, replacement);
-  }
-  return text;
-}
-
 // Gate for integration previews. redactSensitiveText() is deliberately greedy because it
 // scrubs logs, where over-redaction is harmless; used as a patch gate it rejected ordinary
 // code ("// Basic usage", "password = getpass()"), and a rejected preview gets no receipt,
@@ -1444,6 +1426,29 @@ const LIKELY_SECRET_GLOBAL_PATTERNS = LIKELY_SECRET_PATTERNS.map((pattern) => ne
 function redactLikelySecrets(value) {
   // Whole key blocks first: the header pattern alone left the base64 body in the answer.
   let text = redactPrivateKeyBlocks(String(value || ""));
+  for (const pattern of LIKELY_SECRET_GLOBAL_PATTERNS) text = text.replace(pattern, "[credential redacted]");
+  return text;
+}
+
+// Logs, diagnostics, stored results and stored patch previews. The broad rules below catch
+// credential-named keys and short token forms the gate ignores; every shape the gate flags is
+// then masked from the same LIKELY_SECRET_PATTERNS list, so a line the preview flags (or an
+// operator accepts with acceptFlaggedSecretLines) cannot reach a log or a stored record.
+const BROAD_LOG_REDACTIONS = [
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
+  [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
+  [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}/g, "[jwt redacted]"],
+  [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
+  [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
+  [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
+  [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
+  [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
+];
+function redactSensitiveText(value) {
+  let text = redactPrivateKeyBlocks(String(value || ""));
+  for (const [pattern, replacement] of BROAD_LOG_REDACTIONS) {
+    text = text.replace(pattern, replacement);
+  }
   for (const pattern of LIKELY_SECRET_GLOBAL_PATTERNS) text = text.replace(pattern, "[credential redacted]");
   return text;
 }
@@ -11636,7 +11641,11 @@ async function integratePatchWithoutSerialLock({
         targetTree: targetState.targetTree,
         targetStateSha256: targetState.targetStateSha256,
         contractSha256,
-        patchPreview: previewMode === "stat" ? "" : patch.patch,
+        // Accepted flagged lines were inspected in the worktree; the printed preview masks their
+        // values (the receipt still covers the full patch SHA-256), so the response, and every
+        // transcript or log that keeps it, does not carry what the gate took for a credential.
+        patchPreview: previewMode === "stat" ? "" : secretLines.length ? redactLikelySecrets(patch.patch) : patch.patch,
+        patchPreviewMaskedLines: secretLines,
         patchStat: diffStatFromPatch(patch.patch),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
@@ -16316,6 +16325,7 @@ server.tool(
             // A dry run printed the whole patch every time (6-13k characters per job) even when
             // the caller had read the diff in the worktree already; stat mode prints line counts.
             previewMode === "stat" && result.patchStat ? `Patch stat (previewMode stat; the receipt covers the full patch):\n${result.patchStat}` : null,
+            previewMode !== "stat" && result.patchPreviewMaskedLines?.length ? `Patch preview masks the flagged values on patch lines ${result.patchPreviewMaskedLines.slice(0, 10).join(", ")}${result.patchPreviewMaskedLines.length > 10 ? ", ..." : ""} (acceptFlaggedSecretLines); the receipt covers the full unmasked patch SHA-256.` : null,
             previewMode !== "stat" && result.patchPreview ? `Patch preview:\n${result.patchPreview}` : null,
             previewMode !== "stat" && result.patchPreviewTruncated ? "Patch preview truncated: yes (apply remains blocked on the full patch SHA-256)" : null,
             `Allowed edits: ${normalizeLockPathList(allowedEdits).join(", ")}`,
@@ -24805,6 +24815,8 @@ export const __selfTest = {
     recordMatchesProject,
     recoverIntegrationOperationsWhileLocked,
     patchLikelySecretLines,
+    LIKELY_SECRET_PATTERNS,
+    logEvent,
     containmentStillPossible,
     buildCompactPrompt,
     callerPathSpellings,
