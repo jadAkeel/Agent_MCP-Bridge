@@ -14,6 +14,18 @@ How a fix lands: edit and test in the `C:\Users\10User\bridge-fixes` worktree (b
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-09-30
+
+### Live tree lost its dependencies (Claude, 2026-09-30)
+
+Both clients lost the bridge (`CONNECTION_CLOSED`): `node_modules/` of the live tree `C:\Users\10User\codex-opencode-mcp` was empty, so `server.js` died on `ERR_MODULE_NOT_FOUND` for `@modelcontextprotocol/sdk`. The directory was last written at 2026-09-29 21:36:51, the second a review session ran `git worktree remove --force C:\Users\10User\bridge-fixes`. Restored with `npm ci` (no tracked file changed). Reproduced in a scratch repository: a worktree whose ignored `node_modules` is a junction to the main checkout's `node_modules`, removed with `git worktree remove --force`, leaves the main `node_modules` directory in place but empty, which is exactly what was found. That `bridge-fixes/node_modules` was such a junction is inferred, not proven: the worktree is gone and the transcript of the session that created it is not available. Node's `fs.rm` does not follow junctions (checked), so the bridge's own `rm` calls and `tests/review2-g.js` (which links fixtures to the checkout's `node_modules`) are not the cause.
+
+Branch `bridge/b030-worktree-links` (worktree `C:\Users\10User\bridge-b030`). Tests: `tests/review-b030.js` and a junction case in `bin/bridge-gc.js --self-test`; both fail without the fix.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-030 | Removing a worktree that holds a junction (or an untracked directory symlink) into another directory deletes that directory's files. The bridge removes agent worktrees (`cleanupWorktree`) and `bin/bridge-gc.js --apply` removes retained ones with `git worktree remove --force`, so a builder that links `node_modules/` or `.venv/` to the user's checkout to skip an install empties the user's checkout at cleanup. | On Windows, `git worktree remove` deletes ignored and untracked directories by recursing into them and follows a junction into its target. | New `bin/worktree-links.js`: before the removal every link in the worktree that the index does not track as a symlink is unlinked (the link, never its target). The bridge keeps the worktree as `cleanup_failed` when a link cannot be detached; the GC then skips git and removes the directory with `fs.rm`, which does not follow links. Tracked symlinks are left to git. | (this commit) | fixed, not deployed (`bridge/b030-worktree-links`) |
+
 ## 2026-09-29
 
 ### Measurement follow-up: fixes for B-018 and B-020..B-026 (Claude, 2026-09-29)

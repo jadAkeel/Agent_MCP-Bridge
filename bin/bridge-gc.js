@@ -8,12 +8,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { detachWorktreeLinks } from "./worktree-links.js";
 
 const execFileAsync = promisify(execFile);
 requireSelfTestRun(import.meta.url);
@@ -471,7 +472,19 @@ async function applyReport(report, options) {
     const outcome = { path: item.path, action: item.action, ok: false, detail: "" };
     try {
       if (item.action === "remove_worktree") {
-        const removed = await runGit(["worktree", "remove", "--force", item.path], item.sourceRepo);
+        // B-030: git deletes through a junction into its target; detach links first. If they
+        // cannot be detached (no readable index), skip git: the rm below never follows a link
+        // and the prune drops the worktree's admin entry.
+        let linksDetached = true;
+        try {
+          await detachWorktreeLinks(item.path);
+        } catch (error) {
+          linksDetached = false;
+          outcome.detail = `links not detached (${String(error?.message || error).trim()}); removed without git`;
+        }
+        const removed = linksDetached
+          ? await runGit(["worktree", "remove", "--force", item.path], item.sourceRepo)
+          : { exitCode: 0, stdout: "", stderr: "" };
         if (removed.exitCode !== 0 && existsSync(item.path)) {
           outcome.detail = `git worktree remove failed: ${(removed.stderr || removed.stdout).trim()}`;
           results.push(outcome);
@@ -633,6 +646,13 @@ async function selfTest() {
     await git(sourceRepo, "worktree", "add", "--quiet", "-b", "agent/builder/retained", retainedPath, "HEAD");
     await git(sourceRepo, "worktree", "add", "--quiet", "-b", "agent/builder/cleaned", cleanedPath, "HEAD");
     await git(missingRepo, "worktree", "add", "--quiet", "-b", "agent/builder/orphan", orphanPath, "HEAD");
+    // B-030: an untracked node_modules junction into a directory outside the worktree; removing
+    // the worktree must not delete the files it points at.
+    const sharedDependencies = path.join(fixtureRoot, "shared-node_modules");
+    await writeFile(path.join(sourceRepo, ".git", "info", "exclude"), "node_modules\n", "utf8");
+    await mkdir(path.join(sharedDependencies, "pkg"), { recursive: true });
+    await writeFile(path.join(sharedDependencies, "pkg", "index.js"), "module.exports = 1;\n", "utf8");
+    await symlink(sharedDependencies, path.join(cleanedPath, "node_modules"), process.platform === "win32" ? "junction" : "dir");
     await writeFile(path.join(retainedPath, "work.txt"), "unintegrated work\n", "utf8");
     await git(retainedPath, "add", "work.txt");
     await git(retainedPath, "commit", "--quiet", "-m", "work");
@@ -685,6 +705,8 @@ async function selfTest() {
 
     // 2. Apply without --include-retained: stale removed, retained and orphan kept, young orphan DB kept, registry repaired.
     const applied = await runGc({ stateDir, apply: true, includeRetained: false, olderThanDays: 7, deleteBranches: false, pruneDatabases: true });
+    assert.equal(existsSync(cleanedPath), false);
+    assert.equal(existsSync(path.join(sharedDependencies, "pkg", "index.js")), true, "B-030: removal followed the junction");
     assert.equal(applied.applied.every((outcome) => outcome.ok), true, JSON.stringify(applied.applied, null, 2));
     assert.equal(existsSync(orphanPath), true);
     assert.equal(existsSync(cleanedPath), false);
