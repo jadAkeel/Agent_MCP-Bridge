@@ -629,6 +629,191 @@ test("Q-003: a job whose stream carried no usage shows none in the list", async 
   assert.equal(view.heavyToolCalls, undefined);
 });
 
+// ---------------------------------------------------------------------------- Q-004
+const AGENT_USAGE = { steps: 2, inputCount: 1200, outputCount: 80, reasoningCount: 30, cacheReadCount: 5, cacheWriteCount: 0, cost: 0, rootSteps: 2 };
+function metadataFor(agent) {
+  return { ok: true, metadata: {
+    name: agent, mode: "primary", provider: "fixture", model: "model-a", variant: "high",
+    canEdit: agent === "builder" || agent === "debugger", canDelegate: false, externalDirectoryDenied: true, webDenied: true,
+    bashAutomaticAllowSafe: true, protectedEditsDenied: true, permissionProfileSha256: `profile-${agent}`,
+  } };
+}
+// The agent run is replaced; `runs` records every call so a test can see the prompts and timeouts.
+function installAgentRuntime(onRun) {
+  const runs = [];
+  selfTestHooks.agentRuntimeTestHook = {
+    resolveAgent: async (requestedAgent, cwd, allowFallbackToBuild, subagentStrategy) => ({
+      requestedAgent, actualAgent: requestedAgent, requestedAgentMode: "primary", actualAgentMode: "primary",
+      fallbackUsed: false, proxyUsed: false, subagentStrategy, availableAgents: [requestedAgent], discoveryExitCode: 0,
+    }),
+    readAgentDebugMetadata: async (agent) => metadataFor(agent),
+    runOpenCodeWithPolicy: async (agent, prompt, cwd, dryRun, lockPlan, timeoutMs) => {
+      const run = { prompt, cwd, timeoutMs, index: runs.length };
+      runs.push(run);
+      const childStartedAtMs = Date.now();
+      if (!dryRun) await onRun(run);
+      return {
+        exitCode: 0, stdout: "Done.", stderr: "", errorType: null, durationMs: 1, dryRun,
+        assistantFinalResponseDetected: true, childExecutionIntervals: [], configuredProvider: "fixture", configuredModel: "model-a",
+        childStartedAtMs, childFinishedAtMs: Date.now() + 1,
+        usage: { ...AGENT_USAGE }, providerRetryWarningCount: 1, providerConcurrencyWaitMs: 7,
+        runPhaseTimings: { preSlotMs: 1, providerWaitMs: 7, finalAttestationMs: 2, spawnGateMs: 0, afterExitMs: 0 },
+      };
+    },
+  };
+  return runs;
+}
+const fixWriteJob = (file, extra = {}) => ({
+  agent: "builder", task: `Write ${file} cleanly.`, cwd: repo, write: true, lockMode: "simple", lockedPaths: [file], allowedEdits: [file],
+  validationCommand: "git diff --check", timeoutMs: 600000, scopeContract: { ...writeScope(file), write: [file], read: [file] }, ...extra,
+});
+const runDirect = async (job) => textOf(await callTool("run_opencode_agent", job));
+async function cleanRetainedWorktrees() {
+  const { listRetainedWorktreeArtifacts, cleanupWorktree } = __selfTest.internals;
+  for (const item of await listRetainedWorktreeArtifacts(repo)) await cleanupWorktree({ path: item.worktreePath, branch: item.branch, repoRoot: repo }, "always", true).catch(() => null);
+}
+
+test("Q-004: a failed validation gets one fix pass with its output, then validates again", async () => {
+  const runs = installAgentRuntime(async ({ cwd, index }) => {
+    await writeFile(path.join(cwd, "src", "a.txt"), index === 0 ? "trailing space \n" : "clean line\n", "utf8");
+  });
+  const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1 }));
+  assert.equal(runs.length, 2, "exactly one extra run");
+  assert.doesNotMatch(runs[0].prompt, /VALIDATION FIX PASS/);
+  assert.match(runs[1].prompt, /VALIDATION FIX PASS/);
+  assert.ok(runs[1].prompt.includes(runs[0].prompt), "the second prompt contains the job's own prompt");
+  assert.match(runs[1].prompt, /Validation command: git diff --check/);
+  assert.match(runs[1].prompt, /Validation exit code: 2/);
+  assert.match(runs[1].prompt, /trailing whitespace/i);
+  assert.equal(runs[1].cwd, runs[0].cwd, "the same worktree");
+  assert.ok(runs[1].timeoutMs > 0 && runs[1].timeoutMs <= 600000, `the pass uses what is left of the job timeout: ${runs[1].timeoutMs}`);
+  assert.match(text, /Validation fix pass: used 1 of 1; first validation: exit code 2/);
+  assert.match(text, /Final validation: passed/);
+  assert.match(text, /Validation gate: passed/);
+  assert.match(text, /Token usage: steps=4 input=2400 output=160/, "both runs' tokens are reported");
+  assert.match(text, /Provider error lines in OpenCode stderr[^\n]*: 2/);
+  assert.match(text, /Worktree changed files: src\/a\.txt/);
+  assert.doesNotMatch(text, /errorType: validation_command_failed|Error type: validation_command_failed/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: still failing after the pass fails the job as before; there is never a second pass", async () => {
+  const runs = installAgentRuntime(async ({ cwd }) => {
+    await writeFile(path.join(cwd, "src", "a.txt"), "still trailing \n", "utf8");
+  });
+  const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1 }));
+  assert.equal(runs.length, 2);
+  assert.match(text, /Validation fix pass: used 1 of 1/);
+  assert.match(text, /Final validation: failed/);
+  assert.match(text, /Validation gate: failed/);
+  assert.match(text, /Error type: validation_command_failed/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: without the option a failed validation is final", async () => {
+  for (const extra of [{}, { validationFixPasses: 0 }]) {
+    const runs = installAgentRuntime(async ({ cwd }) => writeFile(path.join(cwd, "src", "a.txt"), "trailing \n", "utf8"));
+    const text = await runDirect(fixWriteJob("src/a.txt", extra));
+    assert.equal(runs.length, 1, JSON.stringify(extra));
+    assert.doesNotMatch(text, /Validation fix pass/);
+    assert.match(text, /Error type: validation_command_failed/);
+    await cleanRetainedWorktrees();
+  }
+});
+
+test("Q-004: the pass is skipped, and says why, when too little of the job timeout is left", async () => {
+  const runs = installAgentRuntime(async ({ cwd }) => writeFile(path.join(cwd, "src", "a.txt"), "trailing \n", "utf8"));
+  const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1, timeoutMs: 30000 }));
+  assert.equal(runs.length, 1);
+  assert.match(text, /Validation fix pass: skipped \(only 30 s of the job timeout are left \(a pass needs 60 s\)\)/);
+  assert.match(text, /Error type: validation_command_failed/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: scope and lock rules judge the pass: an edit outside the allowed files fails the job", async () => {
+  const runs = installAgentRuntime(async ({ cwd, index }) => {
+    await writeFile(path.join(cwd, "src", "a.txt"), index === 0 ? "trailing \n" : "clean\n", "utf8");
+    if (index === 1) await writeFile(path.join(cwd, "src", "b.txt"), "outside the allowed edits\n", "utf8");
+  });
+  const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1 }));
+  assert.equal(runs.length, 2);
+  assert.match(text, /changed_file_validation_error|worktree_changed_file_validation_error/);
+  assert.match(text, /src\/b\.txt/);
+  assert.match(text, /Validation gate: skipped_due_to_prior_failure/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: an agent error in the pass is the job's error", async () => {
+  installAgentRuntime(async ({ cwd }) => writeFile(path.join(cwd, "src", "a.txt"), "trailing \n", "utf8"));
+  const base = selfTestHooks.agentRuntimeTestHook.runOpenCodeWithPolicy;
+  let calls = 0;
+  selfTestHooks.agentRuntimeTestHook.runOpenCodeWithPolicy = async (...args) => {
+    const result = await base(...args);
+    calls += 1;
+    return calls === 2 ? { ...result, errorType: "agent_timeout", timedOut: true } : result;
+  };
+  const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1 }));
+  assert.equal(calls, 2);
+  assert.match(text, /Error type: agent_timeout/);
+  assert.match(text, /Validation fix pass: used 1 of 1/);
+  assert.match(text, /Final validation: skipped_due_to_prior_failure/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: the option is refused where it does nothing or is not supported", async () => {
+  installAgentRuntime(async () => {});
+  const refused = async (job, errorType) => {
+    const response = await callTool("run_opencode_agent", job);
+    assert.match(textOf(response), new RegExp(`errorType: ${errorType}`), textOf(response));
+  };
+  await refused(fixWriteJob("src/a.txt", { validationFixPasses: 1, validationCommand: "", scopeContract: { ...writeScope("src/a.txt"), validationCommand: "" } }), "validation_fix_pass_not_applicable");
+  await refused(readJob({ validationFixPasses: 1 }), "validation_fix_pass_not_applicable");
+  await refused(fixWriteJob("src/a.txt", { validationFixPasses: 2 }), "validation_fix_pass_invalid");
+  const parallel = textOf(await callTool("run_opencode_parallel", { jobs: [fixWriteJob("src/a.txt", { validationFixPasses: 1, lockMode: "strict" })] }));
+  assert.match(parallel, /errorType: validation_fix_pass_unsupported_in_parallel/);
+  const queued = await enqueueQueueJob(fixWriteJob("src/a.txt", { validationFixPasses: 1, validationCommand: "", scopeContract: { ...writeScope("src/a.txt"), validationCommand: "" } }));
+  assert.equal(queued.ok, false);
+  assert.equal(queued.errorType, "validation_fix_pass_not_applicable");
+});
+
+test("Q-004: a queued job reports its fix pass in the list and in get_opencode_job", async () => {
+  selfTestHooks.queueJobExecutorTestHook = null;
+  const runs = installAgentRuntime(async ({ cwd, index }) => {
+    await writeFile(path.join(cwd, "src", "b.txt"), index === 0 ? "trailing \n" : "clean\n", "utf8");
+  });
+  const enqueued = await enqueueQueueJob(fixWriteJob("src/b.txt", { validationFixPasses: 1, idempotencyKey: "fix-pass-queue" }));
+  assert.equal(enqueued.ok, true, enqueued.error);
+  const jobId = enqueued.record.jobId;
+  assert.ok(await waitFor(async () => ["completed", "failed"].includes((await durable(jobId))?.status), 20000), "the queued job ends");
+  const record = await durable(jobId);
+  assert.equal(record.status, "completed", `${record.errorType}: ${record.errorReason}`);
+  assert.equal(runs.length, 2);
+  assert.equal(record.validationFixPass.used, 1);
+  assert.equal(record.validationFixPass.finalValidation, "passed");
+  assert.equal(record.usage.inputCount, 2400);
+  const line = textOf(await callTool("list_opencode_jobs", { cwd: repo })).split("\n").find((item) => item.includes(jobId));
+  assert.match(line, /fixPass=used\(passed\)/);
+  assert.match(line, /tokens=2400in\/160out/);
+  const view = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId })));
+  assert.equal(view.validationFixPass.used, 1);
+  assert.match(view.resultText, /Validation fix pass: used 1 of 1/);
+  await cleanRetainedWorktrees();
+});
+
+test("Q-004: a requeued job keeps validationFixPasses", async () => {
+  selfTestHooks.queueJobExecutorTestHook = async (request) => {
+    requests.set(request.task, request);
+    return failedExecution();
+  };
+  const enqueued = await enqueueQueueJob(fixWriteJob("src/a.txt", { validationFixPasses: 1, idempotencyKey: "fix-pass-requeue" }));
+  assert.equal(enqueued.ok, true, enqueued.error);
+  assert.ok(await waitFor(async () => (await durable(enqueued.record.jobId))?.status === "failed"));
+  const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: enqueued.record.jobId });
+  assert.notEqual(response.isError, true, textOf(response));
+  assert.ok(await waitFor(() => requests.get("Write src/a.txt cleanly.")?.validationFixPasses === 1));
+  selfTestHooks.queueJobExecutorTestHook = null;
+});
+
 let failed = 0;
 const skips = [];
 try {

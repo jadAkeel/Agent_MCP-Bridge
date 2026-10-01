@@ -600,6 +600,7 @@ const jobInputShape = {
   sharedFiles: z.array(z.string()).optional(),
   serialOnly: z.array(z.string()).optional(),
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
+  validationFixPasses: z.number().int().min(0).max(1).optional().describe("0 (default) or 1. A write job cannot run its own checks (builders have no shell), so with 1 a failed validationCommand gives the agent one more run in the same worktree with the validation output, then validates again. Uses the rest of the job timeout; scope and lock rules apply unchanged. Not available in run_opencode_parallel."),
   timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
@@ -15857,6 +15858,7 @@ server.tool(
     sharedFiles,
     serialOnly,
     validationCommand,
+    validationFixPasses,
     delegation,
   }) => {
     const toolStarted = nowMs();
@@ -15892,6 +15894,7 @@ server.tool(
       sharedFiles,
       serialOnly,
       validationCommand,
+      validationFixPasses,
       delegation,
     };
     const directRunId = makeQueueJobId(agent);
@@ -16142,7 +16145,7 @@ function diagnoseJobView(job) {
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
   "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
-  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "phaseTimings",
+  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
 ];
@@ -16179,6 +16182,7 @@ function compactQueueJobLines(records) {
       record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
       record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
       record.usage?.steps && record.usage.cacheReadCount ? `cacheRead=${record.usage.cacheReadCount}` : "",
+      record.validationFixPass ? `fixPass=${record.validationFixPass.used ? `used(${record.validationFixPass.finalValidation})` : "skipped"}` : "",
       record.providerRetryWarningCount ? `providerErrorLines=${record.providerRetryWarningCount}` : "",
       record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
@@ -18181,6 +18185,14 @@ function validateParallelWritePlan(jobs) {
     if (sanitizedError) {
       return { ...sanitizedError, lockPlans };
     }
+    if (job.validationFixPasses) {
+      return {
+        error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
+        errorType: "validation_fix_pass_unsupported_in_parallel",
+        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove validationFixPasses.",
+        lockPlans,
+      };
+    }
     const planPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.forbiddenEdits, plan.sharedFiles, plan.serialOnly, scopeContractPathInputs(plan.scopeContract));
     const orchestratorError = orchestratorPolicyError(job, plan, "parallel");
     if (orchestratorError) {
@@ -18383,6 +18395,23 @@ function validateParallelWritePlan(jobs) {
   return { error: null, lockPlans };
 }
 
+// Q-004: validationFixPasses is 0 or 1 and only means something for a write job whose
+// validationCommand the bridge runs; anything else would be an option that silently does nothing.
+function validationFixPassError(job, lockPlan) {
+  const requested = job?.validationFixPasses;
+  if (requested === undefined || requested === null || requested === 0) return null;
+  if (requested !== 1) {
+    return { errorType: "validation_fix_pass_invalid", error: `validationFixPasses must be 0 or 1; got ${JSON.stringify(requested)}.`, suggestedFix: "Use validationFixPasses 0 (default) or 1." };
+  }
+  if (lockPlan.lockType === "read" || job.sanitizedWorkspace) {
+    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses applies to write jobs only; a read-only or sanitized-workspace job has no validation to fix.", suggestedFix: "Remove validationFixPasses." };
+  }
+  if (!String(lockPlan.validationCommand || "").trim()) {
+    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses needs a validationCommand: the fix pass runs after that command fails.", suggestedFix: "Add a validationCommand, or remove validationFixPasses." };
+  }
+  return null;
+}
+
 function validateSingleLockPlan(job) {
   const sanitizedError = sanitizedJobPolicyError(job);
   if (sanitizedError) {
@@ -18436,6 +18465,9 @@ function validateSingleLockPlan(job) {
       lockPlan,
     };
   }
+
+  const fixPassError = validationFixPassError(job, lockPlan);
+  if (fixPassError) return { ...fixPassError, lockPlan };
 
   const unsafeReason = unsafePathReason(planPathInputs, lockPlan.cwd);
   if (unsafeReason) {
@@ -18526,6 +18558,78 @@ function jobAgentRuntime() {
     readAgentDebugMetadata: hook?.readAgentDebugMetadata || readAgentDebugMetadata,
     runOpenCodeWithPolicy: hook?.runOpenCodeWithPolicy || runOpenCodeWithPolicy,
   };
+}
+
+// Q-004: the validation fix pass. OpenCode's `run` can continue a session (--session <id> or
+// --continue, present in OpenCode 1.18), but the spawn path passes neither: it keeps no session
+// id for a job (the stream parser knows the root session but the run result does not carry it),
+// and --continue resumes the project's last session, which with parallel builders may be another
+// job's. Resuming by id is untested against a real model here. The fix pass is therefore a
+// second fresh run in the same worktree with the job's own prompt plus the validation output;
+// the files the first run wrote are already there.
+const VALIDATION_FIX_MIN_REMAINING_MS = 60 * 1000;
+const VALIDATION_FIX_OUTPUT_CHARS = 4000;
+
+// Agent process time of one run, without the wait for a provider slot (which is not part of the
+// job timeout).
+function agentProcessMsOf(agentResult) {
+  const started = Number(agentResult?.childStartedAtMs) || 0;
+  const finished = Number(agentResult?.childFinishedAtMs) || 0;
+  if (started && finished) return Math.max(0, finished - started);
+  return Math.max(0, (Number(agentResult?.durationMs) || 0) - (Number(agentResult?.providerConcurrencyWaitMs) || 0));
+}
+
+function buildValidationFixPrompt(prompt, validationGate) {
+  const clip = (value) => String(value || "").slice(0, VALIDATION_FIX_OUTPUT_CHARS);
+  return [
+    prompt,
+    "",
+    "VALIDATION FIX PASS (the second and last run of this job)",
+    "Your changes from the first run are in this working tree. The bridge then ran the validation command and it FAILED. You cannot run commands; the bridge runs it again after this pass.",
+    "Fix only what the output below shows, with the same Scope Contract and allowed edits as before: do not edit other files, do not widen the scope, do not weaken or skip the check.",
+    "If the failure cannot be fixed inside the allowed edits, change nothing and say why in your final report. Answer in the same report format as before.",
+    "",
+    `Validation command: ${validationGate.command}`,
+    `Validation exit code: ${validationGate.exitCode}`,
+    validationGate.stdout ? `Validation stdout:\n${clip(validationGate.stdout)}` : null,
+    validationGate.stderr ? `Validation stderr:\n${clip(validationGate.stderr)}` : null,
+  ].filter((line) => line !== null).join("\n");
+}
+
+// "" when the failed validation gets its pass, else why not. A command that never ran, a
+// timeout, an agent error of its own, a cancellation or too little time left is not fixable by
+// another run.
+function validationFixPassSkipReason({ result, validation, validationGate, aborted = false, remainingMs = 0 }) {
+  if (validationGate.errorType !== "validation_command_failed") return `the validation command did not run to a result (${validationGate.errorType || validationGate.status})`;
+  if (!Number.isInteger(validationGate.exitCode)) return `the validation command ended without an exit code (${validationGate.exitCode})`;
+  if (result.errorType !== "validation_command_failed" || validation.disallowedFiles.length) return `the run also ended with ${result.errorType !== "validation_command_failed" ? result.errorType : "changes outside the allowed edits"}`;
+  if (aborted) return "the job was cancelled or lost its lock";
+  if (remainingMs < VALIDATION_FIX_MIN_REMAINING_MS) return `only ${Math.max(0, Math.round(remainingMs / 1000))} s of the job timeout are left (a pass needs ${VALIDATION_FIX_MIN_REMAINING_MS / 1000} s)`;
+  return "";
+}
+
+// The two runs of one job reported as one: tokens, provider error lines and durations add up and
+// the agent process spans from the first start to the second finish (validation between them is
+// inside it), which keeps wait + agent + after-agent equal to the job duration.
+function mergeValidationFixRuns(first, second) {
+  return {
+    ...second,
+    durationMs: (Number(first.durationMs) || 0) + (Number(second.durationMs) || 0),
+    usage: sumOpenCodeUsage(first.usage, second.usage),
+    heavyToolCalls: mergeHeavyToolCalls(first.heavyToolCalls, second.heavyToolCalls),
+    providerRetryWarningCount: (first.providerRetryWarningCount || 0) + (second.providerRetryWarningCount || 0),
+    providerConcurrencyWaitMs: (Number(first.providerConcurrencyWaitMs) || 0) + (Number(second.providerConcurrencyWaitMs) || 0),
+    childExecutionIntervals: [...(first.childExecutionIntervals || []), ...(second.childExecutionIntervals || [])],
+    childStartedAtMs: Number(first.childStartedAtMs) || Number(second.childStartedAtMs) || 0,
+  };
+}
+
+function formatValidationFixPass(info) {
+  if (!info) return "";
+  const first = `first validation: exit code ${info.firstValidation?.exitCode}${info.firstValidation?.excerpt ? `\n${info.firstValidation.excerpt}` : ""}`;
+  return info.used
+    ? `Validation fix pass: used ${info.used} of ${info.requested}; ${first}\nFinal validation: ${info.finalValidation}`
+    : `Validation fix pass: skipped (${info.skipped}); ${first}`;
 }
 
 // True only for a reader whose final pre-spawn attestation passed with edits denied; any other
@@ -19142,13 +19246,13 @@ async function executeOpenCodeJob(requestedJob, {
         ),
       };
     };
-    let result = await jobAgentRuntime().runOpenCodeWithPolicy(
+    const runAgent = (agentPrompt, runTimeoutMs) => jobAgentRuntime().runOpenCodeWithPolicy(
       resolution.actualAgent,
-      prompt,
+      agentPrompt,
       executionCwd,
       dryRun,
       lockPlan,
-      lockPlan.timeoutMs,
+      runTimeoutMs,
       {
         signal: executionSignal,
         agentMetadata,
@@ -19156,92 +19260,121 @@ async function executeOpenCodeJob(requestedJob, {
         onSupervisorHeartbeat: renewExecutionSupervisorAuthority,
       }
     );
-    phaseClock.mark("openCodeRun");
-    containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
-      || result?.terminationErrorType === "process_tree_termination_unconfirmed";
-    if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
-    if (stopLockHeartbeat.signal?.aborted) {
-      result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
-      result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
-    }
-    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
-    // Validation is judged on tracked and untracked files only: ignored build/cache output
-    // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
-    const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
-      ? afterFiles
-      : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
-    const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
-    const sanitizedAfter = manifestProtected && !dryRun
-      ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
-      : null;
-    result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
-      ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
-      : changedFilesBetween(beforeFiles, afterFiles);
-    if (readerEditsDenied && result.changedFiles.length) {
-      result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
-      result.changedFiles = [];
-    }
-    if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
-    if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
-      const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
-      if (move) {
-        result.readOnlyHeadMove = move;
+    // Q-004: everything that judges one agent run (changed files against the scope, git control
+    // surface, HEAD, scope filesystem state, then the validation command) is one closure, so the
+    // validation fix pass judges its second run exactly as the first.
+    const evaluateAgentRun = async (result) => {
+      phaseClock.mark("openCodeRun");
+      containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
+        || result?.terminationErrorType === "process_tree_termination_unconfirmed";
+      if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
+      if (stopLockHeartbeat.signal?.aborted) {
+        result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
+        result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
+      }
+      const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+      // Validation is judged on tracked and untracked files only: ignored build/cache output
+      // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
+      const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
+        ? afterFiles
+        : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
+      const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
+      const sanitizedAfter = manifestProtected && !dryRun
+        ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
+        : null;
+      result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
+        ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
+        : changedFilesBetween(beforeFiles, afterFiles);
+      if (readerEditsDenied && result.changedFiles.length) {
+        result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
+        result.changedFiles = [];
+      }
+      if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
+      if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
+        const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
+        if (move) {
+          result.readOnlyHeadMove = move;
+        } else {
+          result.errorType = "repository_head_changed_during_execution";
+          result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+        }
+      }
+      result.executionHeadBefore = executionHeadBefore;
+      result.executionHeadAfter = executionHeadAfterAgent;
+      if (sanitizedAfter && !sanitizedAfter.ok && !result.errorType) {
+        result.errorType = sanitizedAfter.errorType;
+        result.stderr = [result.stderr, sanitizedAfter.error].filter(Boolean).join("\n");
+      }
+      result.sanitizedWorkspaceVerification = manifestProtected ? { preflight: sanitizedPreflight, before: sanitizedBefore, after: sanitizedAfter } : null;
+
+      let validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
+      const postExecutionPathError = dryRun ? "" : unsafePathReason(
+        lockPlan.lockedPaths.concat(
+          lockPlan.allowedEdits,
+          lockPlan.forbiddenEdits,
+          lockPlan.sharedFiles,
+          scopeContractPathInputs(lockPlan.scopeContract),
+          result.changedFiles
+        ),
+        executionCwd
+      );
+      if (postExecutionPathError) {
+        validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(result.changedFiles));
+        result.errorType ||= "unsafe_path_after_execution";
+        result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
+      }
+      const scopeFilesystemViolation = scopeFilesystemBefore
+        ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
+        : null;
+      if (scopeFilesystemViolation) {
+        validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(scopeFilesystemViolation.paths));
+        result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
+        result.errorType ||= scopeFilesystemViolation.errorType;
+        result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
+      }
+      phaseClock.mark("postAgentChecks");
+      const validationGate = manifestProtected
+        ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
+        : !validation.disallowedFiles.length && !result.errorType
+        ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal })
+        : {
+            status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
+            command: lockPlan.validationCommand || "",
+            exitCode: "not_run",
+            durationMs: 0,
+            stdout: "",
+            stderr: "",
+            errorType: null,
+          };
+      if (validationGate.errorType && !result.errorType) {
+        result.errorType = validationGate.errorType;
+      }
+      phaseClock.mark("validation");
+      return { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate };
+    };
+    let { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(await runAgent(prompt, lockPlan.timeoutMs));
+    // Q-004: a builder cannot run its own checks, so a job that asked for validationFixPasses: 1
+    // gets one more run in the same worktree when its validation command failed, with the
+    // validation output, inside what is left of the job timeout. The second run is judged by the
+    // same checks and the validation command runs again; the job fails as before if it still fails.
+    if (Number(requestedJob.validationFixPasses) === 1 && !dryRun && validationGate.status === "failed") {
+      const firstValidation = {
+        exitCode: validationGate.exitCode,
+        durationMs: validationGate.durationMs || 0,
+        excerpt: truncateText([validationGate.stderr, validationGate.stdout].filter(Boolean).join("\n"), 600),
+      };
+      const remainingMs = Math.floor(timeoutForAgent(resolution.actualAgent, lockPlan, lockPlan.timeoutMs) - agentProcessMsOf(result));
+      const fixPrompt = buildValidationFixPrompt(prompt, validationGate);
+      const skipReason = validationFixPassSkipReason({ result, validation, validationGate, aborted: Boolean(executionSignal?.aborted), remainingMs })
+        || openCodeCommandLineLengthError(OPENCODE_EXE, openCodeRunArgs(resolution.actualAgent, fixPrompt, null));
+      if (skipReason) {
+        result.validationFixPass = { requested: 1, used: 0, skipped: skipReason, firstValidation };
       } else {
-        result.errorType = "repository_head_changed_during_execution";
-        result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+        const fixedRun = await runAgent(fixPrompt, remainingMs);
+        ({ result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(mergeValidationFixRuns(result, fixedRun)));
+        result.validationFixPass = { requested: 1, used: 1, firstValidation, finalValidation: validationGate.status };
       }
     }
-    result.executionHeadBefore = executionHeadBefore;
-    result.executionHeadAfter = executionHeadAfterAgent;
-    if (sanitizedAfter && !sanitizedAfter.ok && !result.errorType) {
-      result.errorType = sanitizedAfter.errorType;
-      result.stderr = [result.stderr, sanitizedAfter.error].filter(Boolean).join("\n");
-    }
-    result.sanitizedWorkspaceVerification = manifestProtected ? { preflight: sanitizedPreflight, before: sanitizedBefore, after: sanitizedAfter } : null;
-
-    let validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
-    const postExecutionPathError = dryRun ? "" : unsafePathReason(
-      lockPlan.lockedPaths.concat(
-        lockPlan.allowedEdits,
-        lockPlan.forbiddenEdits,
-        lockPlan.sharedFiles,
-        scopeContractPathInputs(lockPlan.scopeContract),
-        result.changedFiles
-      ),
-      executionCwd
-    );
-    if (postExecutionPathError) {
-      validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(result.changedFiles));
-      result.errorType ||= "unsafe_path_after_execution";
-      result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
-    }
-    const scopeFilesystemViolation = scopeFilesystemBefore
-      ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
-      : null;
-    if (scopeFilesystemViolation) {
-      validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(scopeFilesystemViolation.paths));
-      result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
-      result.errorType ||= scopeFilesystemViolation.errorType;
-      result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
-    }
-    phaseClock.mark("postAgentChecks");
-    const validationGate = manifestProtected
-      ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
-      : !validation.disallowedFiles.length && !result.errorType
-      ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal })
-      : {
-          status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
-          command: lockPlan.validationCommand || "",
-          exitCode: "not_run",
-          durationMs: 0,
-          stdout: "",
-          stderr: "",
-          errorType: null,
-        };
-    if (validationGate.errorType && !result.errorType) {
-      result.errorType = validationGate.errorType;
-    }
-    phaseClock.mark("validation");
 
     const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     if (gitControlBefore && lockPlan.validationCommand) {
@@ -19433,7 +19566,7 @@ async function executeOpenCodeJob(requestedJob, {
     const lockLines = [`Temporary lock acquired: ${hardLockSummary(acquiredLock)}`, `Temporary lock released: ${lockRelease.text}`];
     const singleParts = formatSingleResultParts({ resolution, result, cwd: executionCwd, lockPlan });
     const driftLine = formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift);
-    const validationGateText = formatValidationGateResult(validationGate);
+    const validationGateText = [formatValidationFixPass(result.validationFixPass), formatValidationGateResult(validationGate)].filter(Boolean).join("\n");
     // Stored view (queue result text, run audit): the same text without the patch preview, fitted
     // to the result limit report-first. The lock lines are safety evidence, so they stay in the
     // shortened stand-in for the preamble.
@@ -19633,6 +19766,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     providerRetryWarningCount: record.providerRetryWarningCount || 0,
     usage: record.usage || null,
     heavyToolCalls: record.heavyToolCalls || null,
+    validationFixPass: record.validationFixPass || null,
     phaseTimings: record.phaseTimings || null,
     readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
@@ -21838,6 +21972,7 @@ async function startQueueRecord(record) {
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
         heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
+        validationFixPass: execution.result?.validationFixPass || null,
         phaseTimings: execution.result?.phaseTimings || null,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
