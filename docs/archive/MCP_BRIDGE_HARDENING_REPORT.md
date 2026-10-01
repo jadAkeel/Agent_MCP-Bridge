@@ -12,16 +12,16 @@ This pass found no new bridge-runtime defect. It did find and correct two operat
 
 The hardened immutable release is active:
 
-`C:\Users\10User\codex-opencode-mcp-releases\server-b7a08c20-20260810`
+`C:\Users\<you>\codex-opencode-mcp-releases\server-b7a08c20-20260810`
 
 The Codex config was atomically replaced only after its preactivation SHA-256 was rechecked. The preactivation config, an activation backup, and the prior immutable release remain available for rollback:
 
 - Active config SHA-256: `9b0c6e7def9ab56826fd1e68b5936f7e8f30d975140e57ed6f369dd4fb71c1e3`
-- Rollback config: `C:\Users\10User\.codex\config.toml.rollback-20260810-b7a08c20`
+- Rollback config: `C:\Users\<you>\.codex\config.toml.rollback-20260810-b7a08c20`
 - Rollback config SHA-256: `0dcc58622ab5c29694e4518425b2006a2e3b107ac7f685b9bcb86c21706ce9af`
-- Activation backup: `C:\Users\10User\.codex\config.toml.activation-backup-20260810-b7a08c20`
+- Activation backup: `C:\Users\<you>\.codex\config.toml.activation-backup-20260810-b7a08c20`
 - Activation backup SHA-256: `0dcc58622ab5c29694e4518425b2006a2e3b107ac7f685b9bcb86c21706ce9af`
-- Prior release: `C:\Users\10User\codex-opencode-mcp-releases\server-b7a08c20-20260809`
+- Prior release: `C:\Users\<you>\codex-opencode-mcp-releases\server-b7a08c20-20260809`
 - Prior server SHA-256: `b7a08c205bde9630d03f2962410c61e4a84341ae1e8330d20bba2d6f51dfd367`
 
 Already-running MCP processes keep their inherited configuration until restarted; fresh processes now resolve the active entry above.

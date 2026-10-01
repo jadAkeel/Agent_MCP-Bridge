@@ -18,11 +18,11 @@
 
 This is an evidence-based architecture, security, reliability, configuration, and operational review of the Codex ↔ OpenCode MCP Bridge at:
 
-- Source: C:\Users\10User\codex-opencode-mcp
-- Active Codex configuration: C:\Users\10User\.codex
-- Active OpenCode configuration: C:\Users\10User\.config\opencode
-- Installed releases: C:\Users\10User\codex-opencode-mcp-releases
-- Active release: C:\Users\10User\codex-opencode-mcp-releases\server-7fe9678a5b50b8ba-lock-fd589adb560b2faf
+- Source: C:\Users\<you>\codex-opencode-mcp
+- Active Codex configuration: C:\Users\<you>\.codex
+- Active OpenCode configuration: C:\Users\<you>\.config\opencode
+- Installed releases: C:\Users\<you>\codex-opencode-mcp-releases
+- Active release: C:\Users\<you>\codex-opencode-mcp-releases\server-7fe9678a5b50b8ba-lock-fd589adb560b2faf
 
 The original audit was read-only except for this report and disposable temporary fixtures. After the user explicitly requested fixes, the remediation pass updated the source, documentation, selected active agents, active Codex MCP configuration, and installed release. No commit, push, merge, or deployment to an external service was performed.
 
@@ -211,9 +211,9 @@ flowchart LR
 | bin/e2e-contractor.js | Contractor E2E | Source-only; absent from active release |
 | codex/agents | Source Codex custom agents | All active copies match |
 | opencode/agents | Source OpenCode custom agents | All active copies match |
-| C:\Users\10User\.codex\config.toml | Active Codex/MCP configuration | Points to active release |
-| C:\Users\10User\.config\opencode\opencode.jsonc | Active OpenCode defaults | Loaded |
-| C:\Users\10User\.codex\codex-opencode-mcp | Global bridge SQLite/worktree state | Active |
+| C:\Users\<you>\.codex\config.toml | Active Codex/MCP configuration | Points to active release |
+| C:\Users\<you>\.config\opencode\opencode.jsonc | Active OpenCode defaults | Loaded |
+| C:\Users\<you>\.codex\codex-opencode-mcp | Global bridge SQLite/worktree state | Active |
 | installed releases | Content-addressed-looking server directories | Nine present; active directory is user-writable |
 
 Repository stack: Node.js ESM, MCP SDK, Zod schemas, Node built-in SQLite, Git worktrees, OpenCode CLI subprocesses, and a LangGraph TUI.
@@ -230,7 +230,7 @@ Repository stack: Node.js ESM, MCP SDK, Zod schemas, Node built-in SQLite, Git w
 
 Active Codex config points to:
 
-C:\Users\10User\codex-opencode-mcp-releases\server-60dadee4e3e0-lock-fd589adb560b\server.js
+C:\Users\<you>\codex-opencode-mcp-releases\server-60dadee4e3e0-lock-fd589adb560b\server.js
 
 Configured expected server hash equals the active and source server hash. The directory suffix also reflects the server and lock hashes.
 
@@ -396,7 +396,7 @@ Runtime built-ins also discovered: build, plan, general, compaction, summary, an
 ### Worktrees
 
 - Active mode: write.
-- Root: global under C:\Users\10User\.codex\codex-opencode-mcp\worktrees.
+- Root: global under C:\Users\<you>\.codex\codex-opencode-mcp\worktrees.
 - Cleanup: never during execution for every writer, including direct, queued, parallel, pipeline, and Contractor work.
 - Cleanup is owned by receipt-bound reviewed integration and requires an explicit passing validation gate plus `cleanupAfterSuccess: true`; pipeline cleanup waits for final gates.
 - Worktree creation uses Git argument arrays and a generated branch/path.
@@ -579,7 +579,7 @@ Runtime built-ins also discovered: build, plan, general, compaction, summary, an
 - **Severity:** Medium
 - **Status:** Confirmed
 - **Affected:** active release ACL and verifyReleaseIntegrity
-- **Evidence:** owner QSC-PC\10User has FullControl. Startup lines 8129-8137 hash only process.argv[1]/server.js. Lockfile and node_modules are not verified.
+- **Evidence:** owner <machine>\<you> has FullControl. Startup lines 8129-8137 hash only process.argv[1]/server.js. Lockfile and node_modules are not verified.
 - **Impact:** Dependency or package-script tampering can survive the server hash check.
 - **Existing mitigation:** Active server hash is pinned and currently matches; lockfile hash is encoded in directory name; dependency audit is clean.
 - **Fix:** Install release read-only for the runtime identity, verify an operator-hash-pinned exact manifest covering server, package, lock, and dependency tree, and reject unexpected files. This is not a public-key signature.

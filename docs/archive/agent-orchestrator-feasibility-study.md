@@ -69,7 +69,7 @@
 
 | الحقل | القيمة | الدليل | الثقة |
 |---|---|---|---|
-| Local repository root | `C:\Users\10User\codex-opencode-mcp` | `git rev-parse --show-toplevel` | High |
+| Local repository root | `C:\Users\<you>\codex-opencode-mcp` | `git rev-parse --show-toplevel` | High |
 | Git remote | `https://github.com/jadAkeel/Ai_Agent.git` | `git remote -v` | High |
 | Current branch | `main` | `git branch --show-current` | High |
 | Current commit | `3bab0826d1379b96c8b7a31e373daf290824362f` | `git rev-parse HEAD` | High |
@@ -80,9 +80,9 @@
 ### source مقابل generated/runtime
 
 - **Source**: جذر المستودع أعلاه، ويضم `server.js`، `bin/`، `opencode/`، `codex/`، `docs/`، `package.json` و`package-lock.json`.
-- **Runtime state**: `C:\Users\10User\.codex\codex-opencode-mcp`، ويضم قواعد `projects/*.sqlite`، `provider-concurrency.sqlite*`، `queue-request.key`، و`opencode-home`.
-- **Generated worktrees**: `C:\Users\10User\.codex\codex-opencode-mcp\worktrees\*`. ملفات `.git` داخلها تشير إلى المستودع الحقيقي؛ ليست source roots مستقلة.
-- **Immutable active release**: `C:\Users\10User\codex-opencode-mcp-releases\server-23fa331e-20260812-final`. تجزئة `server.js` فيه تطابق المصدر وقت الدراسة: `23FA331EC829E00C3DF944EFCDB45DA4A46AEF32E322BBA2D18223C1C9E2172D`؛ تجزئة manifest الفعالة `E28794089E2D6275F4E393AA57CA7AEE950BCEB9282796650FE784FF6C34ADB0`.
+- **Runtime state**: `C:\Users\<you>\.codex\codex-opencode-mcp`، ويضم قواعد `projects/*.sqlite`، `provider-concurrency.sqlite*`، `queue-request.key`، و`opencode-home`.
+- **Generated worktrees**: `C:\Users\<you>\.codex\codex-opencode-mcp\worktrees\*`. ملفات `.git` داخلها تشير إلى المستودع الحقيقي؛ ليست source roots مستقلة.
+- **Immutable active release**: `C:\Users\<you>\codex-opencode-mcp-releases\server-23fa331e-20260812-final`. تجزئة `server.js` فيه تطابق المصدر وقت الدراسة: `23FA331EC829E00C3DF944EFCDB45DA4A46AEF32E322BBA2D18223C1C9E2172D`؛ تجزئة manifest الفعالة `E28794089E2D6275F4E393AA57CA7AEE950BCEB9282796650FE784FF6C34ADB0`.
 - **Archived/unrelated**: لم تُعامل مجلدات releases أو attachments أو visualization workspace كمستودع المصدر.
 
 ### الحالة الفعلية المهمة أمنياً
@@ -660,7 +660,7 @@ Scope Contracts، allowed/forbidden enforcement، persistent locks، clean-sourc
 
 | المصدر | ما دعمه |
 |---|---|
-| `C:\Users\10User\codex-opencode-mcp\server.js:124-179` | configuration/defaults |
+| `C:\Users\<you>\codex-opencode-mcp\server.js:124-179` | configuration/defaults |
 | `server.js:281-360` | strict contracts/schemas |
 | `server.js:385-450`, `:609-727` | env minimization، redaction، persisted/log data minimization |
 | `server.js:730-960`, `:3860-4180` | subprocess bounds، timeout/retry، model evidence |

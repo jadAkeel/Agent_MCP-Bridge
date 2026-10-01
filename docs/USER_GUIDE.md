@@ -42,6 +42,8 @@ The bridge sits between the two. Its job is to make that hand-off **safe, predic
 - **State.** Nothing is lost if a process crashes, because jobs, locks and results are stored durably.
 - **Cleanup.** Leftovers can be inventoried and removed with one command.
 
+Claude Code can use the same bridge in the same way, side by side with Codex (see [section 7b](#7b-using-the-bridge-from-claude-code)); where this guide says Codex, Claude Code works the same unless noted.
+
 In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execute bounded tasks.**
 
 ---
@@ -52,8 +54,8 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 | --- | --- | --- |
 | **Codex** | The AI you talk to. It is the orchestrator and the only one allowed to integrate changes. | The Codex app/CLI |
 | **Codex orchestrator profile** | The Codex agent you select for work, `principal-engineer-orchestrator`. | `codex/agents/*.toml`, installed into `~/.codex` |
-| **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 22 tools to Codex. | Production runs from an immutable release folder, not this checkout |
-| **OpenCode** | The agent runtime that actually runs the helper agents. Pinned to version `1.17.13`. | Installed on `PATH` |
+| **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 26 tools to its MCP clients, Codex and Claude Code. | This checkout, pinned by hash, or an immutable release folder (see [section 12](#12-updating-and-rolling-back)) |
+| **OpenCode** | The agent runtime that actually runs the helper agents. Version `1.18.32`: the plugin manifest (`openCodeVersion` in `opencode/plugin-integrity-manifest.json`) requires exactly that version for the Gemini profile. | Installed on `PATH` |
 | **OpenCode agents** | Role profiles such as `builder`, `reviewer` and `debugger`. Each has fixed permissions and a pinned model. | `opencode/agents/*.md`, copied to the runtime folder automatically when a release starts |
 | **Skills** | Reusable instruction packs the agents load, such as `code-review-checklist` and `debugging-investigation`. | `opencode/skills/` |
 | **State store** | SQLite databases (one per project) holding jobs, locks, queues and audit records, plus retained worktrees. | `~/.codex/codex-opencode-mcp` |
@@ -213,7 +215,7 @@ Orchestrator profiles (advanced):
 - A model that is **not** allowlisted is rejected before anything runs (`configured_model_requirement_mismatch`). There is no silent fallback.
 - **To allow a new model:** add it to `CODEX_OPENCODE_MODEL_ALLOWLIST` in `~/.codex/config.toml` under `[mcp_servers.opencode.env]`, restart Codex, then run `npm run smoke:live`.
 
-> **Model identity note.** OpenCode 1.17.13 does not report which model actually answered. The bridge therefore reports the *configured* model and never claims runtime proof it does not have. Keep `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=false`, because `true` rejects every real run on this OpenCode version.
+> **Model identity note.** OpenCode (observed on 1.17.13) does not report in every stream which model actually answered. The bridge therefore reports the *configured* model and never claims runtime proof it does not have. Keep `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=false`, because `true` rejects every real run whose stream lacks that proof.
 
 ---
 
@@ -287,7 +289,7 @@ Safety checks during integration:
 
 ## 10. Housekeeping and maintenance
 
-Run all of these from `C:\Users\10User\codex-opencode-mcp`, the bridge repository.
+Run all of these from `<bridge-dir>`, your clone of the bridge repository (placeholders as in [ONBOARDING.md](ONBOARDING.md)).
 
 | Command | What it does | When |
 | --- | --- | --- |
@@ -331,6 +333,8 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `validation_command_failed` | The validation command ran and returned a non-zero exit code. | Read the validation output in the result; fix the code or the command. |
 | `queue_write_requires_worktree` | A queued write job needs worktree mode. | Keep `CODEX_OPENCODE_WORKTREE_MODE=write`. |
 | `agent_empty_final_response` | The agent exited without an answer. | Retry. If it repeats, run `npm run smoke:live`. |
+| `agent_timeout` / `agent_idle_timeout` with `outcome=timed_out_with_changes` | The agent ran out of time (or was silent past `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS`) after it had already changed files. The worktree is kept. | Inspect the worktree; integrate it if the change is complete, or `requeue_opencode_job` with a longer `timeoutMs`. |
+| `opencode_quota_exhausted` with "Provider ... is paused until ..." | An earlier job hit the provider's hard quota and the provider gave a reset time. Until then every new job on that provider fails at once, in every bridge process. `get_opencode_bridge_status` lists it under `Paused providers`. | Wait until the time shown, then enqueue again. An allowlisted model on another provider helps only when `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` is unset, so that each provider has its own key. |
 | `essential_output_truncated` | The output was too large to trust. | Narrow the task. |
 | `worktree_created_dirty` | A new worktree was not clean. It is kept as evidence. | Run `npm run gc` and inspect it. |
 | `git_repository_config_unsafe` | The repository has git config the bridge refuses to run with, such as filters or hooks. | Remove the unsafe local git config. |
@@ -387,7 +391,7 @@ The command prints `Writers unblocked: yes`, or names another operation that sti
 
 ## 12. Updating and rolling back
 
-Production never runs this mutable checkout. It runs a **release folder** whose `server.js` hash is pinned in `~/.codex/config.toml`.
+The client entry runs either this checkout or a **release folder**, and in both cases the `server.js` hash is pinned in `~/.codex/config.toml` (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`). A release is the stricter profile, but a release cannot yet be built from a fresh clone (log.md B-037; ONBOARDING step 15), so a new install runs the checkout, re-pinned with `npm run release:activate -- --sync-clients` after every change to `server.js`.
 
 ### Changing bridge code, agent profiles, or skills
 
@@ -428,15 +432,17 @@ This is the release gate (`bin/release-gate.js`). It runs, in order and stopping
 
 The end of the output lists each step, the concurrency test's check count, and `skipped: <n>` with the name and reason of every skipped test. A skip is not a pass: read the reasons before you release. The only expected skip on this machine is the tracked-symlink case in `tests/review-b030.js` when Windows cannot create symlinks (no Developer Mode). If a file of the source tree changes while the gate runs, the receipt is marked failed.
 
-### Current state on this machine
+### Example of an installed release layout
+
+An operator who runs from releases ends up with a layout like this. `<releases-dir>` is the folder that holds the release folders: `--releases-root` when given, otherwise the parent of the active release, otherwise `<state-dir>\releases`. The release names and the backup time are illustrative.
 
 | Item | Value |
 | --- | --- |
-| Active release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260924-3` |
-| Rollback release | `C:\Users\10User\codex-opencode-mcp-releases\server-daily-20260924-2` |
+| Active release | `<releases-dir>\server-daily-20260924-3` |
+| Rollback release | `<releases-dir>\server-daily-20260924-2` |
 | Config backup | `~/.codex/config.toml.rollback-20260924065005` |
-| Runtime agents | `~/.codex/opencode-gemini-runtime-v1/opencode/agents` |
-| State | `~/.codex/codex-opencode-mcp` |
+| Runtime agents | `<runtime-dir>\opencode\agents` |
+| State | `<state-dir>` (default `~/.codex/codex-opencode-mcp`) |
 
 ---
 
@@ -453,7 +459,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `run_opencode_agent` | Runs one bounded agent. |
 | | `run_opencode_parallel` | Runs independent jobs together and waits for all of them. |
 | Queue | `enqueue_opencode_job` | Durable queued job. |
-| | `list_opencode_jobs` / `get_opencode_job` | Inspect queued jobs. |
+| | `list_opencode_jobs` / `get_opencode_job` | Inspect queued jobs. A running job's line shows how long its agent has been silent (`idle 3m`); a finished one may show `outcome=completed_no_changes` (a writer that changed nothing), `outcome=completed_with_truncated_output` or `outcome=timed_out_with_changes`. |
 | | `cancel_opencode_job` | Cancel a queued or running job. |
 | | (job option) `validationFixPasses: 1` | A write job whose validation command failed gets one more agent run in the same worktree with the validation output (builders cannot run checks themselves), then validates again. |
 | | `requeue_opencode_job` | Run a failed, cancelled or interrupted job again as a new job from its stored request (optional new `model` from the allowlist, new `timeoutMs`). Completed and unfinished jobs are refused. |
@@ -480,7 +486,7 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 
 | Variable | Recommended | Effect |
 | --- | --- | --- |
-| `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE` | `false` | `true` rejects every real run on OpenCode 1.17.13. |
+| `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE` | `false` | `true` rejects every real run whose OpenCode stream carries no runtime model identity (see the model identity note in section 7). |
 | `CODEX_OPENCODE_SOURCE_DIRT_POLICY` | `unrelated_ok` | Uncommitted changes outside the job's files are tolerated. `strict` rejects any dirt. |
 | `CODEX_OPENCODE_MODEL_ALLOWLIST` | your trusted models | Models a job may select per request. |
 | `CODEX_OPENCODE_WORKTREE_MODE` | `write` | Writers run in isolated worktrees. |
@@ -503,6 +509,7 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS` | 20 min |
 | `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | 5 min |
 | `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` | 20 min (how long a job may wait for a provider slot) |
+| `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS` | off (`0`). When set, an agent that writes nothing to stdout or stderr for that long is stopped and the job fails as `agent_idle_timeout`; keep it at 10 minutes or more, because a long reasoning step or tool call is silent. |
 
 The Codex `tool_timeout_sec` must cover the longest job the bridge allows. Codex gives up on a tool call after that time, and the job's result is lost even if the job is still running. The bound is:
 
