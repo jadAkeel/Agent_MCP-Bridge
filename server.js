@@ -5003,6 +5003,17 @@ function syntheticProviderQuotaNotice(finalText) {
   return { errorType: "opencode_quota_exhausted", resetMs, resetText: match[1] };
 }
 
+// B-043: "Streaming response failed: [504] Upstream idle timeout exceeded" came back as an error
+// event whose only evidence was its message text. It matched no classifier, so the run ended as
+// opencode_api_error with "Provider error type: none" and none of the retry rules applied.
+// GATEWAY_TIMEOUT_TEXT_PATTERN is the wording providerErrorTypeFromText maps to
+// opencode_transient_provider_error (a bare 504 is fine there: callers only pass diagnostic
+// text). GATEWAY_FAILURE_MESSAGE_PATTERN is the narrower set that may classify free message
+// text with no other provider evidence: bracketed 5xx codes and the timeout phrases, never a
+// bare number, so a fixture or an agent quoting "504" in a message is not mistaken for one.
+const GATEWAY_TIMEOUT_TEXT_PATTERN = /\b504\b|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
+const GATEWAY_FAILURE_MESSAGE_PATTERN = /\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
+
 function providerErrorTypeFromText(value) {
   const text = String(value || "");
   if (!text.trim()) {
@@ -5033,7 +5044,12 @@ function providerErrorTypeFromText(value) {
   if (/model.{0,40}(not found|unavailable|unsupported|does not exist)|unknown model|invalid model/i.test(text)) {
     return "opencode_model_error";
   }
-  if (/\b(?:500|502|503|504)\b|service unavailable|bad gateway|gateway timeout/i.test(text)) {
+  // B-043: a 504 / gateway or upstream idle timeout is a transient provider error (the same
+  // retry rules as ProviderHeaderTimeoutError below), not an unclassified API error.
+  if (GATEWAY_TIMEOUT_TEXT_PATTERN.test(text)) {
+    return "opencode_transient_provider_error";
+  }
+  if (/\b(?:500|502|503)\b|service unavailable|bad gateway/i.test(text)) {
     return "opencode_provider_unavailable";
   }
   if (/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET)|socket hang up|network error|fetch failed/i.test(text)) {
@@ -5054,7 +5070,7 @@ function providerErrorTypeFromDiagnosticLine(value) {
     return "";
   }
   const authoritativeMarker = /(?:\bAPIError\b|\bCreditsError\b|\bProvider[A-Za-z]*(?:Error|Timeout)\b|\bOAuth\b|\bHTTP\s+[45]\d\d\b|\b(?:status|statusCode|code)\s*[:=]\s*["']?(?:[45]\d\d|RESOURCE_EXHAUSTED|rateLimitExceeded|invalid_grant)\b|\bRESOURCE_EXHAUSTED\b|\brateLimitExceeded\b|\binvalid_(?:grant|client)\b|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_[A-Z_]+|DEADLINE_EXCEEDED)\b|\b401\s+Unauthorized\b|\b429\s+Too Many Requests\b)/i;
-  if (authoritativeMarker.test(line)) return providerErrorTypeFromText(line);
+  if (authoritativeMarker.test(line) || GATEWAY_FAILURE_MESSAGE_PATTERN.test(line)) return providerErrorTypeFromText(line);
   // B-023: OpenCode logs retried provider failures as the AI SDK's AI_APICallError (and
   // AI_RetryError). Such a line alone only ever counts as a transient failure: a billing/auth
   // reading of its free text must not stop a live run or fail one that produced its answer,
@@ -5123,6 +5139,11 @@ function providerErrorTypeFromStructuredEvent(event) {
     type = statusType;
   } else {
     type = (fieldType && fieldType !== "opencode_api_error" ? fieldType : "") || contextualType || fieldType;
+  }
+  // B-043: an error event carrying only a message (name "UnknownError", no status field) that
+  // says "[504] Upstream idle timeout exceeded" is a gateway failure all the same.
+  if ((!type || type === "opencode_api_error") && GATEWAY_FAILURE_MESSAGE_PATTERN.test(messageText)) {
+    type = providerErrorTypeFromText(messageText) || "opencode_transient_provider_error";
   }
   // OpenCode marks provider errors it would retry itself (429, 5xx, overloaded) isRetryable.
   if (errorValue.data?.isRetryable === true || errorValue.isRetryable === true) {
