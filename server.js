@@ -19,6 +19,7 @@ import { createDirectRunAudit, directRunMetrics, ensureDirectRunAuditSchema } fr
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { detachWorktreeLinks } from "./bin/worktree-links.js";
 import { appendOpsLogLine } from "./bin/ops-log.js";
+import { resolvePluginManifestEntryPath } from "./bin/plugin-manifest-paths.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -4917,10 +4918,19 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       || typeof manifest.openCodeVersion !== "string" || !manifest.openCodeVersion.trim()) {
       throw new Error("External plugin manifest must contain version 1 plus non-empty plugins/configs/settings arrays and an exact OpenCode version.");
     }
+    // B-037: config and settings paths may be repository-relative (`opencode/opencode.jsonc`),
+    // resolved against the folder that holds the manifest's opencode/ directory; an absolute
+    // path (a built release, an older pinned setup) is used as written. Every check below sees
+    // the resolved absolute path only.
+    const configs = manifest.configs.map((config) => ({ ...config, path: resolvePluginManifestEntryPath(config?.path, manifestPath) }));
+    const settings = manifest.settings.map((setting) => ({ ...setting, path: resolvePluginManifestEntryPath(setting?.path, manifestPath) }));
+    // A plugin's root and packageRoot are optional: OpenCode's package-cache resolution is
+    // derived from the specifier (expectedOpenCodePluginResolution), so a committed manifest
+    // need not carry one user's cache path. When present they must still be that resolution.
     for (const plugin of manifest.plugins) {
       if (!exactPluginSpecifier(plugin?.specifier)
-        || !path.isAbsolute(String(plugin?.root || ""))
-        || !path.isAbsolute(String(plugin?.packageRoot || ""))
+        || (plugin?.root !== undefined && !path.isAbsolute(String(plugin.root || "")))
+        || (plugin?.packageRoot !== undefined && !path.isAbsolute(String(plugin.packageRoot || "")))
         || !Number.isInteger(plugin?.fileCount) || plugin.fileCount < 1
         || !Number.isInteger(plugin?.entryCount) || plugin.entryCount < plugin.fileCount
         || !/^[a-f0-9]{64}$/.test(String(plugin?.treeSha256 || ""))
@@ -4928,14 +4938,14 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
         throw new Error("External plugin manifest contains an incomplete or unsafe plugin integrity entry.");
       }
     }
-    for (const config of manifest.configs) {
-      if (!path.isAbsolute(String(config?.path || "")) || !/^[a-f0-9]{64}$/.test(String(config?.sha256 || ""))
+    for (const config of configs) {
+      if (!config.path || !/^[a-f0-9]{64}$/.test(String(config?.sha256 || ""))
         || !String(config?.scope || "").trim() || !Array.isArray(config?.plugins) || !config.plugins.length) {
         throw new Error("External plugin manifest contains an incomplete config origin entry.");
       }
     }
-    for (const setting of manifest.settings) {
-      if (!path.isAbsolute(String(setting?.path || "")) || !/^[a-f0-9]{64}$/.test(String(setting?.sha256 || ""))
+    for (const setting of settings) {
+      if (!setting.path || !/^[a-f0-9]{64}$/.test(String(setting?.sha256 || ""))
         || !setting.requiredValues || typeof setting.requiredValues !== "object" || Array.isArray(setting.requiredValues)
         || !Object.keys(setting.requiredValues).length) {
         throw new Error("External plugin manifest contains an incomplete security-settings entry.");
@@ -4951,13 +4961,13 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     const managedDirectories = managedOpenCodeConfigDirectories();
     const configCandidates = pluginConfigCandidatePaths(projectDirectories, managedDirectories);
     const activeConfigs = (await Promise.all(configCandidates.map(readPluginConfigSource))).filter(Boolean);
-    const configuredManifestPaths = new Set(manifest.configs.map((item) => path.resolve(String(item?.path || ""))));
+    const configuredManifestPaths = new Set(configs.map((item) => path.resolve(item.path)));
     const pluginBearingConfigPaths = new Set(activeConfigs.filter((item) => item.specs.length).map((item) => item.path));
     if (JSON.stringify([...pluginBearingConfigPaths].sort()) !== JSON.stringify([...configuredManifestPaths].sort())) {
       throw new Error("Every local plugin-bearing OpenCode config must be an exact hash-pinned manifest source, with no sibling or replacement config.");
     }
-    for (const config of manifest.configs) {
-      const configPath = path.resolve(String(config?.path || ""));
+    for (const config of configs) {
+      const configPath = path.resolve(config.path);
       if (!/^[a-f0-9]{64}$/.test(String(config?.sha256 || ""))) {
         throw new Error(`External plugin manifest contains an invalid config digest: ${configPath}`);
       }
@@ -4981,11 +4991,11 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     for (const plugin of manifest.plugins) {
       const expectedResolution = expectedOpenCodePluginResolution(plugin.specifier);
       if (!expectedResolution
-        || normalizePathForCompare(plugin.root) !== normalizePathForCompare(expectedResolution.root)
-        || normalizePathForCompare(plugin.packageRoot) !== normalizePathForCompare(expectedResolution.packageRoot)) {
+        || (plugin.root !== undefined && normalizePathForCompare(plugin.root) !== normalizePathForCompare(expectedResolution.root))
+        || (plugin.packageRoot !== undefined && normalizePathForCompare(plugin.packageRoot) !== normalizePathForCompare(expectedResolution.packageRoot))) {
         throw new Error(`External plugin manifest does not pin OpenCode's canonical package-cache resolution for ${plugin.specifier}.`);
       }
-      const root = path.resolve(String(plugin.root || ""));
+      const root = expectedResolution.root;
       await assertNoLinkedPath(root, `External plugin cache root for ${plugin.specifier}`);
       const tree = await hashExactTree(root);
       if (tree.treeSha256 !== plugin.treeSha256 || tree.fileCount !== plugin.fileCount || tree.entryCount !== plugin.entryCount) {
@@ -4994,7 +5004,7 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
       if (plugin.packageLockSha256 && await sha256File(path.join(root, "package-lock.json")) !== plugin.packageLockSha256) {
         throw new Error(`External plugin dependency lock integrity mismatch for ${plugin.specifier}.`);
       }
-      const packageRoot = path.resolve(String(plugin.packageRoot || root));
+      const packageRoot = expectedResolution.packageRoot;
       if (packageRoot !== root && !isPathInside(root, packageRoot)) {
         throw new Error(`External plugin package root escapes its pinned tree: ${plugin.specifier}.`);
       }
@@ -5009,8 +5019,8 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
         throw new Error(`External plugin package identity mismatch for ${plugin.specifier}.`);
       }
     }
-    for (const setting of manifest.settings || []) {
-      const settingPath = path.resolve(String(setting?.path || ""));
+    for (const setting of settings) {
+      const settingPath = path.resolve(setting.path);
       const settingDetails = await lstat(settingPath);
       if (settingDetails.isSymbolicLink() || !settingDetails.isFile()) {
         throw new Error(`Pinned external plugin setting is not a regular file: ${settingPath}`);
@@ -5054,13 +5064,13 @@ async function verifyExternalPluginPolicyUnshared(cwd = "") {
     if (!Array.isArray(effective?.plugin) || configuredSpecs.length !== effective.plugin.length || JSON.stringify(configuredSpecs) !== JSON.stringify(allowlist)) {
       throw new Error(`Effective OpenCode plugins do not exactly match the allowlist. Found: ${configuredSpecs.join(", ") || "none"}.`);
     }
-    const expectedOrigins = manifest.configs.flatMap((config) => {
+    const expectedOrigins = configs.flatMap((config) => {
       const specs = Array.isArray(config?.plugins)
         ? config.plugins
-        : manifest.configs.length === 1 ? allowlist : [];
+        : configs.length === 1 ? allowlist : [];
       return specs.map((specifier) => ({
         spec: exactPluginSpecifier(specifier),
-        source: path.resolve(path.dirname(String(config?.path || ""))),
+        source: path.resolve(path.dirname(config.path)),
         scope: String(config?.scope || ""),
       }));
     });
@@ -27534,6 +27544,7 @@ export const __selfTest = {
     commandShape,
     containmentRecord,
     expectedOpenCodePluginResolution,
+    resolvePluginManifestEntryPath,
     applyGitControlSurfaceCheck,
     gitControlSurfaceChanges,
     gitControlSurfaceFingerprint,

@@ -402,7 +402,7 @@ npm run release:activate
 
 It does the whole release in order and stops at the first failure:
 
-1. Checks that the tree can become a release at all: every published file and folder exists (including the untracked `opencode/.gitignore`) and `opencode/plugin-integrity-manifest.json` points at this tree's `opencode.jsonc` and `antigravity.json`. A worktree fails this. Then it runs the release gate, the same as `npm run test:release` (see [below](#before-pushing-source-changes)). If anything fails, nothing is built.
+1. Checks that the tree can become a release at all: every published file and folder exists (including `opencode/.gitignore`) and `opencode/plugin-integrity-manifest.json` points at this tree's `opencode.jsonc` and `antigravity.json` (as committed it names them `opencode/opencode.jsonc` and `opencode/antigravity.json`, relative to the tree that holds it, so any clone or worktree passes; log.md B-037). Then it runs the release gate, the same as `npm run test:release` (see [below](#before-pushing-source-changes)). If anything fails, nothing is built.
 2. Builds a new folder next to the active release, for example `server-daily-20260924-3`, checks that the source tree is still the one the gate tested, and stores the gate's receipt next to it as `server-daily-20260924-3.gate-receipt.json`.
 3. Writes a candidate config with the new path and hash and checks it in a fresh bridge process.
 4. Backs up `~/.codex/config.toml` as `config.toml.rollback-<time>`, then swaps in the new config.

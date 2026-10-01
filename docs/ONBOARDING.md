@@ -119,9 +119,9 @@ The last line is a placeholder: step 7 replaces it with the SHA-256 of `server.j
 exist, because `--sync-clients` only rewrites a pin that is there, and until it holds the right
 hash `npm run doctor` reports `Failure [server-pin]`.
 
-This entry runs the bridge from your checkout, which is how you start (step 15 covers releases
-and a gap that currently blocks them). The command is the absolute Node path, not `node`, so a
-`PATH` change cannot swap the interpreter.
+This entry runs the bridge from your checkout, which is how you start (step 15 covers
+releases). The command is the absolute Node path, not `node`, so a `PATH` change cannot swap
+the interpreter.
 
 **Not run here against the real `~/.codex/config.toml`** (the scratch setup must not change the
 operator's clients). The same entry was written to a scratch `CODEX_HOME` and read back with:
@@ -411,19 +411,23 @@ re-registers Claude Code with the restored entry. Restart both clients before `s
 matters to them. `npm run release:activate -- --inspect` lists the active release, releases a
 running bridge still loads, and what `--prune` would delete.
 
-**Known gap (log.md B-037): a release cannot yet be built from a new clone.** In the scratch
-run `npm run release:activate` stopped twice before building anything:
+A release builds from any clone, at any path and on any account: the committed
+`opencode/plugin-integrity-manifest.json` names `opencode/opencode.jsonc` and
+`opencode/antigravity.json` relative to the repository (the folder that holds the manifest's
+`opencode/` directory) and leaves the plugin's cache path to the bridge, which derives it from
+the plugin name and your OpenCode cache folder. `.gitattributes` keeps those hash-pinned files
+byte-for-byte whatever `core.autocrlf` says, and `opencode/.gitignore` is in the repository.
+The release itself records the absolute paths of its own copies (log.md B-037). If you edit
+`opencode/opencode.jsonc` or `opencode/antigravity.json`, update their `sha256` in the manifest,
+or the build refuses them.
 
-1. `ENOENT ... opencode\.gitignore`: the release builder copies `opencode/.gitignore`, but that
-   file ignores itself and is not in the repository.
-2. `Plugin config must be bound to the canonical source-tree file <bridge-dir>\opencode\opencode.jsonc`:
-   `opencode/plugin-integrity-manifest.json` records the absolute paths of the author's
-   checkout, and the builder accepts only those.
-
-Until B-037 is fixed, keep the checkout entry from step 4 (pinned by `--sync-clients`); it is
-the daily profile the author runs too.
+The checkout entry from step 4 (pinned by `--sync-clients`) remains a valid daily profile; it is
+the one the author runs.
 
 **Checked:** the rollback steps against the scratch Codex home (the newest
 `config.toml.rollback-*` restored, then `--sync-clients` re-pinned it and found the Claude
-entry in line) and `--inspect`. **Not run here:** a successful `release:activate`, because of
-B-037.
+entry in line) and `--inspect`. A release build from a checkout of the committed tree at
+another path, with `core.autocrlf=true`, is covered by `tests/review-b037-portable-release.js`
+(part of `npm test`), and `node bin/build-release.js <new-dir>` was run in a fresh `git clone`
+of the fix branch. **Not run here:** a full `release:activate`, because it rewrites the real
+client configs.

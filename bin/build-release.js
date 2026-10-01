@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
@@ -144,9 +145,13 @@ async function stageReleaseOpenCodeConfig({ sourceRoot, staging, destination }) 
     if (path.basename(String(entry?.path || "")).toLowerCase() !== basename.toLowerCase()) {
       throw new Error(`${label} must use the canonical filename ${basename}.`);
     }
+    // B-037: the committed manifest names the file repository-relative (`opencode/<basename>`),
+    // resolved against this source tree, so a clone at any path builds; an absolute path must be
+    // this tree's own file. A relative path that leaves opencode/ resolves to nothing.
     const sourcePath = path.join(sourceRoot, "opencode", basename);
-    if (normalizeFilesystemCase(entry.path) !== normalizeFilesystemCase(sourcePath)) {
-      throw new Error(`${label} must be bound to the canonical source-tree file ${sourcePath}.`);
+    const namedPath = resolvePluginManifestEntryPath(entry?.path, sourceManifestPath);
+    if (!namedPath || normalizeFilesystemCase(namedPath) !== normalizeFilesystemCase(sourcePath)) {
+      throw new Error(`${label} must be bound to the canonical source-tree file ${sourcePath} (write it as opencode/${basename}).`);
     }
     const content = await readPinnedRegularFile(sourcePath, String(entry.sha256 || "").toLowerCase(), label);
     if (/(?:^|[,{]\s*)["']?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|authorization|cookie|credential|password|private[-_]?key|secret)["']?\s*:/im.test(content.toString("utf8"))) {
@@ -352,12 +357,17 @@ async function runSelfTest() {
     await writeFile(sourceConfigPath, "{\"plugin\":[]}\n", "utf8");
     await writeFile(sourceSettingPath, "{\"debug\":false}\n", "utf8");
     const sourcePluginManifestPath = path.join(source, "opencode", "plugin-integrity-manifest.json");
-    const writeSourcePluginManifest = async ({ configPath = sourceConfigPath } = {}) => {
-      await writeFile(sourcePluginManifestPath, `${JSON.stringify({
+    const writeSourcePluginManifest = async ({
+      configPath = sourceConfigPath,
+      configEntry = configPath,
+      settingEntry = sourceSettingPath,
+      manifestPath = sourcePluginManifestPath,
+    } = {}) => {
+      await writeFile(manifestPath, `${JSON.stringify({
         version: 1,
         plugins: [],
-        configs: [{ path: configPath, sha256: await sha256File(configPath), scope: "global", plugins: [] }],
-        settings: [{ path: sourceSettingPath, sha256: await sha256File(sourceSettingPath), requiredValues: { debug: false } }],
+        configs: [{ path: configEntry, sha256: await sha256File(configPath), scope: "global", plugins: [] }],
+        settings: [{ path: settingEntry, sha256: await sha256File(sourceSettingPath), requiredValues: { debug: false } }],
       }, null, 2)}\n`, "utf8");
     };
     await writeSourcePluginManifest();
@@ -378,6 +388,56 @@ async function runSelfTest() {
     const rewrittenPluginManifest = JSON.parse(await readFile(path.join(successfulDestination, "opencode", "plugin-integrity-manifest.json"), "utf8"));
     assert.equal(rewrittenPluginManifest.configs[0].path, path.join(successfulDestination, "opencode", "opencode.jsonc"));
     assert.equal(rewrittenPluginManifest.settings[0].path, path.join(successfulDestination, "opencode", "antigravity.json"));
+
+    // B-037: the committed manifest names its files repository-relative, so the same manifest
+    // builds from a copy of the tree at another path; the staged manifest still carries the
+    // release-local absolute paths the fresh health check and the bridge expect.
+    const relativeEntries = { configEntry: "opencode/opencode.jsonc", settingEntry: "opencode/antigravity.json" };
+    await writeSourcePluginManifest(relativeEntries);
+    const relativeDestination = path.join(releases, "relative-manifest");
+    await buildRelease({ sourceRoot: source, destination: relativeDestination, publishEntries });
+    const relativeStaged = JSON.parse(await readFile(path.join(relativeDestination, "opencode", "plugin-integrity-manifest.json"), "utf8"));
+    assert.equal(relativeStaged.configs[0].path, path.join(relativeDestination, "opencode", "opencode.jsonc"));
+    assert.equal(relativeStaged.settings[0].path, path.join(relativeDestination, "opencode", "antigravity.json"));
+    const movedSource = path.join(fixture, "elsewhere", "another-clone");
+    await mkdir(path.dirname(movedSource), { recursive: true });
+    await cp(source, movedSource, { recursive: true, dereference: false, errorOnExist: true, force: false });
+    const moved = await buildRelease({ sourceRoot: movedSource, destination: path.join(releases, "moved-source"), publishEntries });
+    assert.equal(
+      JSON.parse(await readFile(path.join(moved.releaseDirectory, "opencode", "plugin-integrity-manifest.json"), "utf8")).configs[0].path,
+      path.join(moved.releaseDirectory, "opencode", "opencode.jsonc"),
+    );
+    // The copy with an absolute manifest naming the original tree is still refused.
+    await writeSourcePluginManifest({ manifestPath: path.join(movedSource, "opencode", "plugin-integrity-manifest.json") });
+    await assert.rejects(
+      buildRelease({ sourceRoot: movedSource, destination: path.join(releases, "moved-absolute"), publishEntries }),
+      /canonical source-tree file/
+    );
+    await rm(movedSource, { recursive: true, force: true });
+    for (const escaping of [
+      "../opencode/opencode.jsonc",
+      "opencode/../opencode/opencode.jsonc",
+      "./opencode/opencode.jsonc",
+      "opencode\\opencode.jsonc",
+      "opencode/agents/../opencode.jsonc",
+      "opencode//opencode.jsonc",
+      "opencode.jsonc",
+    ]) {
+      await writeSourcePluginManifest({ ...relativeEntries, configEntry: escaping });
+      await assert.rejects(
+        buildRelease({ sourceRoot: source, destination: path.join(releases, "escaping-relative"), publishEntries }),
+        /canonical source-tree file/,
+        `a relative config path ${escaping} must be refused`
+      );
+    }
+    await writeSourcePluginManifest(relativeEntries);
+    await writeFile(sourceConfigPath, "{\"plugin\":[\"tampered after the manifest\"]}\n", "utf8");
+    await assert.rejects(
+      buildRelease({ sourceRoot: source, destination: path.join(releases, "relative-hash-mismatch"), publishEntries }),
+      /SHA-256 does not match/
+    );
+    await writeFile(sourceConfigPath, "{\"plugin\":[]}\n", "utf8");
+    await writeSourcePluginManifest();
 
     await writeFile(sourceConfigPath, "{\"plugin\":[\"changed\"]}\n", "utf8");
     await assert.rejects(
