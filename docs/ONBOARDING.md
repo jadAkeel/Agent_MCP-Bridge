@@ -392,7 +392,7 @@ Once the checkout entry works, run production from an immutable release instead:
 npm run release:activate
 ```
 
-It runs `npm test`, builds a new release folder under `<state-dir>\releases` (or next to the
+It runs the release gate (the same as `npm run test:release`), builds a new release folder under `<state-dir>\releases` (or next to the
 active release), points the Codex entry at it with its hash, health-checks a fresh bridge,
 backs the old config up as `config.toml.rollback-<time>` next to it, and restores that backup
 itself if the health check fails. Then restart both clients.

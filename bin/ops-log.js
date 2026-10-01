@@ -49,7 +49,7 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
     const day = dayOf(now);
     const file = path.join(directory, `bridge-${day}.jsonl`);
     if (writerState.file !== file) {
-      mkdirSync(directory, { recursive: true });
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
       writerState.day = day;
       writerState.file = file;
       writerState.bytes = existsSync(file) ? statSync(file).size : 0;
@@ -65,7 +65,7 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
       writerState.capped = true;
       line = `${JSON.stringify({ ts: now.toISOString(), level: "warn", event: "ops_log.daily_cap_reached", maxBytes: DAILY_MAX_BYTES, pid: process.pid })}\n`;
     }
-    appendFileSync(file, line, "utf8");
+    appendFileSync(file, line, { encoding: "utf8", mode: 0o600 });
     writerState.bytes += Buffer.byteLength(line);
     return true;
   } catch {
@@ -80,11 +80,24 @@ function readOpsLog(stateDir, { days = 7, now = Date.now() } = {}) {
   const lines = [];
   let files = 0;
   let unreadable = 0;
-  for (const name of readdirSync(directory).sort()) {
+  let names = [];
+  try {
+    names = readdirSync(directory).sort();
+  } catch {
+    return { lines, files, unreadable: 1 };
+  }
+  for (const name of names) {
     const match = LOG_FILE_PATTERN.exec(name);
     if (!match || Date.parse(`${match[1]}T23:59:59Z`) < since) continue;
     files += 1;
-    for (const text of readFileSync(path.join(directory, name), "utf8").split(/\r?\n/)) {
+    let content = "";
+    try {
+      content = readFileSync(path.join(directory, name), "utf8");
+    } catch {
+      unreadable += 1;
+      continue;
+    }
+    for (const text of content.split(/\r?\n/)) {
       if (!text.trim()) continue;
       try {
         const line = JSON.parse(text);

@@ -50,7 +50,7 @@ Run these from `<bridge-dir>`.
 | `npm run gc` / `npm run gc:apply` | List or remove leftover worktrees and dead databases |
 | `npm run tui` | Terminal dashboard for pipelines and jobs |
 | `npm run incidents` | Summarize recurring warnings and errors from the operations log |
-| `npm run release:activate -- --sync-clients` | Re-pin the `server.js` hash and copy the Codex entry to Claude Code |
+| `npm run release:activate -- --sync-clients` | Re-pin the `server.js` and plugin-manifest hashes and copy the Codex entry to Claude Code |
 | `npm run release:activate` | Run the release gate, build, activate, and verify a new release in one step |
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |

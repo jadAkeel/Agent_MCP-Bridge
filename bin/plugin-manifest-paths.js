@@ -30,7 +30,12 @@ function resolvePluginManifestEntryPath(entryPath, manifestPath) {
     return "";
   }
   if (typeof manifestPath !== "string" || !path.isAbsolute(manifestPath)) return "";
-  const root = path.dirname(path.dirname(path.resolve(manifestPath)));
+  // The manifest must itself sit in an opencode/ folder (the repository's, a release's, or
+  // <XDG_CONFIG_HOME>/opencode/): otherwise "opencode/opencode.jsonc" would name a sibling
+  // folder of wherever the manifest was copied, and the error would be misleading.
+  const manifestDirectory = path.dirname(path.resolve(manifestPath));
+  if (path.basename(manifestDirectory).toLowerCase() !== RELATIVE_ENTRY_ROOT) return "";
+  const root = path.dirname(manifestDirectory);
   return path.join(root, ...segments);
 }
 

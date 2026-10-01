@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-01
 
+### Public release preparation: B-037, the operations log, docs (Claude, 2026-10-01)
+
+Branch `bridge/public-release` (worktree `C:\Users\<you>\bridge-public`, its own `npm ci`) from `ca088bb`, merging `bridge/ops-log` (rebased; its row renumbered B-039 -> B-047, B-039 being the quota row), `bridge/b037-portable-release` and `bridge/public-docs`. Conflicts: the `npm test` chain in `package.json` (both additions kept) and the `server.js` import block. An independent read-only review of the whole diff (Opus 5.5) found no blocker; its should-fix items are applied here: a relative manifest entry resolves only when the manifest itself sits in an `opencode/` folder (a copy elsewhere failed safely but with a misleading error); `tests/review-b037-portable-release.js` canonicalizes its scratch directory (macOS `tmpdir()` is under the `/var` symlink, which the bridge's link checks refuse); the operations log folder and files are created `0o700`/`0o600`, and `readOpsLog` tolerates an unreadable folder or file instead of aborting the doctor; ONBOARDING §15 says the release gate runs, not `npm test`; the daily cap is documented per bridge process. The author's paths in `log.md` and `docs/` are replaced by placeholders (`<you>`, `<machine>`, `<bridge-dir>`); the git history still carries them.
+
+Open from the same review (not defects): `appendOpsLogLine` writes synchronously on the warn/error path (74 call sites; heartbeat failures under SQLITE_BUSY can fire every few seconds); the 20 MB daily cap is per process, so N bridges can write N x 20 MB to one file; no test drives `logEvent` into the operations log (only the module's self-test); the root `AGENTS.md` is a third-party agent-install block; `server.js` still prints "OpenCode 1.17.13 emits no runtime identity"; ONBOARDING §3 and §15 give PowerShell-only commands; macOS and Linux are unverified.
+
 ### Round 5: hidden queue cap, 504 not transient, silent timed-out writers, no memory floor, no idle detection (Claude, 2026-10-01)
 
 Found while running 10-20 parallel builder jobs. Branch `bridge/round5-fixes` (worktree `C:\Users\<you>\bridge-round5`, node_modules linked from the live tree) from `dc0ea73`. Tests: `tests/review-round5.js` (in `npm test`). Out of scope and still open: batch integration of several worktrees, per-tool token usage, changing the concurrency limit at runtime, a requeue tool, relaxing integration receipt staleness.

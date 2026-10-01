@@ -19,7 +19,7 @@ import { strict as assert } from "node:assert";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,8 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SERVER_PATH = path.join(SOURCE_ROOT, "server.js");
-const scratch = await mkdtemp(path.join(tmpdir(), "codex-b037-"));
+// realpath: on macOS tmpdir() sits under /var, a symlink, which the bridge's link checks refuse.
+const scratch = await realpath(await mkdtemp(path.join(tmpdir(), "codex-b037-")));
 // Importing the bridge must not touch the real state or cache directories (R-173).
 const importState = path.join(scratch, "import-state");
 await mkdir(importState, { recursive: true });
@@ -214,6 +215,15 @@ try {
       42,
     ]) {
       assert.equal(serverResolve(entry, manifestPath), "", `${JSON.stringify(entry)} must not resolve`);
+    }
+    // The manifest itself must sit in an opencode/ folder; copied elsewhere, a relative entry
+    // would name a sibling folder of that place.
+    for (const misplaced of [
+      path.join(scratch, "trusted", "plugin-integrity-manifest.json"),
+      path.join(scratch, "any", "clone", "plugin-integrity-manifest.json"),
+      path.join(scratch, "opencode-copy", "plugin-integrity-manifest.json"),
+    ]) {
+      assert.equal(serverResolve("opencode/opencode.jsonc", misplaced), "", `${misplaced} must not resolve a relative entry`);
     }
   });
 
