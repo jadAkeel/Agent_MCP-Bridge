@@ -150,6 +150,14 @@ const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
 // 1 ms, so a progress heartbeat interval of 2147483648 became a notification flood. Every
 // CODEX_OPENCODE_*_MS setting is a timer, lease or timeout, so readIntegerEnv caps them here.
 const MAX_TIMER_MS = 2 ** 31 - 1;
+// Q-002: the two concurrency limits can be changed in the running process (set_opencode_concurrency),
+// persisted in provider-concurrency.sqlite so a restart keeps them until cleared. CONFIG reads
+// them through accessors, so every use of CONFIG.providerConcurrencyLimit / queueParallelLimit
+// (slot leases, diagnose, the parallel-batch check, the scheduler) sees the effective value.
+const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
+const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
+const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
+const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -182,7 +190,7 @@ const CONFIG = Object.freeze({
   modelOverrideAllowlist: readCsvEnv("CODEX_OPENCODE_MODEL_ALLOWLIST", []),
   worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
-  queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
+  get queueParallelLimit() { return RUNTIME_CONCURRENCY.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT; },
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -216,7 +224,7 @@ const CONFIG = Object.freeze({
   trustedPolicySha256: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_SHA256 || "").trim().toLowerCase(),
   trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
   trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
-  providerConcurrencyLimit: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2),
+  get providerConcurrencyLimit() { return RUNTIME_CONCURRENCY.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT; },
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
   // How long a job may wait for a provider slot. The wait is not part of the agent's run
@@ -2947,6 +2955,11 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
           reason TEXT NOT NULL DEFAULT '',
           set_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS runtime_settings (
+          name TEXT PRIMARY KEY,
+          value INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
       ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
@@ -2972,6 +2985,154 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
   throw new Error("Provider lease database initialization exhausted its retry budget.");
 }
 
+// Q-002: runtime override of the provider slot limit and the queue parallel limit. The rows live
+// in provider-concurrency.sqlite (shared by every bridge process and every project); a process
+// applies them at its next scheduler pass or slot request, and a restart reloads them.
+const RUNTIME_PROVIDER_LIMIT_SETTING = "provider_concurrency_limit";
+const RUNTIME_QUEUE_LIMIT_SETTING = "queue_parallel_limit";
+const RUNTIME_CONCURRENCY_REFRESH_MS = 5000;
+let runtimeConcurrencyRefreshedFor = "";
+let runtimeConcurrencyRefreshedAt = 0;
+
+// Returns "" for a usable limit, else why it is refused. The tool schema checks the same range,
+// but a direct handler call skips the schema.
+function runtimeConcurrencyLimitError(name, value) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) {
+    return `${name} must be an integer from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}; got ${JSON.stringify(value)}.`;
+  }
+  return "";
+}
+
+function readRuntimeConcurrencyRows(db) {
+  const settings = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+  let updatedAtMs = 0;
+  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?)")
+    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+  for (const row of rows) {
+    const value = Number(row.value);
+    // A hand-edited row outside the accepted range is ignored, not applied.
+    if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
+    if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
+    else settings.queueParallelLimit = value;
+    updatedAtMs = Math.max(updatedAtMs, Number(row.updated_at) || 0);
+  }
+  if (updatedAtMs) settings.updatedAt = new Date(updatedAtMs).toISOString();
+  return settings;
+}
+
+function applyRuntimeConcurrency(settings) {
+  const changed = RUNTIME_CONCURRENCY.providerLimit !== settings.providerLimit
+    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit;
+  Object.assign(RUNTIME_CONCURRENCY, {
+    providerLimit: settings.providerLimit,
+    queueParallelLimit: settings.queueParallelLimit,
+    updatedAt: settings.updatedAt || "",
+  });
+  if (changed) {
+    logEvent("info", "concurrency.runtime_limits_applied", {
+      providerLimit: CONFIG.providerConcurrencyLimit,
+      queueParallelLimit: CONFIG.queueParallelLimit,
+      providerOverride: settings.providerLimit !== null,
+      queueOverride: settings.queueParallelLimit !== null,
+    });
+  }
+  return changed;
+}
+
+// Reads the persisted overrides into this process (at most every few seconds unless forced, and
+// again whenever the state directory differs from the last read). A failed read keeps the values
+// already in force.
+async function refreshRuntimeConcurrency({ force = false } = {}) {
+  const directory = effectiveBridgeStateDirectory();
+  if (!force && runtimeConcurrencyRefreshedFor === directory && Date.now() - runtimeConcurrencyRefreshedAt < RUNTIME_CONCURRENCY_REFRESH_MS) return false;
+  let db = null;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    const changed = applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
+    runtimeConcurrencyRefreshedFor = directory;
+    runtimeConcurrencyRefreshedAt = Date.now();
+    return changed;
+  } catch (error) {
+    logEvent("warn", "concurrency.runtime_refresh_failed", { error: redactSensitiveText(error?.message || String(error)) });
+    return false;
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// One line each for get_opencode_bridge_status: the value in force, the env value and whether a
+// runtime override produced the difference.
+function describeConcurrencyLimits() {
+  const describe = (effective, env, override) => `effective ${effective} (env ${env}${override !== null ? `, runtime override set ${RUNTIME_CONCURRENCY.updatedAt || "earlier"}` : ""})`;
+  return {
+    provider: describe(CONFIG.providerConcurrencyLimit, ENV_PROVIDER_CONCURRENCY_LIMIT, RUNTIME_CONCURRENCY.providerLimit),
+    queue: describe(CONFIG.queueParallelLimit, ENV_QUEUE_PARALLEL_LIMIT, RUNTIME_CONCURRENCY.queueParallelLimit),
+  };
+}
+
+// Sets (or, with reset, clears) the persisted overrides and applies them to this process. Running
+// jobs are untouched: a lower limit only keeps new jobs from starting until enough have finished.
+async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset = false } = {}) {
+  const hasProvider = providerLimit !== undefined && providerLimit !== null;
+  const hasQueue = queueParallelLimit !== undefined && queueParallelLimit !== null;
+  if (reset && (hasProvider || hasQueue)) {
+    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit or queueParallelLimit." };
+  }
+  if (!reset && !hasProvider && !hasQueue) {
+    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit and/or queueParallelLimit, or reset: true to return to the environment values." };
+  }
+  const invalid = (hasProvider ? runtimeConcurrencyLimitError("providerLimit", providerLimit) : "")
+    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "");
+  if (invalid) return { ok: false, errorType: "concurrency_invalid", error: invalid };
+
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 10000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const before = readRuntimeConcurrencyRows(db);
+    const effectiveProviderBefore = before.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
+    const now = Date.now();
+    if (reset) {
+      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+    } else {
+      const upsert = db.prepare(`
+        INSERT INTO runtime_settings (name, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `);
+      if (hasProvider) upsert.run(RUNTIME_PROVIDER_LIMIT_SETTING, providerLimit, now);
+      if (hasQueue) upsert.run(RUNTIME_QUEUE_LIMIT_SETTING, queueParallelLimit, now);
+    }
+    const after = readRuntimeConcurrencyRows(db);
+    const effectiveProviderAfter = after.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
+    // acquireProviderLease keeps the stricter of a stored capacity and the configured limit while
+    // leases are held (an older bridge process may hold them under another limit), so a raise
+    // would not apply until those drained. The rows are only a cache of the last configured limit:
+    // removing them makes the next slot request store the new value and use it at once.
+    if (effectiveProviderAfter !== effectiveProviderBefore) db.prepare("DELETE FROM provider_capacities").run();
+    db.exec("COMMIT");
+    transactionOpen = false;
+    const previous = {
+      providerLimit: effectiveProviderBefore,
+      queueParallelLimit: before.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT,
+    };
+    applyRuntimeConcurrency(after);
+    runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
+    runtimeConcurrencyRefreshedAt = Date.now();
+    // A raised queue limit can start jobs that were waiting for a free worker.
+    scheduleQueue();
+    return { ok: true, previous, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit }, reset: Boolean(reset) };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    return { ok: false, errorType: "concurrency_persist_failed", error: redactSensitiveText(error?.message || String(error)) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
 async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
@@ -2990,6 +3151,11 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       db.exec("BEGIN IMMEDIATE");
       db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
       db.prepare("DELETE FROM provider_cooldowns WHERE until_at <= ?").run(now);
+      // Q-002: the limit in force is the persisted runtime override, read in this transaction so a
+      // raise or lowering made by any bridge process applies to the slot being decided right now.
+      applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
+      runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
+      runtimeConcurrencyRefreshedAt = Date.now();
       // A provider whose quota ran out fails new jobs at once instead of starting agents that
       // can only burn their wait budget (or the quota of the next account) until the reset.
       const cooldown = db.prepare("SELECT until_at, error_type, reason FROM provider_cooldowns WHERE provider_key = ?").get(providerKey);
@@ -3516,6 +3682,7 @@ async function providerCapacitySnapshot() {
     db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
     const now = Date.now();
     db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
+    applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
     const likePattern = providerKeyLikePattern(CONFIG.providerConcurrencyKey);
     const capacityRows = db.prepare(`
       SELECT provider_key, capacity FROM provider_capacities WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'
@@ -3568,7 +3735,7 @@ async function providerCapacitySnapshot() {
       errorType: row.error_type,
       reason: row.reason || "",
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases, cooldowns };
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns };
   } catch (error) {
     return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], cooldowns: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
@@ -15210,7 +15377,8 @@ server.tool(
             `Bridge state directory: ${GLOBAL_BRIDGE_STATE_DIR}`,
             `OpenCode external plugins: ${CONFIG.allowExternalPlugins ? "enabled (exact allowlist and pinned tree verified)" : "disabled (--pure)"}`,
             `External plugin manifest SHA-256: ${pluginPolicy.manifestSha256 || "not applicable"}`,
-            `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
+            `Provider/account concurrency limit: ${describeConcurrencyLimits().provider}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
+            `Queue parallel limit (this process): ${describeConcurrencyLimits().queue}`,
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
@@ -15528,6 +15696,7 @@ server.tool(
 
     // run_opencode_parallel rejects a batch above the per-provider slot limit; the preflight
     // must not accept what the run would refuse.
+    if (executionMode === "parallel") await refreshRuntimeConcurrency();
     const capacityError = executionMode === "parallel"
       ? parallelBatchCapacityError(jobs, parallelProviderKeys(plannedResolutions, plannedMetadata, lockPlans))
       : null;
@@ -16178,6 +16347,47 @@ server.tool(
         },
       ],
     };
+  }
+);
+
+// A short refusal for the queue-management tools (not an agent job, so no lock or worktree lines).
+function formatToolRefusal({ headline, errorType, reason, suggestedFix }) {
+  return [headline, "", `errorType: ${errorType}`, `reason: ${reason}`, `suggestedFix: ${suggestedFix}`].join("\n");
+}
+
+function formatConcurrencyChange(change) {
+  const described = describeConcurrencyLimits();
+  return [
+    change.reset ? "OpenCode concurrency limits reset to the environment values." : "OpenCode concurrency limits updated.",
+    `Provider slots per provider: ${described.provider}; was ${change.previous.providerLimit}`,
+    `Queue parallel limit (this process): ${described.queue}; was ${change.previous.queueParallelLimit}`,
+    "Running jobs keep their slots; a lower limit only holds back new starts until enough jobs have finished.",
+    `Persisted in ${path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite")}: other bridge processes pick it up at their next scheduler pass or slot request, and a restart keeps it until reset: true.`,
+  ].join("\n");
+}
+
+server.tool(
+  "set_opencode_concurrency",
+  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) and/or the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}. The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
+  {
+    providerLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Simultaneous model calls per provider, across all bridge processes."),
+    queueParallelLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Queue jobs this bridge process runs at once (the provider limit still caps model calls)."),
+    reset: z.boolean().optional().describe("Clear both runtime overrides and return to the environment values. Do not combine with a limit."),
+  },
+  async ({ providerLimit, queueParallelLimit, reset = false }) => {
+    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset });
+    if (!change.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Concurrency change rejected.",
+          errorType: change.errorType,
+          reason: change.error,
+          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, or reset: true.`,
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: formatConcurrencyChange(change) }] };
   }
 );
 
@@ -21354,6 +21564,8 @@ function scheduleQueue(delayMs = 0) {
     queueScheduleRequested = false;
     let progressed = false;
     try {
+      // Q-002: a limit changed by another bridge process, or persisted before this one started.
+      await refreshRuntimeConcurrency();
       const runningCount = runningQueueRecords().length;
       let capacity = Math.max(0, CONFIG.queueParallelLimit - runningCount);
       if (!capacity) {
@@ -23878,6 +24090,7 @@ server.tool(
       parallelAgentMetadata[index] = metadata;
     }
 
+    await refreshRuntimeConcurrency();
     const capacityError = parallelBatchCapacityError(jobs, parallelProviderKeys(parallelResolutions, parallelAgentMetadata, lockPlans));
     if (capacityError) {
       return { content: [{ type: "text", text: formatRejectedExecution({
@@ -25867,6 +26080,15 @@ export const __selfTest = {
     beginBridgeStartupRecovery,
     readPositiveIntEnv,
     readUserLineEndingGitConfig,
+    // tests/review-queue-features.js
+    ENV_PROVIDER_CONCURRENCY_LIMIT,
+    ENV_QUEUE_PARALLEL_LIMIT,
+    MAX_RUNTIME_CONCURRENCY_LIMIT,
+    RUNTIME_CONCURRENCY,
+    describeConcurrencyLimits,
+    refreshRuntimeConcurrency,
+    runtimeConcurrencyLimitError,
+    setRuntimeConcurrency,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
