@@ -17,7 +17,7 @@ const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const internals = __selfTest.internals;
 
 const scratch = await mkdtemp(path.join(tmpdir(), "review-provider-quota-"));
-__selfTest.stateDirectoryOverride = scratch;
+__selfTest.hooks.stateDirectoryOverride = scratch;
 
 const sessionID = "ses_root";
 const stream = (...texts) => [
@@ -131,7 +131,7 @@ try {
     }
   }
 } finally {
-  __selfTest.stateDirectoryOverride = "";
+  __selfTest.hooks.stateDirectoryOverride = "";
   await rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
 const skipGateFailed = finishSkips({ file: "tests/review-provider-quota.js", total: tests.length, skips });
