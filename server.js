@@ -186,6 +186,11 @@ const CONFIG = Object.freeze({
   // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
   // (twenty agent processes, their worktrees and test runs exhausted a laptop).
   minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", 0),
+  // B-046: 0 disables. An agent that writes nothing to stdout or stderr for this long is stopped
+  // through the process-tree supervisor and fails as agent_idle_timeout (a stalled provider stream
+  // held a slot for 20+ minutes). Output arrives per finished step, so keep this well above the
+  // longest tool call or reasoning pause a healthy agent has.
+  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 0),
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -427,9 +432,6 @@ function queueMemoryGate() {
   return { floorMb, freeMb, totalMb, blocked: floorMb > 0 && freeMb < floorMb };
 }
 
-// Called by the scheduler pass: holds back every job that could start while free memory is under
-// the floor. The jobs stay pending and the next poll (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) tries
-// again; nothing is written to the durable record, so a held pass costs one memory read.
 // Lines of get_opencode_bridge_status: the floor, the memory the machine has now, and whether this
 // process is holding jobs back for it.
 function queueMemoryStatusLines(gate = queueMemoryGate()) {
@@ -445,6 +447,9 @@ function queueMemoryStatusLines(gate = queueMemoryGate()) {
   ];
 }
 
+// Called by the scheduler pass: holds back every job that could start while free memory is under
+// the floor. The jobs stay pending and the next poll (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) tries
+// again; nothing is written to the durable record, so a held pass costs one memory read.
 function holdQueueForMemory(gate, records) {
   const waiting = records.filter((record) => ["pending", "planned"].includes(record.status));
   const now = new Date().toISOString();
@@ -468,6 +473,28 @@ function releaseQueueMemoryHold(gate) {
   }
   queueMemoryHold = null;
   queueMemoryWaitingJobs.clear();
+}
+
+// B-046: when the agent process of a queue job last wrote to stdout or stderr (epoch ms), by job id.
+// Kept in this bridge process (like waiting_for_provider_slot): a listing from another bridge
+// process shows no idle time. The entry exists only while the job's agent process runs.
+const agentActivityByJobId = new Map();
+
+function noteAgentActivity(jobId, atMs = Date.now()) {
+  if (jobId) agentActivityByJobId.set(jobId, atMs);
+}
+
+function clearAgentActivity(jobId) {
+  if (jobId) agentActivityByJobId.delete(jobId);
+}
+
+// "3m", "45s", "1h05m": how long a running agent has been silent.
+function formatIdleDuration(ms) {
+  const seconds = Math.max(0, Math.floor(Number(ms) / 1000)) || 0;
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 let selfTestContractorAuthorizationSha256 = "";
 let selfTestModelOverrideAllowlist = null;
@@ -1960,6 +1987,11 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
   terminateOnProviderError = false,
   onSpawn = null,
   beforeHeartbeat = null,
+  // B-046: onActivity(epochMs) runs for the launch and for every chunk the payload writes to
+  // stdout or stderr; idleTimeoutMs > 0 ends the payload (the supervisor's terminate path) once
+  // it has written nothing for that long.
+  onActivity = null,
+  idleTimeoutMs = 0,
   supervisorScriptForTest = "",
 } = {}) {
   return new Promise((resolve) => {
@@ -1991,6 +2023,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let cancelled = false;
     let cancellationErrorType = "";
     let providerTerminated = false;
+    let idleTimedOut = false;
+    let lastActivityMs = 0;
+    let idleTimer = null;
     let startupTimer = null;
     let heartbeatTimer = null;
     let terminationFallbackTimer = null;
@@ -2025,10 +2060,12 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     const clearTimers = () => {
       if (startupTimer) clearTimeout(startupTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (terminationFallbackTimer) clearTimeout(terminationFallbackTimer);
       if (exitCloseFallbackTimer) clearTimeout(exitCloseFallbackTimer);
       startupTimer = null;
       heartbeatTimer = null;
+      idleTimer = null;
       terminationFallbackTimer = null;
       exitCloseFallbackTimer = null;
     };
@@ -2079,6 +2116,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         cancelled,
         cancellationErrorType,
         providerTerminated,
+        idleTimedOut,
         treeTerminationConfirmed: false,
         terminationErrorType: errorType,
         containmentGuarantee: "supervisor_unavailable",
@@ -2093,6 +2131,8 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       terminationReason = reason;
       if (reason === "timeout") timedOut = true;
       if (reason === "provider_error") providerTerminated = true;
+      // An idle stop is a timeout for everything downstream (exit 124, retry rules); idleTimedOut tells which.
+      if (reason === "idle_timeout") { idleTimedOut = true; timedOut = true; }
       if (!launchSent) {
         try { supervisor.stdin.end(); } catch { /* Close is the pre-launch cancellation signal. */ }
       } else if (!sendControl({ type: "terminate", reason })) {
@@ -2113,6 +2153,24 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       cancelled = true;
       cancellationErrorType = abortSignalErrorType(signal);
       requestTermination("cancelled");
+    };
+
+    const noteActivity = () => {
+      lastActivityMs = Date.now();
+      if (typeof onActivity !== "function") return;
+      try { onActivity(lastActivityMs); } catch { /* A display hook must never end the run. */ }
+    };
+
+    // One timer re-armed for the remaining time, not one per output chunk.
+    const armIdleTimer = () => {
+      if (!(idleTimeoutMs > 0) || settled || terminationRequested || idleTimer) return;
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        if (settled || terminationRequested) return;
+        if (Date.now() - lastActivityMs >= idleTimeoutMs) requestTermination("idle_timeout");
+        else armIdleTimer();
+      }, Math.max(20, lastActivityMs + idleTimeoutMs - Date.now()));
+      idleTimer.unref?.();
     };
 
     const maybeLaunch = () => {
@@ -2146,6 +2204,8 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         clearTimeout(startupTimer);
         startupTimer = null;
       }
+      noteActivity();
+      armIdleTimer();
       heartbeatTimer = setInterval(() => {
         if (heartbeatInFlight || settled || terminationRequested) return;
         heartbeatInFlight = true;
@@ -2215,6 +2275,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         cancelled,
         cancellationErrorType,
         providerTerminated,
+        idleTimedOut,
         directChildClosed: Boolean(event.payloadExitCode !== null || event.payloadSignal),
         treeTerminationConfirmed: verifiedTermination,
         terminationErrorType,
@@ -2261,6 +2322,8 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         controlExitEvent = event;
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         heartbeatTimer = null;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = null;
         if (!exitCloseFallbackTimer) {
           exitCloseFallbackTimer = setTimeout(() => {
             if (!settled) finishFromControlExit(controlExitEvent);
@@ -2349,6 +2412,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
 
     supervisor.stdout.on("data", (chunk) => {
       if (settled) return;
+      noteActivity();
       stdoutHash.update(chunk);
       consumeStdout(stdoutDecoder.write(chunk));
     });
@@ -2358,6 +2422,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
 
     supervisor.stderr.on("data", (chunk) => {
       if (settled) return;
+      noteActivity();
       stderrHash.update(chunk);
       consumeStderr(stderrDecoder.write(chunk));
     });
@@ -6802,6 +6867,11 @@ function classifyResultError(result) {
     return "opencode_api_error";
   }
 
+  // B-046: stopped by the idle watchdog, not by the run clock.
+  if (result.idleTimedOut) {
+    return "agent_idle_timeout";
+  }
+
   if (isTimeoutResult(result)) {
     return "agent_timeout";
   }
@@ -7244,10 +7314,14 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
         terminateOnProviderError: true,
         onSpawn: persistSupervisorAuthority,
         beforeHeartbeat: renewSupervisorAuthority,
+        // B-046: queue jobs show their last output; the idle watchdog is off unless configured.
+        onActivity: slotWaitJobId ? (atMs) => noteAgentActivity(slotWaitJobId, atMs) : null,
+        idleTimeoutMs: CONFIG.agentIdleTimeoutMs,
       }
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
   } finally {
+    clearAgentActivity(slotWaitJobId);
     await stopProviderLeaseHeartbeat();
     if (containmentUnconfirmed) {
       providerQuarantine = await quarantineProviderLease(providerLease.lease, await containmentRecord(result));
@@ -7296,6 +7370,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     dryRun: false,
     timeoutMs,
     timedOut: isTimeoutResult(result),
+    idleTimedOut: Boolean(result.idleTimedOut),
+    idleTimeoutMs: result.idleTimedOut ? CONFIG.agentIdleTimeoutMs : 0,
     cancelled: Boolean(result.cancelled),
     cancellationErrorType: result.cancellationErrorType || "",
     providerTerminated: Boolean(result.providerTerminated),
@@ -7507,7 +7583,7 @@ function readOnlyRetryBudgetExhaustedResult(lastResult, attemptsMade, maxRetries
     retryAttempt: attempts - 1,
     maxRetries,
     attemptsMade: attempts,
-    errorType: timedOut ? "agent_timeout" : "read_only_agent_unavailable",
+    errorType: lastResult?.idleTimedOut ? "agent_idle_timeout" : timedOut ? "agent_timeout" : "read_only_agent_unavailable",
     stderr: [
       lastResult?.stderr || "",
       timedOut
@@ -7591,6 +7667,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     result?.timedOut ? `Agent timeout: ${resolution.actualAgent || resolution.requestedAgent}` : null,
     `Timeout ms: ${result?.timeoutMs ?? "not specified"}`,
     `Timed out: ${result?.timedOut ? "yes" : "no"}`,
+    result?.idleTimedOut ? `Agent idle timeout: the agent wrote no output for ${result.idleTimeoutMs} ms (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS) and was stopped` : null,
     timedOutWriterLine(result),
     `Read-only unavailable: ${result?.readOnlyUnavailable ? "yes" : "no"}`,
     `Retry attempts used: ${result?.retryAttempt ?? 0}`,
@@ -7714,6 +7791,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
     result?.assistantResponseTruncated ? "Assistant response truncated: yes" : null,
     result?.rawOutputTruncated ? "Raw process output truncated: yes" : null,
     result?.timedOut ? `Timed out: yes (timeout ms ${result.timeoutMs ?? "not specified"})` : null,
+    result?.idleTimedOut ? `Idle timeout: yes (no output for ${result.idleTimeoutMs} ms)` : null,
     timedOutWriterLine(result),
     result?.readOnlyUnavailable ? "Read-only unavailable: yes" : null,
     result?.retryAttempt ? `Retry attempts used: ${result.retryAttempt} of ${result.maxRetries ?? 0}` : null,
@@ -15892,7 +15970,7 @@ server.tool(
           text: [
             `Queue mode: ${effectiveQueueMode()}`,
             `Jobs: ${records.length}${shown.length < records.length ? ` (showing the newest ${shown.length})` : ""}`,
-            detail ? JSON.stringify(shown, null, 2) : compactQueueJobLines(shown),
+            detail ? JSON.stringify(shown.map((record) => ({ ...record, ...queueAgentActivity(record) })), null, 2) : compactQueueJobLines(shown),
           ].join("\n"),
         },
       ],
@@ -16008,6 +16086,7 @@ function diagnoseJobView(job) {
     pipelineId: job.parentJobId || "",
     status: job.status,
     stage: queueRunStage(job),
+    ...queueAgentActivity(job),
     errorType: job.errorType || "",
     failureReason: job.errorReason || "",
     requestedAgent: job.agent || "",
@@ -16038,7 +16117,7 @@ function diagnoseJobView(job) {
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
   "jobId", "idempotencyKey", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
-  "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
+  "agentStartedAt", "lastActivityAt", "idleMs", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
   "providerRetryWarningCount", "usage", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
@@ -16067,6 +16146,7 @@ function compactQueueJobLines(records) {
   return records.map((record) => {
     const stage = queueRunStage(record);
     const timing = queueAgentTiming(record);
+    const activity = queueAgentActivity(record);
     const parts = [
       record.jobId,
       record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
@@ -16075,6 +16155,7 @@ function compactQueueJobLines(records) {
       stage && stage !== record.status ? `stage=${stage}` : "",
       timing.waitBeforeAgentMs ? `waitBeforeAgentMs=${timing.waitBeforeAgentMs}` : "",
       timing.agentRunMs ? `agentRunMs=${timing.agentRunMs}` : "",
+      activity.idleMs !== undefined ? `idle ${formatIdleDuration(activity.idleMs)}` : "",
       timing.afterAgentMs ? `afterAgentMs=${timing.afterAgentMs}` : "",
       record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
       record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
@@ -16106,7 +16187,7 @@ server.tool(
       : null;
     // record_json keeps the stage and timings of its last write; a running job's are derived now.
     const snapshot = persisted
-      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted) }
+      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted), ...queueAgentActivity(persisted) }
       : null;
     if (!snapshot) {
       const lookupRoot = projectRoot || await resolveProjectStateRoot(process.cwd());
@@ -19383,6 +19464,16 @@ function queueAgentTiming(record, now = Date.now()) {
     agentRunMs: Math.max(0, (Number.isFinite(finishedMs) ? finishedMs : now) - agentStartedMs),
     waitBeforeAgentMs,
   };
+}
+
+// B-046: last output of a running agent. Derived when read, never stored: a stored value would be
+// stale the moment it was written. Empty for jobs of another bridge process and for jobs whose
+// agent is not running.
+function queueAgentActivity(record, now = Date.now()) {
+  if (queueRunStage(record) !== "agent_running") return {};
+  const lastMs = agentActivityByJobId.get(record.jobId);
+  if (!Number.isFinite(lastMs)) return {};
+  return { lastActivityAt: new Date(lastMs).toISOString(), idleMs: Math.max(0, now - lastMs) };
 }
 
 function queueRecordSnapshot(record, includeResult = true) {
@@ -26059,7 +26150,12 @@ export const __selfTest = {
     queueCapacityReport,
     timedOutWriterNote,
     queueMemoryGate,
+    queueMemoryStatusLines,
     queueMemoryWaitingJobs,
+    agentActivityByJobId,
+    formatIdleDuration,
+    noteAgentActivity,
+    queueAgentActivity,
     // tests/review2-a.js
     beginBridgeStartupRecovery,
     readPositiveIntEnv,

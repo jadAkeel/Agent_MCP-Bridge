@@ -330,23 +330,32 @@ test("B-045: the memory gate is off by default and blocks only below the floor",
   await withMemory({ floorMb: 2048, freeMb: 4096 }, () => assert.equal(internals.queueMemoryGate().blocked, false));
 });
 
-test("B-045: get_opencode_bridge_status shows the floor, the free memory and a hold", async () => {
+test("B-045: the status lines show the floor, the free memory, a hold and an unsatisfiable floor", async () => {
+  const lines = (gate) => internals.queueMemoryStatusLines(gate).join("\n");
+  assert.match(
+    lines({ floorMb: 0, freeMb: 5000, totalMb: 16000, blocked: false }),
+    /Minimum free memory to start a queue job \(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): disabled \(0\)\nFree memory now: 5000 MB of 16000 MB$/
+  );
+  const held = lines({ floorMb: 1024, freeMb: 100, totalMb: 16000, blocked: true });
+  assert.match(held, /\(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): 1024 MB/);
+  assert.match(held, /Free memory now: 100 MB of 16000 MB/);
+  assert.match(held, /Queue starts held for low memory/);
+  // A floor the machine can never satisfy is called out, not left to look like a stuck queue.
+  assert.match(
+    lines({ floorMb: 20000, freeMb: 5000, totalMb: 16000, blocked: true }),
+    /Warning: the free-memory floor \(20000 MB\) is not below the machine's total memory \(16000 MB\)/
+  );
+  assert.doesNotMatch(held, /Warning/);
+  // The tools print the same lines (one status call: it starts the real OpenCode version check).
   const repo = await makeRepo("b045-status");
-  let status = await callTool("get_opencode_bridge_status", { cwd: repo });
-  assert.match(status, /Minimum free memory to start a queue job \(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): disabled \(0\)/);
-  assert.match(status, /Free memory now: \d+ MB of \d+ MB/);
   await withMemory({ floorMb: 1024, freeMb: 100 }, async () => {
-    status = await callTool("get_opencode_bridge_status", { cwd: repo });
-    assert.match(status, /Minimum free memory to start a queue job \(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): 1024 MB/);
+    const status = await callTool("get_opencode_bridge_status", { cwd: repo });
+    assert.match(status, /\(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): 1024 MB/);
     assert.match(status, /Free memory now: 100 MB of \d+ MB/);
     assert.match(status, /Queue starts held for low memory/);
     const report = JSON.parse(await callTool("diagnose_opencode_bridge", { cwd: repo }));
     assert.equal(report.summary.minFreeMemoryMb, 1024);
     assert.equal(report.summary.freeMemoryMb, 100);
-  });
-  // A floor the machine can never satisfy is called out, not left to look like a stuck queue.
-  await withMemory({ floorMb: 100_000_000, freeMb: 5000 }, async () => {
-    assert.match(await callTool("get_opencode_bridge_status", { cwd: repo }), /Warning: the free-memory floor \(100000000 MB\) is not below the machine's total memory/);
   });
 });
 
@@ -400,13 +409,154 @@ test("B-045: with the floor disabled a low free-memory reading does not hold the
   }
 });
 
+// B-046 ------------------------------------------------------------------------------------
+
+const quietAfterHello = "process.stdout.write('hello'); setTimeout(() => {}, 30000)";
+
+test("B-046: an agent that writes nothing for the idle timeout is stopped and reported as idle", async () => {
+  const activity = [];
+  const started = Date.now();
+  const result = await internals.runSpawnCommand(process.execPath, ["-e", quietAfterHello], process.cwd(), 60_000, null, {
+    idleTimeoutMs: 1000,
+    onActivity: (atMs) => activity.push(atMs),
+  });
+  assert.equal(result.idleTimedOut, true, JSON.stringify(result).slice(0, 600));
+  assert.equal(result.timedOut, true, "an idle stop is a timeout for the retry rules");
+  assert.equal(result.exitCode, 124);
+  assert.equal(result.stdout, "hello");
+  assert.ok(Date.now() - started < 25_000, `stopped late: ${Date.now() - started} ms`);
+  assert.ok(activity.length >= 2, "the launch and the output are both activity");
+  assert.equal(result.terminationErrorType || "", "", "the process tree ended through the supervisor");
+  assert.equal(internals.classifyResultError({ ...result, dryRun: false, assistantFinalResponseDetected: false }), "agent_idle_timeout");
+});
+
+test("B-046: output keeps an agent alive, and the watchdog is off at 0", async () => {
+  const chatty = "let n = 0; const t = setInterval(() => { process.stdout.write('tick' + (n += 1) + '\\n'); if (n === 12) { clearInterval(t); } }, 150)";
+  const alive = await internals.runSpawnCommand(process.execPath, ["-e", chatty], process.cwd(), 60_000, null, { idleTimeoutMs: 900 });
+  assert.equal(alive.idleTimedOut, false);
+  assert.equal(alive.timedOut, false);
+  assert.equal(alive.exitCode, 0);
+  assert.match(alive.stdout, /tick12/);
+  const off = await internals.runSpawnCommand(process.execPath, ["-e", "setTimeout(() => {}, 1500)"], process.cwd(), 60_000, null, { idleTimeoutMs: 0 });
+  assert.equal(off.idleTimedOut, false);
+  assert.equal(off.exitCode, 0);
+  assert.equal(internals.CONFIG.agentIdleTimeoutMs, 0, "disabled unless CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS is set");
+});
+
+test("B-046: the idle result is reported like a timeout but named agent_idle_timeout", () => {
+  const resolution = { requestedAgent: "builder", actualAgent: "builder" };
+  const idle = {
+    exitCode: 124, timedOut: true, idleTimedOut: true, idleTimeoutMs: 600000, timeoutMs: 1800000, errorType: "agent_idle_timeout",
+    dryRun: false, changedFiles: ["src/a.txt"], worktree: { path: "C:/work/wt", removed: false }, assistantFinalResponseDetected: false,
+  };
+  assert.equal(internals.classifyResultError({ exitCode: 124, timedOut: true, idleTimedOut: true, dryRun: false }), "agent_idle_timeout");
+  assert.equal(internals.classifyResultError({ exitCode: 124, timedOut: true, dryRun: false }), "agent_timeout");
+  const lines = internals.compactJobLines({ resolution, result: idle }).join("\n");
+  assert.match(lines, /Idle timeout: yes \(no output for 600000 ms\)/);
+  assert.match(lines, /Timed out with changes: stopped as idle after writing 1 changed file\(s\); worktree retained/);
+  const preamble = internals.formatSingleResultParts({ resolution, result: idle, cwd: "C:/work", lockPlan: null }).preamble;
+  assert.match(preamble, /Agent idle timeout: the agent wrote no output for 600000 ms \(CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS\) and was stopped/);
+  assert.match(preamble, /^Error type: agent_idle_timeout$/m);
+});
+
+test("B-046: a running job shows when its agent last wrote (idle time), a finished or foreign job does not", async () => {
+  const jobId = "builder-idle-display-1";
+  const base = { jobId, agent: "builder", mode: "write", status: "running", childProcessStartedAt: new Date().toISOString(), agentStartedAt: new Date().toISOString() };
+  assert.deepEqual(internals.queueAgentActivity(base), {}, "no activity known yet");
+  const now = Date.now();
+  internals.noteAgentActivity(jobId, now - 3 * 60_000 - 5_000);
+  try {
+    const activity = internals.queueAgentActivity(base, now);
+    assert.equal(activity.idleMs, 3 * 60_000 + 5_000);
+    assert.equal(activity.lastActivityAt, new Date(now - 3 * 60_000 - 5_000).toISOString());
+    assert.match(internals.compactQueueJobLines([base]), /status=running stage=agent_running[^\n]* idle 3m\b/);
+    // Not running (finished, or still starting): nothing to show.
+    assert.deepEqual(internals.queueAgentActivity({ ...base, status: "failed" }, now), {});
+    assert.deepEqual(internals.queueAgentActivity({ ...base, childProcessStartedAt: "" }, now), {});
+    assert.deepEqual(internals.queueAgentActivity({ ...base, jobId: "builder-other-bridge" }, now), {});
+    assert.doesNotMatch(internals.compactQueueJobLines([{ ...base, status: "completed" }]), /idle /);
+  } finally {
+    internals.agentActivityByJobId.delete(jobId);
+  }
+  assert.deepEqual([0, 12_000, 59_999, 60_000, 180_000, 3_599_000, 3_900_000].map(internals.formatIdleDuration), ["0s", "12s", "59s", "1m", "3m", "59m", "1h05m"]);
+});
+
+test("B-046: list_opencode_jobs and get_opencode_job report the idle time of a job whose agent is running", async () => {
+  const repo = await makeSourceRepo("b046-display");
+  let release = () => {};
+  const hold = new Promise((resolve) => { release = resolve; });
+  let atRun = null;
+  installRuntime({});
+  const runtime = hooks.agentRuntimeTestHook;
+  hooks.agentRuntimeTestHook = {
+    ...runtime,
+    runOpenCodeWithPolicy: async (agent, prompt, cwd, dryRun, lockPlan, timeoutMs, options = {}) => {
+      // What runOpenCode does: the supervisor identity is persisted (the job is then agent_running)
+      // and the agent's output keeps noting activity under the job id of the provider-wait store.
+      const jobId = internals.providerSlotWaitStorage.getStore()?.jobId;
+      await options.onSpawn?.({ pid: process.pid, startedAt: new Date().toISOString(), processRole: "supervisor", containmentIdentity: "round5-fixture" });
+      internals.noteAgentActivity(jobId, Date.now() - 4 * 60_000);
+      atRun = jobId;
+      await hold;
+      internals.agentActivityByJobId.delete(jobId);
+      return runtime.runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan);
+    },
+  };
+  const jobId = await enqueueWriter(repo);
+  try {
+    const deadline = Date.now() + 20_000;
+    while (atRun !== jobId && Date.now() < deadline) await sleep(25);
+    assert.equal(atRun, jobId, "the job reached its agent");
+    const listing = await callTool("list_opencode_jobs", { cwd: repo });
+    assert.match(listing, new RegExp(`${jobId}[^\\n]*status=running stage=agent_running[^\\n]* idle 4m\\b`), listing);
+    const view = JSON.parse(await callTool("get_opencode_job", { jobId, cwd: repo }));
+    assert.equal(view.runStage, "agent_running");
+    assert.ok(view.idleMs >= 4 * 60_000 && view.idleMs < 4 * 60_000 + 30_000, JSON.stringify(view));
+    assert.ok(Date.parse(view.lastActivityAt) <= Date.now() - 4 * 60_000 + 1000);
+    const detail = JSON.parse(await callTool("get_opencode_job", { jobId, cwd: repo, detail: true }));
+    assert.ok(detail.idleMs >= 4 * 60_000);
+    const diagnose = JSON.parse(await callTool("diagnose_opencode_bridge", { cwd: repo }));
+    assert.ok(diagnose.jobs.find((job) => job.jobId === jobId)?.idleMs >= 4 * 60_000);
+  } finally {
+    release();
+    const finished = await waitForQueueJob(jobId);
+    hooks.agentRuntimeTestHook = null;
+    assert.equal(finished.status === "completed" || finished.status === "failed", true);
+    await dropRetainedWorktrees(repo, jobId);
+  }
+  assert.doesNotMatch(await callTool("list_opencode_jobs", { cwd: repo }), /idle \d/, "a finished job shows no idle time");
+});
+
+test("B-046: a queued writer stopped as idle fails as agent_idle_timeout and keeps its worktree", async () => {
+  const repo = await makeSourceRepo("b046-queue");
+  installRuntime({
+    onRun: async ({ cwd }) => internals.writeFile(path.join(cwd, "src", "a.txt"), "edit before the stall\n", "utf8"),
+    outcome: () => ({ exitCode: 124, timedOut: true, idleTimedOut: true, idleTimeoutMs: 600000, timeoutMs: 1800000, errorType: "agent_idle_timeout", stdout: "", assistantFinalResponseDetected: false }),
+  });
+  const jobId = await enqueueWriter(repo);
+  try {
+    const record = await waitForQueueJob(jobId);
+    assert.equal(record.status, "failed");
+    assert.equal(record.errorType, "agent_idle_timeout");
+    assert.deepEqual(record.changedFiles, ["src/a.txt"]);
+    assert.ok(record.worktreePath, "the worktree is retained");
+    assert.match(record.errorReason, /^stopped as idle after writing 1 changed file\(s\); worktree retained/);
+    assert.equal(record.completionOutcome, "timed_out_with_changes");
+    assert.match(await callTool("list_opencode_jobs", { cwd: repo }), /error=agent_idle_timeout[^\n]*note="stopped as idle after writing 1 changed file\(s\); worktree retained"/);
+  } finally {
+    hooks.agentRuntimeTestHook = null;
+    await dropRetainedWorktrees(repo, jobId);
+  }
+});
+
 let failed = 0;
 const skips = [];
 try {
   for (const { name, fn } of tests) {
+    const startedAt = Date.now();
     try {
       await fn();
-      process.stdout.write(`ok   ${name}\n`);
+      process.stdout.write(`ok   ${name} (${Date.now() - startedAt} ms)\n`);
     } catch (error) {
       if (error instanceof SkipTest) {
         skips.push({ name, reason: error.message, optional: error.optional });
