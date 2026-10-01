@@ -10908,6 +10908,225 @@ async function collectIntegrationPatchUntimed({ cwd, worktreePath = "", branch =
   };
 }
 
+// The write plan a patch's changed files are validated against: the same shape for a single
+// integration and for each item of a batch.
+function integrationScopePlan({ cwd, allowedEdits, forbiddenEdits = [], sharedFiles = [], serialOnly = [] }) {
+  const allowed = normalizeLockPathList(allowedEdits);
+  return {
+    agent: "merge_manager",
+    cwd,
+    lockType: "write",
+    lockMode: "serial_integration",
+    lockedPaths: allowed,
+    allowedEdits: allowed,
+    forbiddenEdits: mergePathLists(DEFAULT_FORBIDDEN_EDIT_PATHS, forbiddenEdits),
+    sharedFiles: normalizeLockPathList(sharedFiles),
+    serialOnly: normalizeLockPathList(serialOnly),
+    scopeContract: null,
+  };
+}
+
+// I-002: one integration of several disjoint worktrees/branches. A batch is capped so one call
+// stays inside the client's tool timeout (every item rehashes its own source tree).
+const INTEGRATION_BATCH_MAX_ITEMS = 25;
+const INTEGRATION_BATCH_COLLECT_CONCURRENCY = 4;
+
+function integrationBatchItemLabel(item) {
+  return item.worktreePath ? path.resolve(item.worktreePath) : `branch ${item.branch}`;
+}
+
+// Paths two items both write, or one writes below a path the other writes as a file. Compared
+// case-folded, like the target-movement check.
+function integrationBatchOverlaps(itemFiles) {
+  const owner = new Map();
+  const conflicts = [];
+  const seen = new Set();
+  const record = (file, other, current) => {
+    const key = `${file}\0${other}\0${current}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    conflicts.push({ path: file, items: [other + 1, current + 1] });
+  };
+  itemFiles.forEach((files, index) => {
+    for (const file of normalizeLockPathList(files)) {
+      const key = file.toLowerCase();
+      const other = owner.get(key);
+      if (other !== undefined && other !== index) record(file, other, index);
+      else owner.set(key, index);
+    }
+  });
+  itemFiles.forEach((files, index) => {
+    for (const file of normalizeLockPathList(files)) {
+      const key = file.toLowerCase();
+      for (let slash = key.lastIndexOf("/"); slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
+        const other = owner.get(key.slice(0, slash));
+        if (other !== undefined && other !== index) record(file, other, index);
+      }
+    }
+  });
+  return conflicts;
+}
+
+// Collects every item with the single-item collector, refuses anything that is not a clean,
+// in-scope, pairwise disjoint set of patches, and returns ONE composite patch shaped like a
+// single collectIntegrationPatch result (so the rest of the integration, the receipt, the
+// journal and the recovery run unchanged on it): the item patches concatenated in the caller's
+// order, patchSha256 of those exact bytes, and sourceStateSha256 / sourceBaseCommit that commit
+// to every item's own identity. Because the paths are disjoint the concatenation applies the
+// same as applying the items one after the other.
+async function collectIntegrationBatchPatch({ cwd, items, sourceBaseCommit = "", forbiddenEdits = [], sharedFiles = [], serialOnly = [] }) {
+  const fail = (errorType, error, extra = {}) => ({ ok: false, errorType, error, ...extra });
+  if (!Array.isArray(items) || !items.length) {
+    return fail("integration_batch_empty", "A batch integration needs at least one item.");
+  }
+  if (items.length > INTEGRATION_BATCH_MAX_ITEMS) {
+    return fail("integration_batch_too_large", `A batch integration takes at most ${INTEGRATION_BATCH_MAX_ITEMS} items; this one has ${items.length}. Split it into batches of ${INTEGRATION_BATCH_MAX_ITEMS} or fewer.`);
+  }
+  const malformed = items
+    .map((item, index) => ({ index, both: Boolean(item.worktreePath) === Boolean(item.branch), noScope: !normalizeLockPathList(item.allowedEdits || []).length }))
+    .filter((item) => item.both || item.noScope);
+  if (malformed.length) {
+    return fail(
+      "integration_batch_item_invalid",
+      `Batch item(s) ${malformed.map((item) => item.index + 1).join(", ")} must each name exactly one of worktreePath or branch and a non-empty allowedEdits.`,
+      { batchItemNumbers: malformed.map((item) => item.index + 1) }
+    );
+  }
+  // A base commit that is not an exact object id (the "batch:<hash>" marker of a batch whose items
+  // had different bases) cannot be passed down; each item then takes its own merge base again and
+  // the composite identity decides whether it is the reviewed one.
+  const baseHint = GIT_OBJECT_ID_PATTERN.test(String(sourceBaseCommit || "")) ? String(sourceBaseCommit) : "";
+  const collected = new Array(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      try {
+        collected[index] = await collectIntegrationPatch({
+          cwd,
+          worktreePath: items[index].worktreePath || "",
+          branch: items[index].worktreePath ? "" : items[index].branch || "",
+          sourceBaseCommit: baseHint,
+        });
+      } catch (error) {
+        collected[index] = fail("integration_patch_create_failed", redactSensitiveText(error?.message || String(error)));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(INTEGRATION_BATCH_COLLECT_CONCURRENCY, items.length) }, worker));
+  const failedIndex = collected.findIndex((result) => !result?.ok);
+  if (failedIndex !== -1) {
+    const failure = collected[failedIndex];
+    return {
+      ...failure,
+      ok: false,
+      error: `Batch item ${failedIndex + 1} of ${items.length} (${integrationBatchItemLabel(items[failedIndex])}): ${failure?.error || "the source could not be collected."} Nothing was applied.`,
+      batchItemNumbers: [failedIndex + 1],
+    };
+  }
+  const empty = collected.map((patch, index) => (patch.patch.trim() ? -1 : index)).filter((index) => index !== -1);
+  if (empty.length) {
+    return fail(
+      "integration_batch_item_empty",
+      `Batch item(s) ${empty.map((index) => `${index + 1} (${integrationBatchItemLabel(items[index])})`).join(", ")} changed nothing. A builder that wrote no files is not an integration (check its report); remove it from the batch.`,
+      { batchItemNumbers: empty.map((index) => index + 1) }
+    );
+  }
+  const pathless = collected.map((patch, index) => (normalizeLockPathList(patch.changedFiles || []).length ? -1 : index)).filter((index) => index !== -1);
+  if (pathless.length) {
+    return fail(
+      "integration_patch_paths_unknown",
+      `Batch item(s) ${pathless.map((index) => index + 1).join(", ")} carry a patch whose changed-file list is empty; the bridge refuses to validate or apply a patch whose paths it cannot list.`,
+      { batchItemNumbers: pathless.map((index) => index + 1) }
+    );
+  }
+  const outOfScope = [];
+  collected.forEach((patch, index) => {
+    const validation = validateChangedFilesForPlan({
+      changedFiles: patch.changedFiles,
+      lockPlan: integrationScopePlan({ cwd, allowedEdits: items[index].allowedEdits, forbiddenEdits, sharedFiles, serialOnly }),
+      parallel: false,
+    });
+    if (validation.disallowedFiles.length) outOfScope.push({ index, validation });
+  });
+  if (outOfScope.length) {
+    const first = outOfScope[0];
+    return fail(
+      changedFileValidationErrorType(first.validation),
+      `Batch item(s) ${outOfScope.map((item) => `${item.index + 1} (${integrationBatchItemLabel(items[item.index])})`).join(", ")} contain files outside their allowedEdits or inside forbidden/shared paths. Nothing was applied.`,
+      {
+        changedFiles: normalizeLockPathList(collected.flatMap((patch) => patch.changedFiles)),
+        disallowedFiles: normalizeLockPathList(outOfScope.flatMap((item) => item.validation.disallowedFiles)),
+        serialOnlyMatches: first.validation.serialOnlyMatches,
+        batchItemNumbers: outOfScope.map((item) => item.index + 1),
+      }
+    );
+  }
+  const overlapping = integrationBatchOverlaps(collected.map((patch) => patch.changedFiles));
+  if (overlapping.length) {
+    return fail(
+      "integration_batch_overlap",
+      `Batch items write the same paths: ${overlapping.slice(0, 8).map((conflict) => `${conflict.path} (items ${conflict.items.join(" and ")})`).join("; ")}${overlapping.length > 8 ? `; and ${overlapping.length - 8} more` : ""}. A batch takes only disjoint patches; integrate overlapping worktrees one after the other.`,
+      {
+        changedFiles: normalizeLockPathList(collected.flatMap((patch) => patch.changedFiles)),
+        overlappingPaths: overlapping.slice(0, 50),
+        batchItemNumbers: [...new Set(overlapping.flatMap((conflict) => conflict.items))].sort((left, right) => left - right),
+      }
+    );
+  }
+
+  const chunks = collected.map((patch) => {
+    const bytes = Buffer.isBuffer(patch.patchBytes) ? patch.patchBytes : Buffer.from(String(patch.patch || ""), "utf8");
+    return bytes.length && bytes[bytes.length - 1] !== 0x0a ? Buffer.concat([bytes, Buffer.from("\n")]) : bytes;
+  });
+  const patchBytes = Buffer.concat(chunks);
+  let lineStart = 1;
+  const summaries = collected.map((patch, index) => {
+    const lines = chunks[index].toString("utf8").split("\n").length - 1;
+    const summary = {
+      index: index + 1,
+      sourceType: patch.sourceType,
+      source: patch.source,
+      changedFiles: normalizeLockPathList(patch.changedFiles),
+      patchSha256: patch.patchSha256,
+      sourceStateSha256: patch.sourceStateSha256,
+      sourceBaseCommit: patch.sourceBaseCommit,
+      sourceHead: patch.sourceHead,
+      patchLineStart: lineStart,
+      patchLineCount: lines,
+    };
+    lineStart += lines;
+    return summary;
+  });
+  const identitySha256 = createHash("sha256")
+    .update(JSON.stringify(summaries.map((item) => [item.sourceType, item.source, item.sourceBaseCommit, item.sourceHead, item.patchSha256, item.sourceStateSha256])))
+    .digest("hex");
+  const bases = [...new Set(summaries.map((item) => item.sourceBaseCommit))];
+  return {
+    ok: true,
+    sourceType: "batch",
+    source: `batch of ${summaries.length} item(s)`,
+    // Sorted like git lists a single patch's files, whatever the order of the items.
+    changedFiles: normalizeLockPathList(collected.flatMap((patch) => patch.changedFiles)).sort(),
+    patch: patchBytes.toString("utf8"),
+    patchBytes,
+    patchSha256: createHash("sha256").update(patchBytes).digest("hex"),
+    sourceStateSha256: createHash("sha256").update("integration-batch-v1\0").update(identitySha256).digest("hex"),
+    sourceBaseCommit: bases.length === 1 ? bases[0] : `batch:${createHash("sha256").update(bases.join("\0")).digest("hex")}`,
+    sourceHead: "",
+    items: summaries,
+  };
+}
+
+// The item that holds line `line` (1-based) of a batch's combined patch, for messages about
+// flagged lines; null for a single-item patch.
+function integrationBatchItemAtLine(patch, line) {
+  const item = (patch?.items || []).find((candidate) => line >= candidate.patchLineStart && line < candidate.patchLineStart + candidate.patchLineCount);
+  return item ? { item: item.index, source: item.source, line: line - item.patchLineStart + 1 } : null;
+}
+
 async function writeTemporaryPatchFile(patch) {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-opencode-patch-"));
   const patchFile = path.join(dir, "changes.patch");
@@ -11500,7 +11719,7 @@ async function captureGitHead(cwd) {
   return result.stdout.trim();
 }
 
-function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget, cleanupAfterSuccess }) {
+function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget, cleanupAfterSuccess, items = null }) {
   return {
     cwd: path.resolve(cwd || process.cwd()),
     worktreePath: worktreePath ? path.resolve(worktreePath) : "",
@@ -11512,6 +11731,18 @@ function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, for
     validationCommand: String(validationCommand || "").trim(),
     allowDirtyTarget: Boolean(allowDirtyTarget),
     cleanupAfterSuccess: Boolean(cleanupAfterSuccess),
+    // I-002: a batch integration binds every item, in the caller's order, with its own scope and
+    // cleanup choice. A single integration has no such key, so its contract hash is unchanged.
+    ...(Array.isArray(items) && items.length
+      ? {
+          items: items.map((item) => ({
+            worktreePath: item.worktreePath ? path.resolve(item.worktreePath) : "",
+            branch: String(item.branch || ""),
+            allowedEdits: normalizeLockPathList(item.allowedEdits).sort(),
+            cleanupAfterSuccess: Boolean(item.cleanup),
+          })),
+        }
+      : {}),
   };
 }
 
@@ -11524,7 +11755,7 @@ function integrationContractSha256(options) {
 // caller can dry-run again with the same ones (the usual case: validationCommand only on apply).
 function integrationContractDifference(previewContract, applyContract) {
   if (!previewContract || !applyContract) return "";
-  const show = (value) => (Array.isArray(value) ? `[${value.join(", ")}]` : JSON.stringify(value));
+  const show = (value) => (Array.isArray(value) && value.every((item) => typeof item !== "object") ? `[${value.join(", ")}]` : JSON.stringify(value));
   const fields = Object.keys(applyContract)
     .filter((key) => JSON.stringify(previewContract[key]) !== JSON.stringify(applyContract[key]))
     .map((key) => `${key} (dry run ${show(previewContract[key])}, apply ${show(applyContract[key])})`);
@@ -11720,6 +11951,24 @@ async function integratePatchSerially(options) {
   }
 
   const targetCwd = path.resolve(targetRoot.stdout.trim());
+  // I-002: a batch's items carry their own scopes, normalized against the target like
+  // allowedEdits; the serial lock and the combined plan cover their union.
+  if (options.batch) {
+    const batchItems = (Array.isArray(options.batch.items) ? options.batch.items : []).map((item) => ({
+      worktreePath: item?.worktreePath ? path.resolve(item.worktreePath) : "",
+      branch: String(item?.branch || ""),
+      allowedEdits: normalizeLockPathListForCwd(item?.allowedEdits, targetCwd),
+      cleanup: Boolean(item?.cleanup),
+    }));
+    options = {
+      ...options,
+      batch: { ...options.batch, items: batchItems },
+      allowedEdits: batchItems.flatMap((item) => item.allowedEdits),
+      worktreePath: "",
+      branch: "",
+      cleanupAfterSuccess: false,
+    };
+  }
   const normalizedAllowed = normalizeLockPathListForCwd(options.allowedEdits, targetCwd);
   if (!normalizedAllowed.length) {
     return integratePatchWithoutSerialLock({ ...options, cwd: targetCwd });
@@ -11824,6 +12073,14 @@ async function integratePatchSerially(options) {
         cwd: targetCwd,
         worktreePath: options.worktreePath,
         deferCleanup: Boolean(options.deferCleanup),
+        beforeCleanupHook: options.beforeCleanupHook,
+      });
+    }
+    if (result.ok && result.status === "applied" && options.batch) {
+      await cleanupIntegratedBatchWorktreesWhileLocked({
+        result,
+        cwd: targetCwd,
+        items: options.batch.items,
         beforeCleanupHook: options.beforeCleanupHook,
       });
     }
@@ -12192,6 +12449,7 @@ async function integratePatchWithoutSerialLock({
   signal = null,
   integrationLock = null,
   previewMode = "full",
+  batch = null,
 }) {
   const requestedCwd = path.resolve(cwd || process.cwd());
   const targetRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], requestedCwd, 1000 * 15);
@@ -12203,6 +12461,11 @@ async function integratePatchWithoutSerialLock({
     };
   }
   const targetCwd = path.resolve(targetRoot.stdout.trim());
+  // I-002: a batch carries its own items; allowedEdits is then the union the serial lock covers.
+  const batchItems = Array.isArray(batch?.items) && batch.items.length ? batch.items : null;
+  if (batch && !batchItems) {
+    return { ok: false, errorType: "integration_batch_empty", error: "A batch integration needs at least one item." };
+  }
   if (signal?.aborted) {
     return {
       ok: false,
@@ -12219,12 +12482,21 @@ async function integratePatchWithoutSerialLock({
   // the target result still decides first, as when they ran one after the other.
   const [targetCapture, patchCapture] = await Promise.allSettled([
     captureIntegrationTargetState(targetCwd),
-    collectIntegrationPatch({
-      cwd: targetCwd,
-      worktreePath,
-      branch,
-      sourceBaseCommit: expectedSourceIdentity?.sourceBaseCommit || previewReceipt?.sourceBaseCommit || "",
-    }),
+    batchItems
+      ? collectIntegrationBatchPatch({
+          cwd: targetCwd,
+          items: batchItems,
+          sourceBaseCommit: previewReceipt?.sourceBaseCommit || "",
+          forbiddenEdits,
+          sharedFiles,
+          serialOnly,
+        })
+      : collectIntegrationPatch({
+          cwd: targetCwd,
+          worktreePath,
+          branch,
+          sourceBaseCommit: expectedSourceIdentity?.sourceBaseCommit || previewReceipt?.sourceBaseCommit || "",
+        }),
   ]);
   if (targetCapture.status === "rejected") throw targetCapture.reason;
   const targetState = targetCapture.value;
@@ -12265,6 +12537,7 @@ async function integratePatchWithoutSerialLock({
     validationCommand,
     allowDirtyTarget,
     cleanupAfterSuccess,
+    items: batchItems,
   });
   const contractSha256 = integrationContractSha256(contract);
   const currentPreviewIdentity = {
@@ -12352,18 +12625,7 @@ async function integratePatchWithoutSerialLock({
     };
   }
 
-  const lockPlan = {
-    agent: "merge_manager",
-    cwd: targetCwd,
-    lockType: "write",
-    lockMode: "serial_integration",
-    lockedPaths: normalizedAllowed,
-    allowedEdits: normalizedAllowed,
-    forbiddenEdits: mergePathLists(DEFAULT_FORBIDDEN_EDIT_PATHS, forbiddenEdits),
-    sharedFiles: normalizeLockPathList(sharedFiles),
-    serialOnly: normalizeLockPathList(serialOnly),
-    scopeContract: null,
-  };
+  const lockPlan = integrationScopePlan({ cwd: targetCwd, allowedEdits: normalizedAllowed, forbiddenEdits, sharedFiles, serialOnly });
   const sourceValidation = validateChangedFilesForPlan({ changedFiles: patch.changedFiles, lockPlan, parallel: false });
   if (sourceValidation.disallowedFiles.length) {
     return {
@@ -12425,11 +12687,18 @@ async function integratePatchWithoutSerialLock({
       }
       const secretLines = patchLikelySecretLines(patch.patch);
       if (secretLines.length && !acceptFlaggedSecretLines) {
+        // In a batch the numbers count lines of the combined patch; name the item and the line in it.
+        const flagged = patch.items
+          ? secretLines.slice(0, 10).map((line) => {
+              const where = integrationBatchItemAtLine(patch, line);
+              return where ? `${line} (item ${where.item}, ${where.source}, line ${where.line} of its patch)` : String(line);
+            }).join(", ")
+          : secretLines.slice(0, 10).join(", ");
         return {
           ok: false,
           status: "preview_rejected",
           errorType: "integration_preview_contains_sensitive_text",
-          error: `The patch adds what looks like a real credential (patch lines ${secretLines.slice(0, 10).join(", ")}${secretLines.length > 10 ? ", ..." : ""}). No review receipt was issued because the bridge cannot expose or silently redact essential review evidence. Remove the secret from the worktree and preview again, or, if you inspected those lines in the worktree and they hold no real credential, preview again with acceptFlaggedSecretLines: true.`,
+          error: `The patch adds what looks like a real credential (patch lines ${flagged}${secretLines.length > 10 ? ", ..." : ""}). No review receipt was issued because the bridge cannot expose or silently redact essential review evidence. Remove the secret from the worktree and preview again, or, if you inspected those lines in the worktree and they hold no real credential, preview again with acceptFlaggedSecretLines: true.`,
           changedFiles: patch.changedFiles,
           patchSha256: patch.patchSha256,
           patchPreview: "",
@@ -12514,6 +12783,7 @@ async function integratePatchWithoutSerialLock({
         allowDirtyTarget: Boolean(allowDirtyTarget),
         previewReceipt: generatedReceipt,
         validationGate: { status: "skipped_dry_run", command: validationCommand, exitCode: "not_run", durationMs: 0 },
+        ...(patch.items ? { batchItems: patch.items } : {}),
       };
     }
 
@@ -13074,6 +13344,7 @@ async function integratePatchWithoutSerialLock({
       allowDirtyTarget: Boolean(allowDirtyTarget),
       operationId: integrationOperationId,
       journalStatus: "committed",
+      ...(patch.items ? { batchItems: patch.items } : {}),
       ...(receiptEvidence.targetMoved
         ? {
             targetMovedSincePreview: {
@@ -13273,6 +13544,50 @@ async function cleanupIntegratedWorktreeWhileLocked({
       ? "The integrated worktree was removed, but its local source branch was retained."
       : "Integrated source worktree could not be removed.");
   }
+}
+
+// I-002: after a batch landed (one durable, validated operation) each requested worktree goes
+// through the single-item cleanup with its own source identity, so a worktree edited after review
+// is retained. One by one: removals share the repository's ref locks. A failure here never
+// replaces the committed integration result.
+async function cleanupIntegratedBatchWorktreesWhileLocked({ result, cwd, items, beforeCleanupHook = null }) {
+  const identities = Array.isArray(result.batchItems) ? result.batchItems : [];
+  const warnings = [];
+  let removed = 0;
+  let requested = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const identity = identities[index];
+    if (!identity) continue;
+    if (!item.cleanup || !item.worktreePath) {
+      identity.sourceCleanup = { cleanup: "not_requested" };
+      continue;
+    }
+    requested += 1;
+    const itemResult = {
+      ok: true,
+      status: "applied",
+      validationGate: result.validationGate,
+      patchSha256: identity.patchSha256,
+      sourceStateSha256: identity.sourceStateSha256,
+      sourceBaseCommit: identity.sourceBaseCommit,
+      integratedTargetStateSha256: result.integratedTargetStateSha256,
+      integratedTrackedStateSha256: result.integratedTrackedStateSha256,
+    };
+    try {
+      await cleanupIntegratedWorktreeWhileLocked({ result: itemResult, cwd, worktreePath: item.worktreePath, deferCleanup: false, beforeCleanupHook });
+    } catch (error) {
+      itemResult.sourceCleanup = { cleanup: "failed", error: redactSensitiveText(error?.message || String(error)) };
+      itemResult.cleanupWarning = itemResult.sourceCleanup.error;
+    }
+    identity.sourceCleanup = itemResult.sourceCleanup;
+    if (itemResult.sourceCleanup?.cleanup === "success") removed += 1;
+    if (itemResult.cleanupWarning) warnings.push(`item ${identity.index} (${item.worktreePath}): ${itemResult.cleanupWarning}`);
+  }
+  if (requested) {
+    result.sourceCleanup = { cleanup: removed === requested ? "success" : "partial", requested, removed, retained: requested - removed };
+  }
+  if (warnings.length) result.cleanupWarning = warnings.join(" ");
 }
 
 async function recordChangedFiles(runId, cwd, changedFiles, disallowedFiles = []) {
@@ -17048,7 +17363,7 @@ server.tool(
 
 server.tool(
   "integrate_opencode_worktree",
-  "Serially integrate one OpenCode worktree or branch after ownership, patch, conflict, and validation checks.",
+  "Serially integrate one OpenCode worktree or branch after ownership, patch, conflict, and validation checks. A dry run returns a previewReceipt that the apply must present; the receipt survives a target HEAD that only moved forward past commits touching none of the patched paths between the two calls, and is otherwise integration_preview_stale. To land several disjoint worktrees in one dry run and one apply, use integrate_opencode_worktrees.",
   {
     cwd: z.string().min(1).describe("Canonical target repository path where the patch should be checked or applied."),
     pipelineId: z.string().optional().describe("Optional pipeline id to append this integration result to its audit trail."),
@@ -17351,6 +17666,167 @@ server.tool(
             result.sourceCleanup ? `Source worktree cleanup: ${result.sourceCleanup.cleanup}` : "Source worktree cleanup: not requested",
             result.sourceCleanup?.branchCleanup ? `Source branch cleanup: ${result.sourceCleanup.branchCleanup}` : null,
             result.sourceCleanup?.reason ? `Source worktree cleanup reason: ${result.sourceCleanup.reason}` : null,
+            result.cleanupWarning ? `Cleanup warning: ${result.cleanupWarning}` : null,
+            formatValidationGateResult(result.validationGate),
+            formatIntegrationTimings(result.timings),
+          ].filter(Boolean).join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// I-002: integrate_opencode_worktrees. Landing N disjoint worktrees took 2N calls (a dry run and
+// an apply each). This is a separate tool, not an `items` mode of integrate_opencode_worktree,
+// because that tool's schema requires a top-level allowedEdits and carries the pipeline
+// parameters (pipelineId) a batch cannot honour; overloading it would have loosened a published
+// schema and made every parameter's meaning depend on a mode. It reuses the same engine:
+// integratePatchSerially runs the batch as ONE patch (see collectIntegrationBatchPatch), so the
+// receipt, serial lock, journal operation, validation, rollback and recovery are the single-item
+// ones, and all-or-nothing is a property of that one operation.
+const integrationBatchItemSchema = z
+  .object({
+    worktreePath: z.string().min(1).optional().describe("OpenCode worktree path containing uncommitted changes to integrate. Give worktreePath or branch."),
+    branch: z.string().min(1).optional().describe("Branch containing committed changes to integrate. Give worktreePath or branch."),
+    allowedEdits: z.array(z.string()).min(1).describe("Exact file or directory paths THIS item may change; the item is refused if its patch leaves them."),
+  })
+  .strict();
+
+function formatIntegrationBatchSummary(result, allowedEditsByItem = []) {
+  const items = Array.isArray(result.batchItems) ? result.batchItems : [];
+  const itemLines = items.map((item) => {
+    const cleanup = item.sourceCleanup ? ` [cleanup: ${item.sourceCleanup.cleanup}${item.sourceCleanup.reason ? ` (${item.sourceCleanup.reason})` : ""}]` : "";
+    return `  ${item.index}. ${item.source}: ${item.changedFiles.join(", ")} (patch ${item.patchSha256.slice(0, 12)})${cleanup}`;
+  });
+  return {
+    itemLines,
+    scopeLine: `Allowed edits per item: ${allowedEditsByItem.map((edits, index) => `${index + 1}: ${normalizeLockPathList(edits).join(", ")}`).join("; ")}`,
+  };
+}
+
+server.tool(
+  "integrate_opencode_worktrees",
+  `Serially integrate SEVERAL disjoint OpenCode worktrees or branches (at most ${INTEGRATION_BATCH_MAX_ITEMS}) as ONE all-or-nothing operation with one receipt. dryRun: true collects and checks every item (scope per item, no two items touching the same path, the combined patch applies) and returns one previewReceipt bound to all of them; the apply passes the same items and arguments plus reviewed: true and that receipt, and either lands every item as one journaled operation (one validationCommand run after all are applied, one rollback if it fails) or applies none. forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget and cleanupAfterSuccess apply to the whole batch; allowedEdits is per item. A source that changed nothing, or two items writing the same path, refuses the batch. A target HEAD that moves past commits touching none of the patched paths between the dry run and the apply does not invalidate the receipt. Not available for pipeline items (use integrate_opencode_worktree with pipelineId).`,
+  {
+    cwd: z.string().min(1).describe("Canonical target repository path where the patches should be checked or applied."),
+    items: z.array(integrationBatchItemSchema).min(1).max(INTEGRATION_BATCH_MAX_ITEMS).describe(`The worktrees/branches to integrate, in the order they are reviewed (the receipt binds the order). 1 to ${INTEGRATION_BATCH_MAX_ITEMS} items, pairwise disjoint paths.`),
+    forbiddenEdits: z.array(z.string()).optional().describe("Paths that must not change in any item."),
+    sharedFiles: z.array(z.string()).optional().describe("Shared/frozen paths that must not change in any item."),
+    serialOnly: z.array(z.string()).optional().describe("Serial-only paths that must not be integrated as part of a batch."),
+    validationCommand: z.string().optional().describe("Command run ONCE after every item is applied. Parsed without a shell. If it fails, no item stays applied."),
+    dryRun: z.boolean().optional().describe("Check every item and the combined patch without applying anything; returns the batch previewReceipt."),
+    reviewed: z.boolean().optional().describe("Required true for non-dry-run integration after the patches were reviewed."),
+    previewReceipt: integrationPreviewReceiptSchema.optional().describe("Exact receipt returned by the batch dry run. Required for apply; valid only for the same items, in the same order, with the same arguments."),
+    cleanupAfterSuccess: z.boolean().optional().describe("Remove each source worktree and its local branch after the batch passed a validationCommand. Defaults to true for the worktrees the bridge created; pass false to keep all."),
+    allowDirtyTarget: z.boolean().optional().describe("Allow integration into a target repo that already has changes (none of them on the batch's paths). Defaults to false."),
+    acceptFlaggedSecretLines: z.boolean().optional().describe("Dry run only: issue the receipt although the secret gate flagged patch lines, after you inspected those lines in the named item's worktree and found no real credential. Defaults to false."),
+    acceptBinaryHunks: z.boolean().optional().describe("Dry run only: issue the receipt although the combined patch has binary hunks for files without a known binary extension, after you inspected those files. Defaults to false."),
+    previewMode: z.enum(["full", "stat"]).optional().describe("Dry run output: full (default) prints the whole combined patch, subject to the preview size cap; stat prints per-file line counts and the patch SHA-256. The receipt is the same."),
+  },
+  async ({
+    cwd = "",
+    items = [],
+    forbiddenEdits = [],
+    sharedFiles = [],
+    serialOnly = [],
+    validationCommand = "",
+    dryRun = false,
+    reviewed = false,
+    previewReceipt = null,
+    cleanupAfterSuccess = undefined,
+    allowDirtyTarget = false,
+    acceptFlaggedSecretLines = false,
+    acceptBinaryHunks = false,
+    previewMode = "full",
+  }) => {
+    const started = nowMs();
+    const targetCwd = cwd || process.cwd();
+    const batchItems = (Array.isArray(items) ? items : []).map((item) => ({
+      worktreePath: item?.worktreePath || "",
+      branch: item?.branch || "",
+      allowedEdits: item?.allowedEdits || [],
+      cleanup: cleanupAfterSuccess ?? isBridgeGeneratedWorktree(targetCwd, item?.worktreePath),
+    }));
+    const integrationTimings = {};
+    const integrationStarted = nowMs();
+    const result = await integrationTimingStorage.run(integrationTimings, () => integratePatchSerially({
+      cwd: targetCwd,
+      batch: { items: batchItems },
+      allowedEdits: batchItems.flatMap((item) => item.allowedEdits),
+      forbiddenEdits,
+      sharedFiles,
+      serialOnly,
+      validationCommand,
+      dryRun,
+      reviewed,
+      previewReceipt,
+      allowDirtyTarget,
+      acceptFlaggedSecretLines,
+      acceptBinaryHunks,
+      previewMode,
+    }));
+    result.timings = { totalMs: Math.round(nowMs() - integrationStarted), phases: { ...integrationTimings } };
+    if (!result.ok) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              formatRejectedExecution({
+                headline: "Serial batch integration rejected.",
+                errorType: result.errorType || "integration_rejected",
+                reason: result.error || "Integration failed.",
+                requestedAgent: "merge_manager",
+                actualAgent: "none",
+                lockMode: "serial_integration",
+                durationMs: nowMs() - started,
+                conflictingPaths: result.overlappingPaths?.map((conflict) => conflict.path) || result.conflictingPaths || result.disallowedFiles || result.changedFiles || [],
+                allowedEdits: normalizeLockPathList(batchItems.flatMap((item) => item.allowedEdits)),
+                rollback: result.rollback?.rollback || "",
+                rollbackFiles: result.rollback?.rollbackFiles || [],
+                unresolvedFiles: result.rollback?.unresolvedFiles || [],
+                suggestedFix: result.suggestedFix || "Fix or remove the item named in the reason and dry-run the batch again; nothing was applied unless the reason says an operation needs recovery.",
+              }),
+              result.batchItemNumbers?.length ? `Batch item number(s) involved: ${result.batchItemNumbers.join(", ")}` : null,
+              result.validationGate ? formatValidationGateResult(result.validationGate) : null,
+              formatIntegrationTimings(result.timings),
+            ].filter(Boolean).join("\n\n"),
+          },
+        ],
+      };
+    }
+
+    const summary = formatIntegrationBatchSummary(result, batchItems.map((item) => item.allowedEdits));
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            "Serial batch integration accepted.",
+            "",
+            `Status: ${result.status}`,
+            `Items: ${result.batchItems?.length || 0}`,
+            `Dry run: ${result.dryRun ? "yes" : "no"}`,
+            result.targetMovedSincePreview ? formatIntegrationTargetMove(result.targetMovedSincePreview) : null,
+            ...summary.itemLines,
+            `Changed files from all items: ${result.changedFiles?.length ? result.changedFiles.join(", ") : "none detected"}`,
+            `Applied files: ${result.appliedFiles?.length ? result.appliedFiles.join(", ") : "none"}`,
+            `Pre-existing target changes: ${result.preExistingTargetChanges?.length ? result.preExistingTargetChanges.join(", ") : "none"}`,
+            `Dirty target explicitly allowed: ${result.allowDirtyTarget ? "yes (rollback cannot cover unrelated external mutations)" : "no"}`,
+            result.patchSha256 ? `Combined patch SHA-256: ${result.patchSha256}` : null,
+            result.sourceBaseCommit ? `Source base commit: ${result.sourceBaseCommit}` : null,
+            result.sourceStateSha256 ? `Source state SHA-256 (all items): ${result.sourceStateSha256}` : null,
+            result.targetStateSha256 ? `Target state SHA-256: ${result.targetStateSha256}` : null,
+            result.contractSha256 ? `Integration contract SHA-256: ${result.contractSha256}` : null,
+            result.operationId ? `Integration operation: ${result.operationId} (${result.journalStatus || "unknown"})` : null,
+            result.previewReceipt ? `Preview receipt: ${JSON.stringify(result.previewReceipt)}` : null,
+            previewMode === "stat" && result.patchStat ? `Patch stat (previewMode stat; the receipt covers the full combined patch):\n${result.patchStat}` : null,
+            previewMode !== "stat" && result.patchPreviewMaskedLines?.length ? `Patch preview masks the flagged values on combined patch lines ${result.patchPreviewMaskedLines.slice(0, 10).join(", ")}${result.patchPreviewMaskedLines.length > 10 ? ", ..." : ""} (acceptFlaggedSecretLines); the receipt covers the full unmasked patch SHA-256.` : null,
+            previewMode !== "stat" && result.patchPreview ? `Patch preview:\n${result.patchPreview}` : null,
+            summary.scopeLine,
+            `Forbidden edits: ${normalizeLockPathList(forbiddenEdits).length ? normalizeLockPathList(forbiddenEdits).join(", ") : "none specified"}`,
+            `Shared files frozen: ${normalizeLockPathList(sharedFiles).length ? normalizeLockPathList(sharedFiles).join(", ") : "none specified"}`,
+            result.sourceCleanup ? `Source worktree cleanup: ${result.sourceCleanup.cleanup} (${result.sourceCleanup.removed} of ${result.sourceCleanup.requested} removed)` : "Source worktree cleanup: not requested",
             result.cleanupWarning ? `Cleanup warning: ${result.cleanupWarning}` : null,
             formatValidationGateResult(result.validationGate),
             formatIntegrationTimings(result.timings),
@@ -25889,8 +26365,11 @@ export const __selfTest = {
     integrationCleanupTargetStateError,
     integrationPreviewReceiptError,
     capturePatchedPathsState,
+    collectIntegrationBatchPatch,
+    integrationBatchOverlaps,
     integrationPathsTouching,
     integrationTargetMovementEvidence,
+    INTEGRATION_BATCH_MAX_ITEMS,
     isManagedReadOnlyAgent,
     isOrchestratorAgent,
     isPathInside,
