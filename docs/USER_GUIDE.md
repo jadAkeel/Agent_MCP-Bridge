@@ -275,7 +275,8 @@ Writer output is **never merged automatically**. Integration happens in two step
 
 Safety checks during integration:
 
-- If anything changed between preview and apply, the bridge refuses with `integration_preview_stale`. Preview again.
+- If anything changed between preview and apply, the bridge refuses with `integration_preview_stale`. Preview again. The exception is a target whose HEAD only moved forward past commits that touch none of the patched paths: the receipt still applies and the result says `Target moved N commit(s) since preview; none touched the patched paths`.
+- Many disjoint worktrees (for example one new file each) can be previewed and applied together with `integrate_opencode_worktrees`: one receipt, and either every item lands or none does.
 - Failed, partial, unreviewed or not-yet-integrated worktrees are **kept**, so you never lose work.
 - If an agent needs a new package, it stops and returns `DEPENDENCY_REQUIRED {...}`. Codex then:
   1. adds the dependency itself, after your review;
@@ -464,6 +465,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `finalize_multi_agent_pipeline` | Final validation and reviewer/tester gates. |
 | | `abandon_multi_agent_pipeline` | Retire an obsolete pipeline. Never deletes unintegrated work. |
 | Integration | `integrate_opencode_worktree` | Dry-run preview, then receipt-bound apply. |
+| Batch integration | `integrate_opencode_worktrees` | The same for 1 to 25 disjoint worktrees at once: one receipt, one all-or-nothing apply. |
 | | `resolve_integration_quarantine` | Close a quarantine recovery cannot clear: `verify_restored` or `accept_current`. See [A quarantine that does not clear](#a-quarantine-that-does-not-clear). |
 | Locks (manual) | `acquire_agent_lock` / `release_agent_lock` / `list_agent_locks` | Exceptional debugging only. |
 | Sanitized data | `verify_sanitized_workspace` | Verifies a hash-pinned, read-only data workspace. |

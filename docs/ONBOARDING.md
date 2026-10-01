@@ -316,6 +316,12 @@ Integration is two calls of `integrate_opencode_worktree` with **the same argume
    the bridge removes the worktree and its branch.
 5. Run your project's real tests in `<project>` and commit.
 
+To land several disjoint worktrees at once (up to 25), `integrate_opencode_worktrees` takes
+`items: [{ worktreePath, allowedEdits }, ...]` and the same shared arguments, and works the same
+way: one dry run, one `previewReceipt` for the whole batch, one apply that lands every item or none.
+A commit that another process lands on your checkout between the dry run and the apply does not
+stale the receipt unless it touched one of the patched paths.
+
 **Checked:** a dry run and an apply with a branch source ran through the scratch bridge's MCP
 interface against the scratch project.
 
