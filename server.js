@@ -620,6 +620,10 @@ const integrationPreviewReceiptSchema = z
     targetHead: z.string().min(1),
     targetStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
     contractSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    // I-001: identity of the patched paths alone (HEAD entry, index entry and working bytes of
+    // each), bound into previewId. It lets the apply accept a target HEAD that moved on commits
+    // that left those paths alone. Receipts issued without it stay strict.
+    patchedPathsStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
   })
   .strict();
 
@@ -11308,6 +11312,141 @@ async function captureIntegrationTargetStateUntimed(cwd) {
   };
 }
 
+// I-001: a preview receipt binds the whole target (HEAD, tree, status, working patch, index,
+// ignored-file metadata), so any commit another process landed on a busy checkout made it stale,
+// even when the commit had nothing to do with the patched paths. A receipt issued with
+// patchedPathsStateSha256 survives a HEAD that only moved forward past commits that left the
+// patched paths alone; everything else stays the strict comparison.
+const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+// The changed paths (from `git diff --name-only`) that can affect how the patch lands on its
+// paths: a changed path equal to a patched path, a directory above one (a file/directory
+// switch), a path below one, or a .gitattributes file whose rules reach a patched path (it
+// changes line-ending conversion and filters). Compared case-folded so a case-insensitive
+// checkout never reads a rename of case as unrelated. Renames arrive as two paths
+// (--no-renames), so both sides count.
+function integrationPathsTouching(changedPaths, patchedFiles) {
+  const patched = new Set();
+  const patchedDirectories = new Set();
+  const patchedKeys = [];
+  for (const file of normalizeLockPathList(patchedFiles)) {
+    const key = file.toLowerCase();
+    patched.add(key);
+    patchedKeys.push(key);
+    for (let slash = key.lastIndexOf("/"); slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
+      patchedDirectories.add(key.slice(0, slash));
+    }
+  }
+  const touched = [];
+  for (const changed of normalizeLockPathList(changedPaths)) {
+    const key = changed.toLowerCase();
+    let hit = patched.has(key) || patchedDirectories.has(key);
+    for (let slash = key.lastIndexOf("/"); !hit && slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
+      hit = patched.has(key.slice(0, slash));
+    }
+    if (!hit && (key === ".gitattributes" || key.endsWith("/.gitattributes"))) {
+      const directory = key.slice(0, Math.max(0, key.length - ".gitattributes".length));
+      hit = !directory || patchedKeys.some((candidate) => candidate.startsWith(directory));
+    }
+    if (hit) touched.push(changed);
+  }
+  return touched;
+}
+
+// `git ls-tree` entries ("<mode> <type> <object>") of the patched paths at one commit; a path
+// the commit does not hold has no entry.
+async function integrationHeadEntries(cwd, head, files) {
+  const entries = new Map();
+  const wanted = normalizeLockPathList(files);
+  for (let offset = 0; offset < wanted.length; offset += 100) {
+    const result = await runGitReadOnlyCommand(
+      ["--literal-pathspecs", "ls-tree", "-z", head, "--", ...wanted.slice(offset, offset + 100)],
+      cwd,
+      1000 * 30
+    );
+    if (result.exitCode !== 0) {
+      const error = new Error(result.stderr || `Could not read the patched paths at ${head}.`);
+      error.errorType = "integration_target_state_failed";
+      throw error;
+    }
+    for (const record of splitNulSeparated(result.stdout)) {
+      const tab = record.indexOf("\t");
+      if (tab > 0) entries.set(record.slice(tab + 1), record.slice(0, tab));
+    }
+  }
+  return entries;
+}
+
+// One hash over what decides how a patch lands on its own paths: each path's entry in HEAD, its
+// index entry and its working-tree fingerprint. The three maps are keyed by normalized path.
+function patchedPathsStateSha256Of({ files, headEntries, indexSnapshot, workingSnapshot }) {
+  const hash = createHash("sha256");
+  hash.update("patched-paths-state-v1\n");
+  for (const file of normalizeLockPathList(files).sort()) {
+    hash.update(JSON.stringify([file, headEntries.get(file) ?? "", indexSnapshot.get(file) ?? "", workingSnapshot.get(file) ?? ""]));
+    hash.update("\n");
+  }
+  return hash.digest("hex");
+}
+
+async function capturePatchedPathsState(cwd, head, files) {
+  try {
+    const headEntries = await integrationHeadEntries(cwd, head, files);
+    const indexSnapshot = await gitIndexPathSnapshot(cwd, files);
+    const workingSnapshot = await exactIntegrationFileSnapshot(cwd, files);
+    return {
+      ok: true,
+      headEntries,
+      indexSnapshot,
+      workingSnapshot,
+      sha256: patchedPathsStateSha256Of({ files, headEntries, indexSnapshot, workingSnapshot }),
+    };
+  } catch (error) {
+    return { ok: false, error: redactSensitiveText(error?.message || String(error)) };
+  }
+}
+
+// Decides whether a receipt issued at previewHead may still be used at currentHead. All four must
+// hold, else the caller keeps the plain stale error: (a) previewHead is an ancestor of
+// currentHead (a fast-forward; a rewritten or switched history is not), (b) no path changed
+// between the two commits touches a patched path (integrationPathsTouching), (c) the patched
+// paths' HEAD entries, index entries and working bytes are the ones the receipt recorded, and
+// (d) the receipt carries that record at all. The caller has already verified the receipt's HMAC,
+// so previewHead and previewPathsStateSha256 are values this bridge issued.
+async function integrationTargetMovementEvidence({ cwd, previewHead, currentHead, files, previewPathsStateSha256 }) {
+  const reject = (reason) => ({ ok: false, reason });
+  if (!GIT_OBJECT_ID_PATTERN.test(String(previewHead || "")) || !GIT_OBJECT_ID_PATTERN.test(String(currentHead || ""))) {
+    return reject("a HEAD in the comparison is not a commit object id");
+  }
+  if (!/^[a-f0-9]{64}$/i.test(String(previewPathsStateSha256 || ""))) {
+    return reject("the receipt records no patched-path state to compare");
+  }
+  if (!normalizeLockPathList(files || []).length) return reject("the patch has no known paths to compare");
+  const ancestor = await runGitReadOnlyCommand(["merge-base", "--is-ancestor", previewHead, currentHead], cwd, 1000 * 15);
+  if (ancestor.exitCode === 1) return reject("the reviewed HEAD is not an ancestor of the current HEAD (history was rewritten or another branch was checked out)");
+  if (ancestor.exitCode !== 0) return reject(`git could not relate the two HEADs (${(ancestor.stderr || "").trim().slice(0, 200) || `exit ${ancestor.exitCode}`})`);
+  const diff = await runGitReadOnlyCommand(["diff", "--name-only", "-z", "--no-renames", previewHead, currentHead, "--"], cwd, 1000 * 30);
+  if (diff.exitCode !== 0) return reject(`git could not list the paths changed since the preview (${(diff.stderr || "").trim().slice(0, 200) || `exit ${diff.exitCode}`})`);
+  const touched = integrationPathsTouching(splitNulSeparated(diff.stdout), files);
+  if (touched.length) {
+    return reject(`commits since the preview changed ${touched.slice(0, 5).join(", ")}${touched.length > 5 ? ` and ${touched.length - 5} more` : ""}, which the patch touches or depends on`);
+  }
+  const count = await runGitReadOnlyCommand(["rev-list", "--count", `${previewHead}..${currentHead}`], cwd, 1000 * 15);
+  const commits = count.exitCode === 0 ? Number.parseInt(count.stdout.trim(), 10) : NaN;
+  if (!Number.isSafeInteger(commits) || commits < 1) return reject("git could not count the commits since the preview");
+  const state = await capturePatchedPathsState(cwd, currentHead, files);
+  if (!state.ok) return reject(`the patched paths could not be read (${state.error})`);
+  if (state.sha256.toLowerCase() !== String(previewPathsStateSha256).toLowerCase()) {
+    return reject("the HEAD, index or working-tree state of the patched paths is no longer the reviewed one");
+  }
+  return { ok: true, commits, previewHead, currentHead, headEntries: state.headEntries };
+}
+
+function formatIntegrationTargetMove(move) {
+  if (!move) return null;
+  return `Target moved ${move.commits} commit(s) since preview; none touched the patched paths (${String(move.previewHead).slice(0, 12)}..${String(move.currentHead).slice(0, 12)}).`;
+}
+
 // A read-only agent cannot move HEAD (its bash is limited to read-only git and is attested
 // before spawn), so any HEAD move during its run was made by another client: a new commit, or a
 // `commit --amend` / `pull --rebase` that rewrote history. Returns the move so the caller keeps
@@ -11436,7 +11575,7 @@ async function claimIntegrationPreviewReceipt(projectKey, previewId, expiresAt, 
   }
 }
 
-async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, contract = null, projectKey = "" }) {
+async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha256, contract = null, projectKey = "", patchedPathsStateSha256 = "" }) {
   const normalizedProjectKey = path.resolve(projectKey || process.cwd());
   const previewKey = await integrationPreviewKey();
   const createdAtMs = Date.now();
@@ -11466,6 +11605,7 @@ async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha25
     targetHead: targetState.targetHead,
     targetStateSha256: targetState.targetStateSha256,
     contractSha256,
+    ...(patchedPathsStateSha256 ? { patchedPathsStateSha256 } : {}),
   };
   const previewId = createHmac("sha256", previewKey).update(JSON.stringify(identity)).digest("hex");
   const receipt = {
@@ -11477,7 +11617,9 @@ async function makeIntegrationPreviewReceipt({ patch, targetState, contractSha25
   return receipt;
 }
 
-async function integrationPreviewReceiptError(receipt, expected, consume = false, projectKey = "") {
+// `evidence`, when given, receives { targetMoved } if the receipt was accepted although the
+// target HEAD moved since the preview (I-001).
+async function integrationPreviewReceiptError(receipt, expected, consume = false, projectKey = "", evidence = null) {
   if (!receipt) return "A reviewed apply requires the exact previewReceipt returned by a prior dry run.";
   sweepIntegrationPreviews();
   let parsed;
@@ -11492,8 +11634,15 @@ async function integrationPreviewReceiptError(receipt, expected, consume = false
     return "The integration preview receipt has invalid or expired timestamps.";
   }
   const fields = ["patchSha256", "sourceBaseCommit", "sourceStateSha256", "targetHead", "targetStateSha256", "contractSha256"];
+  // The target fields are decided after the receipt's HMAC is verified (below): a moved HEAD may
+  // still be accepted, and that decision runs git with values taken from the receipt.
+  let targetMismatch = "";
   for (const field of fields) {
     if (parsed[field] === expected[field]) continue;
+    if (field === "targetHead" || field === "targetStateSha256") {
+      targetMismatch ||= field;
+      continue;
+    }
     if (field === "contractSha256") {
       const difference = integrationContractDifference(INTEGRATION_PREVIEWS.get(parsed.previewId)?.contract, expected.contract);
       if (difference) return `Integration preview does not match this apply. ${difference}`;
@@ -11511,6 +11660,7 @@ async function integrationPreviewReceiptError(receipt, expected, consume = false
     targetHead: parsed.targetHead,
     targetStateSha256: parsed.targetStateSha256,
     contractSha256: parsed.contractSha256,
+    ...(parsed.patchedPathsStateSha256 ? { patchedPathsStateSha256: parsed.patchedPathsStateSha256 } : {}),
   };
   const expectedId = createHmac("sha256", previewKey).update(JSON.stringify(identity)).digest("hex");
   const receivedBytes = Buffer.from(parsed.previewId, "hex");
@@ -11524,6 +11674,27 @@ async function integrationPreviewReceiptError(receipt, expected, consume = false
     || issued.projectKey !== normalizedProjectKey
     || JSON.stringify(issued.identity) !== JSON.stringify(identity))) {
     return "Integration preview receipt was not issued by this bridge process or was already consumed.";
+  }
+  if (targetMismatch) {
+    // Only a HEAD that moved can be reused, and only when the commits left the patched paths
+    // alone; a changed working tree or index with the same HEAD is the plain stale error.
+    let detail = "";
+    if (parsed.targetHead !== expected.targetHead) {
+      const moved = await integrationTargetMovementEvidence({
+        cwd: normalizedProjectKey,
+        previewHead: parsed.targetHead,
+        currentHead: expected.targetHead,
+        files: expected.changedFiles,
+        previewPathsStateSha256: parsed.patchedPathsStateSha256,
+      });
+      if (moved.ok) {
+        targetMismatch = "";
+        if (evidence) evidence.targetMoved = moved;
+      } else {
+        detail = ` (the target moved since the preview and the receipt cannot be carried over: ${moved.reason})`;
+      }
+    }
+    if (targetMismatch) return `Integration preview is stale: ${targetMismatch} changed after review${detail}.`;
   }
   try {
     if (!await claimIntegrationPreviewReceipt(normalizedProjectKey, parsed.previewId, expiresAt, consume)) {
@@ -12104,9 +12275,12 @@ async function integratePatchWithoutSerialLock({
     targetStateSha256: targetState.targetStateSha256,
     contractSha256,
     contract,
+    changedFiles: patch.changedFiles,
   };
+  // I-001: filled when the receipt is accepted although the target HEAD moved since the preview.
+  const receiptEvidence = {};
   if (!dryRun && reviewed) {
-    const earlyReceiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, false, targetCwd);
+    const earlyReceiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, false, targetCwd, receiptEvidence);
     if (earlyReceiptError) {
       const contractMismatch = earlyReceiptError.startsWith("Integration preview does not match this apply.");
       return {
@@ -12290,12 +12464,17 @@ async function integratePatchWithoutSerialLock({
       }
       let generatedReceipt;
       try {
+        // I-001: what the patch lands on, kept in the receipt so a later HEAD move that leaves
+        // these paths alone does not stale it. If the paths cannot be read (a directory where
+        // the patch expects a file, a file over the snapshot limit) the receipt stays strict.
+        const patchedPathsState = await capturePatchedPathsState(targetCwd, targetState.targetHead, patch.changedFiles);
         generatedReceipt = await makeIntegrationPreviewReceipt({
           patch,
           targetState,
           contractSha256,
           contract,
           projectKey: targetCwd,
+          patchedPathsStateSha256: patchedPathsState.ok ? patchedPathsState.sha256 : "",
         });
       } catch (error) {
         return {
@@ -12349,7 +12528,8 @@ async function integratePatchWithoutSerialLock({
     }
 
 
-    const receiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, true, targetCwd);
+    delete receiptEvidence.targetMoved;
+    const receiptError = await integrationPreviewReceiptError(previewReceipt, currentPreviewIdentity, true, targetCwd, receiptEvidence);
     if (receiptError) {
       return {
         ok: false,
@@ -12363,8 +12543,10 @@ async function integratePatchWithoutSerialLock({
       };
     }
 
-    // The receipt check above matched targetState in full (ignored-file metadata included);
-    // from here on only non-ignored drift fails the integration. B-026: a second full capture
+    // The receipt check above matched targetState in full (ignored-file metadata included), or,
+    // when the target HEAD had moved past commits that left the patched paths alone (I-001),
+    // matched the reviewed state of those paths; from here on only non-ignored drift fails the
+    // integration. B-026: a second full capture
     // here repeated finalPreApplyState below (same tracked identity, compared to the same
     // targetState, with only read-only work between them) and cost one whole-tree rehash.
     const simulation = await simulateIntegrationPatchSnapshot({
@@ -12384,18 +12566,40 @@ async function integratePatchWithoutSerialLock({
     expectedPostApplySnapshot = simulation.snapshot;
     preApplyExactSnapshot = await exactIntegrationFileSnapshot(targetCwd, patch.changedFiles);
     preApplyIndexSnapshot = await gitIndexPathSnapshot(targetCwd, patch.changedFiles);
+    if (receiptEvidence.targetMoved) {
+      // I-001: the receipt was carried over a moved HEAD on the strength of a read taken a moment
+      // ago. These are the very bytes and index entries the apply below protects (it re-reads the
+      // bytes right before the first write), so they must be the reviewed ones; HEAD itself is
+      // pinned to targetState by the final-preparation checks that follow.
+      const baselinePathsState = patchedPathsStateSha256Of({
+        files: patch.changedFiles,
+        headEntries: receiptEvidence.targetMoved.headEntries,
+        indexSnapshot: preApplyIndexSnapshot,
+        workingSnapshot: preApplyExactSnapshot,
+      });
+      if (baselinePathsState.toLowerCase() !== String(previewReceipt?.patchedPathsStateSha256 || "").toLowerCase()) {
+        return {
+          ok: false,
+          errorType: "integration_preview_stale",
+          error: "Integration preview is stale: the patched paths changed while the apply was being prepared (the target HEAD had moved since the preview). The patch was not applied and the source was retained.",
+          suggestedFix: "Run the dry run again to review the current patch and target, then apply with its new previewReceipt.",
+          changedFiles: patch.changedFiles,
+          expectedTargetHead: targetState.targetHead,
+        };
+      }
+    }
     rollbackBaseline = await captureRollbackBaseline(targetCwd, { files: patch.changedFiles });
     before = await gitChangedFileSnapshot(targetCwd, { includeIgnored: false });
     const finalPreApplyState = await captureIntegrationTargetState(targetCwd);
     if (!finalPreApplyState.ok
-      || rollbackBaseline.baseCommit !== previewReceipt.targetHead
+      || rollbackBaseline.baseCommit !== targetState.targetHead
       || finalPreApplyState.trackedStateSha256 !== targetState.trackedStateSha256) {
       return {
         ok: false,
         errorType: "integration_preview_stale",
         error: "Integration target changed during final preparation. The patch was not applied and the source was retained.",
         changedFiles: patch.changedFiles,
-        expectedTargetHead: previewReceipt.targetHead,
+        expectedTargetHead: targetState.targetHead,
         actualTargetHead: finalPreApplyState.targetHead || rollbackBaseline.baseCommit || "",
       };
     }
@@ -12417,12 +12621,12 @@ async function integratePatchWithoutSerialLock({
       }
       const headChanged = Boolean(
         immediatePreApplyState.targetHead
-        && immediatePreApplyState.targetHead !== previewReceipt.targetHead
+        && immediatePreApplyState.targetHead !== targetState.targetHead
       );
       if (headChanged) {
         const committedChanges = await runCommand(
           "git",
-          ["diff", "--name-only", "-z", "--no-renames", `${previewReceipt.targetHead}..${immediatePreApplyState.targetHead}`, "--"],
+          ["diff", "--name-only", "-z", "--no-renames", `${targetState.targetHead}..${immediatePreApplyState.targetHead}`, "--"],
           targetCwd,
           1000 * 15,
         );
@@ -12436,7 +12640,7 @@ async function integratePatchWithoutSerialLock({
         error: "Integration target changed immediately before patch application. The reviewed patch was not applied, external state was retained, and the source remains available.",
         changedFiles: patch.changedFiles,
         unexpectedTargetChanges: unresolvedFiles,
-        expectedTargetHead: previewReceipt.targetHead,
+        expectedTargetHead: targetState.targetHead,
         actualTargetHead: immediatePreApplyState.targetHead || "",
         rollback: {
           rollback: headChanged || unresolvedFiles.length ? "not_attempted_unattributed_changes" : "not_needed",
@@ -12491,7 +12695,7 @@ async function integratePatchWithoutSerialLock({
     const applied = await applyPatchFile({
       cwd: targetCwd,
       patchFile,
-      targetHead: previewReceipt.targetHead,
+      targetHead: targetState.targetHead,
       files: patch.changedFiles,
       baselineSnapshot: preApplyExactSnapshot,
       signal,
@@ -12539,13 +12743,13 @@ async function integratePatchWithoutSerialLock({
     patchApplied = true;
 
     const postApplyHead = await captureGitHead(targetCwd);
-    if (postApplyHead !== previewReceipt.targetHead) {
+    if (postApplyHead !== targetState.targetHead) {
       return {
         ok: false,
         errorType: "integration_target_head_changed",
         error: "Target HEAD changed during patch application. No rollback or index reset was attempted because ownership is ambiguous; the source was retained.",
         changedFiles: patch.changedFiles,
-        expectedTargetHead: previewReceipt.targetHead,
+        expectedTargetHead: targetState.targetHead,
         actualTargetHead: postApplyHead,
         indexReset: { ok: false, resetFiles: [], ownershipMismatches: patch.changedFiles, errors: ["Target HEAD changed; index ownership is ambiguous."] },
         rollback: { rollback: "not_attempted_unattributed_changes", rollbackFiles: [], unresolvedFiles: patch.changedFiles, ownershipMismatches: patch.changedFiles },
@@ -12708,14 +12912,14 @@ async function integratePatchWithoutSerialLock({
       // Exact evidence is mandatory for acceptance; retain potentially external content.
     }
     const postValidationHead = await captureGitHead(targetCwd);
-    if (postValidationHead !== previewReceipt.targetHead) {
+    if (postValidationHead !== targetState.targetHead) {
       return {
         ok: false,
         errorType: "integration_target_head_changed",
         error: "Target HEAD changed during validation. No rollback or index reset was attempted because ownership is ambiguous; the source was retained.",
         changedFiles: patch.changedFiles,
         appliedFiles: postValidationFiles,
-        expectedTargetHead: previewReceipt.targetHead,
+        expectedTargetHead: targetState.targetHead,
         actualTargetHead: postValidationHead,
         validationGate,
         indexReset: { ok: false, resetFiles: [], ownershipMismatches: patch.changedFiles, errors: ["Target HEAD changed; index ownership is ambiguous."] },
@@ -12787,14 +12991,14 @@ async function integratePatchWithoutSerialLock({
     }
 
     const finalTargetHead = await captureGitHead(targetCwd);
-    if (finalTargetHead !== previewReceipt.targetHead) {
+    if (finalTargetHead !== targetState.targetHead) {
       return {
         ok: false,
         errorType: "integration_target_head_changed",
         error: "Target HEAD changed before integration completion. The isolated real index was preserved, no ambiguous rollback was attempted, and the source was retained.",
         changedFiles: patch.changedFiles,
         appliedFiles,
-        expectedTargetHead: previewReceipt.targetHead,
+        expectedTargetHead: targetState.targetHead,
         actualTargetHead: finalTargetHead,
         validationGate,
         indexReset,
@@ -12870,6 +13074,15 @@ async function integratePatchWithoutSerialLock({
       allowDirtyTarget: Boolean(allowDirtyTarget),
       operationId: integrationOperationId,
       journalStatus: "committed",
+      ...(receiptEvidence.targetMoved
+        ? {
+            targetMovedSincePreview: {
+              commits: receiptEvidence.targetMoved.commits,
+              previewHead: receiptEvidence.targetMoved.previewHead,
+              currentHead: receiptEvidence.targetMoved.currentHead,
+            },
+          }
+        : {}),
     };
   } catch (error) {
     if (!patchApplied && error?.errorType === "pipeline_terminal") {
@@ -17115,6 +17328,7 @@ server.tool(
             `Source type: ${result.sourceType || "unknown"}`,
             `Source: ${result.source || "not specified"}`,
             `Dry run: ${result.dryRun ? "yes" : "no"}`,
+            result.targetMovedSincePreview ? formatIntegrationTargetMove(result.targetMovedSincePreview) : null,
             `Changed files from source: ${result.changedFiles?.length ? result.changedFiles.join(", ") : "none detected"}`,
             `Applied files: ${result.appliedFiles?.length ? result.appliedFiles.join(", ") : "none"}`,
             `Pre-existing target changes: ${result.preExistingTargetChanges?.length ? result.preExistingTargetChanges.join(", ") : "none"}`,
@@ -25674,6 +25888,9 @@ export const __selfTest = {
     integratePatchSerially,
     integrationCleanupTargetStateError,
     integrationPreviewReceiptError,
+    capturePatchedPathsState,
+    integrationPathsTouching,
+    integrationTargetMovementEvidence,
     isManagedReadOnlyAgent,
     isOrchestratorAgent,
     isPathInside,

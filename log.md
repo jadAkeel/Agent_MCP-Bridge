@@ -16,6 +16,14 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-01
 
+### Integration receipts on a busy target, and batch integration (Claude, 2026-10-01)
+
+Found while landing about 70 builder worktrees, each writing one new file `out/<cat>/batch-NNN.json`, into one repository another process kept committing to. Branch `bridge/batch-integration` (worktree `C:\Users\10User\bridge-integ`) from `dc0ea73`. Tests: `tests/review-integration-batch.js` (in `npm test` after `review-provider-quota.js`).
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| I-001 | Every apply failed with `integration_preview_stale: targetHead changed after review` as soon as any commit landed on the target between the dry run and the apply, although none touched the patched paths. | The receipt binds `targetStateSha256`, a hash of the whole target (HEAD, tree, whole-tree status, working patch, index, ignored-file metadata), so any commit changed it. | The receipt now also carries `patchedPathsStateSha256` (bound into `previewId`): a hash of each patched path's HEAD entry, index entry and working-tree bytes. When only HEAD moved, `integrationTargetMovementEvidence` accepts the receipt if and only if (a) the reviewed HEAD is an ancestor of the current one, (b) `git diff --name-only --no-renames` between the two touches no patched path, no directory above or file below one, and no `.gitattributes` that reaches one, (c) the patched paths' current HEAD/index/working state hashes to the recorded value, and (d) the receipt carries that record. The check runs after the receipt's HMAC is verified, and the path state is checked a second time against the exact snapshots the apply protects. Everything else (a changed working tree or index with the same HEAD, a rewritten history, a receipt issued before this change) keeps the plain stale error. The apply pins the current HEAD for its own checks, and says `Target moved N commit(s) since preview; none touched the patched paths`. | `bridge/batch-integration` | fixed, not deployed |
+
 ### Provider quota exhaustion passed as success (Claude, 2026-10-01)
 
 Found while running 10 question-writing builders (google/antigravity-gemini-3.8-flash@high) on `C:\Users\10User\Desktop\leb\arena-question-authoring`; the run notes are in that repository's `bridge-issues.log.md`. Branch `bridge/quota-and-slots` (worktree `C:\Users\10User\bridge-quota`, its own `npm ci`) from `7e508c7`. Tests: `tests/review-provider-quota.js` (8 cases, in `npm test`).
