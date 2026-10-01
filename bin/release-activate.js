@@ -214,7 +214,15 @@ async function nextReleaseDirectory(releasesRoot) {
 
 function tomlHeader(line) {
   const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$/.exec(line);
-  return header ? header[1].trim() : null;
+  if (!header) return null;
+  // Canonicalize simple bare/quoted dotted keys, without interpreting dots
+  // inside a quoted key as table separators. Complex keys stay untouched and
+  // the document-level validator still refuses an unsafe rewrite.
+  const key = header[1].trim();
+  if (/^(?:[\w-]+|"[\w-]+"|'[\w-]+')(?:\s*\.\s*(?:[\w-]+|"[\w-]+"|'[\w-]+'))*$/.test(key)) {
+    return key.split(/\s*\.\s*/).map((part) => part.replace(/^["']|["']$/g, "")).join(".");
+  }
+  return key;
 }
 
 // Rewrites only the MCP entry's args line (in [mcp_servers.opencode]) and the hash
@@ -325,6 +333,52 @@ const BRIDGE_TIMEOUT_DEFAULTS_MS = {
 };
 const CLIENT_TIMEOUT_MARGIN_MS = 1000 * 60 * 5;
 
+function clientToolTimeoutSeconds(env = {}) {
+  const limit = (key) => Number(env[key]) > 0 ? Number(env[key]) : BRIDGE_TIMEOUT_DEFAULTS_MS[key];
+  const longest = Math.max(...Object.keys(BRIDGE_TIMEOUT_DEFAULTS_MS)
+    .filter((key) => key.endsWith("AGENT_TIMEOUT_MS") || /_(BUILDER|ORCHESTRATOR|CONTRACTOR)_TIMEOUT_MS$/.test(key))
+    .map(limit));
+  return Math.ceil((limit("CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS") + longest
+    + limit("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS") + CLIENT_TIMEOUT_MARGIN_MS) / 1000);
+}
+
+// Setup replaces the whole entry; activation still uses the narrower rewriteConfig.
+// Keep the untouched slices verbatim, including CRLFs and tables between the entry
+// and its env. Parse both documents with the existing TOML validator before writing.
+function rewriteCodexConfig(text, entryText) {
+  const spans = [];
+  let offset = 0;
+  let start = null;
+  for (const line of text.match(/[^\n]*\n|[^\n]+$/g) || []) {
+    const header = tomlHeader(line.replace(/\r?\n$/, ""));
+    if (header !== null) {
+      if (start !== null) spans.push([start, offset]);
+      start = /^mcp_servers\.opencode(?:\.|$)/.test(header) ? offset : null;
+    }
+    offset += line.length;
+  }
+  if (start !== null) spans.push([start, text.length]);
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const replacement = entryText.replace(/\r?\n/g, eol);
+  let rewritten = "";
+  let cursor = 0;
+  for (const [index, [from, to]] of spans.entries()) {
+    rewritten += text.slice(cursor, from);
+    if (index === 0) rewritten += replacement;
+    cursor = to;
+  }
+  rewritten += text.slice(cursor);
+  if (!spans.length) rewritten = text + (text && !text.endsWith("\n") ? eol : "") + replacement;
+  const [before, after] = parseTomlDocuments([text, rewritten]);
+  delete before.mcp_servers?.opencode;
+  const desired = after.mcp_servers?.opencode;
+  delete after.mcp_servers?.opencode;
+  // A fresh MCP parent is the only permitted addition outside the entry.
+  if (!before.mcp_servers && after.mcp_servers && !Object.keys(after.mcp_servers).length) delete after.mcp_servers;
+  if (!isDeepStrictEqual(before, after)) throw new Error("Setup would change TOML outside the opencode tables; nothing was written.");
+  return { text: rewritten, entry: desired, existed: spans.length > 0 };
+}
+
 function clientToolTimeoutWarning(text, env = {}) {
   let section = "";
   let toolTimeoutSec = null;
@@ -394,7 +448,7 @@ async function assertLiveConfigIs(configPath, expected, when) {
 async function replaceConfigAtomically(configPath, text, stamp, expected) {
   const stagedPath = `${configPath}.activating-${stamp}`;
   try {
-    await writeFile(stagedPath, text, "utf8");
+    await writeFile(stagedPath, text, { encoding: "utf8", mode: 0o600 });
     await assertLiveConfigIs(configPath, expected, "since this run read it");
     await renameWithRetry(stagedPath, configPath);
   } finally {
@@ -660,6 +714,18 @@ function claudeEntryFor(codexEntry) {
   return { type: "stdio", command: codexEntry.command, args: codexEntry.args, env: codexEntry.env };
 }
 
+function rewriteClaudeConfig(text, entry) {
+  const document = text === null ? {} : JSON.parse(text);
+  if (!document || typeof document !== "object" || Array.isArray(document)
+    || (document.mcpServers && (typeof document.mcpServers !== "object" || Array.isArray(document.mcpServers)))) {
+    throw new Error("Claude user config must be a JSON object with an object mcpServers.");
+  }
+  const desired = claudeEntryFor(entry);
+  if (sameClaudeEntry(document.mcpServers?.[SERVER_NAME], desired)) return text;
+  document.mcpServers = { ...document.mcpServers, [SERVER_NAME]: desired };
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
 function sameClaudeEntry(left, right) {
   return (left?.type || "stdio") === (right?.type || "stdio")
     && left?.command === right?.command
@@ -689,8 +755,30 @@ async function syncClaudeCodeEntry(configPath, {
   claude = claudeCodeCommand(),
   claudeConfigPath = defaultClaudeConfigPath(),
   env = process.env,
+  // Setup accepts an arbitrary user config filename. The CLI only routes to
+  // CLAUDE_CONFIG_DIR/.claude.json, so use the same entry builder with guarded
+  // atomic file registration for that mode, including first-time registration.
+  configOnly = false,
+  expectedText,
 } = {}) {
   const fail = (message) => ({ ok: false, updated: false, message });
+  if (configOnly) {
+    try {
+      const original = await readFile(claudeConfigPath, "utf8").catch((error) => { if (error.code === "ENOENT") return null; throw error; });
+      if (expectedText !== undefined && original !== expectedText) throw new Error("Claude config changed since setup read it; refusing a concurrent edit.");
+      const text = rewriteClaudeConfig(original, await loadMcpEntry(configPath, SERVER_NAME));
+      if (text === original) return { ok: true, updated: false, message: "Claude Code entry already matches; nothing to update." };
+      await mkdir(path.dirname(claudeConfigPath), { recursive: true });
+      const stamp = `${timestamp()}-${process.pid}`;
+      if (original !== null) {
+        await writeFile(`${claudeConfigPath}.setup-backup-${stamp}`, original, { flag: "wx", mode: 0o600 });
+        await replaceConfigAtomically(claudeConfigPath, text, stamp, original);
+      } else {
+        await writeFile(claudeConfigPath, text, { flag: "wx", mode: 0o600 });
+      }
+      return { ok: true, updated: true, message: `Claude Code entry registered in ${claudeConfigPath}.` };
+    } catch (error) { return fail(error.message); }
+  }
   if (!claude) {
     return fail("Claude Code executable not found (probed ~/.local/bin, npm prefixes and PATH); its MCP entry was NOT updated. Pass --skip-claude-code if Claude Code does not use this bridge.");
   }
@@ -1567,10 +1655,15 @@ export {
   assertCleanSourceTree,
   assertRewritePreservesConfig,
   claudeCodeCommand,
+  clientToolTimeoutSeconds,
   cleanupUnactivatedRelease,
   listReleases,
   repinnableServerSha256,
   resolveReleasesRoot,
   rewriteConfig,
+  rewriteCodexConfig,
+  rewriteClaudeConfig,
+  renameWithRetry,
+  replaceConfigAtomically,
   syncClaudeCodeEntry,
 };

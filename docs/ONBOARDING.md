@@ -25,6 +25,7 @@ instead of `&&` there.
 | --- | --- | --- |
 | Node.js | 22.12 or newer | `node --version` |
 | Git | Any current version (the scratch run used 2.39) | `git --version` |
+| Python | 3.11 or newer; config validation, doctor and smoke use `tomllib` | `python --version` |
 | OpenCode | The scratch run used 1.18.32; the Gemini profile's plugin manifest requires exactly that version | `opencode --version` |
 | Codex CLI | Any current version | `codex --version` |
 | Claude Code (optional) | Only if Claude Code will use the bridge too | `claude --version` |
@@ -39,11 +40,15 @@ claude auth status
 
 **Checked:** all five version commands and the three sign-in checks.
 
-`opencode auth list` shows the providers OpenCode has credentials for. The managed agent
+`opencode auth list` shows the providers OpenCode has credentials for. Most managed agent
 profiles use `opencode/muse-spark-1.3-contributor-free` (in the scratch run it answered with no
-extra sign-in); the sanitized reader uses `openai/gpt-5.6-terra`, which needs OpenCode's OpenAI
-sign-in. Add a provider with `opencode auth login`. The live smoke in step 8 proves that the
-configured model answers.
+extra sign-in); `reviewer` and `tester` currently pin `google/antigravity-gemini-3.8-flash`,
+which needs the managed Gemini plugin/profile and provider sign-in. The sanitized reader
+uses `openai/gpt-5.6-terra`, which needs OpenCode's OpenAI sign-in. Setup copies these reviewed
+profiles as they are; a pure health check proves discovery, not that every model is available.
+Use the managed Gemini profile for the shipped reviewer/tester, or review a pure-compatible
+profile change separately. Add a provider with `opencode auth login`. The live smoke in step 8
+proves that its selected agent's model answers (the default agent is `planner`).
 
 ## 2. Get the code and install it
 
@@ -70,6 +75,25 @@ ones fail `npm test`: `tests/review-spawn.js` needs a C compiler (`gcc` on `PATH
 knowingly for one run.
 
 ## 3. The OpenCode runtime folder
+
+### Fast path (setup covers steps 3–8)
+
+From the installed clone, run `npm run setup` (or `npm run setup -- --yes` to approve
+non-interactively). It checks step 1, previews every change, creates the runtime, writes the
+Codex entry and real server pin, registers Claude Code when installed, syncs agents/skills,
+and runs the doctor and **health-only** smoke. Restart Codex and Claude Code, then run
+`npm run smoke:live` once to prove provider readiness. Setup cannot sign in or restart clients
+for you. It does not run the full `npm test` suite from step 2.
+
+Defaults: `$CODEX_HOME` (or `~/.codex`), runtime `<CODEX_HOME>/opencode-bridge-runtime`,
+state `<CODEX_HOME>/codex-opencode-mcp`. Use `--codex-home`, `--runtime-dir`, `--state-dir`
+and `--claude-config` to isolate another setup, `--skip-claude-code` for Codex only,
+`--provider-limit N` (default 2), and `--dry-run` to preview without writing anything.
+The default profile is `pure`; `--profile gemini` requires the reviewed plugin cache and
+OpenCode 1.18.32 (see [Reference](REFERENCE.md#managed-gemini-oauth-profile)).
+Existing Codex configs are backed up as `config.toml.setup-backup-<time>`; only the
+`opencode` tables are replaced. Other TOML bytes stay identical. A second completed run
+is a no-op. The manual steps below explain what setup writes.
 
 The bridge must not run agents from your personal OpenCode config: it attests the managed
 profiles in `opencode/agents` and `opencode/skills` of this repository, copied into a folder of
@@ -170,7 +194,8 @@ returned inside one tool call. The full formula is in the Reference under "Confi
 
 ## 7. Connect Claude Code and check both entries match
 
-Skip this step if only Codex uses the bridge.
+Skip the Claude registration if only Codex uses the bridge; the managed-runtime sync and
+server pinning below are still required. `npm run setup -- --skip-claude-code` does all three safely.
 
 Claude Code needs the same command, arguments and environment as the Codex entry. Register it
 once, built from the Codex entry itself so nothing is retyped. `claude mcp add-json` takes the
@@ -195,6 +220,11 @@ npm run release:activate -- --sync-clients
 
 `sync-managed-runtime.js` is a dry run without `--apply`; it reads the target folders from the
 Codex entry (`--config <file>` for another one).
+The manual tools default to `~/.codex/config.toml`; when using a different `$CODEX_HOME`,
+pass `--config <CODEX_HOME>/config.toml` to sync, release sync, doctor and both smoke commands.
+Setup passes that explicit path itself. Its Claude registration uses the shared entry helper
+with atomic JSON file writes, so an arbitrary `--claude-config <file>` cannot accidentally
+route `claude mcp add-json` to the real `.claude.json`.
 
 `--sync-clients` re-pins `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` (and the plugin manifest hash
 in the Gemini profile) from the files themselves, health-checks a fresh bridge process, and

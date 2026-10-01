@@ -191,7 +191,7 @@ async function claudeEntryComparison(entry, claudeConfigPath) {
   return { failures, warnings: [] };
 }
 
-async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaudeConfigPath(), stateDir: stateDirOverride = "", quarantineMaxAgeMinutes = DEFAULT_QUARANTINE_MAX_AGE_MINUTES }) {
+async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaudeConfigPath(), stateDir: stateDirOverride = "", quarantineMaxAgeMinutes = DEFAULT_QUARANTINE_MAX_AGE_MINUTES, skipClaudeCode = false }) {
   const startedAt = Date.now();
   const failures = [];
   const warnings = [];
@@ -215,7 +215,7 @@ async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaud
         failures.push({ check: "release", message: errorMessage(error) });
       }
     }
-    const claude = await claudeEntryComparison(entry, claudeConfigPath);
+    const claude = skipClaudeCode ? { failures: [], warnings: ["Claude Code comparison skipped by setup."] } : await claudeEntryComparison(entry, claudeConfigPath);
     failures.push(...claude.failures);
     warnings.push(...claude.warnings);
   }

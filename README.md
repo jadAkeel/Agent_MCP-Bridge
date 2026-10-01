@@ -16,6 +16,7 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 - Node.js 22.12 or newer
 - Git
+- Python 3.11 or newer (`tomllib` is used by the config validator, doctor and health smoke)
 - OpenCode 1.18.32 on `PATH`: the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`). The Gemini profile refuses any other version; the default pure profile does not check it, but 1.18.32 is the tested version.
 - Codex CLI, with an MCP entry in `~/.codex/config.toml`; see [codex/config.example.toml](codex/config.example.toml)
 - Claude Code (optional), registered with the same entry; see [docs/ONBOARDING.md](docs/ONBOARDING.md) step 7
@@ -24,13 +25,21 @@ The setup is tested on Windows 11 only; macOS and Linux are not verified yet.
 
 ## Install
 
-```powershell
-git clone https://github.com/jadAkeel/Agent_MCP-Bridge.git <bridge-dir>
-cd <bridge-dir>
-npm ci
+```bash
+git clone https://github.com/jadAkeel/Agent_MCP-Bridge.git && cd Agent_MCP-Bridge && npm ci && npm run setup
 ```
 
-Then follow [docs/ONBOARDING.md](docs/ONBOARDING.md) steps 1 to 8: prerequisites and sign-in checks, the test suite, the OpenCode runtime folder, the Codex entry, the Claude Code entry and hash pinning, and the health checks.
+In Windows PowerShell 5.1, run those four commands on separate lines (`&&` requires PowerShell 7 or a POSIX shell).
+Then restart Codex and Claude Code, and run `npm run smoke:live` once.
+
+Setup checks prerequisites and sign-in, previews its changes for approval, creates the isolated
+runtime, registers both clients with the real server hash, copies managed agents/skills, and runs
+the doctor and health smoke. Re-running a completed setup changes nothing. Use
+`npm run setup -- --yes` for non-interactive approval, `--dry-run` for a write-free preview, or
+`--skip-claude-code` for Codex only. Defaults and the optional Gemini profile are in
+[docs/REFERENCE.md](docs/REFERENCE.md#one-command-setup). The manual explanation of steps 3–8
+remains in [docs/ONBOARDING.md](docs/ONBOARDING.md). Run `npm test` to verify the clone separately.
+The `agent-mcp-bridge` bin entry is ready for a future `npx` release; this package is still private and unpublished.
 
 ## Quick start
 

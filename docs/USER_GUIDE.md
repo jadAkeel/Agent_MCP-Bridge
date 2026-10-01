@@ -293,6 +293,7 @@ Run all of these from `<bridge-dir>`, your clone of the bridge repository (place
 
 | Command | What it does | When |
 | --- | --- | --- |
+| `npm run setup` (`-- --yes`, `--dry-run`, `--skip-claude-code`) | Preview/apply the first-run runtime and client entries, pin the server, sync profiles and run doctor/health. Repeated completed setup is a no-op. See [flags](REFERENCE.md#one-command-setup). | After `npm ci` in a new clone |
 | `npm run gc` | Dry run. Lists orphan worktrees, stale records, worktrees awaiting review, and dead project databases. Changes nothing. | Any time |
 | `npm run gc:apply` | Removes orphans (source repository gone), repairs the registry, prunes dead databases. | **Weekly** |
 | `npm run gc -- --include-retained --older-than 14 --apply` | Also removes reviewed-and-abandoned worktrees older than 14 days. Branches are kept. | Monthly, or when space is tight |

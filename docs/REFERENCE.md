@@ -464,6 +464,49 @@ Every `CODEX_OPENCODE_*` variable that `server.js` reads is listed here with its
 | `CODEX_OPENCODE_TERMINAL_PIPELINE_MAX_ROWS` | `10000` | Finished pipeline rows kept per state database. |
 | `CODEX_OPENCODE_TERMINAL_INTEGRATION_MAX_ROWS` | `10000` | Finished integration-operation rows kept per state database (unresolved and quarantined operations are kept). |
 
+## One-command setup
+
+`npm run setup -- [flags]` invokes `bin/setup.js`. The package also declares
+`agent-mcp-bridge` as its bin entry for future `npx` distribution; `private: true` remains
+set and no public npm package is available yet.
+
+| Flag | Meaning / default |
+| --- | --- |
+| `--yes` | Approve the displayed file changes without a prompt. Without approval, a non-interactive write exits 2. |
+| `--dry-run` | Print full new content and unified diffs for changed files, including managed profiles. No directories, backups or files are written. Auth checks (which can refresh credentials), doctor and smoke are deferred. |
+| `--skip-claude-code` | Do not register or compare Claude Code, even when an older entry exists. Missing `claude` also disables registration. |
+| `--profile pure\|gemini` | Default `pure` copies `opencode.jsonc` and runs OpenCode with `--pure`. Gemini also copies settings and a runtime-bound reviewed manifest, pins its hash and sets the exact plugin allowlist; OpenCode must be exactly 1.18.32. |
+| `--runtime-dir <dir>` | Dedicated XDG config root; default `<CODEX_HOME>/opencode-bridge-runtime`. Files live in its `opencode/` child. |
+| `--state-dir <dir>` | Bridge state; default `<CODEX_HOME>/codex-opencode-mcp`. |
+| `--codex-home <dir>` | Default `$CODEX_HOME`, else `~/.codex`; setup writes its `config.toml`. |
+| `--claude-config <file>` | Default `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`. Shared registration helper atomically updates this exact filename, preserving unrelated JSON values. |
+| `--provider-limit N` | Integer 1–32; default 2. |
+| `--self-test` | Scratch-only tests with no client installation or provider sign-in needed. |
+| `--help` | Show usage. |
+
+Required preflight: Node >=22.12, Git, OpenCode, Codex, and Python >=3.11 (`tomllib`,
+already used by the release/config/doctor helpers). Version mismatch in pure OpenCode is
+a warning, not a refusal. Client sign-in checks warn without stopping, and do not print
+credential output. First-run values match ONBOARDING §5; timeouts stay built-in, giving
+`tool_timeout_sec = 3000` using the shared §6 formula (5100 applies to raised timeouts).
+The server pin is computed from this checkout's bytes.
+
+Setup previews before requesting approval, backs up an existing Codex config as
+`config.toml.setup-backup-<time>`, keeps unrelated TOML byte-for-byte, and refuses invalid
+TOML, linked destinations or concurrent config edits. Existing changed Claude JSON also
+gets a setup backup. Completed repeated runs write nothing and do not rerun state-writing
+verification. Exit codes: **0** done/dry-run/no-op, **1** preflight failed, **2** write
+refused/failed (including verification failures). On failure inspect the printed checks
+and backups before retrying. Setup ends with restart Codex, restart Claude Code, and run
+`npm run smoke:live` once; it sends no model request itself.
+
+Gemini setup validates the config/settings against the reviewed manifest before rebinding
+its paths to the runtime copies; it does not install a plugin, regenerate trusted cache
+digests, copy OAuth account files or sign in. The existing reviewed plugin cache must
+already match [Managed Gemini OAuth profile](#managed-gemini-oauth-profile), and the health
+smoke will refuse a missing/mismatching cache. Windows 11 is the tested platform;
+POSIX code paths are guarded and self-testable, but macOS/Linux setup is not verified.
+
 ## Operational Boundaries
 
 - Bridge-owned Git commands run with a reduced environment, system/global configuration disabled, credential prompting disabled, and a process-unique nonexistent `core.hooksPath`. On Windows the bridge also forces `core.longpaths=true` for its own Git commands and its OpenCode children, because generated worktree roots plus repository-relative paths routinely exceed the legacy 260-character limit and global Git configuration is intentionally ignored. Repository-local filter/diff/merge drivers, credential/header rewrites, executable core controls, and config includes are rejected as `git_repository_config_unsafe` before worktree creation or patch capture. Worktrees start from a pinned committed `HEAD` and tree. Under the default `CODEX_OPENCODE_SOURCE_DIRT_POLICY=strict`, any source dirt—including unrelated dirt—is rejected as `dirty_worktree_requires_checkpoint`; `unrelated_ok` tolerates dirt outside the job scope and reports it. A newly created worktree that is not immediately clean is rejected as `worktree_created_dirty` and retained as evidence.

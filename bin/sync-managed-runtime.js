@@ -463,4 +463,4 @@ if (isMainModule(import.meta.url)) {
   });
 }
 
-export { planTree, runSync };
+export { assertNoLinkedComponents, planTree, runSync };

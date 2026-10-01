@@ -16,6 +16,49 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-01
 
+### One-command setup (Claude, 2026-10-01)
+
+Branch `bridge/setup-cli`, isolated worktree `<bridge-setup>` from `1176a18`, with its own
+`npm ci` (no dependency links, B-030). Setup and review tests use scratch `CODEX_HOME`,
+Claude JSON, XDG config/cache/data/state and bridge state. No live client or release
+activation is part of this change. `bin/setup.js --self-test` and
+`tests/review-setup-cli.js` are in `npm test` immediately after the operations-log self-test.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-048 | A fresh clone needed manual ONBOARDING steps 3–8, including ~15 env values, two client entries and a placeholder server pin. | No first-install command; release sync only re-pins an existing entry and refuses a missing Claude registration. | `npm run setup` / `agent-mcp-bridge` bin entry (package remains private): prerequisite/auth checks, isolated runtime, reviewed first-run env, actual server SHA-256, shared timeout formula (3000 s for built-in values), exact table replacement with backup/approval, shared Claude registration helper with atomic first-time JSON writes, imported managed sync, doctor and real MCP health smoke. Dry-run prints all content/diffs without writes; completed repeated setup is a byte-for-byte no-op. | (this commit) | fixed, not deployed |
+| B-049 | The listed prerequisites were insufficient: doctor, health smoke and release config validation require Python, but step 1 omitted it. | Existing helpers parse TOML with Python `tomllib`, which needs 3.11+. | Add Python >=3.11 to setup preflight, README and ONBOARDING; reuse the existing parser and hash helpers. | (this commit) | fixed, not deployed |
+| B-050 | ONBOARDING said to skip step 7 entirely without Claude Code, leaving checkout agents/skills unsynced and the placeholder server pin uncorrected. | Claude registration and mandatory runtime sync/pinning shared one section. | Clarify that only Claude registration is optional; `setup --skip-claude-code` still syncs/pins/verifies and deliberately skips comparison with a stale Claude entry. | (this commit) | fixed, not deployed |
+| B-051 | Manual maintenance commands could read the real Codex home after an operator selected a scratch/custom `CODEX_HOME`; an arbitrary Claude config filename cannot be selected by `claude mcp add-json`. | The existing sync/doctor/smoke default paths use `homedir()/.codex`, and Claude CLI routes to `CLAUDE_CONFIG_DIR/.claude.json`. | Setup always passes an explicit config path and uses `syncClaudeCodeEntry`'s opt-in atomic-file bootstrap mode for the exact Claude JSON path; existing release CLI behavior is retained. Document explicit `--config` for the manual commands. | (this commit) | fixed, not deployed |
+| B-052 | Copying the Gemini runtime files cannot make a fresh machine provider-ready by itself. | Manifest pins the exact OpenCode 1.18.32 host and reviewed plugin-cache tree; rebuilding/installing a different cache cannot be silently trusted, and OAuth sign-in is interactive. | Validate reviewed config/settings hashes, copy their bytes, rebind only manifest paths to runtime copies and pin the resulting manifest. Keep cache installation/digest review and sign-in operator-owned; health refuses an absent/mismatched cache. The final model smoke and client restarts remain explicit operator actions. | (this commit) | fixed, not deployed |
+| B-053 | Fresh scratch dry-run initially reported installed Claude Code as missing on Windows. | New npm Claude packages declare `bin/claude.exe`, not a JS entry; passing that native bin to Node fails the version probe. | Resolve npm shims through their package's bin metadata, running native `.exe` bins directly and JS bins through the absolute Node executable. Add a deterministic native-bin fixture regression. | (this commit) | fixed, not deployed |
+| B-054 | ONBOARDING step 1 claimed the managed profiles all used Muse; a pure health pass could be mistaken for reviewer/tester model readiness. | Shipped `reviewer.md` and `tester.md` pin `google/antigravity-gemini-3.8-flash`; health only discovers roles, and the default live smoke calls the Muse planner. | Correct the provider/account explanation. Setup copies the reviewed profiles unchanged; shipped reviewer/tester require the managed Gemini profile or a separately reviewed pure-compatible profile change. No credentials or model policy are invented by setup. | (this commit) | fixed, not deployed (documentation) |
+| B-055 | A real OpenCode dry-run version probe created an empty planned runtime directory although setup wrote no files. | OpenCode 1.18.32 eagerly creates `<XDG_CONFIG_HOME>/opencode` even for `--version`. | Version-only dry-run probing uses the checkout's already-existing OpenCode config root; auth/doctor/smoke remain deferred. Regression checks the probe environment; real installed-CLI dry-run is checked for absent target directories. | (this commit) | fixed, not deployed |
+
+Verification: `npm ci` installed 93 packages, audit 0 vulnerabilities;
+`node bin/setup.js --self-test` passed; `node tests/review-setup-cli.js` passed 12 checks,
+skipped 0; `node --test bin/daily-doctor.test.js` passed 7 tests, skipped 0. Final `npm test`
+passed with scratch HOME/USERPROFILE, CODEX_HOME, Claude config dir and bridge state:
+`Self tests passed.` and exactly
+`Total skipped: 3 across 9 reporting test file(s) (tests/review-spawn.js 1, tests/review-b030.js 1, tests/review2-e.js 1).`
+All three skips are optional (two symlink privileges, one Windows quoted filename); no
+required-skip override was set. An earlier run with an outer `XDG_CACHE_HOME` failed the
+existing plugin fixture because it expects its own HOME-relative cache; the final run lets
+each fixture own XDG paths under its isolated home, without changing that test.
+
+Real installed-CLI scratch checks: `npm run setup -- --yes --codex-home <scratch>/apply-codex
+--runtime-dir <scratch>/apply-runtime --state-dir <scratch>/apply-state --claude-config
+<scratch>/apply-claude/custom.json` passed doctor (`healthy`, `server-pinned`) and health
+smoke (`passed`, missing agents `none`) without signed-in accounts or a model request.
+`npm run setup -- --yes --dry-run --codex-home <scratch>/dry2-codex --runtime-dir
+<scratch>/dry2-runtime --state-dir <scratch>/dry2-state --claude-config
+<scratch>/dry2-claude/custom.json` printed full content for 34 planned files; all four target
+roots were still absent afterwards. Versions: Node 24.11.1, Git 2.39.1, OpenCode 1.18.32,
+Codex 0.159.3, Claude 2.1.228, Python 3.12.4. `git diff --check` passed.
+TestSprite 0.6.0 is installed but `testsprite auth status` / `testsprite project list
+--output json` returned `AUTH_REQUIRED`; that extra verification is blocked (run
+`testsprite setup` to authenticate), and no deployed TestSprite check is claimed.
+
 ### Public release preparation: B-037, the operations log, docs (Claude, 2026-10-01)
 
 Branch `bridge/public-release` (worktree `C:\Users\<you>\bridge-public`, its own `npm ci`) from `ca088bb`, merging `bridge/ops-log` (rebased; its row renumbered B-039 -> B-047, B-039 being the quota row), `bridge/b037-portable-release` and `bridge/public-docs`. Conflicts: the `npm test` chain in `package.json` (both additions kept) and the `server.js` import block. An independent read-only review of the whole diff (Opus 5.5) found no blocker; its should-fix items are applied here: a relative manifest entry resolves only when the manifest itself sits in an `opencode/` folder (a copy elsewhere failed safely but with a misleading error); `tests/review-b037-portable-release.js` canonicalizes its scratch directory (macOS `tmpdir()` is under the `/var` symlink, which the bridge's link checks refuse); the operations log folder and files are created `0o700`/`0o600`, and `readOpsLog` tolerates an unreadable folder or file instead of aborting the doctor; ONBOARDING §15 says the release gate runs, not `npm test`; the daily cap is documented per bridge process. The author's paths in `log.md` and `docs/` are replaced by placeholders (`<you>`, `<machine>`, `<bridge-dir>`); the git history still carries them.
