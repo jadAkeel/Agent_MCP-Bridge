@@ -59,7 +59,7 @@ Run these from `<bridge-dir>`.
 
 - Production-tested: the owner's daily use from Codex and Claude Code on Windows 11, and the release gate `npm run test:release`.
 - Not tested: macOS and Linux, and a fresh-machine setup by a second developer. ONBOARDING was checked in a scratch setup on the owner's machine.
-- Known gap: a release cannot yet be built from a fresh clone (log.md B-037); a new install runs the checkout, pinned by hash, as ONBOARDING step 15 describes.
+- A release builds from a fresh clone at any path (log.md B-037, covered by `tests/review-b037-portable-release.js`); a new install starts on the checkout, pinned by hash, and moves to a release as ONBOARDING step 15 describes.
 
 ## Documentation
 

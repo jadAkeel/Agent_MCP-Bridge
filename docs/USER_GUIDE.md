@@ -394,7 +394,7 @@ The command prints `Writers unblocked: yes`, or names another operation that sti
 
 ## 12. Updating and rolling back
 
-The client entry runs either this checkout or a **release folder**, and in both cases the `server.js` hash is pinned in `~/.codex/config.toml` (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`). A release is the stricter profile, but a release cannot yet be built from a fresh clone (log.md B-037; ONBOARDING step 15), so a new install runs the checkout, re-pinned with `npm run release:activate -- --sync-clients` after every change to `server.js`.
+The client entry runs either this checkout or a **release folder**, and in both cases the `server.js` hash is pinned in `~/.codex/config.toml` (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`). A release is the stricter profile, and a release builds from any clone (log.md B-037; ONBOARDING step 15). A new install may still run the checkout, re-pinned with `npm run release:activate -- --sync-clients` after every change to `server.js`.
 
 ### Changing bridge code, agent profiles, or skills
 
