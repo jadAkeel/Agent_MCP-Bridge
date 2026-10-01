@@ -144,6 +144,28 @@ test("B-043: a 504 line in OpenCode's stderr counts as a failed provider attempt
   assert.equal(unrecovered.apiErrorDetected, true);
 });
 
+test("B-043: a loose gateway phrase on a non-JSON stdout line or in stderr does not fail a run that produced its answer", () => {
+  const answer = finalTextEvents().join("\n");
+  for (const phrase of ["gateway timeout while fetching docs", "upstream timeout in the sample config", "Gateway Time-out is how nginx words a 504"]) {
+    const stdoutNoise = internals.inspectOpenCodeEventStream(`${phrase}\n${answer}`);
+    assert.equal(stdoutNoise.apiErrorDetected, false, phrase);
+    assert.equal(stdoutNoise.providerErrorType, "", phrase);
+    assert.equal(stdoutNoise.finalResponseDetected, true, phrase);
+    assert.equal(stdoutNoise.recoveredTransientProviderError, false);
+    const stderrNoise = internals.inspectOpenCodeEventStream(answer, `ERROR service=tool ${phrase}`);
+    assert.equal(stderrNoise.apiErrorDetected, false, phrase);
+    assert.equal(stderrNoise.providerErrorType, "", phrase);
+    assert.equal(stderrNoise.providerRetryWarningCount, 0, "not counted as a failed provider attempt");
+  }
+  // The bracketed status and the exact upstream-idle-timeout phrase are still recognised on a stderr line ...
+  assert.equal(internals.providerErrorTypeFromDiagnosticLine("ERROR 2026-10-01 service=llm stream failed [504] gateway"), TRANSIENT);
+  assert.equal(internals.providerErrorTypeFromDiagnosticLine("Upstream idle timeout exceeded"), TRANSIENT);
+  assert.equal(internals.providerErrorTypeFromDiagnosticLine("gateway timeout while fetching docs"), "");
+  // ... and a structured string error event (already an error) may be named by the wider phrases.
+  assert.equal(internals.providerErrorTypeFromStructuredEvent({ type: "error", error: "Gateway Timeout" }), TRANSIENT);
+  assert.equal(internals.providerErrorTypeFromStructuredEvent({ type: "error", error: "something unrelated failed" }), "");
+});
+
 test("B-043: the existing retry-safety rules decide who retries (readers before any tool call; never a writer)", () => {
   const retryable = internals.readOnlyResultRetryable;
   const readerMetadata = { ok: true, metadata: { canEdit: false, canDelegate: false, externalDirectoryDenied: true } };
@@ -385,6 +407,44 @@ test("B-045: the queue starts no job below the floor, labels it waiting_for_memo
       assert.equal(ran, 1);
       assert.equal(internals.queueMemoryWaitingJobs.size, 0, "the hold is released once the job started");
       assert.doesNotMatch(await callTool("list_opencode_jobs", { cwd: repo }), /waiting_for_memory/);
+    });
+  } finally {
+    hooks.agentRuntimeTestHook = null;
+  }
+});
+
+test("B-045: a cancellation of a held pending job is still processed while memory is low", async () => {
+  const repo = await makeRepo("b045-cancel");
+  let ran = 0;
+  installRuntime({ onRun: async () => { ran += 1; } });
+  hooks.queueModeOverride = "sqlite";
+  try {
+    await withMemory({ floorMb: 1024, freeMb: 100 }, async () => {
+      const enqueued = await callTool("enqueue_opencode_job", { agent: "reviewer", task: "Review.", cwd: repo, write: false, lockMode: "off" });
+      const jobId = /Job ID: (\S+)/.exec(enqueued)?.[1];
+      assert.ok(jobId, enqueued);
+      const other = /Job ID: (\S+)/.exec(await callTool("enqueue_opencode_job", { agent: "reviewer", task: "Review too.", cwd: repo, write: false, lockMode: "off" }))?.[1];
+      await sleep(600);
+      const record = internals.QUEUE_JOBS.get(jobId);
+      assert.equal(record.status, "pending");
+      assert.equal(internals.queueRunStage(record), "waiting_for_memory");
+      // What the queue heartbeat does when another bridge process cancelled the row (cancel_opencode_job
+      // from this process cancels a pending job directly and never reaches the scheduler).
+      record.cancellationRequested = true;
+      record.cancellationRequestedAt = new Date().toISOString();
+      const deadline = Date.now() + 10_000;
+      while (record.status !== "cancelled" && Date.now() < deadline) await sleep(50);
+      assert.equal(record.status, "cancelled", "the hold must not keep a cancellation from being processed");
+      assert.equal(ran, 0, "nothing was started");
+      // The other held job is untouched and still waits; it starts once memory is back.
+      assert.equal(internals.QUEUE_JOBS.get(other).status, "pending");
+      await sleep(400);
+      assert.equal(internals.queueMemoryWaitingJobs.has(jobId), false, "a cancelled job is no longer listed as waiting");
+      assert.equal(internals.queueMemoryWaitingJobs.has(other), true);
+      hooks.freeMemoryBytesTestHook = () => 4096 * MB;
+      const finished = await waitForQueueJob(other);
+      assert.equal(finished.status, "completed", finished.errorReason);
+      assert.equal(ran, 1);
     });
   } finally {
     hooks.agentRuntimeTestHook = null;

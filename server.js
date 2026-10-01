@@ -5145,10 +5145,13 @@ function syntheticProviderQuotaNotice(finalText) {
 // GATEWAY_TIMEOUT_TEXT_PATTERN is the wording providerErrorTypeFromText maps to
 // opencode_transient_provider_error (a bare 504 is fine there: callers only pass diagnostic
 // text). GATEWAY_FAILURE_MESSAGE_PATTERN is the narrower set that may classify free message
-// text with no other provider evidence: bracketed 5xx codes and the timeout phrases, never a
-// bare number, so a fixture or an agent quoting "504" in a message is not mistaken for one.
+// text of an event that already is an error with no other provider evidence: bracketed 5xx codes
+// and the timeout phrases, never a bare number, so a fixture or an agent quoting "504" in a
+// message is not mistaken for one. GATEWAY_DIAGNOSTIC_LINE_PATTERN is narrower still, for
+// stderr and non-JSON stdout lines (see providerErrorTypeFromDiagnosticLine).
 const GATEWAY_TIMEOUT_TEXT_PATTERN = /\b504\b|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
-const GATEWAY_FAILURE_MESSAGE_PATTERN = /\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
+const GATEWAY_DIAGNOSTIC_LINE_PATTERN = /\[50[0234]\]|\bupstream[\s-]+idle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
+const GATEWAY_FAILURE_MESSAGE_PATTERN =/\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 
 function providerErrorTypeFromText(value) {
   const text = String(value || "");
@@ -5206,7 +5209,10 @@ function providerErrorTypeFromDiagnosticLine(value) {
     return "";
   }
   const authoritativeMarker = /(?:\bAPIError\b|\bCreditsError\b|\bProvider[A-Za-z]*(?:Error|Timeout)\b|\bOAuth\b|\bHTTP\s+[45]\d\d\b|\b(?:status|statusCode|code)\s*[:=]\s*["']?(?:[45]\d\d|RESOURCE_EXHAUSTED|rateLimitExceeded|invalid_grant)\b|\bRESOURCE_EXHAUSTED\b|\brateLimitExceeded\b|\binvalid_(?:grant|client)\b|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_[A-Z_]+|DEADLINE_EXCEEDED)\b|\b401\s+Unauthorized\b|\b429\s+Too Many Requests\b)/i;
-  if (authoritativeMarker.test(line) || GATEWAY_FAILURE_MESSAGE_PATTERN.test(line)) return providerErrorTypeFromText(line);
+  // Diagnostic lines come from stderr and from stdout lines that are not JSON, and a match there can
+  // fail a run that produced its answer: the free-text (no authoritative marker) gateway match is
+  // only the bracketed status or the exact upstream-idle-timeout phrase, never "gateway timeout" alone.
+  if (authoritativeMarker.test(line) || GATEWAY_DIAGNOSTIC_LINE_PATTERN.test(line)) return providerErrorTypeFromText(line);
   // B-023: OpenCode logs retried provider failures as the AI SDK's AI_APICallError (and
   // AI_RetryError). Such a line alone only ever counts as a transient failure: a billing/auth
   // reading of its free text must not stop a live run or fail one that produced its answer,
@@ -5226,7 +5232,9 @@ function providerErrorTypeFromStructuredEvent(event) {
   }
   const errorValue = event.error ?? event.data?.error ?? event.properties?.error;
   if (typeof errorValue === "string") {
-    return providerErrorTypeFromDiagnosticLine(errorValue);
+    // The event already is an error, so the wider gateway phrases may name its type here.
+    return providerErrorTypeFromDiagnosticLine(errorValue)
+      || (GATEWAY_FAILURE_MESSAGE_PATTERN.test(errorValue) ? providerErrorTypeFromText(errorValue) : "");
   }
   if (!errorValue || typeof errorValue !== "object") {
     return "";
@@ -21633,15 +21641,16 @@ function scheduleQueue(delayMs = 0) {
         return;
       }
 
-      // B-045: below the free-memory floor nothing new starts. This pass makes no progress, so the
-      // scheduler polls again (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) and starts the jobs once memory recovers.
+      // B-045: below the free-memory floor nothing new is planned or started, but the pass still runs
+      // for everything that does not start an agent (a cancellation of a pending job is processed
+      // below, so an operator cancelling queued jobs to free memory sees it happen). A pass that
+      // starts nothing makes no progress, so the scheduler polls again
+      // (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) and starts the jobs once memory recovers.
       const memoryGate = queueMemoryGate();
       const startableRecords = [...QUEUE_JOBS.values()].filter((record) => ["pending", "planned", "blocked"].includes(record.status));
-      if (memoryGate.blocked && startableRecords.length) {
-        holdQueueForMemory(memoryGate, startableRecords);
-        return;
-      }
-      releaseQueueMemoryHold(memoryGate);
+      const holdStarts = memoryGate.blocked && startableRecords.length > 0;
+      if (holdStarts) holdQueueForMemory(memoryGate, startableRecords);
+      else releaseQueueMemoryHold(memoryGate);
 
       for (const record of QUEUE_JOBS.values()) {
         if (!capacity) {
@@ -21674,6 +21683,9 @@ function scheduleQueue(delayMs = 0) {
             });
             continue;
           }
+
+          // B-045: planning and starting wait for memory; the job stays pending (no durable write per poll).
+          if (holdStarts) continue;
 
           if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
           if (record.status === "blocked") {
@@ -26149,6 +26161,7 @@ export const __selfTest = {
     // tests/review-round5.js
     queueCapacityReport,
     timedOutWriterNote,
+    providerErrorTypeFromDiagnosticLine,
     queueMemoryGate,
     queueMemoryStatusLines,
     queueMemoryWaitingJobs,
