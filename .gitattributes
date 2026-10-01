@@ -1,0 +1,9 @@
+# Files whose exact bytes are hash-pinned: opencode/plugin-integrity-manifest.json pins the
+# config and settings, the clients pin the manifest, and the plugin cache's package.json is a
+# copy of cortexkit-server-package.json inside the pinned plugin tree. A checkout must keep the
+# committed bytes whatever core.autocrlf says (Git for Windows defaults to true, which wrote
+# CRLF and broke the pins in a fresh clone; log.md B-037).
+opencode/opencode.jsonc -text
+opencode/antigravity.json -text
+opencode/plugin-integrity-manifest.json -text
+opencode/cortexkit-server-package.json -text

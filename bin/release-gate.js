@@ -31,6 +31,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LEGACY_PUBLISH_ENTRIES } from "./build-release.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
 import { digestTree } from "./plugin-tree-digest.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -42,9 +43,6 @@ const RECEIPT_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const DEFAULT_RECEIPT_PATH = path.join(SOURCE_ROOT, ".release-gate", "receipt.json");
 const SOURCE_TREE_ENTRIES = Object.freeze(LEGACY_PUBLISH_ENTRIES.filter((entry) => entry !== "node_modules"));
 const REQUIRED_STEPS = Object.freeze(["installed dependencies", "npm test", "test:concurrency", "npm audit", "live health smoke"]);
-// The only publish entry a source tree may lack: it is untracked (it ignores itself), so a fresh
-// worktree has none. The release build still refuses a tree without it.
-const OPTIONAL_SOURCE_ENTRIES = Object.freeze(["opencode/.gitignore"]);
 const FAILED_OUTPUT_TAIL_LINES = 30;
 
 function defaultConfigPath() {
@@ -115,7 +113,7 @@ function gateSteps({ sourceRoot = SOURCE_ROOT, configPath = defaultConfigPath() 
 }
 
 async function sourceTreeDigest(sourceRoot = SOURCE_ROOT) {
-  const digest = await digestTree(sourceRoot, { include: SOURCE_TREE_ENTRIES, allowMissing: OPTIONAL_SOURCE_ENTRIES, label: "Release source" });
+  const digest = await digestTree(sourceRoot, { include: SOURCE_TREE_ENTRIES, label: "Release source" });
   return { treeSha256: digest.treeSha256, fileCount: digest.fileCount, entries: [...SOURCE_TREE_ENTRIES] };
 }
 
@@ -148,7 +146,7 @@ async function assertReleaseSourceComplete(sourceRoot = SOURCE_ROOT) {
       const expected = path.join(sourceRoot, "opencode", basename);
       if (entries.length !== 1) {
         problems.push(`plugin-integrity-manifest.json ${list} must hold exactly one entry (it holds ${entries.length})`);
-      } else if (fold(String(entries[0]?.path || "")) !== fold(expected)) {
+      } else if (fold(resolvePluginManifestEntryPath(entries[0]?.path, manifestPath) || ".") !== fold(expected)) {
         problems.push(`plugin-integrity-manifest.json ${list}[0].path is ${entries[0]?.path || "(empty)"}, not this tree's ${expected}`);
       }
     }
@@ -459,11 +457,11 @@ async function selfTest() {
     });
     assert.match(drifting.receipt.failure, /source tree changed while the gate ran/);
 
-    // Only opencode/.gitignore may be missing (a worktree lacks the untracked file): it is
-    // digested as absent, not as the tree that has it. Any other missing entry is refused.
-    const withIgnore = (await sourceTreeDigest(source)).treeSha256;
+    // Every publish entry must exist, opencode/.gitignore included: it is tracked since B-037
+    // (it used to ignore itself, so a fresh worktree lacked it and the digest allowed that).
     await rm(path.join(source, "opencode", ".gitignore"));
-    assert.notEqual((await sourceTreeDigest(source)).treeSha256, withIgnore);
+    await assert.rejects(sourceTreeDigest(source), /ENOENT/, "a missing opencode/.gitignore is not digested as absent");
+    await writeFile(path.join(source, "opencode", ".gitignore"), "log/\n", "utf8");
     await rename(path.join(source, "tests"), path.join(fixture, "tests-away"));
     await assert.rejects(sourceTreeDigest(source), /ENOENT/, "a missing tests/ is not digested as absent");
     await rename(path.join(fixture, "tests-away"), path.join(source, "tests"));
@@ -474,6 +472,12 @@ async function selfTest() {
     await writeFile(path.join(source, "opencode", ".gitignore"), "log/\n", "utf8");
     await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bind(source), "utf8");
     await assertReleaseSourceComplete(source);
+    // B-037: the committed form is repository-relative and binds whichever tree holds it.
+    const bindRelative = (configPath = "opencode/opencode.jsonc") => JSON.stringify({ version: 1, configs: [{ path: configPath }], settings: [{ path: "opencode/antigravity.json" }] });
+    await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bindRelative(), "utf8");
+    await assertReleaseSourceComplete(source);
+    await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bindRelative("../opencode/opencode.jsonc"), "utf8");
+    await assert.rejects(assertReleaseSourceComplete(source), /configs\[0\]\.path is \.\.\/opencode\/opencode\.jsonc, not this tree's/);
     await writeFile(path.join(source, "opencode", "plugin-integrity-manifest.json"), bind(path.join(fixture, "live-tree")), "utf8");
     await rm(path.join(source, "opencode", ".gitignore"));
     await rm(path.join(source, "opencode", "skills"), { recursive: true });
@@ -486,6 +490,7 @@ async function selfTest() {
       return true;
     });
     await mkdir(path.join(source, "opencode", "skills"));
+    await writeFile(path.join(source, "opencode", ".gitignore"), "log/\n", "utf8");
 
     // Installed dependencies must be what package-lock.json pins.
     const deps = path.join(fixture, "deps");

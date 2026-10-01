@@ -4,8 +4,6 @@
   "plugins": [
     {
       "specifier": "@cortexkit/opencode-antigravity-auth@2.2.1",
-      "root": "C:\\Users\\10User\\.cache\\opencode\\packages\\@cortexkit\\opencode-antigravity-auth@2.2.1",
-      "packageRoot": "C:\\Users\\10User\\.cache\\opencode\\packages\\@cortexkit\\opencode-antigravity-auth@2.2.1\\node_modules\\@cortexkit\\opencode-antigravity-auth",
       "fileCount": 1403,
       "entryCount": 1473,
       "packageLockSha256": "c36bb578a1ffa8a326cebb91b9cdc374719d88690cbc8ae77735028afd8f3f25",
@@ -14,7 +12,7 @@
   ],
   "configs": [
     {
-      "path": "C:\\Users\\10User\\codex-opencode-mcp\\opencode\\opencode.jsonc",
+      "path": "opencode/opencode.jsonc",
       "sha256": "e1f9ab495e1616ef5d7decff50cf9d353c08e82fdadae6d14e7f9c375b1cf766",
       "scope": "global",
       "plugins": ["@cortexkit/opencode-antigravity-auth@2.2.1"]
@@ -22,7 +20,7 @@
   ],
   "settings": [
     {
-      "path": "C:\\Users\\10User\\codex-opencode-mcp\\opencode\\antigravity.json",
+      "path": "opencode/antigravity.json",
       "sha256": "cff6726cb6a3e45713e0018401ddb094fcc07e5b6c4227fa0a0e35e85b0d810f",
       "requiredValues": {
         "auto_update": false,
