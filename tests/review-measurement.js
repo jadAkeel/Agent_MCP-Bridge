@@ -169,7 +169,7 @@ test("B-024/B-025: the phase clock partitions the job and the queue reports the 
   assert.deepEqual(queueAgentTiming({ ...record, phaseTimings: null }), { agentRunMs: 90000, waitBeforeAgentMs: 10000 }, "records written before the fix keep the old reading");
   const line = compactQueueJobLines([record]);
   assert.match(line, /waitBeforeAgentMs=10000 agentRunMs=60000 afterAgentMs=30000/);
-  assert.match(line, /tokens=1200in\/80out providerErrorLines=3/);
+  assert.match(line, /tokens=1200in\/80out cacheRead=5 providerErrorLines=3/);
 });
 
 // ---------------------------------------------------------------------------- B-018 / B-020 / B-021

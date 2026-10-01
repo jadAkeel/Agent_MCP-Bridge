@@ -150,6 +150,14 @@ const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
 // 1 ms, so a progress heartbeat interval of 2147483648 became a notification flood. Every
 // CODEX_OPENCODE_*_MS setting is a timer, lease or timeout, so readIntegerEnv caps them here.
 const MAX_TIMER_MS = 2 ** 31 - 1;
+// Q-002: the two concurrency limits can be changed in the running process (set_opencode_concurrency),
+// persisted in provider-concurrency.sqlite so a restart keeps them until cleared. CONFIG reads
+// them through accessors, so every use of CONFIG.providerConcurrencyLimit / queueParallelLimit
+// (slot leases, diagnose, the parallel-batch check, the scheduler) sees the effective value.
+const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
+const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
+const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
+const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -182,7 +190,7 @@ const CONFIG = Object.freeze({
   modelOverrideAllowlist: readCsvEnv("CODEX_OPENCODE_MODEL_ALLOWLIST", []),
   worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
-  queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
+  get queueParallelLimit() { return RUNTIME_CONCURRENCY.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT; },
   // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
   // (twenty agent processes, their worktrees and test runs exhausted a laptop).
   minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", 0),
@@ -224,7 +232,7 @@ const CONFIG = Object.freeze({
   trustedPolicySha256: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_SHA256 || "").trim().toLowerCase(),
   trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
   trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
-  providerConcurrencyLimit: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2),
+  get providerConcurrencyLimit() { return RUNTIME_CONCURRENCY.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT; },
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
   // How long a job may wait for a provider slot. The wait is not part of the agent's run
@@ -707,6 +715,7 @@ const jobInputShape = {
   sharedFiles: z.array(z.string()).optional(),
   serialOnly: z.array(z.string()).optional(),
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
+  validationFixPasses: z.number().int().min(0).max(1).optional().describe("0 (default) or 1. A write job cannot run its own checks (builders have no shell), so with 1 a failed validationCommand gives the agent one more run in the same worktree with the validation output, then validates again. Uses the rest of the job timeout; scope and lock rules apply unchanged. Not available in run_opencode_parallel."),
   timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
@@ -3100,6 +3109,11 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
           reason TEXT NOT NULL DEFAULT '',
           set_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS runtime_settings (
+          name TEXT PRIMARY KEY,
+          value INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
       ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
@@ -3125,6 +3139,154 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
   throw new Error("Provider lease database initialization exhausted its retry budget.");
 }
 
+// Q-002: runtime override of the provider slot limit and the queue parallel limit. The rows live
+// in provider-concurrency.sqlite (shared by every bridge process and every project); a process
+// applies them at its next scheduler pass or slot request, and a restart reloads them.
+const RUNTIME_PROVIDER_LIMIT_SETTING = "provider_concurrency_limit";
+const RUNTIME_QUEUE_LIMIT_SETTING = "queue_parallel_limit";
+const RUNTIME_CONCURRENCY_REFRESH_MS = 5000;
+let runtimeConcurrencyRefreshedFor = "";
+let runtimeConcurrencyRefreshedAt = 0;
+
+// Returns "" for a usable limit, else why it is refused. The tool schema checks the same range,
+// but a direct handler call skips the schema.
+function runtimeConcurrencyLimitError(name, value) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) {
+    return `${name} must be an integer from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}; got ${JSON.stringify(value)}.`;
+  }
+  return "";
+}
+
+function readRuntimeConcurrencyRows(db) {
+  const settings = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+  let updatedAtMs = 0;
+  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?)")
+    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+  for (const row of rows) {
+    const value = Number(row.value);
+    // A hand-edited row outside the accepted range is ignored, not applied.
+    if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
+    if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
+    else settings.queueParallelLimit = value;
+    updatedAtMs = Math.max(updatedAtMs, Number(row.updated_at) || 0);
+  }
+  if (updatedAtMs) settings.updatedAt = new Date(updatedAtMs).toISOString();
+  return settings;
+}
+
+function applyRuntimeConcurrency(settings) {
+  const changed = RUNTIME_CONCURRENCY.providerLimit !== settings.providerLimit
+    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit;
+  Object.assign(RUNTIME_CONCURRENCY, {
+    providerLimit: settings.providerLimit,
+    queueParallelLimit: settings.queueParallelLimit,
+    updatedAt: settings.updatedAt || "",
+  });
+  if (changed) {
+    logEvent("info", "concurrency.runtime_limits_applied", {
+      providerLimit: CONFIG.providerConcurrencyLimit,
+      queueParallelLimit: CONFIG.queueParallelLimit,
+      providerOverride: settings.providerLimit !== null,
+      queueOverride: settings.queueParallelLimit !== null,
+    });
+  }
+  return changed;
+}
+
+// Reads the persisted overrides into this process (at most every few seconds unless forced, and
+// again whenever the state directory differs from the last read). A failed read keeps the values
+// already in force.
+async function refreshRuntimeConcurrency({ force = false } = {}) {
+  const directory = effectiveBridgeStateDirectory();
+  if (!force && runtimeConcurrencyRefreshedFor === directory && Date.now() - runtimeConcurrencyRefreshedAt < RUNTIME_CONCURRENCY_REFRESH_MS) return false;
+  let db = null;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    const changed = applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
+    runtimeConcurrencyRefreshedFor = directory;
+    runtimeConcurrencyRefreshedAt = Date.now();
+    return changed;
+  } catch (error) {
+    logEvent("warn", "concurrency.runtime_refresh_failed", { error: redactSensitiveText(error?.message || String(error)) });
+    return false;
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// One line each for get_opencode_bridge_status: the value in force, the env value and whether a
+// runtime override produced the difference.
+function describeConcurrencyLimits() {
+  const describe = (effective, env, override) => `effective ${effective} (env ${env}${override !== null ? `, runtime override set ${RUNTIME_CONCURRENCY.updatedAt || "earlier"}` : ""})`;
+  return {
+    provider: describe(CONFIG.providerConcurrencyLimit, ENV_PROVIDER_CONCURRENCY_LIMIT, RUNTIME_CONCURRENCY.providerLimit),
+    queue: describe(CONFIG.queueParallelLimit, ENV_QUEUE_PARALLEL_LIMIT, RUNTIME_CONCURRENCY.queueParallelLimit),
+  };
+}
+
+// Sets (or, with reset, clears) the persisted overrides and applies them to this process. Running
+// jobs are untouched: a lower limit only keeps new jobs from starting until enough have finished.
+async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset = false } = {}) {
+  const hasProvider = providerLimit !== undefined && providerLimit !== null;
+  const hasQueue = queueParallelLimit !== undefined && queueParallelLimit !== null;
+  if (reset && (hasProvider || hasQueue)) {
+    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit or queueParallelLimit." };
+  }
+  if (!reset && !hasProvider && !hasQueue) {
+    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit and/or queueParallelLimit, or reset: true to return to the environment values." };
+  }
+  const invalid = (hasProvider ? runtimeConcurrencyLimitError("providerLimit", providerLimit) : "")
+    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "");
+  if (invalid) return { ok: false, errorType: "concurrency_invalid", error: invalid };
+
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 10000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const before = readRuntimeConcurrencyRows(db);
+    const effectiveProviderBefore = before.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
+    const now = Date.now();
+    if (reset) {
+      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+    } else {
+      const upsert = db.prepare(`
+        INSERT INTO runtime_settings (name, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `);
+      if (hasProvider) upsert.run(RUNTIME_PROVIDER_LIMIT_SETTING, providerLimit, now);
+      if (hasQueue) upsert.run(RUNTIME_QUEUE_LIMIT_SETTING, queueParallelLimit, now);
+    }
+    const after = readRuntimeConcurrencyRows(db);
+    const effectiveProviderAfter = after.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
+    // acquireProviderLease keeps the stricter of a stored capacity and the configured limit while
+    // leases are held (an older bridge process may hold them under another limit), so a raise
+    // would not apply until those drained. The rows are only a cache of the last configured limit:
+    // removing them makes the next slot request store the new value and use it at once.
+    if (effectiveProviderAfter !== effectiveProviderBefore) db.prepare("DELETE FROM provider_capacities").run();
+    db.exec("COMMIT");
+    transactionOpen = false;
+    const previous = {
+      providerLimit: effectiveProviderBefore,
+      queueParallelLimit: before.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT,
+    };
+    applyRuntimeConcurrency(after);
+    runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
+    runtimeConcurrencyRefreshedAt = Date.now();
+    // A raised queue limit can start jobs that were waiting for a free worker.
+    scheduleQueue();
+    return { ok: true, previous, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit }, reset: Boolean(reset) };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    return { ok: false, errorType: "concurrency_persist_failed", error: redactSensitiveText(error?.message || String(error)) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
 async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
@@ -3143,6 +3305,11 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       db.exec("BEGIN IMMEDIATE");
       db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
       db.prepare("DELETE FROM provider_cooldowns WHERE until_at <= ?").run(now);
+      // Q-002: the limit in force is the persisted runtime override, read in this transaction so a
+      // raise or lowering made by any bridge process applies to the slot being decided right now.
+      applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
+      runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
+      runtimeConcurrencyRefreshedAt = Date.now();
       // A provider whose quota ran out fails new jobs at once instead of starting agents that
       // can only burn their wait budget (or the quota of the next account) until the reset.
       const cooldown = db.prepare("SELECT until_at, error_type, reason FROM provider_cooldowns WHERE provider_key = ?").get(providerKey);
@@ -3669,6 +3836,7 @@ async function providerCapacitySnapshot() {
     db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
     const now = Date.now();
     db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
+    applyRuntimeConcurrency(readRuntimeConcurrencyRows(db));
     const likePattern = providerKeyLikePattern(CONFIG.providerConcurrencyKey);
     const capacityRows = db.prepare(`
       SELECT provider_key, capacity FROM provider_capacities WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'
@@ -3721,7 +3889,7 @@ async function providerCapacitySnapshot() {
       errorType: row.error_type,
       reason: row.reason || "",
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases, cooldowns };
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns };
   } catch (error) {
     return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], cooldowns: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
@@ -5355,10 +5523,86 @@ function formatOpenCodeUsage(usage) {
   return `steps=${usage.steps} input=${usage.inputCount} output=${usage.outputCount} reasoning=${usage.reasoningCount} cache_read=${usage.cacheReadCount} cache_write=${usage.cacheWriteCount} cost=${cost}${cost === 0 ? " (provider reported no price)" : ""}`;
 }
 
+// Q-003: OpenCode reports token counts per model step (step_finish), not per tool call. A tool
+// call's cost is therefore estimated from what the stream does carry: the call's result enters
+// the prompt of the step after it, so the growth of the prompt size (input + cache read + cache
+// write) from one step to the next, less the assistant output of that step, is the size of that
+// step's tool results; it is split over the step's calls by result length. Every later step
+// sends the result again, so growth x later steps is the input the result cost. These are
+// estimates for ranking ("which call read the most"), not billing figures. Field names avoid
+// "token" and "input" for sanitizePersistedValue.
+function emptyToolWeights() {
+  return new Map();
+}
+
+function toolWeightSession(weights, sessionId) {
+  if (!weights.has(sessionId)) weights.set(sessionId, { pending: [], steps: [] });
+  return weights.get(sessionId);
+}
+
+function noteToolUse(weights, sessionId, part) {
+  const session = toolWeightSession(weights, sessionId);
+  if (session.pending.length >= 25) return;
+  const input = part?.state?.input && typeof part.state.input === "object" ? part.state.input : {};
+  const targetKey = ["pattern", "command", "filePath", "path", "url", "query", "description"].find((key) => typeof input[key] === "string" && input[key]);
+  const label = targetKey ? `${targetKey === "filePath" || targetKey === "path" ? "" : `${targetKey}: `}${input[targetKey]}${targetKey === "pattern" && typeof input.path === "string" && input.path ? ` in ${input.path}` : ""}` : "";
+  session.pending.push({
+    tool: String(part?.tool || "unknown").slice(0, 40),
+    target: redactSensitiveText(label).replace(/\s+/g, " ").slice(0, 120),
+    outputChars: String(part?.state?.output ?? part?.state?.error ?? "").length,
+  });
+}
+
+function noteStepFinish(weights, sessionId, tokens) {
+  const count = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
+  const session = toolWeightSession(weights, sessionId);
+  session.steps.push({
+    context: count(tokens?.input) + count(tokens?.cache?.read) + count(tokens?.cache?.write),
+    output: count(tokens?.output),
+    tools: session.pending,
+  });
+  session.pending = [];
+}
+
+function heaviestToolCalls(weights, limit = 3) {
+  const calls = [];
+  for (const session of weights.values()) {
+    const { steps } = session;
+    for (let index = 0; index < steps.length - 1; index += 1) {
+      const step = steps[index];
+      if (!step.tools.length) continue;
+      const growth = Math.max(0, steps[index + 1].context - step.context - step.output);
+      if (!growth) continue;
+      const totalChars = step.tools.reduce((sum, tool) => sum + tool.outputChars, 0);
+      const laterSteps = steps.length - 1 - index;
+      for (const tool of step.tools) {
+        const share = totalChars ? tool.outputChars / totalChars : 1 / step.tools.length;
+        const added = Math.round(growth * share);
+        if (added) calls.push({ tool: tool.tool, target: tool.target, addedContextCount: added, laterSteps, rereadInputCount: added * laterSteps });
+      }
+    }
+  }
+  return calls.sort((left, right) => right.rereadInputCount - left.rereadInputCount).slice(0, limit);
+}
+
+// Top calls over several runs of one job (read-only retries, a validation fix pass).
+function mergeHeavyToolCalls(...lists) {
+  return lists.flat().filter((call) => call && typeof call === "object")
+    .sort((left, right) => Number(right.rereadInputCount || 0) - Number(left.rereadInputCount || 0)).slice(0, 3);
+}
+
+function formatHeavyToolCalls(calls) {
+  if (!Array.isArray(calls) || !calls.length) return "";
+  return `Heaviest tool calls (estimated input re-read by later steps): ${calls
+    .map((call) => `${call.tool}${call.target ? ` ${call.target}` : ""} +${call.addedContextCount} context x ${call.laterSteps} steps = ~${call.rereadInputCount}`)
+    .join("; ")}`;
+}
+
 function inspectOpenCodeEventStream(stdout, stderr = "") {
   const stderrDiagnosticLines = providerDiagnosticLinesFromStderr(stderr);
   const stderrProviderErrorType = providerErrorTypeFromText(stderrDiagnosticLines.slice(-100).join("\n"));
   const usage = emptyOpenCodeUsage();
+  const toolWeights = emptyToolWeights();
   let providerErrorType = stderrProviderErrorType;
   let stdoutErrorDetected = false;
   const toolOutcomes = [];
@@ -5402,7 +5646,10 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
         continue;
       }
       // Not a turn boundary: step_finish follows the final text part, so it leaves lastEvent alone.
-      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) continue;
+      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) {
+        noteStepFinish(toolWeights, sessionId, event.part.tokens);
+        continue;
+      }
       if (event?.type === "text" && event?.part?.type === "text") {
         state.lastEvent = "incomplete_text";
         if (!event.part.time?.end) continue;
@@ -5430,6 +5677,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
             status: String(event?.part?.state?.status || "unknown"),
           });
         }
+        noteToolUse(toolWeights, sessionId, event.part);
       }
     } catch {
       invalidLines += 1;
@@ -5476,6 +5724,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     // Each classified stderr line is one provider attempt that failed (OpenCode retries some itself).
     providerRetryWarningCount: stderrDiagnosticLines.length,
     usage,
+    heavyToolCalls: heaviestToolCalls(toolWeights),
     retryAfterMs: quotaNotice?.resetMs || retryAfterMsFromText(`${stderr}\n${stdout}`),
     runtimeObservedProvider: runtimeModelEvidence?.provider || "",
     runtimeObservedModel: runtimeModelEvidence?.model || "",
@@ -7394,6 +7643,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     providerWarningType: inspection.providerWarningType,
     providerRetryWarningCount: inspection.providerRetryWarningCount || 0,
     usage: inspection.usage,
+    heavyToolCalls: inspection.heavyToolCalls || [],
     retryAfterMs: inspection.retryAfterMs || 0,
     assistantFinalResponseDetected: inspection.finalResponseDetected,
     assistantResponseTruncated: inspection.finalTextTruncated,
@@ -7530,6 +7780,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   let attemptsMade = 0;
   const childExecutionIntervals = [];
   let usageTotal = null;
+  let heavyToolCallsTotal = [];
   let providerRetryWarningTotal = 0;
   const policyStarted = nowMs();
   // The retry budget bounds retries; it must never shorten the first attempt below the
@@ -7552,8 +7803,10 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
     // Every attempt used provider tokens; the last attempt's result reports all of them.
     usageTotal = sumOpenCodeUsage(usageTotal, lastResult.usage);
+    heavyToolCallsTotal = mergeHeavyToolCalls(heavyToolCallsTotal, lastResult.heavyToolCalls);
     providerRetryWarningTotal += lastResult.providerRetryWarningCount || 0;
     lastResult.usage = usageTotal;
+    lastResult.heavyToolCalls = heavyToolCallsTotal;
     lastResult.providerRetryWarningCount = providerRetryWarningTotal;
     lastResult.retryAttempt = attempt;
     lastResult.maxRetries = maxReadOnlyAgentRetries;
@@ -7638,6 +7891,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     `Provider warning type: ${result?.providerWarningType || "none"}`,
     `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result?.providerRetryWarningCount || 0}`,
     `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
+    formatHeavyToolCalls(result?.heavyToolCalls) || null,
     `Configured provider: ${result?.configuredProvider || "unknown"}`,
     `Configured model: ${result?.configuredModel || "unknown"}`,
     `Configured variant: ${result?.configuredVariant || "unknown"}`,
@@ -7783,6 +8037,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
       : null,
     timing.length ? `Timing: ${timing.join(" ")}` : null,
     `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
+    formatHeavyToolCalls(result?.heavyToolCalls) || null,
     result?.providerWarningType ? `Provider warning type: ${result.providerWarningType}` : null,
     result?.providerErrorType ? `Provider error type: ${result.providerErrorType}` : null,
     result?.providerCooldownUntil ? `Provider paused until: ${result.providerCooldownUntil} (new jobs on this provider fail at once until then)` : null,
@@ -15435,8 +15690,8 @@ server.tool(
             `Bridge state directory: ${GLOBAL_BRIDGE_STATE_DIR}`,
             `OpenCode external plugins: ${CONFIG.allowExternalPlugins ? "enabled (exact allowlist and pinned tree verified)" : "disabled (--pure)"}`,
             `External plugin manifest SHA-256: ${pluginPolicy.manifestSha256 || "not applicable"}`,
-            `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
-            `Queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): ${queueCapacity.queueParallelLimit} job(s) at once per bridge process${queueCapacity.queueMode === "off" ? " (queue mode is off)" : ""}`,
+            `Provider/account concurrency limit: ${describeConcurrencyLimits().provider}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
+            `Queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): ${queueCapacity.queueParallelLimit} job(s) at once per bridge process${queueCapacity.queueMode === "off" ? " (queue mode is off)" : ""}; ${describeConcurrencyLimits().queue}`,
             `Parallel call job limit (CODEX_OPENCODE_PARALLEL_LIMIT): ${queueCapacity.parallelCallLimit} job(s) per run_opencode_parallel call (does not bound the queue)`,
             ...(queueCapacity.warning ? [queueCapacity.warning] : []),
             ...queueMemoryStatusLines(),
@@ -15768,6 +16023,7 @@ server.tool(
 
     // run_opencode_parallel rejects a batch above the per-provider slot limit; the preflight
     // must not accept what the run would refuse.
+    if (executionMode === "parallel") await refreshRuntimeConcurrency();
     const capacityError = executionMode === "parallel"
       ? parallelBatchCapacityError(jobs, parallelProviderKeys(plannedResolutions, plannedMetadata, lockPlans))
       : null;
@@ -15841,6 +16097,7 @@ server.tool(
     sharedFiles,
     serialOnly,
     validationCommand,
+    validationFixPasses,
     delegation,
   }) => {
     const toolStarted = nowMs();
@@ -15876,6 +16133,7 @@ server.tool(
       sharedFiles,
       serialOnly,
       validationCommand,
+      validationFixPasses,
       delegation,
     };
     const directRunId = makeQueueJobId(agent);
@@ -16080,6 +16338,7 @@ function directRunView(run, artifacts = [], { detail = false } = {}) {
     providerWaitMs: run.providerWaitMs,
     providerRetryWarningCount: run.providerRetryWarnings,
     usage,
+    ...(usage?.steps ? { usageSummary: formatOpenCodeUsage(usage) } : {}),
     configuredModel: run.configuredModel || "",
     worktrees: artifacts.map((artifact) => retainedWorktreeView(artifact, { run })),
     ...resultView,
@@ -16124,9 +16383,9 @@ function diagnoseJobView(job) {
 }
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
-  "jobId", "idempotencyKey", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "lastActivityAt", "idleMs", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
-  "providerRetryWarningCount", "usage", "phaseTimings",
+  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
 ];
@@ -16158,6 +16417,8 @@ function compactQueueJobLines(records) {
     const parts = [
       record.jobId,
       record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
+      record.requeuedFrom ? `requeuedFrom=${record.requeuedFrom}` : "",
+      record.requeuedAs ? `requeuedAs=${record.requeuedAs}` : "",
       `agent=${record.agent || "?"}`,
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
@@ -16167,6 +16428,8 @@ function compactQueueJobLines(records) {
       timing.afterAgentMs ? `afterAgentMs=${timing.afterAgentMs}` : "",
       record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
       record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
+      record.usage?.steps && record.usage.cacheReadCount ? `cacheRead=${record.usage.cacheReadCount}` : "",
+      record.validationFixPass ? `fixPass=${record.validationFixPass.used ? `used(${record.validationFixPass.finalValidation})` : "skipped"}` : "",
       record.providerRetryWarningCount ? `providerErrorLines=${record.providerRetryWarningCount}` : "",
       record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
@@ -16195,7 +16458,14 @@ server.tool(
       : null;
     // record_json keeps the stage and timings of its last write; a running job's are derived now.
     const snapshot = persisted
-      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted), ...queueAgentActivity(persisted) }
+      ? {
+        ...persisted,
+        runStage: queueRunStage(persisted),
+        ...queueAgentTiming(persisted),
+        ...queueAgentActivity(persisted),
+        // One readable line next to the usage counts: the totals a job read, so a very heavy one is noticed.
+        ...(persisted.usage?.steps ? { usageSummary: formatOpenCodeUsage(persisted.usage) } : {}),
+      }
       : null;
     if (!snapshot) {
       const lookupRoot = projectRoot || await resolveProjectStateRoot(process.cwd());
@@ -16427,6 +16697,107 @@ server.tool(
         },
       ],
     };
+  }
+);
+
+// A short refusal for the queue-management tools (not an agent job, so no lock or worktree lines).
+function formatToolRefusal({ headline, errorType, reason, suggestedFix }) {
+  return [headline, "", `errorType: ${errorType}`, `reason: ${reason}`, `suggestedFix: ${suggestedFix}`].join("\n");
+}
+
+function formatConcurrencyChange(change) {
+  const described = describeConcurrencyLimits();
+  return [
+    change.reset ? "OpenCode concurrency limits reset to the environment values." : "OpenCode concurrency limits updated.",
+    `Provider slots per provider: ${described.provider}; was ${change.previous.providerLimit}`,
+    `Queue parallel limit (this process): ${described.queue}; was ${change.previous.queueParallelLimit}`,
+    "Running jobs keep their slots; a lower limit only holds back new starts until enough jobs have finished.",
+    `Persisted in ${path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite")}: other bridge processes pick it up at their next scheduler pass or slot request, and a restart keeps it until reset: true.`,
+  ].join("\n");
+}
+
+server.tool(
+  "requeue_opencode_job",
+  "Re-run a failed, cancelled, interrupted or not_resumable queue job as a NEW job built from its stored request (agent, task, model pin, Scope Contract, locks, validationCommand, timeout). The request goes through the normal enqueue validation again; the new job gets its own id and a derived idempotency key (<original key>:requeue:<n>), and the two jobs reference each other (requeuedFrom / requeuedAs). Completed and unfinished jobs are refused. Optional overrides: model (must be in CODEX_OPENCODE_MODEL_ALLOWLIST) and timeoutMs.",
+  {
+    cwd: z.string().min(1).describe("Canonical repository path of the project that owns the job."),
+    jobId: z.string().min(1).describe("The failed, cancelled, interrupted or not_resumable job to run again."),
+    model: z.string().optional().describe("Run the new job on this model instead: provider/model[@variant], an entry of CODEX_OPENCODE_MODEL_ALLOWLIST."),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms for the new job (at most 24 h)."),
+  },
+  async ({ cwd, jobId, model, timeoutMs }) => {
+    const started = nowMs();
+    const requeued = await requeueQueueJob({ cwd, jobId, model, timeoutMs });
+    if (!requeued.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Requeue refused.",
+          errorType: requeued.errorType,
+          reason: requeued.error,
+          suggestedFix: requeued.suggestedFix || "Fix the cause above and call requeue_opencode_job again.",
+        }) }],
+      };
+    }
+    const record = requeued.record;
+    const queueAssessment = await assessQueuePlan([{
+      jobId: record.jobId,
+      lockType: record.mode === "read" ? "read" : "write",
+      cwd: record.cwd,
+      lockedPaths: record.lockedPaths,
+      allowedEdits: record.allowedEdits,
+      scopeContract: record.scopeContract,
+    }]);
+    return {
+      content: [{
+        type: "text",
+        text: [
+          "OpenCode job requeued.",
+          `New job ID: ${record.jobId}`,
+          `Requeued from: ${requeued.originalJobId} (was ${requeued.originalStatus}${requeued.originalErrorType ? `, ${requeued.originalErrorType}` : ""})`,
+          `Idempotency key: ${requeued.idempotencyKey}`,
+          `Deduplicated: ${requeued.deduplicated ? "yes (the same requeue already created this job)" : "no"}`,
+          `Overrides: ${requeued.overrides.length ? requeued.overrides.join(", ") : "none"}`,
+          `Status: ${record.status}`,
+          `Agent: ${record.agent}`,
+          `Mode: ${record.mode}`,
+          `Lock mode: ${record.lockMode}`,
+          `Locked paths: ${(record.lockedPaths || []).length ? record.lockedPaths.join(", ") : "none"}`,
+          `Allowed edits: ${(record.allowedEdits || []).length ? record.allowedEdits.join(", ") : "none"}`,
+          `Queue mode: ${effectiveQueueMode()}`,
+          `Queue assessment: ${queueAssessment.status}`,
+          `Queue reason: ${queueAssessment.reason}`,
+          requeued.originalWorktreePath ? `The previous attempt's worktree is untouched: ${requeued.originalWorktreePath}` : null,
+          ...requeued.warnings.map((warning) => `Warning: ${warning}`),
+          `Duration ms: ${Math.round(nowMs() - started)}`,
+        ].filter((line) => line !== null).join("\n"),
+      }],
+    };
+  }
+);
+
+server.tool(
+  "set_opencode_concurrency",
+  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) and/or the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}. The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
+  {
+    providerLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Simultaneous model calls per provider, across all bridge processes."),
+    queueParallelLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Queue jobs this bridge process runs at once (the provider limit still caps model calls)."),
+    reset: z.boolean().optional().describe("Clear both runtime overrides and return to the environment values. Do not combine with a limit."),
+  },
+  async ({ providerLimit, queueParallelLimit, reset = false }) => {
+    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset });
+    if (!change.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Concurrency change rejected.",
+          errorType: change.errorType,
+          reason: change.error,
+          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, or reset: true.`,
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: formatConcurrencyChange(change) }] };
   }
 );
 
@@ -18063,6 +18434,14 @@ function validateParallelWritePlan(jobs) {
     if (sanitizedError) {
       return { ...sanitizedError, lockPlans };
     }
+    if (job.validationFixPasses) {
+      return {
+        error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
+        errorType: "validation_fix_pass_unsupported_in_parallel",
+        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove validationFixPasses.",
+        lockPlans,
+      };
+    }
     const planPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.forbiddenEdits, plan.sharedFiles, plan.serialOnly, scopeContractPathInputs(plan.scopeContract));
     const orchestratorError = orchestratorPolicyError(job, plan, "parallel");
     if (orchestratorError) {
@@ -18265,6 +18644,23 @@ function validateParallelWritePlan(jobs) {
   return { error: null, lockPlans };
 }
 
+// Q-004: validationFixPasses is 0 or 1 and only means something for a write job whose
+// validationCommand the bridge runs; anything else would be an option that silently does nothing.
+function validationFixPassError(job, lockPlan) {
+  const requested = job?.validationFixPasses;
+  if (requested === undefined || requested === null || requested === 0) return null;
+  if (requested !== 1) {
+    return { errorType: "validation_fix_pass_invalid", error: `validationFixPasses must be 0 or 1; got ${JSON.stringify(requested)}.`, suggestedFix: "Use validationFixPasses 0 (default) or 1." };
+  }
+  if (lockPlan.lockType === "read" || job.sanitizedWorkspace) {
+    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses applies to write jobs only; a read-only or sanitized-workspace job has no validation to fix.", suggestedFix: "Remove validationFixPasses." };
+  }
+  if (!String(lockPlan.validationCommand || "").trim()) {
+    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses needs a validationCommand: the fix pass runs after that command fails.", suggestedFix: "Add a validationCommand, or remove validationFixPasses." };
+  }
+  return null;
+}
+
 function validateSingleLockPlan(job) {
   const sanitizedError = sanitizedJobPolicyError(job);
   if (sanitizedError) {
@@ -18318,6 +18714,9 @@ function validateSingleLockPlan(job) {
       lockPlan,
     };
   }
+
+  const fixPassError = validationFixPassError(job, lockPlan);
+  if (fixPassError) return { ...fixPassError, lockPlan };
 
   const unsafeReason = unsafePathReason(planPathInputs, lockPlan.cwd);
   if (unsafeReason) {
@@ -18408,6 +18807,78 @@ function jobAgentRuntime() {
     readAgentDebugMetadata: hook?.readAgentDebugMetadata || readAgentDebugMetadata,
     runOpenCodeWithPolicy: hook?.runOpenCodeWithPolicy || runOpenCodeWithPolicy,
   };
+}
+
+// Q-004: the validation fix pass. OpenCode's `run` can continue a session (--session <id> or
+// --continue, present in OpenCode 1.18), but the spawn path passes neither: it keeps no session
+// id for a job (the stream parser knows the root session but the run result does not carry it),
+// and --continue resumes the project's last session, which with parallel builders may be another
+// job's. Resuming by id is untested against a real model here. The fix pass is therefore a
+// second fresh run in the same worktree with the job's own prompt plus the validation output;
+// the files the first run wrote are already there.
+const VALIDATION_FIX_MIN_REMAINING_MS = 60 * 1000;
+const VALIDATION_FIX_OUTPUT_CHARS = 4000;
+
+// Agent process time of one run, without the wait for a provider slot (which is not part of the
+// job timeout).
+function agentProcessMsOf(agentResult) {
+  const started = Number(agentResult?.childStartedAtMs) || 0;
+  const finished = Number(agentResult?.childFinishedAtMs) || 0;
+  if (started && finished) return Math.max(0, finished - started);
+  return Math.max(0, (Number(agentResult?.durationMs) || 0) - (Number(agentResult?.providerConcurrencyWaitMs) || 0));
+}
+
+function buildValidationFixPrompt(prompt, validationGate) {
+  const clip = (value) => String(value || "").slice(0, VALIDATION_FIX_OUTPUT_CHARS);
+  return [
+    prompt,
+    "",
+    "VALIDATION FIX PASS (the second and last run of this job)",
+    "Your changes from the first run are in this working tree. The bridge then ran the validation command and it FAILED. You cannot run commands; the bridge runs it again after this pass.",
+    "Fix only what the output below shows, with the same Scope Contract and allowed edits as before: do not edit other files, do not widen the scope, do not weaken or skip the check.",
+    "If the failure cannot be fixed inside the allowed edits, change nothing and say why in your final report. Answer in the same report format as before.",
+    "",
+    `Validation command: ${validationGate.command}`,
+    `Validation exit code: ${validationGate.exitCode}`,
+    validationGate.stdout ? `Validation stdout:\n${clip(validationGate.stdout)}` : null,
+    validationGate.stderr ? `Validation stderr:\n${clip(validationGate.stderr)}` : null,
+  ].filter((line) => line !== null).join("\n");
+}
+
+// "" when the failed validation gets its pass, else why not. A command that never ran, a
+// timeout, an agent error of its own, a cancellation or too little time left is not fixable by
+// another run.
+function validationFixPassSkipReason({ result, validation, validationGate, aborted = false, remainingMs = 0 }) {
+  if (validationGate.errorType !== "validation_command_failed") return `the validation command did not run to a result (${validationGate.errorType || validationGate.status})`;
+  if (!Number.isInteger(validationGate.exitCode)) return `the validation command ended without an exit code (${validationGate.exitCode})`;
+  if (result.errorType !== "validation_command_failed" || validation.disallowedFiles.length) return `the run also ended with ${result.errorType !== "validation_command_failed" ? result.errorType : "changes outside the allowed edits"}`;
+  if (aborted) return "the job was cancelled or lost its lock";
+  if (remainingMs < VALIDATION_FIX_MIN_REMAINING_MS) return `only ${Math.max(0, Math.round(remainingMs / 1000))} s of the job timeout are left (a pass needs ${VALIDATION_FIX_MIN_REMAINING_MS / 1000} s)`;
+  return "";
+}
+
+// The two runs of one job reported as one: tokens, provider error lines and durations add up and
+// the agent process spans from the first start to the second finish (validation between them is
+// inside it), which keeps wait + agent + after-agent equal to the job duration.
+function mergeValidationFixRuns(first, second) {
+  return {
+    ...second,
+    durationMs: (Number(first.durationMs) || 0) + (Number(second.durationMs) || 0),
+    usage: sumOpenCodeUsage(first.usage, second.usage),
+    heavyToolCalls: mergeHeavyToolCalls(first.heavyToolCalls, second.heavyToolCalls),
+    providerRetryWarningCount: (first.providerRetryWarningCount || 0) + (second.providerRetryWarningCount || 0),
+    providerConcurrencyWaitMs: (Number(first.providerConcurrencyWaitMs) || 0) + (Number(second.providerConcurrencyWaitMs) || 0),
+    childExecutionIntervals: [...(first.childExecutionIntervals || []), ...(second.childExecutionIntervals || [])],
+    childStartedAtMs: Number(first.childStartedAtMs) || Number(second.childStartedAtMs) || 0,
+  };
+}
+
+function formatValidationFixPass(info) {
+  if (!info) return "";
+  const first = `first validation: exit code ${info.firstValidation?.exitCode}${info.firstValidation?.excerpt ? `\n${info.firstValidation.excerpt}` : ""}`;
+  return info.used
+    ? `Validation fix pass: used ${info.used} of ${info.requested}; ${first}\nFinal validation: ${info.finalValidation}`
+    : `Validation fix pass: skipped (${info.skipped}); ${first}`;
 }
 
 // True only for a reader whose final pre-spawn attestation passed with edits denied; any other
@@ -19024,13 +19495,13 @@ async function executeOpenCodeJob(requestedJob, {
         ),
       };
     };
-    let result = await jobAgentRuntime().runOpenCodeWithPolicy(
+    const runAgent = (agentPrompt, runTimeoutMs) => jobAgentRuntime().runOpenCodeWithPolicy(
       resolution.actualAgent,
-      prompt,
+      agentPrompt,
       executionCwd,
       dryRun,
       lockPlan,
-      lockPlan.timeoutMs,
+      runTimeoutMs,
       {
         signal: executionSignal,
         agentMetadata,
@@ -19038,92 +19509,121 @@ async function executeOpenCodeJob(requestedJob, {
         onSupervisorHeartbeat: renewExecutionSupervisorAuthority,
       }
     );
-    phaseClock.mark("openCodeRun");
-    containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
-      || result?.terminationErrorType === "process_tree_termination_unconfirmed";
-    if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
-    if (stopLockHeartbeat.signal?.aborted) {
-      result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
-      result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
-    }
-    const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
-    // Validation is judged on tracked and untracked files only: ignored build/cache output
-    // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
-    const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
-      ? afterFiles
-      : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
-    const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
-    const sanitizedAfter = manifestProtected && !dryRun
-      ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
-      : null;
-    result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
-      ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
-      : changedFilesBetween(beforeFiles, afterFiles);
-    if (readerEditsDenied && result.changedFiles.length) {
-      result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
-      result.changedFiles = [];
-    }
-    if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
-    if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
-      const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
-      if (move) {
-        result.readOnlyHeadMove = move;
+    // Q-004: everything that judges one agent run (changed files against the scope, git control
+    // surface, HEAD, scope filesystem state, then the validation command) is one closure, so the
+    // validation fix pass judges its second run exactly as the first.
+    const evaluateAgentRun = async (result) => {
+      phaseClock.mark("openCodeRun");
+      containmentQuarantined = result?.errorType === "process_tree_termination_unconfirmed"
+        || result?.terminationErrorType === "process_tree_termination_unconfirmed";
+      if (containmentQuarantined) containmentEvidence = await containmentRecord(result);
+      if (stopLockHeartbeat.signal?.aborted) {
+        result.errorType = abortSignalErrorType(stopLockHeartbeat.signal, result.errorType || "write_lock_ownership_lost");
+        result.stderr = [result.stderr, stopLockHeartbeat.signal.reason?.message || "Durable lock ownership was lost during execution."].filter(Boolean).join("\n");
+      }
+      const afterFiles = dryRun || manifestProtected ? new Map() : await gitChangedFileSnapshot(executionCwd, readerSnapshotOptions);
+      // Validation is judged on tracked and untracked files only: ignored build/cache output
+      // (__pycache__/, coverage/) written by a test command is not a workspace mutation.
+      const afterFilesForValidation = dryRun || manifestProtected || readerEditsDenied
+        ? afterFiles
+        : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
+      const executionHeadAfterAgent = dryRun || manifestProtected ? executionHeadBefore : await captureGitHead(executionCwd);
+      const sanitizedAfter = manifestProtected && !dryRun
+        ? await verifySanitizedWorkspace(requestedJob.sanitizedWorkspace, "after_wave")
+        : null;
+      result.changedFiles = sanitizedAfter && !sanitizedAfter.ok
+        ? normalizeLockPathList((sanitizedAfter.discrepancies || []).map((item) => item.path))
+        : changedFilesBetween(beforeFiles, afterFiles);
+      if (readerEditsDenied && result.changedFiles.length) {
+        result.readOnlyWorkspaceDrift = readOnlyWorkspaceDrift(result.changedFiles, afterFiles, executionHeadBefore !== executionHeadAfterAgent);
+        result.changedFiles = [];
+      }
+      if (gitControlBefore) applyGitControlSurfaceCheck(result, gitControlBefore, await gitControlSurfaceFingerprint(executionCwd));
+      if (executionHeadAfterAgent !== executionHeadBefore && !result.errorType) {
+        const move = result.changedFiles.length ? null : await readOnlyHeadMove(lockPlan, executionCwd, executionHeadBefore, executionHeadAfterAgent);
+        if (move) {
+          result.readOnlyHeadMove = move;
+        } else {
+          result.errorType = "repository_head_changed_during_execution";
+          result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+        }
+      }
+      result.executionHeadBefore = executionHeadBefore;
+      result.executionHeadAfter = executionHeadAfterAgent;
+      if (sanitizedAfter && !sanitizedAfter.ok && !result.errorType) {
+        result.errorType = sanitizedAfter.errorType;
+        result.stderr = [result.stderr, sanitizedAfter.error].filter(Boolean).join("\n");
+      }
+      result.sanitizedWorkspaceVerification = manifestProtected ? { preflight: sanitizedPreflight, before: sanitizedBefore, after: sanitizedAfter } : null;
+
+      let validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
+      const postExecutionPathError = dryRun ? "" : unsafePathReason(
+        lockPlan.lockedPaths.concat(
+          lockPlan.allowedEdits,
+          lockPlan.forbiddenEdits,
+          lockPlan.sharedFiles,
+          scopeContractPathInputs(lockPlan.scopeContract),
+          result.changedFiles
+        ),
+        executionCwd
+      );
+      if (postExecutionPathError) {
+        validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(result.changedFiles));
+        result.errorType ||= "unsafe_path_after_execution";
+        result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
+      }
+      const scopeFilesystemViolation = scopeFilesystemBefore
+        ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
+        : null;
+      if (scopeFilesystemViolation) {
+        validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(scopeFilesystemViolation.paths));
+        result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
+        result.errorType ||= scopeFilesystemViolation.errorType;
+        result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
+      }
+      phaseClock.mark("postAgentChecks");
+      const validationGate = manifestProtected
+        ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
+        : !validation.disallowedFiles.length && !result.errorType
+        ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal })
+        : {
+            status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
+            command: lockPlan.validationCommand || "",
+            exitCode: "not_run",
+            durationMs: 0,
+            stdout: "",
+            stderr: "",
+            errorType: null,
+          };
+      if (validationGate.errorType && !result.errorType) {
+        result.errorType = validationGate.errorType;
+      }
+      phaseClock.mark("validation");
+      return { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate };
+    };
+    let { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(await runAgent(prompt, lockPlan.timeoutMs));
+    // Q-004: a builder cannot run its own checks, so a job that asked for validationFixPasses: 1
+    // gets one more run in the same worktree when its validation command failed, with the
+    // validation output, inside what is left of the job timeout. The second run is judged by the
+    // same checks and the validation command runs again; the job fails as before if it still fails.
+    if (Number(requestedJob.validationFixPasses) === 1 && !dryRun && validationGate.status === "failed") {
+      const firstValidation = {
+        exitCode: validationGate.exitCode,
+        durationMs: validationGate.durationMs || 0,
+        excerpt: truncateText([validationGate.stderr, validationGate.stdout].filter(Boolean).join("\n"), 600),
+      };
+      const remainingMs = Math.floor(timeoutForAgent(resolution.actualAgent, lockPlan, lockPlan.timeoutMs) - agentProcessMsOf(result));
+      const fixPrompt = buildValidationFixPrompt(prompt, validationGate);
+      const skipReason = validationFixPassSkipReason({ result, validation, validationGate, aborted: Boolean(executionSignal?.aborted), remainingMs })
+        || openCodeCommandLineLengthError(OPENCODE_EXE, openCodeRunArgs(resolution.actualAgent, fixPrompt, null));
+      if (skipReason) {
+        result.validationFixPass = { requested: 1, used: 0, skipped: skipReason, firstValidation };
       } else {
-        result.errorType = "repository_head_changed_during_execution";
-        result.stderr = [result.stderr, "Repository HEAD changed during OpenCode execution. The change is unattributed and was retained for review."].filter(Boolean).join("\n");
+        const fixedRun = await runAgent(fixPrompt, remainingMs);
+        ({ result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(mergeValidationFixRuns(result, fixedRun)));
+        result.validationFixPass = { requested: 1, used: 1, firstValidation, finalValidation: validationGate.status };
       }
     }
-    result.executionHeadBefore = executionHeadBefore;
-    result.executionHeadAfter = executionHeadAfterAgent;
-    if (sanitizedAfter && !sanitizedAfter.ok && !result.errorType) {
-      result.errorType = sanitizedAfter.errorType;
-      result.stderr = [result.stderr, sanitizedAfter.error].filter(Boolean).join("\n");
-    }
-    result.sanitizedWorkspaceVerification = manifestProtected ? { preflight: sanitizedPreflight, before: sanitizedBefore, after: sanitizedAfter } : null;
-
-    let validation = validateChangedFilesForPlan({ changedFiles: result.changedFiles, lockPlan, parallel: false });
-    const postExecutionPathError = dryRun ? "" : unsafePathReason(
-      lockPlan.lockedPaths.concat(
-        lockPlan.allowedEdits,
-        lockPlan.forbiddenEdits,
-        lockPlan.sharedFiles,
-        scopeContractPathInputs(lockPlan.scopeContract),
-        result.changedFiles
-      ),
-      executionCwd
-    );
-    if (postExecutionPathError) {
-      validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(result.changedFiles));
-      result.errorType ||= "unsafe_path_after_execution";
-      result.stderr = [result.stderr, postExecutionPathError].filter(Boolean).join("\n");
-    }
-    const scopeFilesystemViolation = scopeFilesystemBefore
-      ? writableScopeFilesystemViolation(scopeFilesystemBefore, await captureWritableScopeFilesystemState(executionCwd, lockPlan))
-      : null;
-    if (scopeFilesystemViolation) {
-      validation.disallowedFiles = normalizeLockPathList(validation.disallowedFiles.concat(scopeFilesystemViolation.paths));
-      result.unsafeFilesystemPaths = scopeFilesystemViolation.paths;
-      result.errorType ||= scopeFilesystemViolation.errorType;
-      result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
-    }
-    phaseClock.mark("postAgentChecks");
-    const validationGate = manifestProtected
-      ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
-      : !validation.disallowedFiles.length && !result.errorType
-      ? await runValidationGate({ command: lockPlan.validationCommand, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal })
-      : {
-          status: lockPlan.validationCommand ? "skipped_due_to_prior_failure" : "skipped",
-          command: lockPlan.validationCommand || "",
-          exitCode: "not_run",
-          durationMs: 0,
-          stdout: "",
-          stderr: "",
-          errorType: null,
-        };
-    if (validationGate.errorType && !result.errorType) {
-      result.errorType = validationGate.errorType;
-    }
-    phaseClock.mark("validation");
 
     const afterValidationFiles = dryRun || manifestProtected ? afterFiles : await gitChangedFileSnapshot(executionCwd, { includeIgnored: false });
     if (gitControlBefore && lockPlan.validationCommand) {
@@ -19315,7 +19815,7 @@ async function executeOpenCodeJob(requestedJob, {
     const lockLines = [`Temporary lock acquired: ${hardLockSummary(acquiredLock)}`, `Temporary lock released: ${lockRelease.text}`];
     const singleParts = formatSingleResultParts({ resolution, result, cwd: executionCwd, lockPlan });
     const driftLine = formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift);
-    const validationGateText = formatValidationGateResult(validationGate);
+    const validationGateText = [formatValidationFixPass(result.validationFixPass), formatValidationGateResult(validationGate)].filter(Boolean).join("\n");
     // Stored view (queue result text, run audit): the same text without the patch preview, fitted
     // to the result limit report-first. The lock lines are safety evidence, so they stay in the
     // shortened stand-in for the preamble.
@@ -19497,6 +19997,10 @@ function queueRecordSnapshot(record, includeResult = true) {
     parentJobId: record.parentJobId || "",
     idempotencyKey: record.idempotencyKey || "",
     requestFingerprint: record.requestFingerprint || "",
+    requeuedFrom: record.requeuedFrom || "",
+    requeuedAs: record.requeuedAs || "",
+    requeueSequence: record.requeueSequence || 0,
+    requeuedAt: record.requeuedAt || "",
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -19525,6 +20029,8 @@ function queueRecordSnapshot(record, includeResult = true) {
     providerWaitMs: record.providerWaitMs || 0,
     providerRetryWarningCount: record.providerRetryWarningCount || 0,
     usage: record.usage || null,
+    heavyToolCalls: record.heavyToolCalls || null,
+    validationFixPass: record.validationFixPass || null,
     phaseTimings: record.phaseTimings || null,
     readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
@@ -20633,7 +21139,7 @@ async function assessQueuePlan(lockPlans = []) {
   };
 }
 
-async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true } = {}) {
+async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true, recordFields = null } = {}) {
   if (effectiveQueueMode() === "off") {
     return {
       ok: false,
@@ -20744,6 +21250,8 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     containmentQuarantined: false,
     revision: 0,
   };
+  // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
+  if (recordFields) Object.assign(record, recordFields);
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -20772,6 +21280,202 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     scheduleQueue();
   }
   return { ok: true, record };
+}
+
+// Q-001: requeue_opencode_job. Terminal states, from the queue state machine:
+//   failed, cancelled     the run (or its start) ended without a result: requeue is the retry.
+//   interrupted           the owner's lease lapsed while the job was active: retry-able, but the
+//                         previous child may still be alive, which is checked below.
+//   not_resumable         a never-started job that recovery could not resume. Requeue works only
+//                         when the encrypted request survived; the usual cause (a legacy record
+//                         without one) is refused with what is missing.
+//   completed             a success: re-running finished work is a deliberate new enqueue.
+// Every other status is unfinished and has to be cancelled or awaited first.
+const REQUEUE_ELIGIBLE_STATUSES = new Set(["failed", "cancelled", "interrupted", "not_resumable"]);
+const REQUEUE_UNFINISHED_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
+const REQUEUE_KEY_SUFFIX = /(?::requeue:\d+)+$/;
+
+// <original key>:requeue:<n>, where n counts the requeues down the chain (a requeue of a requeue
+// keeps the root key, so keys do not grow); a job without a key uses its job id. The key is
+// deterministic, so a repeated or concurrent requeue of the same job deduplicates to one job.
+function requeueIdempotencyKey(original, sequence) {
+  const base = String(original.idempotencyKey || "").replace(REQUEUE_KEY_SUFFIX, "") || String(original.jobId);
+  const suffix = `:requeue:${sequence}`;
+  if (base.length + suffix.length <= 200) return `${base}${suffix}`;
+  const digest = createHash("sha256").update(base).digest("hex").slice(0, 16);
+  return `${base.slice(0, 200 - suffix.length - digest.length - 1)}~${digest}${suffix}`;
+}
+
+function requeueRefusal(errorType, error, suggestedFix = "") {
+  return { ok: false, errorType, error, suggestedFix };
+}
+
+// Records the successor on the terminal row of the original. A terminal row is not rewritten by
+// the owner any more, so this is a guarded single UPDATE on the revision it read.
+async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
+  const db = await openLockDb(projectRoot);
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { marked: false, reason: "the original is no longer a terminal job" };
+      let summary = {};
+      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { marked: false, reason: "the original record is unreadable" }; }
+      if (summary.requeuedAs && summary.requeuedAs !== newJobId) return { marked: false, reason: `already requeued as ${summary.requeuedAs}`, requeuedAs: summary.requeuedAs };
+      if (summary.requeuedAs === newJobId) return { marked: true };
+      const requeuedAt = new Date().toISOString();
+      const changed = db.prepare(`
+        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
+        WHERE job_id = ? AND revision = ? AND status = ?
+      `).run(
+        JSON.stringify({ ...summary, requeuedAs: newJobId, requeuedAt, revision: Number(row.revision || 0) + 1 }),
+        requeuedAt,
+        jobId,
+        Number(row.revision || 0),
+        row.status
+      );
+      if (Number(changed.changes || 0) === 1) {
+        const live = QUEUE_JOBS.get(jobId);
+        if (live) Object.assign(live, { requeuedAs: newJobId, requeuedAt });
+        return { marked: true };
+      }
+    }
+    return { marked: false, reason: "the original record kept changing" };
+  } finally {
+    closeDb(db);
+  }
+}
+
+// Creates a new queue job from the stored request of a failed, cancelled, interrupted or
+// not_resumable one. The request goes through enqueueQueueJob, the path enqueue_opencode_job uses
+// (lock plan, Scope Contract rules, worktree requirement, fingerprint, idempotency), after a
+// zod check against the current job input schema; nothing is replayed unchecked.
+async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }) {
+  if (typeof jobId !== "string" || !jobId.trim()) return requeueRefusal("requeue_invalid_arguments", "jobId must be a non-empty string.");
+  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_AGENT_TIMEOUT_MS)) {
+    return requeueRefusal("requeue_invalid_arguments", `timeoutMs must be a positive integer of at most ${MAX_AGENT_TIMEOUT_MS} ms; got ${JSON.stringify(timeoutMs)}.`);
+  }
+  if (model !== undefined && model !== "" && typeof model !== "string") {
+    return requeueRefusal("requeue_invalid_arguments", `model must be a "provider/model[@variant]" string; got ${JSON.stringify(model)}.`);
+  }
+  if (effectiveQueueMode() !== "sqlite") {
+    return requeueRefusal("requeue_requires_sqlite_queue", "Only the SQLite queue keeps the original request (encrypted); in the other modes it is dropped when the job ends.", "Re-enqueue the job with enqueue_opencode_job and a new idempotencyKey.");
+  }
+
+  let modelRequirement = null;
+  if (model) {
+    const parsed = parseModelAllowlistEntry(model);
+    if (!parsed) return requeueRefusal("requeue_model_invalid", `model "${model}" is not in provider/model[@variant] form.`, "Use the form of CODEX_OPENCODE_MODEL_ALLOWLIST entries, for example google/antigravity-gemini-3.8-flash@high.");
+    modelRequirement = { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
+  }
+
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  const db = await openLockDb(projectRoot);
+  let row;
+  try {
+    row = db.prepare("SELECT job_id, cwd, status, revision, idempotency_key, request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+  } finally {
+    closeDb(db);
+  }
+  if (!row) return requeueRefusal("requeue_job_not_found", `No queue job ${jobId} in ${projectRoot}.`, "Check the job id and cwd with list_opencode_jobs.");
+  let summary = {};
+  try { summary = JSON.parse(row.record_json || "{}"); } catch { summary = {}; }
+  if (row.status === "completed") {
+    return requeueRefusal("requeue_job_completed", `Job ${jobId} completed. Only failed, cancelled, interrupted or not_resumable jobs can be requeued; re-running finished work would duplicate it.`, "If the work really must run again, use enqueue_opencode_job with a new idempotencyKey.");
+  }
+  if (REQUEUE_UNFINISHED_STATUSES.has(row.status)) {
+    return requeueRefusal("requeue_job_not_terminal", `Job ${jobId} is still ${row.status}.`, "Wait for it to finish, or cancel_opencode_job it first.");
+  }
+  if (!REQUEUE_ELIGIBLE_STATUSES.has(row.status)) {
+    return requeueRefusal("requeue_job_status_unsupported", `Job ${jobId} has status "${row.status}", which requeue does not handle.`);
+  }
+  if (summary.parentJobId) {
+    return requeueRefusal("requeue_pipeline_child", `Job ${jobId} belongs to pipeline/parent ${summary.parentJobId}; a requeued copy would not be tracked by it.`, "Re-run it through the pipeline, or enqueue a standalone job.");
+  }
+  if (summary.requeuedAs) {
+    return requeueRefusal("requeue_already_requeued", `Job ${jobId} was already requeued as ${summary.requeuedAs}.`, `Requeue ${summary.requeuedAs} if that one failed.`);
+  }
+  if (row.status === "interrupted" && summary.orphanChildProcessAlive && processIsAlive(Number(summary.orphanChildProcessId || 0))) {
+    return requeueRefusal("requeue_orphan_child_alive", `The previous run of ${jobId} left a child process (pid ${summary.orphanChildProcessId}) that is still alive and may still be writing its worktree.`, "Inspect it with diagnose_opencode_bridge and stop it before requeuing.");
+  }
+  if (!row.request_encrypted) {
+    return requeueRefusal(
+      "requeue_request_not_stored",
+      `The original request of ${jobId} (agent, task, model pin, Scope Contract, locks, validationCommand, timeout) is not stored: this record has no encrypted request. It predates encrypted requests or was never persisted with one.`,
+      "Enqueue the work again with enqueue_opencode_job."
+    );
+  }
+  let stored;
+  try {
+    stored = await decryptQueueRequest(row.request_encrypted, row.job_id);
+  } catch (error) {
+    return requeueRefusal("requeue_request_unreadable", `The stored request of ${jobId} could not be decrypted (${redactSensitiveText(error?.message || String(error))}); queue-request.key may have changed.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+    return requeueRefusal("requeue_request_not_stored", `The stored request of ${jobId} is empty or not an object.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  if (stored.orchestratorMode === "contractor" || stored.internalQueueContractorProof || stored.internalQueueJobId) {
+    return requeueRefusal("requeue_contractor_unsupported", `Job ${jobId} ran in contractor mode. Its authorization token is never stored, so it cannot be replayed.`, "Enqueue it again with a fresh contractorAuthorizationToken.");
+  }
+  const checked = z.object(jobInputShape).strict().safeParse(stored);
+  if (!checked.success) {
+    const problems = checked.error.issues.map((issue) => `${issue.path.join(".") || "(request)"}: ${issue.message}`).slice(0, 8);
+    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} does not satisfy the current job input schema: ${problems.join("; ")}.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  const request = checked.data;
+  if (!request.sanitizedWorkspace && !recordMatchesProject({ cwd: request.cwd }, projectRoot)) {
+    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} names ${request.cwd}, not ${projectRoot}.`);
+  }
+
+  const warnings = [];
+  const overrides = [];
+  const job = { ...request };
+  if (modelRequirement) {
+    if (!allowlistedModelOverride(modelRequirement, request.agent)) {
+      const allowlist = activeModelOverrideAllowlist();
+      return requeueRefusal(
+        "requeue_model_not_allowlisted",
+        `model ${model} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or the agent ${request.agent} cannot be overridden.`,
+        "Pick a listed model, or ask the operator to add it to the allowlist."
+      );
+    }
+    const previous = request.scopeContract?.modelRequirement;
+    job.scopeContract = {
+      ...(request.scopeContract || {}),
+      modelRequirement: { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...modelRequirement },
+    };
+    overrides.push(`model=${model}`);
+  } else if (request.scopeContract?.modelRequirement && !allowlistedModelOverride(request.scopeContract.modelRequirement, request.agent)) {
+    warnings.push(`The stored model pin ${request.scopeContract.modelRequirement.provider}/${request.scopeContract.modelRequirement.model} is not in the current allowlist; the job runs only if it matches the agent's managed profile.`);
+  }
+  if (timeoutMs !== undefined) {
+    job.timeoutMs = timeoutMs;
+    overrides.push(`timeoutMs=${timeoutMs}`);
+  }
+
+  const sequence = Number(summary.requeueSequence || 0) + 1;
+  const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
+  job.idempotencyKey = idempotencyKey;
+  const enqueued = await enqueueQueueJob(job, "", { recordFields: { requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
+  if (!enqueued.ok) {
+    return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
+  }
+  const marked = await markQueueJobRequeued(projectRoot, jobId, enqueued.record.jobId);
+  if (!marked.marked) {
+    warnings.push(`The original job could not be marked as requeued (${marked.reason}); the new job ${enqueued.record.jobId} exists.`);
+  }
+  return {
+    ok: true,
+    record: enqueued.record,
+    deduplicated: Boolean(enqueued.deduplicated),
+    originalJobId: jobId,
+    originalStatus: row.status,
+    originalErrorType: summary.errorType || "",
+    originalWorktreePath: summary.worktreePath || "",
+    idempotencyKey,
+    sequence,
+    overrides,
+    warnings,
+  };
 }
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
@@ -21535,6 +22239,8 @@ async function startQueueRecord(record) {
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
+        heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
+        validationFixPass: execution.result?.validationFixPass || null,
         phaseTimings: execution.result?.phaseTimings || null,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
@@ -21635,6 +22341,8 @@ function scheduleQueue(delayMs = 0) {
     queueScheduleRequested = false;
     let progressed = false;
     try {
+      // Q-002: a limit changed by another bridge process, or persisted before this one started.
+      await refreshRuntimeConcurrency();
       const runningCount = runningQueueRecords().length;
       let capacity = Math.max(0, CONFIG.queueParallelLimit - runningCount);
       if (!capacity) {
@@ -24173,6 +24881,7 @@ server.tool(
       parallelAgentMetadata[index] = metadata;
     }
 
+    await refreshRuntimeConcurrency();
     const capacityError = parallelBatchCapacityError(jobs, parallelProviderKeys(parallelResolutions, parallelAgentMetadata, lockPlans));
     if (capacityError) {
       return { content: [{ type: "text", text: formatRejectedExecution({
@@ -26173,6 +26882,19 @@ export const __selfTest = {
     beginBridgeStartupRecovery,
     readPositiveIntEnv,
     readUserLineEndingGitConfig,
+    // tests/review-queue-features.js
+    ENV_PROVIDER_CONCURRENCY_LIMIT,
+    ENV_QUEUE_PARALLEL_LIMIT,
+    MAX_RUNTIME_CONCURRENCY_LIMIT,
+    RUNTIME_CONCURRENCY,
+    describeConcurrencyLimits,
+    encryptQueueRequest,
+    markQueueJobRequeued,
+    refreshRuntimeConcurrency,
+    requeueIdempotencyKey,
+    requeueQueueJob,
+    runtimeConcurrencyLimitError,
+    setRuntimeConcurrency,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
