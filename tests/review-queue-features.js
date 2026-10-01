@@ -259,6 +259,271 @@ test("Q-002: a raised queue parallel limit starts waiting jobs without a restart
   }
 });
 
+// ---------------------------------------------------------------------------- Q-001
+const doneExecution = (text = "REPORT: done.") => ({ response: { content: [{ type: "text", text }] }, result: { errorType: "", changedFiles: [] }, validation: null, worktree: null });
+const failedExecution = (errorType = "agent_timeout") => ({ response: { content: [{ type: "text", text: `Job failed.\nerrorType: ${errorType}` }] }, result: { errorType, changedFiles: [] }, validation: null, worktree: null });
+const readJob = (extra = {}) => ({
+  agent: "reviewer", task: "Review src/a.txt for the requeue tests.", cwd: repo, write: false, lockMode: "off",
+  scopeContract: { mode: "read", read: ["src/a.txt"] }, ...extra,
+});
+const writeScope = (file) => ({ mode: "write", read: ["src"], write: [file], allowedEdits: [file], forbidden: [".env"], validationCommand: "git diff --check" });
+const writeJob = (file = "src/a.txt", extra = {}) => ({
+  agent: "builder", task: `Edit ${file} for the requeue tests.`, cwd: repo, write: true, lockMode: "simple",
+  lockedPaths: ["src"], allowedEdits: [file], validationCommand: "git diff --check", timeoutMs: 600000,
+  scopeContract: writeScope(file), ...extra,
+});
+const durable = (jobId) => __selfTest.internals.readPersistedQueueRecord(jobId, repo);
+const requests = new Map();
+async function runToEnd(job, execution) {
+  selfTestHooks.queueJobExecutorTestHook = async (request) => {
+    requests.set(request.task, request);
+    return typeof execution === "function" ? execution(request) : execution;
+  };
+  const enqueued = await enqueueQueueJob(job);
+  assert.equal(enqueued.ok, true, `${enqueued.errorType}: ${enqueued.error}`);
+  assert.ok(await waitFor(async () => ["completed", "failed", "cancelled"].includes((await durable(enqueued.record.jobId))?.status)), "the job must reach a terminal status");
+  return enqueued.record.jobId;
+}
+async function setStatus(jobId, status) {
+  const db = await __selfTest.internals.openLockDb(repo);
+  try {
+    db.prepare("UPDATE opencode_jobs SET status = ?, revision = revision + 1 WHERE job_id = ?").run(status, jobId);
+  } finally {
+    __selfTest.internals.closeDb(db);
+  }
+}
+async function rewriteStored(jobId, mutate, { dropRequest = false } = {}) {
+  const db = await __selfTest.internals.openLockDb(repo);
+  try {
+    const row = db.prepare("SELECT request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+    if (dropRequest) {
+      db.prepare("UPDATE opencode_jobs SET request_encrypted = NULL WHERE job_id = ?").run(jobId);
+      return;
+    }
+    const request = await __selfTest.internals.decryptQueueRequest(row.request_encrypted, jobId);
+    mutate(request);
+    db.prepare("UPDATE opencode_jobs SET request_encrypted = ? WHERE job_id = ?").run(await __selfTest.internals.encryptQueueRequest(request, jobId), jobId);
+  } finally {
+    __selfTest.internals.closeDb(db);
+  }
+}
+async function patchSummary(jobId, patch) {
+  const db = await __selfTest.internals.openLockDb(repo);
+  try {
+    const row = db.prepare("SELECT record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+    db.prepare("UPDATE opencode_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify({ ...JSON.parse(row.record_json), ...patch }), jobId);
+  } finally {
+    __selfTest.internals.closeDb(db);
+  }
+}
+
+test("Q-001: the derived idempotency key is stable, bounded and does not grow down a chain", () => {
+  const { requeueIdempotencyKey } = __selfTest.internals;
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "batch-7", jobId: "j1" }, 1), "batch-7:requeue:1");
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "batch-7:requeue:1", jobId: "j2" }, 2), "batch-7:requeue:2");
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "", jobId: "builder-1-ab" }, 1), "builder-1-ab:requeue:1");
+  const long = requeueIdempotencyKey({ idempotencyKey: "k".repeat(200), jobId: "j" }, 12);
+  assert.ok(long.length <= 200 && long.endsWith(":requeue:12"), long);
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "k".repeat(200), jobId: "j" }, 12), long, "deterministic");
+  assert.notEqual(requeueIdempotencyKey({ idempotencyKey: `${"k".repeat(199)}x`, jobId: "j" }, 12), long, "a different long key does not collide");
+});
+
+test("Q-001: a failed writer is requeued as a new job with the stored request, linked both ways", async () => {
+  const original = await runToEnd(writeJob("src/a.txt", { idempotencyKey: "batch-a" }), failedExecution("agent_timeout"));
+  assert.equal((await durable(original)).status, "failed");
+  const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original });
+  assert.notEqual(response.isError, true, textOf(response));
+  const text = textOf(response);
+  assert.match(text, /^OpenCode job requeued\./);
+  assert.match(text, new RegExp(`Requeued from: ${original} \\(was failed, agent_timeout\\)`));
+  assert.match(text, /Idempotency key: batch-a:requeue:1/);
+  assert.match(text, /Overrides: none/);
+  const created = /New job ID: (\S+)/.exec(text)[1];
+  assert.notEqual(created, original);
+  assert.ok(await waitFor(async () => (await durable(created))?.status === "failed"), "the new job runs (and fails again with the same fixture)");
+
+  const first = await durable(original);
+  const second = await durable(created);
+  assert.equal(first.requeuedAs, created);
+  assert.ok(first.requeuedAt);
+  assert.equal(second.requeuedFrom, original);
+  assert.equal(second.requeueSequence, 1);
+  assert.equal(second.idempotencyKey, "batch-a:requeue:1");
+  assert.equal(second.agent, "builder");
+  assert.deepEqual(second.lockedPaths, first.lockedPaths);
+  assert.deepEqual(second.allowedEdits, first.allowedEdits);
+  assert.deepEqual(second.scopeContract, first.scopeContract);
+
+  // The executor saw the stored request, unchanged (timeout, validationCommand, scope contract).
+  const seen = requests.get("Edit src/a.txt for the requeue tests.");
+  assert.equal(seen.timeoutMs, 600000);
+  assert.equal(seen.validationCommand, "git diff --check");
+  assert.deepEqual(seen.scopeContract, writeScope("src/a.txt"));
+  assert.equal(seen.idempotencyKey, undefined, "the key is kept out of the stored request, as for any job");
+
+  // Lineage is visible in the compact list and in get_opencode_job.
+  const list = textOf(await callTool("list_opencode_jobs", { cwd: repo }));
+  assert.match(list, new RegExp(`${original}[^\\n]*requeuedAs=${created}`));
+  assert.match(list, new RegExp(`${created}[^\\n]*requeuedFrom=${original}`));
+  const view = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId: created })));
+  assert.equal(view.requeuedFrom, original);
+});
+
+test("Q-001: model and timeout overrides pass through, everything else is replayed", async () => {
+  selfTestHooks.selfTestModelOverrideAllowlist = ["fixture/model-b@high", "fixture/model-c"];
+  try {
+    const original = await runToEnd(writeJob("src/b.txt", { idempotencyKey: "batch-b" }), failedExecution("opencode_rate_limited"));
+    const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original, model: "fixture/model-b@high", timeoutMs: 1234567 });
+    assert.notEqual(response.isError, true, textOf(response));
+    assert.match(textOf(response), /Overrides: model=fixture\/model-b@high, timeoutMs=1234567/);
+    const created = /New job ID: (\S+)/.exec(textOf(response))[1];
+    assert.ok(await waitFor(async () => (await durable(created))?.status === "failed"));
+    const seen = requests.get("Edit src/b.txt for the requeue tests.");
+    assert.equal(seen.timeoutMs, 1234567);
+    assert.deepEqual(seen.scopeContract.modelRequirement, { provider: "fixture", model: "model-b", variant: "high" });
+    assert.deepEqual({ ...seen.scopeContract, modelRequirement: undefined }, { ...writeScope("src/b.txt"), modelRequirement: undefined });
+    assert.deepEqual(seen.lockedPaths, ["src"]);
+    assert.equal((await durable(created)).scopeContract.modelRequirement.model, "model-b");
+  } finally {
+    selfTestHooks.selfTestModelOverrideAllowlist = null;
+  }
+});
+
+test("Q-001: a cancelled, interrupted and not_resumable job can be requeued", async () => {
+  for (const status of ["cancelled", "interrupted", "not_resumable"]) {
+    const original = await runToEnd(readJob({ task: `Review for the ${status} requeue test.`, idempotencyKey: `status-${status}` }), failedExecution());
+    await setStatus(original, status);
+    const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original });
+    assert.notEqual(response.isError, true, `${status}: ${textOf(response)}`);
+    assert.match(textOf(response), new RegExp(`Requeued from: ${original} \\(was ${status}`));
+  }
+});
+
+test("Q-001: a completed job is refused", async () => {
+  const original = await runToEnd(readJob({ task: "Completed job for the requeue test.", idempotencyKey: "completed-one" }), doneExecution());
+  assert.equal((await durable(original)).status, "completed");
+  const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original });
+  assert.equal(response.isError, true);
+  assert.match(textOf(response), /errorType: requeue_job_completed/);
+  assert.match(textOf(response), /new idempotencyKey/);
+  assert.equal((await durable(original)).requeuedAs || "", "", "nothing was created or marked");
+  assert.equal((await enqueueQueueJob(readJob({ task: "Completed job for the requeue test.", idempotencyKey: "completed-one:requeue:1" }))).deduplicated, undefined, "no job holds the derived key");
+});
+
+test("Q-001: a model outside the allowlist, a malformed model and a bad timeout are refused", async () => {
+  selfTestHooks.selfTestModelOverrideAllowlist = ["fixture/model-b@high"];
+  try {
+    const original = await runToEnd(readJob({ task: "Failed job for the refusal tests.", idempotencyKey: "refusals" }), failedExecution());
+    for (const [args, errorType] of [
+      [{ model: "evil/model-z" }, "requeue_model_not_allowlisted"],
+      [{ model: "fixture/model-b@low" }, "requeue_model_not_allowlisted"],
+      [{ model: "not-a-model" }, "requeue_model_invalid"],
+      [{ model: "-x/--y" }, "requeue_model_invalid"],
+      [{ timeoutMs: 0 }, "requeue_invalid_arguments"],
+      [{ timeoutMs: 10 ** 12 }, "requeue_invalid_arguments"],
+      [{ timeoutMs: 1.5 }, "requeue_invalid_arguments"],
+    ]) {
+      const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original, ...args });
+      assert.equal(response.isError, true, JSON.stringify(args));
+      assert.match(textOf(response), new RegExp(`errorType: ${errorType}`), JSON.stringify(args));
+    }
+    assert.equal((await durable(original)).requeuedAs || "", "", "a refused requeue leaves the original unmarked");
+    const missing = await callTool("requeue_opencode_job", { cwd: repo, jobId: "builder-0-00000000" });
+    assert.match(textOf(missing), /errorType: requeue_job_not_found/);
+  } finally {
+    selfTestHooks.selfTestModelOverrideAllowlist = null;
+  }
+});
+
+test("Q-001: an unfinished job, a pipeline child and an already requeued job are refused", async () => {
+  const release = [];
+  selfTestHooks.queueJobExecutorTestHook = async () => {
+    await new Promise((resolve) => release.push(resolve));
+    return failedExecution();
+  };
+  const running = await enqueueQueueJob(readJob({ task: "A job that is still running.", idempotencyKey: "still-running" }));
+  assert.equal(running.ok, true);
+  assert.ok(await waitFor(() => release.length === 1));
+  const unfinished = await callTool("requeue_opencode_job", { cwd: repo, jobId: running.record.jobId });
+  assert.equal(unfinished.isError, true);
+  assert.match(textOf(unfinished), /errorType: requeue_job_not_terminal[\s\S]*still running/);
+  release.shift()();
+  assert.ok(await waitFor(async () => (await durable(running.record.jobId))?.status === "failed"));
+
+  await patchSummary(running.record.jobId, { parentJobId: "some-pipeline-1" });
+  const child = await callTool("requeue_opencode_job", { cwd: repo, jobId: running.record.jobId });
+  assert.match(textOf(child), /errorType: requeue_pipeline_child/);
+  await patchSummary(running.record.jobId, { parentJobId: "" });
+
+  selfTestHooks.queueJobExecutorTestHook = async () => failedExecution();
+  const first = await callTool("requeue_opencode_job", { cwd: repo, jobId: running.record.jobId });
+  assert.notEqual(first.isError, true, textOf(first));
+  const created = /New job ID: (\S+)/.exec(textOf(first))[1];
+  const again = await callTool("requeue_opencode_job", { cwd: repo, jobId: running.record.jobId });
+  assert.equal(again.isError, true);
+  assert.match(textOf(again), new RegExp(`errorType: requeue_already_requeued[\\s\\S]*requeued as ${created}`));
+});
+
+test("Q-001: a request that is not stored, unreadable or from a contractor job is refused with what is missing", async () => {
+  const legacy = await runToEnd(readJob({ task: "Legacy record without a request.", idempotencyKey: "legacy-1" }), failedExecution());
+  await rewriteStored(legacy, null, { dropRequest: true });
+  const noRequest = await callTool("requeue_opencode_job", { cwd: repo, jobId: legacy });
+  assert.equal(noRequest.isError, true);
+  assert.match(textOf(noRequest), /errorType: requeue_request_not_stored/);
+  assert.match(textOf(noRequest), /agent, task, model pin, Scope Contract, locks, validationCommand, timeout/);
+
+  const contractor = await runToEnd(readJob({ task: "Contractor-shaped record.", idempotencyKey: "contractor-1" }), failedExecution());
+  await rewriteStored(contractor, (request) => { request.orchestratorMode = "contractor"; });
+  assert.match(textOf(await callTool("requeue_opencode_job", { cwd: repo, jobId: contractor })), /errorType: requeue_contractor_unsupported/);
+
+  const unknown = await runToEnd(readJob({ task: "Record with a field the schema does not know.", idempotencyKey: "unknown-1" }), failedExecution());
+  await rewriteStored(unknown, (request) => { request.shellAccess = true; delete request.agent; });
+  const invalid = textOf(await callTool("requeue_opencode_job", { cwd: repo, jobId: unknown }));
+  assert.match(invalid, /errorType: requeue_request_invalid/);
+  assert.match(invalid, /agent/);
+  assert.match(invalid, /shellAccess|Unrecognized key/);
+});
+
+test("Q-001: the stored request is re-validated; scope rules are not bypassed", async () => {
+  const original = await runToEnd(writeJob("src/a.txt", { task: "Writer whose stored scope later turns out invalid.", idempotencyKey: "scope-1" }), failedExecution());
+  // A stored request that breaks a scope rule enforced today (an allowed edit outside scope.write).
+  await rewriteStored(original, (request) => { request.scopeContract.allowedEdits = ["src/a.txt", "docs/outside.md"]; request.allowedEdits = ["src/a.txt", "docs/outside.md"]; });
+  const response = await callTool("requeue_opencode_job", { cwd: repo, jobId: original });
+  assert.equal(response.isError, true);
+  assert.match(textOf(response), /rejected by the normal enqueue validation/);
+  assert.match(textOf(response), /errorType: scope_write_forbidden/);
+  assert.equal((await durable(original)).requeuedAs || "", "");
+
+  // A stored request without a Scope Contract is a write job the normal path would not accept either.
+  const bare = await runToEnd(writeJob("src/b.txt", { task: "Writer that lost its contract.", idempotencyKey: "scope-2" }), failedExecution());
+  await rewriteStored(bare, (request) => { delete request.scopeContract; });
+  assert.match(textOf(await callTool("requeue_opencode_job", { cwd: repo, jobId: bare })), /errorType: missing_scope_contract/);
+});
+
+test("Q-001: two requeues of the same job at once create one job", async () => {
+  const original = await runToEnd(readJob({ task: "Job requeued twice at once.", idempotencyKey: "race-1" }), failedExecution());
+  selfTestHooks.queueJobExecutorTestHook = async () => doneExecution();
+  const [left, right] = await Promise.all([
+    __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: original }),
+    __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: original }),
+  ]);
+  assert.equal(left.ok && right.ok, true, JSON.stringify([left.error, right.error]));
+  assert.equal(left.record.jobId, right.record.jobId, "the derived key makes the second call a duplicate of the first");
+  assert.equal([left, right].filter((item) => item.deduplicated).length, 1);
+  assert.equal((await durable(original)).requeuedAs, left.record.jobId);
+});
+
+test("Q-001: a still-alive orphan child of an interrupted job blocks the requeue", async () => {
+  const original = await runToEnd(readJob({ task: "Interrupted job with a live orphan.", idempotencyKey: "orphan-1" }), failedExecution());
+  await setStatus(original, "interrupted");
+  await patchSummary(original, { orphanChildProcessAlive: true, orphanChildProcessId: process.pid });
+  const blocked = await callTool("requeue_opencode_job", { cwd: repo, jobId: original });
+  assert.equal(blocked.isError, true);
+  assert.match(textOf(blocked), /errorType: requeue_orphan_child_alive/);
+  await patchSummary(original, { orphanChildProcessAlive: false });
+  assert.notEqual((await callTool("requeue_opencode_job", { cwd: repo, jobId: original })).isError, true);
+});
+
 let failed = 0;
 const skips = [];
 try {

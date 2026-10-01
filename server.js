@@ -16052,7 +16052,7 @@ function diagnoseJobView(job) {
 }
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
-  "jobId", "idempotencyKey", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
   "providerRetryWarningCount", "usage", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
@@ -16080,6 +16080,8 @@ function compactQueueJobLines(records) {
     const parts = [
       record.jobId,
       record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
+      record.requeuedFrom ? `requeuedFrom=${record.requeuedFrom}` : "",
+      record.requeuedAs ? `requeuedAs=${record.requeuedAs}` : "",
       `agent=${record.agent || "?"}`,
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
@@ -16365,6 +16367,66 @@ function formatConcurrencyChange(change) {
     `Persisted in ${path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite")}: other bridge processes pick it up at their next scheduler pass or slot request, and a restart keeps it until reset: true.`,
   ].join("\n");
 }
+
+server.tool(
+  "requeue_opencode_job",
+  "Re-run a failed, cancelled, interrupted or not_resumable queue job as a NEW job built from its stored request (agent, task, model pin, Scope Contract, locks, validationCommand, timeout). The request goes through the normal enqueue validation again; the new job gets its own id and a derived idempotency key (<original key>:requeue:<n>), and the two jobs reference each other (requeuedFrom / requeuedAs). Completed and unfinished jobs are refused. Optional overrides: model (must be in CODEX_OPENCODE_MODEL_ALLOWLIST) and timeoutMs.",
+  {
+    cwd: z.string().min(1).describe("Canonical repository path of the project that owns the job."),
+    jobId: z.string().min(1).describe("The failed, cancelled, interrupted or not_resumable job to run again."),
+    model: z.string().optional().describe("Run the new job on this model instead: provider/model[@variant], an entry of CODEX_OPENCODE_MODEL_ALLOWLIST."),
+    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms for the new job (at most 24 h)."),
+  },
+  async ({ cwd, jobId, model, timeoutMs }) => {
+    const started = nowMs();
+    const requeued = await requeueQueueJob({ cwd, jobId, model, timeoutMs });
+    if (!requeued.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Requeue refused.",
+          errorType: requeued.errorType,
+          reason: requeued.error,
+          suggestedFix: requeued.suggestedFix || "Fix the cause above and call requeue_opencode_job again.",
+        }) }],
+      };
+    }
+    const record = requeued.record;
+    const queueAssessment = await assessQueuePlan([{
+      jobId: record.jobId,
+      lockType: record.mode === "read" ? "read" : "write",
+      cwd: record.cwd,
+      lockedPaths: record.lockedPaths,
+      allowedEdits: record.allowedEdits,
+      scopeContract: record.scopeContract,
+    }]);
+    return {
+      content: [{
+        type: "text",
+        text: [
+          "OpenCode job requeued.",
+          `New job ID: ${record.jobId}`,
+          `Requeued from: ${requeued.originalJobId} (was ${requeued.originalStatus}${requeued.originalErrorType ? `, ${requeued.originalErrorType}` : ""})`,
+          `Idempotency key: ${requeued.idempotencyKey}`,
+          `Deduplicated: ${requeued.deduplicated ? "yes (the same requeue already created this job)" : "no"}`,
+          `Overrides: ${requeued.overrides.length ? requeued.overrides.join(", ") : "none"}`,
+          `Status: ${record.status}`,
+          `Agent: ${record.agent}`,
+          `Mode: ${record.mode}`,
+          `Lock mode: ${record.lockMode}`,
+          `Locked paths: ${(record.lockedPaths || []).length ? record.lockedPaths.join(", ") : "none"}`,
+          `Allowed edits: ${(record.allowedEdits || []).length ? record.allowedEdits.join(", ") : "none"}`,
+          `Queue mode: ${effectiveQueueMode()}`,
+          `Queue assessment: ${queueAssessment.status}`,
+          `Queue reason: ${queueAssessment.reason}`,
+          requeued.originalWorktreePath ? `The previous attempt's worktree is untouched: ${requeued.originalWorktreePath}` : null,
+          ...requeued.warnings.map((warning) => `Warning: ${warning}`),
+          `Duration ms: ${Math.round(nowMs() - started)}`,
+        ].filter((line) => line !== null).join("\n"),
+      }],
+    };
+  }
+);
 
 server.tool(
   "set_opencode_concurrency",
@@ -19443,6 +19505,10 @@ function queueRecordSnapshot(record, includeResult = true) {
     parentJobId: record.parentJobId || "",
     idempotencyKey: record.idempotencyKey || "",
     requestFingerprint: record.requestFingerprint || "",
+    requeuedFrom: record.requeuedFrom || "",
+    requeuedAs: record.requeuedAs || "",
+    requeueSequence: record.requeueSequence || 0,
+    requeuedAt: record.requeuedAt || "",
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -20575,7 +20641,7 @@ async function assessQueuePlan(lockPlans = []) {
   };
 }
 
-async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true } = {}) {
+async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true, recordFields = null } = {}) {
   if (effectiveQueueMode() === "off") {
     return {
       ok: false,
@@ -20686,6 +20752,8 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     containmentQuarantined: false,
     revision: 0,
   };
+  // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
+  if (recordFields) Object.assign(record, recordFields);
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -20714,6 +20782,202 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     scheduleQueue();
   }
   return { ok: true, record };
+}
+
+// Q-001: requeue_opencode_job. Terminal states, from the queue state machine:
+//   failed, cancelled     the run (or its start) ended without a result: requeue is the retry.
+//   interrupted           the owner's lease lapsed while the job was active: retry-able, but the
+//                         previous child may still be alive, which is checked below.
+//   not_resumable         a never-started job that recovery could not resume. Requeue works only
+//                         when the encrypted request survived; the usual cause (a legacy record
+//                         without one) is refused with what is missing.
+//   completed             a success: re-running finished work is a deliberate new enqueue.
+// Every other status is unfinished and has to be cancelled or awaited first.
+const REQUEUE_ELIGIBLE_STATUSES = new Set(["failed", "cancelled", "interrupted", "not_resumable"]);
+const REQUEUE_UNFINISHED_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
+const REQUEUE_KEY_SUFFIX = /(?::requeue:\d+)+$/;
+
+// <original key>:requeue:<n>, where n counts the requeues down the chain (a requeue of a requeue
+// keeps the root key, so keys do not grow); a job without a key uses its job id. The key is
+// deterministic, so a repeated or concurrent requeue of the same job deduplicates to one job.
+function requeueIdempotencyKey(original, sequence) {
+  const base = String(original.idempotencyKey || "").replace(REQUEUE_KEY_SUFFIX, "") || String(original.jobId);
+  const suffix = `:requeue:${sequence}`;
+  if (base.length + suffix.length <= 200) return `${base}${suffix}`;
+  const digest = createHash("sha256").update(base).digest("hex").slice(0, 16);
+  return `${base.slice(0, 200 - suffix.length - digest.length - 1)}~${digest}${suffix}`;
+}
+
+function requeueRefusal(errorType, error, suggestedFix = "") {
+  return { ok: false, errorType, error, suggestedFix };
+}
+
+// Records the successor on the terminal row of the original. A terminal row is not rewritten by
+// the owner any more, so this is a guarded single UPDATE on the revision it read.
+async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
+  const db = await openLockDb(projectRoot);
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { marked: false, reason: "the original is no longer a terminal job" };
+      let summary = {};
+      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { marked: false, reason: "the original record is unreadable" }; }
+      if (summary.requeuedAs && summary.requeuedAs !== newJobId) return { marked: false, reason: `already requeued as ${summary.requeuedAs}`, requeuedAs: summary.requeuedAs };
+      if (summary.requeuedAs === newJobId) return { marked: true };
+      const requeuedAt = new Date().toISOString();
+      const changed = db.prepare(`
+        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
+        WHERE job_id = ? AND revision = ? AND status = ?
+      `).run(
+        JSON.stringify({ ...summary, requeuedAs: newJobId, requeuedAt, revision: Number(row.revision || 0) + 1 }),
+        requeuedAt,
+        jobId,
+        Number(row.revision || 0),
+        row.status
+      );
+      if (Number(changed.changes || 0) === 1) {
+        const live = QUEUE_JOBS.get(jobId);
+        if (live) Object.assign(live, { requeuedAs: newJobId, requeuedAt });
+        return { marked: true };
+      }
+    }
+    return { marked: false, reason: "the original record kept changing" };
+  } finally {
+    closeDb(db);
+  }
+}
+
+// Creates a new queue job from the stored request of a failed, cancelled, interrupted or
+// not_resumable one. The request goes through enqueueQueueJob, the path enqueue_opencode_job uses
+// (lock plan, Scope Contract rules, worktree requirement, fingerprint, idempotency), after a
+// zod check against the current job input schema; nothing is replayed unchecked.
+async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }) {
+  if (typeof jobId !== "string" || !jobId.trim()) return requeueRefusal("requeue_invalid_arguments", "jobId must be a non-empty string.");
+  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_AGENT_TIMEOUT_MS)) {
+    return requeueRefusal("requeue_invalid_arguments", `timeoutMs must be a positive integer of at most ${MAX_AGENT_TIMEOUT_MS} ms; got ${JSON.stringify(timeoutMs)}.`);
+  }
+  if (model !== undefined && model !== "" && typeof model !== "string") {
+    return requeueRefusal("requeue_invalid_arguments", `model must be a "provider/model[@variant]" string; got ${JSON.stringify(model)}.`);
+  }
+  if (effectiveQueueMode() !== "sqlite") {
+    return requeueRefusal("requeue_requires_sqlite_queue", "Only the SQLite queue keeps the original request (encrypted); in the other modes it is dropped when the job ends.", "Re-enqueue the job with enqueue_opencode_job and a new idempotencyKey.");
+  }
+
+  let modelRequirement = null;
+  if (model) {
+    const parsed = parseModelAllowlistEntry(model);
+    if (!parsed) return requeueRefusal("requeue_model_invalid", `model "${model}" is not in provider/model[@variant] form.`, "Use the form of CODEX_OPENCODE_MODEL_ALLOWLIST entries, for example google/antigravity-gemini-3.8-flash@high.");
+    modelRequirement = { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
+  }
+
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  const db = await openLockDb(projectRoot);
+  let row;
+  try {
+    row = db.prepare("SELECT job_id, cwd, status, revision, idempotency_key, request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+  } finally {
+    closeDb(db);
+  }
+  if (!row) return requeueRefusal("requeue_job_not_found", `No queue job ${jobId} in ${projectRoot}.`, "Check the job id and cwd with list_opencode_jobs.");
+  let summary = {};
+  try { summary = JSON.parse(row.record_json || "{}"); } catch { summary = {}; }
+  if (row.status === "completed") {
+    return requeueRefusal("requeue_job_completed", `Job ${jobId} completed. Only failed, cancelled, interrupted or not_resumable jobs can be requeued; re-running finished work would duplicate it.`, "If the work really must run again, use enqueue_opencode_job with a new idempotencyKey.");
+  }
+  if (REQUEUE_UNFINISHED_STATUSES.has(row.status)) {
+    return requeueRefusal("requeue_job_not_terminal", `Job ${jobId} is still ${row.status}.`, "Wait for it to finish, or cancel_opencode_job it first.");
+  }
+  if (!REQUEUE_ELIGIBLE_STATUSES.has(row.status)) {
+    return requeueRefusal("requeue_job_status_unsupported", `Job ${jobId} has status "${row.status}", which requeue does not handle.`);
+  }
+  if (summary.parentJobId) {
+    return requeueRefusal("requeue_pipeline_child", `Job ${jobId} belongs to pipeline/parent ${summary.parentJobId}; a requeued copy would not be tracked by it.`, "Re-run it through the pipeline, or enqueue a standalone job.");
+  }
+  if (summary.requeuedAs) {
+    return requeueRefusal("requeue_already_requeued", `Job ${jobId} was already requeued as ${summary.requeuedAs}.`, `Requeue ${summary.requeuedAs} if that one failed.`);
+  }
+  if (row.status === "interrupted" && summary.orphanChildProcessAlive && processIsAlive(Number(summary.orphanChildProcessId || 0))) {
+    return requeueRefusal("requeue_orphan_child_alive", `The previous run of ${jobId} left a child process (pid ${summary.orphanChildProcessId}) that is still alive and may still be writing its worktree.`, "Inspect it with diagnose_opencode_bridge and stop it before requeuing.");
+  }
+  if (!row.request_encrypted) {
+    return requeueRefusal(
+      "requeue_request_not_stored",
+      `The original request of ${jobId} (agent, task, model pin, Scope Contract, locks, validationCommand, timeout) is not stored: this record has no encrypted request. It predates encrypted requests or was never persisted with one.`,
+      "Enqueue the work again with enqueue_opencode_job."
+    );
+  }
+  let stored;
+  try {
+    stored = await decryptQueueRequest(row.request_encrypted, row.job_id);
+  } catch (error) {
+    return requeueRefusal("requeue_request_unreadable", `The stored request of ${jobId} could not be decrypted (${redactSensitiveText(error?.message || String(error))}); queue-request.key may have changed.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+    return requeueRefusal("requeue_request_not_stored", `The stored request of ${jobId} is empty or not an object.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  if (stored.orchestratorMode === "contractor" || stored.internalQueueContractorProof || stored.internalQueueJobId) {
+    return requeueRefusal("requeue_contractor_unsupported", `Job ${jobId} ran in contractor mode. Its authorization token is never stored, so it cannot be replayed.`, "Enqueue it again with a fresh contractorAuthorizationToken.");
+  }
+  const checked = z.object(jobInputShape).strict().safeParse(stored);
+  if (!checked.success) {
+    const problems = checked.error.issues.map((issue) => `${issue.path.join(".") || "(request)"}: ${issue.message}`).slice(0, 8);
+    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} does not satisfy the current job input schema: ${problems.join("; ")}.`, "Enqueue the work again with enqueue_opencode_job.");
+  }
+  const request = checked.data;
+  if (!request.sanitizedWorkspace && !recordMatchesProject({ cwd: request.cwd }, projectRoot)) {
+    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} names ${request.cwd}, not ${projectRoot}.`);
+  }
+
+  const warnings = [];
+  const overrides = [];
+  const job = { ...request };
+  if (modelRequirement) {
+    if (!allowlistedModelOverride(modelRequirement, request.agent)) {
+      const allowlist = activeModelOverrideAllowlist();
+      return requeueRefusal(
+        "requeue_model_not_allowlisted",
+        `model ${model} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or the agent ${request.agent} cannot be overridden.`,
+        "Pick a listed model, or ask the operator to add it to the allowlist."
+      );
+    }
+    const previous = request.scopeContract?.modelRequirement;
+    job.scopeContract = {
+      ...(request.scopeContract || {}),
+      modelRequirement: { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...modelRequirement },
+    };
+    overrides.push(`model=${model}`);
+  } else if (request.scopeContract?.modelRequirement && !allowlistedModelOverride(request.scopeContract.modelRequirement, request.agent)) {
+    warnings.push(`The stored model pin ${request.scopeContract.modelRequirement.provider}/${request.scopeContract.modelRequirement.model} is not in the current allowlist; the job runs only if it matches the agent's managed profile.`);
+  }
+  if (timeoutMs !== undefined) {
+    job.timeoutMs = timeoutMs;
+    overrides.push(`timeoutMs=${timeoutMs}`);
+  }
+
+  const sequence = Number(summary.requeueSequence || 0) + 1;
+  const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
+  job.idempotencyKey = idempotencyKey;
+  const enqueued = await enqueueQueueJob(job, "", { recordFields: { requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
+  if (!enqueued.ok) {
+    return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
+  }
+  const marked = await markQueueJobRequeued(projectRoot, jobId, enqueued.record.jobId);
+  if (!marked.marked) {
+    warnings.push(`The original job could not be marked as requeued (${marked.reason}); the new job ${enqueued.record.jobId} exists.`);
+  }
+  return {
+    ok: true,
+    record: enqueued.record,
+    deduplicated: Boolean(enqueued.deduplicated),
+    originalJobId: jobId,
+    originalStatus: row.status,
+    originalErrorType: summary.errorType || "",
+    originalWorktreePath: summary.worktreePath || "",
+    idempotencyKey,
+    sequence,
+    overrides,
+    warnings,
+  };
 }
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
@@ -26086,7 +26350,11 @@ export const __selfTest = {
     MAX_RUNTIME_CONCURRENCY_LIMIT,
     RUNTIME_CONCURRENCY,
     describeConcurrencyLimits,
+    encryptQueueRequest,
+    markQueueJobRequeued,
     refreshRuntimeConcurrency,
+    requeueIdempotencyKey,
+    requeueQueueJob,
     runtimeConcurrencyLimitError,
     setRuntimeConcurrency,
   },

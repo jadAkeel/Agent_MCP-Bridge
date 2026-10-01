@@ -454,6 +454,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | Queue | `enqueue_opencode_job` | Durable queued job. |
 | | `list_opencode_jobs` / `get_opencode_job` | Inspect queued jobs. |
 | | `cancel_opencode_job` | Cancel a queued or running job. |
+| | `requeue_opencode_job` | Run a failed, cancelled or interrupted job again as a new job from its stored request (optional new `model` from the allowlist, new `timeoutMs`). Completed and unfinished jobs are refused. |
 | | `set_opencode_concurrency` | Raise or lower the provider slot limit and the queue parallel limit without restarting (running jobs keep going). `reset: true` returns to the environment values. |
 | | `inspect_opencode_queue_recovery` | Recovery state after a crash. |
 | Pipelines | `create_multi_agent_pipeline` | Plan a multi-agent feature. |
