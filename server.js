@@ -2940,6 +2940,13 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
           capacity INTEGER NOT NULL,
           updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_cooldowns (
+          provider_key TEXT PRIMARY KEY,
+          until_at INTEGER NOT NULL,
+          error_type TEXT NOT NULL,
+          reason TEXT NOT NULL DEFAULT '',
+          set_at INTEGER NOT NULL
+        );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
       ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
@@ -2982,6 +2989,24 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       const now = Date.now();
       db.exec("BEGIN IMMEDIATE");
       db.prepare("DELETE FROM provider_leases WHERE expires_at <= ?").run(now);
+      db.prepare("DELETE FROM provider_cooldowns WHERE until_at <= ?").run(now);
+      // A provider whose quota ran out fails new jobs at once instead of starting agents that
+      // can only burn their wait budget (or the quota of the next account) until the reset.
+      const cooldown = db.prepare("SELECT until_at, error_type, reason FROM provider_cooldowns WHERE provider_key = ?").get(providerKey);
+      if (cooldown) {
+        db.exec("ROLLBACK");
+        const untilAt = Number(cooldown.until_at);
+        return {
+          ok: false,
+          errorType: String(cooldown.error_type || "opencode_quota_exhausted"),
+          error: `Provider ${providerKey} is paused until ${new Date(untilAt).toISOString()} (${cooldown.error_type}${cooldown.reason ? `: ${cooldown.reason}` : ""}). The agent was not started; enqueue the job again after that time.`,
+          waitedMs: Date.now() - started,
+          holders: observedHolders,
+          capacity: observedCapacity,
+          cooldownUntil: new Date(untilAt).toISOString(),
+          retryAfterMs: Math.max(0, untilAt - Date.now()),
+        };
+      }
       const active = Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases WHERE provider_key = ?").get(providerKey)?.count || 0);
       const configuredCapacity = CONFIG.providerConcurrencyLimit;
       let effectiveCapacity = configuredCapacity;
@@ -3046,6 +3071,41 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
     holders: observedHolders,
     capacity: observedCapacity,
   };
+}
+
+// A provider pause outlives this process: every bridge (Claude's and Codex's) reads the same
+// table before taking a slot. A later pause never shortens an existing one.
+const PROVIDER_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000;
+
+// Queue jobs of this process that are waiting for a provider slot, so list_opencode_jobs can say
+// "waiting_for_provider_slot" instead of a generic starting_agent (6 "running" jobs on 4 slots).
+const providerSlotWaitStorage = new AsyncLocalStorage();
+const providerSlotWaitingJobs = new Map();
+
+async function recordProviderCooldown({ providerKey, durationMs, errorType, reason = "" }) {
+  const boundedMs = Math.min(PROVIDER_COOLDOWN_MAX_MS, Math.max(0, Math.ceil(Number(durationMs) || 0)));
+  if (!providerKey || boundedMs <= 0) return { ok: false, recorded: false };
+  let db = null;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    const now = Date.now();
+    const untilAt = now + boundedMs;
+    db.prepare(`
+      INSERT INTO provider_cooldowns (provider_key, until_at, error_type, reason, set_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider_key) DO UPDATE SET
+        until_at = MAX(provider_cooldowns.until_at, excluded.until_at),
+        error_type = excluded.error_type,
+        reason = excluded.reason,
+        set_at = excluded.set_at
+    `).run(providerKey, untilAt, String(errorType || "opencode_quota_exhausted"), redactSensitiveText(String(reason || "")).slice(0, 300), now);
+    logEvent("warn", "provider.cooldown_recorded", { providerKey, untilAt: new Date(untilAt).toISOString(), errorType });
+    return { ok: true, recorded: true, untilAt };
+  } catch (error) {
+    logEvent("error", "provider.cooldown_record_failed", { providerKey, error: error.message || String(error) });
+    return { ok: false, recorded: false, error: error.message || String(error) };
+  } finally {
+    if (db) closeDb(db);
+  }
 }
 
 function providerLeaseOwnershipLossError(detail = "Durable provider-capacity ownership could not be renewed before expiry.") {
@@ -3498,9 +3558,19 @@ async function providerCapacitySnapshot() {
         quarantined: held.filter((lease) => lease.quarantined).length,
       };
     });
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases };
+    const cooldowns = db.prepare(`
+      SELECT provider_key, until_at, error_type, reason FROM provider_cooldowns
+      WHERE until_at > ? AND (provider_key = ? OR provider_key LIKE ? ESCAPE '\\') ORDER BY provider_key
+    `).all(now, CONFIG.providerConcurrencyKey, likePattern).map((row) => ({
+      providerKey: row.provider_key,
+      until: new Date(Number(row.until_at)).toISOString(),
+      remainingMs: Math.max(0, Number(row.until_at) - now),
+      errorType: row.error_type,
+      reason: row.reason || "",
+    }));
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), keys, leases, cooldowns };
   } catch (error) {
-    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], error: redactSensitiveText(error.message || String(error)) };
+    return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], cooldowns: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
     if (db) closeDb(db);
   }
@@ -4896,6 +4966,26 @@ function detectsOpenCodeFallback(stderr) {
   return /agent\s+"[^"]+"\s+is a subagent,\s+not a primary agent\.\s+Falling back to default agent/i.test(stderr || "");
 }
 
+// The Antigravity auth plugin answers an exhausted account pool with a synthetic assistant text,
+// not an error event ("All 2 account(s) rate-limited for gemini. Quota resets in 3h 55m. Add more
+// accounts with `opencode auth login` or wait and retry."). The run then looked like a normal
+// final answer, a writer that changed nothing "completed", and five batch jobs were lost
+// silently. Only a final message that starts with the plugin's exact wording counts, so an agent
+// that merely talks about rate limits is never failed.
+const SYNTHETIC_QUOTA_NOTICE_PATTERN = /^(?:Quota protection: )?All \d+ account\(s\) (?:rate-limited for|are over \d+% usage for) [\w.-]+\. Quota resets in (unknown|\d+ms|\d+[hms](?: \d+[ms])?)\./;
+
+function syntheticProviderQuotaNotice(finalText) {
+  const match = String(finalText || "").trim().match(SYNTHETIC_QUOTA_NOTICE_PATTERN);
+  if (!match) return null;
+  let resetMs = 0;
+  if (match[1] !== "unknown") {
+    for (const [, amount, unit] of match[1].matchAll(/(\d+)(ms|h|m|s)/g)) {
+      resetMs += Number(amount) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[unit];
+    }
+  }
+  return { errorType: "opencode_quota_exhausted", resetMs, resetText: match[1] };
+}
+
 function providerErrorTypeFromText(value) {
   const text = String(value || "");
   if (!text.trim()) {
@@ -5191,17 +5281,20 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
   if (recoveredTransientProviderError) {
     providerErrorType = "";
   }
+  const quotaNotice = syntheticProviderQuotaNotice(finalText);
+  if (quotaNotice) providerErrorType = quotaNotice.errorType;
   const apiErrorDetected = stdoutErrorDetected || Boolean(providerErrorType);
   const finalTextTruncated = finalText.length > CONFIG.maxAssistantResponseChars;
   return {
     apiErrorDetected,
     providerErrorType: providerErrorType || "",
-    recoveredTransientProviderError,
-    providerWarningType: recoveredTransientProviderError ? stderrProviderErrorType : "",
+    recoveredTransientProviderError: recoveredTransientProviderError && !quotaNotice,
+    providerWarningType: recoveredTransientProviderError && !quotaNotice ? stderrProviderErrorType : "",
+    providerQuotaNotice: quotaNotice,
     // Each classified stderr line is one provider attempt that failed (OpenCode retries some itself).
     providerRetryWarningCount: stderrDiagnosticLines.length,
     usage,
-    retryAfterMs: retryAfterMsFromText(`${stderr}\n${stdout}`),
+    retryAfterMs: quotaNotice?.resetMs || retryAfterMsFromText(`${stderr}\n${stdout}`),
     runtimeObservedProvider: runtimeModelEvidence?.provider || "",
     runtimeObservedModel: runtimeModelEvidence?.model || "",
     runtimeModelIdentities: identities,
@@ -6801,7 +6894,14 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   // The slot wait has its own budget. It used to come out of the run timeout, so a builder
   // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
   const preSlotMs = Math.round(nowMs() - started);
-  const providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
+  const slotWaitJobId = providerSlotWaitStorage.getStore()?.jobId || "";
+  if (slotWaitJobId) providerSlotWaitingJobs.set(slotWaitJobId, { providerKey, since: new Date().toISOString() });
+  let providerLease;
+  try {
+    providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
+  } finally {
+    if (slotWaitJobId) providerSlotWaitingJobs.delete(slotWaitJobId);
+  }
   if (!providerLease.ok) {
     return {
       stdout: "",
@@ -6813,7 +6913,9 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
       timeoutMs,
       errorType: providerLease.errorType,
       assistantFinalResponseDetected: false,
-      providerErrorType: "",
+      providerErrorType: providerLease.cooldownUntil ? providerLease.errorType : "",
+      retryAfterMs: Number(providerLease.retryAfterMs || 0),
+      providerCooldownUntil: providerLease.cooldownUntil || "",
       toolOutcomes: [],
       configuredProvider: configuredMetadata?.provider || "",
       configuredModel: configuredMetadata?.model || "",
@@ -7157,6 +7259,15 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   if (!runResult.errorType && runtimeModelEvidencePresent && !runResult.modelAttested) {
     runResult.errorType = "opencode_model_mismatch";
   }
+  if (runResult.errorType === "opencode_quota_exhausted" && runResult.retryAfterMs > 0) {
+    const cooldown = await recordProviderCooldown({
+      providerKey,
+      durationMs: runResult.retryAfterMs,
+      errorType: runResult.errorType,
+      reason: inspection.providerQuotaNotice ? `provider reported "Quota resets in ${inspection.providerQuotaNotice.resetText}"` : "provider reported a hard quota with a retry delay",
+    });
+    if (cooldown.recorded) runResult.providerCooldownUntil = new Date(cooldown.untilAt).toISOString();
+  }
   return runResult;
 }
 
@@ -7329,6 +7440,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     `OpenCode native fallback detected: ${result?.openCodeFallbackDetected ? "yes" : "no"}`,
     `OpenCode API error detected: ${result?.openCodeApiErrorDetected ? "yes" : "no"}`,
     `Provider error type: ${result?.providerErrorType || "none"}`,
+    result?.providerCooldownUntil ? `Provider paused until: ${result.providerCooldownUntil} (new jobs on this provider fail at once until then)` : null,
     `Recovered transient provider error: ${result?.recoveredTransientProviderError ? "yes" : "no"}`,
     `Provider warning type: ${result?.providerWarningType || "none"}`,
     `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result?.providerRetryWarningCount || 0}`,
@@ -7451,6 +7563,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
     `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
     result?.providerWarningType ? `Provider warning type: ${result.providerWarningType}` : null,
     result?.providerErrorType ? `Provider error type: ${result.providerErrorType}` : null,
+    result?.providerCooldownUntil ? `Provider paused until: ${result.providerCooldownUntil} (new jobs on this provider fail at once until then)` : null,
     result?.recoveredTransientProviderError ? "Recovered transient provider error: yes" : null,
     result?.providerRetryWarningCount ? `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result.providerRetryWarningCount}` : null,
     result?.openCodeFallbackDetected ? "OpenCode native fallback detected: yes" : null,
@@ -15102,6 +15215,8 @@ server.tool(
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
             ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId} (${lease.providerKey}): pid=${lease.ownerProcessId}, ${lease.quarantined ? "quarantined" : `remainingMs=${lease.remainingMs}`}, heartbeat=${lease.heartbeatAt || "none"}`),
+            `Paused providers: ${(providerCapacity.cooldowns || []).length ? "" : "none"}`,
+            ...(providerCapacity.cooldowns || []).map((item) => `- ${item.providerKey}: paused until ${item.until} (${item.errorType}${item.reason ? `: ${item.reason}` : ""}); new jobs fail at once instead of starting`),
             `Bridge instance id: ${BRIDGE_INSTANCE_ID}`,
             "Default OpenCode orchestrator mode: planning-only",
             `Explicit user-authorized OpenCode contractor mode: ${/^[a-f0-9]{64}$/.test(effectiveContractorAuthorizationSha256()) ? "capability configured" : "disabled (capability not configured)"}`,
@@ -19072,7 +19187,9 @@ function queueRunStage(record) {
   // Before the agent process starts the bridge checks the workspace, creates the worktree,
   // attests the role (several `opencode` calls), snapshots the tree and waits for a provider slot;
   // phaseTimings on the finished record splits these, providerWaitMs is the slot wait alone.
-  return record.childProcessStartedAt ? "agent_running" : "starting_agent";
+  if (record.childProcessStartedAt) return "agent_running";
+  // Known only for jobs this process runs; a job owned by another bridge stays starting_agent.
+  return providerSlotWaitingJobs.has(record.jobId) ? "waiting_for_provider_slot" : "starting_agent";
 }
 
 // B-024: once the job has finished, agentRunMs is the agent process alone (the same number as
@@ -19357,6 +19474,10 @@ function enforceQueueResultEvidence(record) {
     // Only a cut report (or an unstructured text over the limit) is truncated output; the patch
     // preview kept apart in resultDetailText is not.
     record.completionOutcome = "completed_with_truncated_output";
+  } else if (record.status === "completed" && record.mode === "write" && record.noChanges && !record.completionOutcome) {
+    // Still a success ("nothing needed" is legitimate), but a writer that changed nothing is
+    // flagged so a list of finished batch jobs does not hide it among the real outputs.
+    record.completionOutcome = "completed_no_changes";
   }
   return record;
 }
@@ -21013,7 +21134,7 @@ async function startQueueRecord(record) {
       // queue_job_failed without its result, changed files or patch evidence.
       let execution;
       try {
-        execution = await (typeof queueJobExecutorTestHook === "function" ? queueJobExecutorTestHook : executeOpenCodeJob)(record.request, {
+        execution = await providerSlotWaitStorage.run({ jobId: record.jobId }, () => (typeof queueJobExecutorTestHook === "function" ? queueJobExecutorTestHook : executeOpenCodeJob)(record.request, {
         toolStarted: started,
         jobId: record.jobId,
         fromQueue: true,
@@ -21049,7 +21170,7 @@ async function startQueueRecord(record) {
           }
           return { ok: true, deadlineAt: Date.parse(record.leaseExpiresAt || "") };
         },
-        });
+        }));
       } catch (error) {
         await commitQueueTerminalRecord(record, {
           status: "failed",
@@ -25736,6 +25857,12 @@ export const __selfTest = {
     readOnlyWorkspaceDrift,
     reconcilePipelineIntegrationOperationStates,
     trackedTargetStateSha256,
+    // tests/review-provider-quota.js
+    enforceQueueResultEvidence,
+    providerSlotWaitStorage,
+    providerSlotWaitingJobs,
+    recordProviderCooldown,
+    syntheticProviderQuotaNotice,
     // tests/review2-a.js
     beginBridgeStartupRecovery,
     readPositiveIntEnv,

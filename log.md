@@ -14,6 +14,20 @@ How a fix lands: edit and test in the `C:\Users\10User\bridge-fixes` worktree (b
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-01
+
+### Provider quota exhaustion passed as success (Claude, 2026-10-01)
+
+Found while running 10 question-writing builders (google/antigravity-gemini-3.8-flash@high) on `C:\Users\10User\Desktop\leb\arena-question-authoring`; the run notes are in that repository's `bridge-issues.log.md`. Branch `bridge/quota-and-slots` (worktree `C:\Users\10User\bridge-quota`, its own `npm ci`) from `7e508c7`. Tests: `tests/review-provider-quota.js` (8 cases, in `npm test`).
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-039 | Five builder jobs (`builder-1790835882722-bbf429bd` and four more) ended `completed`, `Error type: none`, no files changed, after 12 steps and 141k input tokens: the agent's final answer was "All 2 account(s) rate-limited for gemini. Quota resets in 3h 55m. ..." Only reading the result text showed the loss. | The Antigravity auth plugin (`createSyntheticErrorResponse`) answers an exhausted account pool with a synthetic assistant text, not an error event, so `inspectOpenCodeEventStream` saw a normal final answer. A writer that changed nothing is a legitimate success, so nothing else flagged it. | `syntheticProviderQuotaNotice` matches the plugin's two exact wordings (rate-limited, and the soft-quota "Quota protection") only at the start of the final assistant message, so an agent that quotes them mid-answer is not failed. A match sets `providerErrorType = opencode_quota_exhausted` (the job fails) and `retryAfterMs` from "Quota resets in 3h 55m". A completed write job with no changes gets `completionOutcome = completed_no_changes` (`outcome=` in `list_opencode_jobs`). | | fixed |
+| B-040 | Raising the provider limit from 4 to 10 would only have burnt an exhausted quota faster: every queued job still took a slot, started an agent and read the brief and pools before the plugin refused. | No provider-wide pause. | New table `provider_cooldowns` in `provider-concurrency.sqlite` (shared by every bridge process). A run that ends `opencode_quota_exhausted` with a known reset records a pause for its provider key (capped at 24 h; a later, shorter pause never shortens it). While it lasts, `acquireProviderLease` fails at once with `opencode_quota_exhausted` and "paused until <time> ... The agent was not started"; other providers are untouched; expired rows are deleted. The result shows `Provider paused until:`; `get_opencode_bridge_status` lists `Paused providers`. To lift a pause early (an account was added), delete its row from `provider_cooldowns`. | | fixed |
+| B-041 | `list_opencode_jobs` showed 6 jobs `status=running stage=starting_agent` with a provider limit of 4; two were only waiting for a slot. | `queueRunStage` knew only "child spawned or not". | Queue jobs run inside `providerSlotWaitStorage` (AsyncLocalStorage with the job id); `runOpenCode` marks the job in `providerSlotWaitingJobs` while `acquireProviderLease` waits, and the stage reads `waiting_for_provider_slot`. Known only for jobs of the listing bridge process; another process's jobs stay `starting_agent`. | | fixed |
+
+Still open from the same run (features, not defects): integration is one worktree per dry run + apply, so 10 disjoint new-file patches cost 20 calls (wanted: a batch preview with one receipt); per-tool token usage is not in the job record (two builders read ~1M input tokens of pool grep output); `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` is read at bridge start only (rule: change it while no job runs, then reconnect the client; the status already prints the effective limit per provider key).
+
 ## 2026-09-30
 
 ### Production review (gpt-6.1-sol high, HEAD 92154c7): two release blockers (Claude, 2026-09-30)
