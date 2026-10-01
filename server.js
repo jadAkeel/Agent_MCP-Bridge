@@ -381,6 +381,23 @@ function effectiveQueueMode() {
 function effectiveQueueWriteConflictPolicy() {
   return queueWriteConflictPolicyOverride || CONFIG.queueWriteConflictPolicy;
 }
+
+// B-042: the queue runs at most CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT jobs per bridge process, whatever
+// the provider limit allows; with a provider limit of 10 and a queue limit of 6 (the default) four
+// slots stayed empty and nothing said why. The numbers and the mismatch are printed by
+// get_opencode_bridge_status and diagnose_opencode_bridge. The parallel-call limit is a separate
+// setting (jobs per run_opencode_parallel call) and does not bound the queue.
+function queueCapacityReport({
+  queueParallelLimit = CONFIG.queueParallelLimit,
+  parallelCallLimit = CONFIG.parallelLimit,
+  providerConcurrencyLimit = CONFIG.providerConcurrencyLimit,
+  queueMode = effectiveQueueMode(),
+} = {}) {
+  const warning = queueMode !== "off" && providerConcurrencyLimit > queueParallelLimit
+    ? `Warning: the provider concurrency limit is ${providerConcurrencyLimit} (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) but the queue parallel limit is ${queueParallelLimit} (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): only ${queueParallelLimit} queued jobs will run at once per bridge process. Raise the queue limit to ${providerConcurrencyLimit}, or lower the provider limit.`
+    : "";
+  return { queueMode, queueParallelLimit, parallelCallLimit, providerConcurrencyLimit, warning };
+}
 let selfTestContractorAuthorizationSha256 = "";
 let selfTestModelOverrideAllowlist = null;
 let pipelinePersistenceTestHook = null;
@@ -15108,6 +15125,7 @@ server.tool(
       providerCapacitySnapshot(),
     ]);
     const sourceFreshness = await bridgeSourceFreshness();
+    const queueCapacity = queueCapacityReport();
     const journal = await resolveProjectStateRoot(cwd || process.cwd())
       .then((root) => integrationJournalDiagnosis(root, { limit: 20 }))
       .catch((error) => ({ error: error?.message || String(error) }));
@@ -15211,6 +15229,9 @@ server.tool(
             `OpenCode external plugins: ${CONFIG.allowExternalPlugins ? "enabled (exact allowlist and pinned tree verified)" : "disabled (--pure)"}`,
             `External plugin manifest SHA-256: ${pluginPolicy.manifestSha256 || "not applicable"}`,
             `Provider/account concurrency limit: ${CONFIG.providerConcurrencyLimit}${CONFIG.providerConcurrencyKeyExplicit ? "" : " per configured provider"}`,
+            `Queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): ${queueCapacity.queueParallelLimit} job(s) at once per bridge process${queueCapacity.queueMode === "off" ? " (queue mode is off)" : ""}`,
+            `Parallel call job limit (CODEX_OPENCODE_PARALLEL_LIMIT): ${queueCapacity.parallelCallLimit} job(s) per run_opencode_parallel call (does not bound the queue)`,
+            ...(queueCapacity.warning ? [queueCapacity.warning] : []),
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
@@ -15271,6 +15292,7 @@ server.tool(
     let finishedPipelinesShown = 0;
     const detailPipelines = newestFirst(pipelines, "createdAt")
       .filter((pipeline) => !pipelineFinished(pipeline) || (finishedPipelinesShown += 1) <= DIAGNOSE_DETAIL_LIMIT);
+    const queueCapacity = queueCapacityReport();
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
@@ -15291,6 +15313,11 @@ server.tool(
         providerCapacity: provider.capacity,
         providerSlotsByKey: (provider.keys || []).map((item) => `${item.providerKey}=${item.leases}/${item.capacity}`),
         providerActiveLeases: provider.leases.length,
+        // B-042: the queue cap that decides how many of those slots a bridge process can fill.
+        queueParallelLimit: queueCapacity.queueParallelLimit,
+        parallelCallLimit: queueCapacity.parallelCallLimit,
+        providerConcurrencyLimit: queueCapacity.providerConcurrencyLimit,
+        ...(queueCapacity.warning ? { queueCapacityWarning: queueCapacity.warning } : {}),
       },
       directRuns: detailDirectRuns,
       diagnosticCoverage: {
@@ -25863,6 +25890,8 @@ export const __selfTest = {
     providerSlotWaitingJobs,
     recordProviderCooldown,
     syntheticProviderQuotaNotice,
+    // tests/review-round5.js
+    queueCapacityReport,
     // tests/review2-a.js
     beginBridgeStartupRecovery,
     readPositiveIntEnv,

@@ -16,6 +16,14 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-01
 
+### Round 5: hidden queue cap, 504 not transient, silent timed-out writers, no memory floor, no idle detection (Claude, 2026-10-01)
+
+Found while running 10-20 parallel builder jobs. Branch `bridge/round5-fixes` (worktree `C:\Users\10User\bridge-round5`, node_modules linked from the live tree) from `dc0ea73`. Tests: `tests/review-round5.js` (in `npm test`). Out of scope and still open: batch integration of several worktrees, per-tool token usage, changing the concurrency limit at runtime, a requeue tool, relaxing integration receipt staleness.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-042 | With `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT=10` only 6 queued jobs ran at once; four provider slots stayed empty and nothing said why. | The queue scheduler is capped by `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` (default 6) per bridge process, a separate setting that no status output showed. | `get_opencode_bridge_status` prints the queue parallel limit and the `CODEX_OPENCODE_PARALLEL_LIMIT` (jobs per `run_opencode_parallel` call, which does not bound the queue) and, when the provider limit is the larger one, a warning "only N queued jobs will run at once per bridge process". `diagnose_opencode_bridge` has `queueParallelLimit`, `parallelCallLimit`, `providerConcurrencyLimit` and `queueCapacityWarning` in its summary. | | fixed, not deployed |
+
 ### Provider quota exhaustion passed as success (Claude, 2026-10-01)
 
 Found while running 10 question-writing builders (google/antigravity-gemini-3.8-flash@high) on `C:\Users\10User\Desktop\leb\arena-question-authoring`; the run notes are in that repository's `bridge-issues.log.md`. Branch `bridge/quota-and-slots` (worktree `C:\Users\10User\bridge-quota`, its own `npm ci`) from `7e508c7`. Tests: `tests/review-provider-quota.js` (8 cases, in `npm test`).

@@ -379,7 +379,7 @@ Every `CODEX_OPENCODE_*` variable that `server.js` reads is listed here with its
 | `CODEX_OPENCODE_STARTUP_RECOVERY_WAIT_MS` | `120000` | The bridge answers the MCP handshake before its startup recovery; tool calls wait for the recovery this long, then return `startup_recovery_pending`. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` | `opencode-default-account` | Operator-defined account-pool key used by the global provider lease. |
 | `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable default with restart recovery and cross-process idempotency; use `memory` only for explicitly ephemeral single-process experiments. |
-| `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Per-process queue scheduling limit; provider/account leases impose the cross-process execution cap. |
+| `CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT` | `6` | Per-process queue scheduling limit; provider/account leases impose the cross-process execution cap. The queue never runs more than this many jobs at once in one bridge process, even when `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` is higher; `get_opencode_bridge_status` and `diagnose_opencode_bridge` print both and warn when the provider limit is the larger one. `CODEX_OPENCODE_PARALLEL_LIMIT` (default `6`) is a separate setting: the job count of one `run_opencode_parallel` call. |
 | `CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY` | `wait` | `wait` or `reject`. |
 | `CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS` | `2000` | Retry interval for jobs blocked by a lock held by another bridge process. |
 | `CODEX_OPENCODE_QUEUE_HEARTBEAT_MS` | `15000` | Owner-instance/job heartbeat interval. |
