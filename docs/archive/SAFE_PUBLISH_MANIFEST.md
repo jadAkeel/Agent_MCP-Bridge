@@ -88,7 +88,7 @@ npm audit --omit=dev
 Push-Location opencode
 npm audit --omit=dev
 Pop-Location
-npm audit --prefix 'C:\Users\10User\.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.2.1' --omit=dev
+npm audit --prefix 'C:\Users\<you>\.cache\opencode\packages\@cortexkit\opencode-antigravity-auth@2.2.1' --omit=dev
 git diff --check
 ```
 
@@ -185,7 +185,7 @@ can leave pre-existing children with empty DACLs on some filesystems. Treat any
 nonzero `icacls` result as a gate failure:
 
 ```powershell
-$runtimeIdentity = "QSC-PC\10User"
+$runtimeIdentity = "<machine>\<you>"
 icacls $releaseDirectory /inheritance:r /grant:r `
   "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" `
   "BUILTIN\Administrators:(OI)(CI)(F)" `

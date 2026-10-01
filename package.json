@@ -1,7 +1,7 @@
 {
   "name": "codex-opencode-mcp",
   "version": "1.0.0",
-  "description": "Safety-focused MCP bridge for Codex-managed OpenCode agent delegation.",
+  "description": "Safety-focused MCP bridge that lets Codex and Claude Code delegate bounded tasks to OpenCode agents.",
   "private": true,
   "main": "server.js",
   "scripts": {
@@ -27,8 +27,24 @@
     "sync:runtime": "node bin/sync-managed-runtime.js",
     "incidents": "node bin/ops-log.js --incidents"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "mcp",
+    "codex",
+    "claude-code",
+    "opencode",
+    "agents",
+    "delegation",
+    "worktree"
+  ],
+  "author": "Jad Akil",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jadAkeel/Agent_MCP-Bridge.git"
+  },
+  "homepage": "https://github.com/jadAkeel/Agent_MCP-Bridge#readme",
+  "bugs": {
+    "url": "https://github.com/jadAkeel/Agent_MCP-Bridge/issues"
+  },
   "license": "ISC",
   "type": "module",
   "engines": {

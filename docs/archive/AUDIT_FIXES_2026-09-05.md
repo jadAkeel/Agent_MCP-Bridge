@@ -80,13 +80,13 @@ TestSprite project link was found, so no TestSprite result is claimed.
 
 ## Published release
 
-- Release: `C:\Users\10User\codex-opencode-mcp-releases\server-f1603ba7-20260905-audit-fixes`
+- Release: `C:\Users\<you>\codex-opencode-mcp-releases\server-f1603ba7-20260905-audit-fixes`
 - Server SHA-256: `f1603ba7447bc38fd5d6ed6bdec70303d16c14783bbcbfe1c54e94e8606097e0`
 - Release-manifest SHA-256: `b13bfa30461ee5da3e73754e54fd7a6bba8ad50db8d52459ec95ccc57c0c565a`
 - Plugin-manifest SHA-256: `f0cbc94c468a69145517b7cbae679a40eb8a8fa3f01eb773cd54d2c4beddfc08`
 - Activation fresh health: passed, 21 tools advertised
-- Previous config backup: `C:\Users\10User\.codex\config.toml.rollback-20260905232833`
-- Atomic replacement backup: `C:\Users\10User\.codex\config.toml.activation-backup-20260905232833`
+- Previous config backup: `C:\Users\<you>\.codex\config.toml.rollback-20260905232833`
+- Atomic replacement backup: `C:\Users\<you>\.codex\config.toml.activation-backup-20260905232833`
 
 Existing MCP processes continue on the old release until their task/app process
 is restarted. New processes use the published release.
@@ -109,7 +109,7 @@ its isolated execution requires pure mode.
 The activated deployment uses a hybrid boundary:
 
 - Bridge code is published under
-  `C:\Users\10User\codex-opencode-mcp-releases\server-gemini38-20260906`,
+  `C:\Users\<you>\codex-opencode-mcp-releases\server-gemini38-20260906`,
   protected read/execute-only for the runtime user, and pinned by server SHA-256
   `663e25ac40e9d1957a473e9a1856ef01964dd98da7b0f767ebf3dc3b9fefb78c`.
 - The release manifest remains available as build evidence with SHA-256
@@ -117,7 +117,7 @@ The activated deployment uses a hybrid boundary:
   but the active external-plugin profile intentionally does not set the release
   manifest pin.
 - The dedicated writable OAuth runtime is
-  `C:\Users\10User\.codex\opencode-gemini-runtime-v1`. Plugin version `2.2.1`
+  `C:\Users\<you>\.codex\opencode-gemini-runtime-v1`. Plugin version `2.2.1`
   is exact-allowlisted and the runtime plugin manifest is pinned to
   `4f359d77866e2d3f5cf336c313a758d371c899084a4c7ec53351451dac9d5d48`.
 - Plugin tree verification covers 1,403 files and 1,473 entries. Its tree
@@ -140,8 +140,8 @@ provider response rather than cryptographic runtime-model attestation.
 
 The active config was replaced atomically. Rollback copies are:
 
-- `C:\Users\10User\.codex\config.toml.rollback-20260906105510`
-- `C:\Users\10User\.codex\config.toml.activation-backup-20260906105510`
+- `C:\Users\<you>\.codex\config.toml.rollback-20260906105510`
+- `C:\Users\<you>\.codex\config.toml.activation-backup-20260906105510`
 
 This hybrid mode is weaker than the prior immutable pure profile. OAuth refresh
 requires a writable config runtime, and managed agent/skill content there is not
