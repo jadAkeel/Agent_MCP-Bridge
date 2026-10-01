@@ -10,7 +10,7 @@ import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir, userInfo } from "node:os";
+import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -183,6 +183,9 @@ const CONFIG = Object.freeze({
   worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
   queueParallelLimit: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6),
+  // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
+  // (twenty agent processes, their worktrees and test runs exhausted a laptop).
+  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", 0),
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -397,6 +400,74 @@ function queueCapacityReport({
     ? `Warning: the provider concurrency limit is ${providerConcurrencyLimit} (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) but the queue parallel limit is ${queueParallelLimit} (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): only ${queueParallelLimit} queued jobs will run at once per bridge process. Raise the queue limit to ${providerConcurrencyLimit}, or lower the provider limit.`
     : "";
   return { queueMode, queueParallelLimit, parallelCallLimit, providerConcurrencyLimit, warning };
+}
+
+// B-045: free-memory floor for starting queue jobs. Self-test only: stand in for os.freemem()
+// (bytes) and for CODEX_OPENCODE_MIN_FREE_MEMORY_MB (CONFIG is frozen).
+let freeMemoryBytesTestHook = null;
+let minFreeMemoryMbOverride = null;
+// jobId -> { since } for the pending jobs this process holds back for low memory; the stage of
+// such a job reads "waiting_for_memory" (queueRunStage). Known only for the listing process's
+// own jobs, like waiting_for_provider_slot.
+const queueMemoryWaitingJobs = new Map();
+let queueMemoryHold = null;
+
+function currentFreeMemoryBytes() {
+  if (typeof freeMemoryBytesTestHook === "function" && process.argv.includes("--self-test")) {
+    const value = Number(freeMemoryBytesTestHook());
+    if (Number.isFinite(value) && value >= 0) return value;
+  }
+  return freemem();
+}
+
+function queueMemoryGate() {
+  const floorMb = minFreeMemoryMbOverride ?? CONFIG.minFreeMemoryMb;
+  const freeMb = Math.floor(currentFreeMemoryBytes() / (1024 * 1024));
+  const totalMb = Math.floor(totalmem() / (1024 * 1024));
+  return { floorMb, freeMb, totalMb, blocked: floorMb > 0 && freeMb < floorMb };
+}
+
+// Called by the scheduler pass: holds back every job that could start while free memory is under
+// the floor. The jobs stay pending and the next poll (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) tries
+// again; nothing is written to the durable record, so a held pass costs one memory read.
+// Lines of get_opencode_bridge_status: the floor, the memory the machine has now, and whether this
+// process is holding jobs back for it.
+function queueMemoryStatusLines(gate = queueMemoryGate()) {
+  return [
+    `Minimum free memory to start a queue job (CODEX_OPENCODE_MIN_FREE_MEMORY_MB): ${gate.floorMb > 0 ? `${gate.floorMb} MB` : "disabled (0)"}`,
+    `Free memory now: ${gate.freeMb} MB of ${gate.totalMb} MB`,
+    ...(gate.floorMb > 0 && gate.floorMb >= gate.totalMb
+      ? [`Warning: the free-memory floor (${gate.floorMb} MB) is not below the machine's total memory (${gate.totalMb} MB): no queue job can ever start. Lower CODEX_OPENCODE_MIN_FREE_MEMORY_MB.`]
+      : []),
+    ...(gate.blocked
+      ? [`Queue starts held for low memory: free memory is under the floor; ${queueMemoryWaitingJobs.size} pending job(s) of this bridge process wait (stage waiting_for_memory) and start when it recovers`]
+      : []),
+  ];
+}
+
+function holdQueueForMemory(gate, records) {
+  const waiting = records.filter((record) => ["pending", "planned"].includes(record.status));
+  const now = new Date().toISOString();
+  for (const jobId of [...queueMemoryWaitingJobs.keys()]) {
+    if (!waiting.some((record) => record.jobId === jobId)) queueMemoryWaitingJobs.delete(jobId);
+  }
+  for (const record of waiting) {
+    if (!queueMemoryWaitingJobs.has(record.jobId)) queueMemoryWaitingJobs.set(record.jobId, { since: now });
+  }
+  if (!queueMemoryHold) {
+    queueMemoryHold = { since: now, floorMb: gate.floorMb };
+    logEvent("warn", "queue.memory_hold_started", { freeMb: gate.freeMb, floorMb: gate.floorMb, waitingJobs: waiting.length });
+  }
+  queueMemoryHold.freeMb = gate.freeMb;
+  queueMemoryHold.waitingJobs = waiting.length;
+}
+
+function releaseQueueMemoryHold(gate) {
+  if (queueMemoryHold) {
+    logEvent("info", "queue.memory_hold_released", { freeMb: gate?.freeMb ?? 0, floorMb: gate?.floorMb ?? 0, heldSince: queueMemoryHold.since });
+  }
+  queueMemoryHold = null;
+  queueMemoryWaitingJobs.clear();
 }
 let selfTestContractorAuthorizationSha256 = "";
 let selfTestModelOverrideAllowlist = null;
@@ -15282,6 +15353,7 @@ server.tool(
             `Queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT): ${queueCapacity.queueParallelLimit} job(s) at once per bridge process${queueCapacity.queueMode === "off" ? " (queue mode is off)" : ""}`,
             `Parallel call job limit (CODEX_OPENCODE_PARALLEL_LIMIT): ${queueCapacity.parallelCallLimit} job(s) per run_opencode_parallel call (does not bound the queue)`,
             ...(queueCapacity.warning ? [queueCapacity.warning] : []),
+            ...queueMemoryStatusLines(),
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
@@ -15343,6 +15415,7 @@ server.tool(
     const detailPipelines = newestFirst(pipelines, "createdAt")
       .filter((pipeline) => !pipelineFinished(pipeline) || (finishedPipelinesShown += 1) <= DIAGNOSE_DETAIL_LIMIT);
     const queueCapacity = queueCapacityReport();
+    const memoryGate = queueMemoryGate();
     const report = {
       generatedAt: new Date().toISOString(),
       cwd: projectRoot,
@@ -15368,6 +15441,10 @@ server.tool(
         parallelCallLimit: queueCapacity.parallelCallLimit,
         providerConcurrencyLimit: queueCapacity.providerConcurrencyLimit,
         ...(queueCapacity.warning ? { queueCapacityWarning: queueCapacity.warning } : {}),
+        // B-045: the free-memory floor for starting queue jobs (0 = disabled) and what the machine has now.
+        minFreeMemoryMb: memoryGate.floorMb,
+        freeMemoryMb: memoryGate.freeMb,
+        queueJobsHeldForMemory: memoryGate.blocked ? queueMemoryWaitingJobs.size : 0,
       },
       directRuns: detailDirectRuns,
       diagnosticCoverage: {
@@ -19266,7 +19343,12 @@ async function executeOpenCodeJob(requestedJob, {
 // a provider slot before the agent starts, so status alone cannot tell waiting from working and
 // durationMs includes the wait. runStage and agentRunMs separate the two.
 function queueRunStage(record) {
-  if (record.status !== "running") return record.status || "";
+  if (record.status !== "running") {
+    // B-045: a pending job held back by the free-memory floor (jobs of this process only).
+    return ["pending", "planned"].includes(record.status) && queueMemoryWaitingJobs.has(record.jobId)
+      ? "waiting_for_memory"
+      : record.status || "";
+  }
   // Before the agent process starts the bridge checks the workspace, creates the worktree,
   // attests the role (several `opencode` calls), snapshots the tree and waits for a provider slot;
   // phaseTimings on the finished record splits these, providerWaitMs is the slot wait alone.
@@ -21459,6 +21541,16 @@ function scheduleQueue(delayMs = 0) {
       if (!capacity) {
         return;
       }
+
+      // B-045: below the free-memory floor nothing new starts. This pass makes no progress, so the
+      // scheduler polls again (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) and starts the jobs once memory recovers.
+      const memoryGate = queueMemoryGate();
+      const startableRecords = [...QUEUE_JOBS.values()].filter((record) => ["pending", "planned", "blocked"].includes(record.status));
+      if (memoryGate.blocked && startableRecords.length) {
+        holdQueueForMemory(memoryGate, startableRecords);
+        return;
+      }
+      releaseQueueMemoryHold(memoryGate);
 
       for (const record of QUEUE_JOBS.values()) {
         if (!capacity) {
@@ -25966,6 +26058,8 @@ export const __selfTest = {
     // tests/review-round5.js
     queueCapacityReport,
     timedOutWriterNote,
+    queueMemoryGate,
+    queueMemoryWaitingJobs,
     // tests/review2-a.js
     beginBridgeStartupRecovery,
     readPositiveIntEnv,
@@ -26002,6 +26096,10 @@ export const __selfTest = {
     set bridgeStartupRecovery(value) { bridgeStartupRecovery = value; },
     get agentRuntimeTestHook() { return agentRuntimeTestHook; },
     set agentRuntimeTestHook(value) { agentRuntimeTestHook = value; },
+    get freeMemoryBytesTestHook() { return freeMemoryBytesTestHook; },
+    set freeMemoryBytesTestHook(value) { freeMemoryBytesTestHook = value; },
+    get minFreeMemoryMbOverride() { return minFreeMemoryMbOverride; },
+    set minFreeMemoryMbOverride(value) { minFreeMemoryMbOverride = value; },
   },
 };
 

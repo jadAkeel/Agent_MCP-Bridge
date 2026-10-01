@@ -12,6 +12,8 @@ process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS;
 delete process.env.CODEX_OPENCODE_MIN_FREE_MEMORY_MB;
+// The memory hold polls at this interval; the default (2 s) would only slow the tests.
+process.env.CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS = "200";
 const { mkdtemp, rm } = await import("node:fs/promises");
 const { tmpdir } = await import("node:os");
 const path = (await import("node:path")).default;
@@ -297,6 +299,104 @@ test("B-044: a writer that times out without writing anything is a plain timeout
   } finally {
     hooks.agentRuntimeTestHook = null;
     await dropRetainedWorktrees(repo, jobId);
+  }
+});
+
+// B-045 ------------------------------------------------------------------------------------
+
+const MB = 1024 * 1024;
+async function withMemory({ floorMb, freeMb }, action) {
+  hooks.minFreeMemoryMbOverride = floorMb;
+  hooks.freeMemoryBytesTestHook = typeof freeMb === "function" ? () => freeMb() * MB : () => freeMb * MB;
+  try {
+    return await action();
+  } finally {
+    hooks.minFreeMemoryMbOverride = null;
+    hooks.freeMemoryBytesTestHook = null;
+  }
+}
+
+test("B-045: the memory gate is off by default and blocks only below the floor", async () => {
+  assert.equal(internals.CONFIG.minFreeMemoryMb, 0, "disabled unless CODEX_OPENCODE_MIN_FREE_MEMORY_MB is set");
+  assert.equal(internals.queueMemoryGate().blocked, false);
+  await withMemory({ floorMb: 0, freeMb: 10 }, () => assert.equal(internals.queueMemoryGate().blocked, false));
+  await withMemory({ floorMb: 2048, freeMb: 1000 }, () => {
+    const gate = internals.queueMemoryGate();
+    assert.equal(gate.blocked, true);
+    assert.equal(gate.freeMb, 1000);
+    assert.equal(gate.floorMb, 2048);
+  });
+  await withMemory({ floorMb: 2048, freeMb: 2048 }, () => assert.equal(internals.queueMemoryGate().blocked, false, "free memory equal to the floor starts"));
+  await withMemory({ floorMb: 2048, freeMb: 4096 }, () => assert.equal(internals.queueMemoryGate().blocked, false));
+});
+
+test("B-045: get_opencode_bridge_status shows the floor, the free memory and a hold", async () => {
+  const repo = await makeRepo("b045-status");
+  let status = await callTool("get_opencode_bridge_status", { cwd: repo });
+  assert.match(status, /Minimum free memory to start a queue job \(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): disabled \(0\)/);
+  assert.match(status, /Free memory now: \d+ MB of \d+ MB/);
+  await withMemory({ floorMb: 1024, freeMb: 100 }, async () => {
+    status = await callTool("get_opencode_bridge_status", { cwd: repo });
+    assert.match(status, /Minimum free memory to start a queue job \(CODEX_OPENCODE_MIN_FREE_MEMORY_MB\): 1024 MB/);
+    assert.match(status, /Free memory now: 100 MB of \d+ MB/);
+    assert.match(status, /Queue starts held for low memory/);
+    const report = JSON.parse(await callTool("diagnose_opencode_bridge", { cwd: repo }));
+    assert.equal(report.summary.minFreeMemoryMb, 1024);
+    assert.equal(report.summary.freeMemoryMb, 100);
+  });
+  // A floor the machine can never satisfy is called out, not left to look like a stuck queue.
+  await withMemory({ floorMb: 100_000_000, freeMb: 5000 }, async () => {
+    assert.match(await callTool("get_opencode_bridge_status", { cwd: repo }), /Warning: the free-memory floor \(100000000 MB\) is not below the machine's total memory/);
+  });
+});
+
+test("B-045: the queue starts no job below the floor, labels it waiting_for_memory, and starts it when memory recovers", async () => {
+  const repo = await makeRepo("b045-queue");
+  let ran = 0;
+  installRuntime({ onRun: async () => { ran += 1; } });
+  hooks.queueModeOverride = "sqlite";
+  let freeMb = 100;
+  let jobId = "";
+  try {
+    await withMemory({ floorMb: 1024, freeMb: () => freeMb }, async () => {
+      const enqueued = await callTool("enqueue_opencode_job", { agent: "reviewer", task: "Review.", cwd: repo, write: false, lockMode: "off" });
+      jobId = /Job ID: (\S+)/.exec(enqueued)?.[1];
+      assert.ok(jobId, enqueued);
+      await sleep(900);
+      const record = internals.QUEUE_JOBS.get(jobId);
+      assert.equal(record.status, "pending", "held below the floor");
+      assert.equal(ran, 0, "the agent was not started");
+      assert.equal(internals.queueRunStage(record), "waiting_for_memory");
+      assert.ok(internals.queueMemoryWaitingJobs.has(jobId));
+      assert.match(await callTool("list_opencode_jobs", { cwd: repo }), new RegExp(`${jobId}[^\\n]*status=pending stage=waiting_for_memory`));
+      assert.equal(JSON.parse(await callTool("get_opencode_job", { jobId, cwd: repo })).runStage, "waiting_for_memory");
+      freeMb = 4096;
+      const finished = await waitForQueueJob(jobId);
+      assert.equal(finished.status, "completed", finished.errorReason);
+      assert.equal(ran, 1);
+      assert.equal(internals.queueMemoryWaitingJobs.size, 0, "the hold is released once the job started");
+      assert.doesNotMatch(await callTool("list_opencode_jobs", { cwd: repo }), /waiting_for_memory/);
+    });
+  } finally {
+    hooks.agentRuntimeTestHook = null;
+  }
+});
+
+test("B-045: with the floor disabled a low free-memory reading does not hold the queue", async () => {
+  const repo = await makeRepo("b045-off");
+  let ran = 0;
+  installRuntime({ onRun: async () => { ran += 1; } });
+  hooks.queueModeOverride = "sqlite";
+  try {
+    await withMemory({ floorMb: 0, freeMb: 1 }, async () => {
+      const enqueued = await callTool("enqueue_opencode_job", { agent: "reviewer", task: "Review.", cwd: repo, write: false, lockMode: "off" });
+      const jobId = /Job ID: (\S+)/.exec(enqueued)?.[1];
+      const finished = await waitForQueueJob(jobId);
+      assert.equal(finished.status, "completed", finished.errorReason);
+      assert.equal(ran, 1);
+    });
+  } finally {
+    hooks.agentRuntimeTestHook = null;
   }
 });
 
