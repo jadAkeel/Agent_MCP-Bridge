@@ -524,6 +524,111 @@ test("Q-001: a still-alive orphan child of an interrupted job blocks the requeue
   assert.notEqual((await callTool("requeue_opencode_job", { cwd: repo, jobId: original })).isError, true);
 });
 
+// ---------------------------------------------------------------------------- Q-003
+const sessionID = "ses_root";
+const stepFinish = (input, output, cacheRead = 0, session = sessionID) => JSON.stringify({ type: "step_finish", sessionID: session, part: {
+  type: "step-finish", reason: "tool-calls", sessionID: session, tokens: { total: input + output + cacheRead, input, output, reasoning: 0, cache: { read: cacheRead, write: 0 } }, cost: 0,
+} });
+const toolUse = (tool, input, outputChars, session = sessionID) => JSON.stringify({ type: "tool_use", sessionID: session, part: {
+  type: "tool", tool, sessionID: session, state: { status: "completed", input, output: "x".repeat(outputChars) },
+} });
+const stepStart = (session = sessionID) => JSON.stringify({ type: "step_start", sessionID: session, part: { type: "step-start" } });
+const finalText = (session = sessionID) => JSON.stringify({ type: "text", sessionID: session, part: { id: "p1", messageID: "m1", type: "text", text: "Done.", time: { end: 1 } } });
+
+test("Q-003: the heaviest tool calls are derived from the per-step prompt growth", () => {
+  // Step 1 ends with a prompt of 5000 and 100 output tokens; its grep (40000 chars) and read (2000
+  // chars) results make the prompt of step 2 grow to 15600, so 10500 context tokens were added,
+  // split 10000/500 by result length; the bash result of step 2 adds 400. A result is sent again
+  // by every later step: 2 for step 1's calls, 1 for step 2's.
+  const stdout = [
+    stepStart(),
+    toolUse("grep", { pattern: "pool", path: "docs/question-content" }, 40000),
+    toolUse("read", { filePath: "src/a.txt" }, 2000),
+    stepFinish(5000, 100),
+    stepStart(),
+    toolUse("bash", { command: "git diff --stat" }, 800),
+    stepFinish(600, 300, 15000),
+    stepStart(),
+    finalText(),
+    stepFinish(900, 50, 15400),
+  ].join("\n");
+  const inspection = __selfTest.internals.inspectOpenCodeEventStream(stdout, "");
+  assert.equal(inspection.usage.steps, 3);
+  assert.equal(inspection.usage.inputCount, 6500);
+  assert.equal(inspection.usage.cacheReadCount, 30400);
+  assert.deepEqual(inspection.heavyToolCalls.map((call) => call.tool), ["grep", "read", "bash"]);
+  assert.deepEqual(inspection.heavyToolCalls[0], { tool: "grep", target: "pattern: pool in docs/question-content", addedContextCount: 10000, laterSteps: 2, rereadInputCount: 20000 });
+  assert.equal(inspection.heavyToolCalls[1].addedContextCount, 500);
+  assert.equal(inspection.heavyToolCalls[1].target, "src/a.txt");
+  assert.deepEqual(inspection.heavyToolCalls[2], { tool: "bash", target: "command: git diff --stat", addedContextCount: 400, laterSteps: 1, rereadInputCount: 400 });
+  const line = __selfTest.internals.formatSingleResult({ resolution: { requestedAgent: "builder", actualAgent: "builder" }, result: { usage: inspection.usage, heavyToolCalls: inspection.heavyToolCalls }, cwd: repo, lockPlan: null });
+  assert.match(line, /Token usage: steps=3 input=6500/);
+  assert.match(line, /Heaviest tool calls \(estimated input re-read by later steps\): grep pattern: pool in docs\/question-content \+10000 context x 2 steps = ~20000; read src\/a\.txt/);
+});
+
+test("Q-003: a stream without usage reports none instead of guessing; subagent sessions are kept apart", () => {
+  const { inspectOpenCodeEventStream, formatOpenCodeUsage } = __selfTest.internals;
+  const noUsage = inspectOpenCodeEventStream([stepStart(), toolUse("read", { filePath: "src/a.txt" }, 9000), finalText()].join("\n"), "");
+  assert.deepEqual(noUsage.heavyToolCalls, []);
+  assert.equal(formatOpenCodeUsage(noUsage.usage), "not emitted by OpenCode");
+  // The last step has nothing after it to show what its results cost, so it is never ranked.
+  const lastOnly = inspectOpenCodeEventStream([stepStart(), toolUse("read", { filePath: "src/a.txt" }, 9000), stepFinish(1000, 10), finalText()].join("\n"), "");
+  assert.deepEqual(lastOnly.heavyToolCalls, []);
+  // Two sessions interleave; each session's growth is measured against its own steps.
+  const mixed = inspectOpenCodeEventStream([
+    stepStart(), toolUse("task", { description: "explore" }, 100), stepFinish(1000, 10),
+    stepStart("ses_child"), toolUse("read", { filePath: "big.txt" }, 50000, "ses_child"), stepFinish(500, 5, 0, "ses_child"),
+    stepStart("ses_child"), stepFinish(8500, 5, 0, "ses_child"),
+    stepStart(), stepFinish(1100, 10),
+  ].join("\n"), "");
+  assert.deepEqual(mixed.heavyToolCalls.map((call) => [call.tool, call.addedContextCount, call.laterSteps]), [["read", 8000 - 5, 1], ["task", 90, 1]]);
+});
+
+test("Q-003: a tool target is redacted and bounded", () => {
+  const stdout = [
+    stepStart(),
+    toolUse("bash", { command: `curl -H "Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD" ${"https://example.invalid/".repeat(20)}` }, 100),
+    stepFinish(100, 5),
+    stepStart(), stepFinish(900, 5),
+  ].join("\n");
+  const [call] = __selfTest.internals.inspectOpenCodeEventStream(stdout, "").heavyToolCalls;
+  assert.ok(call.target.length <= 140, `target length ${call.target.length}`);
+  assert.doesNotMatch(call.target, /sk-abcdefghijklmnopqrstuvwxyz/);
+});
+
+test("Q-003: token totals and the heaviest calls reach list_opencode_jobs and get_opencode_job", async () => {
+  const usage = { steps: 9, inputCount: 1048576, outputCount: 5120, reasoningCount: 300, cacheReadCount: 90000, cacheWriteCount: 0, cost: 0, rootSteps: 9 };
+  const heavyToolCalls = [
+    { tool: "grep", target: "pattern: pool in docs/question-content", addedContextCount: 100000, laterSteps: 8, rereadInputCount: 800000 },
+    { tool: "read", target: "docs/big.md", addedContextCount: 20000, laterSteps: 4, rereadInputCount: 80000 },
+  ];
+  const jobId = await runToEnd(readJob({ task: "Heavy reader for the usage test.", idempotencyKey: "usage-1" }), () => ({
+    response: { content: [{ type: "text", text: "REPORT: read a lot." }] },
+    result: { errorType: "", changedFiles: [], usage, heavyToolCalls },
+    validation: null, worktree: null,
+  }));
+  const list = textOf(await callTool("list_opencode_jobs", { cwd: repo }));
+  const line = list.split("\n").find((item) => item.includes(jobId));
+  assert.match(line, /tokens=1048576in\/5120out cacheRead=90000/);
+  const view = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId })));
+  assert.match(view.usageSummary, /^steps=9 input=1048576 output=5120 reasoning=300 cache_read=90000 cache_write=0 cost=0/);
+  assert.equal(view.usage.inputCount, 1048576);
+  assert.equal(view.heavyToolCalls.length, 2);
+  assert.equal(view.heavyToolCalls[0].tool, "grep");
+  assert.equal(view.heavyToolCalls[0].rereadInputCount, 800000);
+  const detail = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId, detail: true })));
+  assert.deepEqual(detail.heavyToolCalls.map((call) => call.target), ["pattern: pool in docs/question-content", "docs/big.md"]);
+});
+
+test("Q-003: a job whose stream carried no usage shows none in the list", async () => {
+  const jobId = await runToEnd(readJob({ task: "No usage in the stream.", idempotencyKey: "usage-2" }), doneExecution());
+  const line = textOf(await callTool("list_opencode_jobs", { cwd: repo })).split("\n").find((item) => item.includes(jobId));
+  assert.doesNotMatch(line, /tokens=/);
+  const view = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId })));
+  assert.equal(view.usageSummary, undefined);
+  assert.equal(view.heavyToolCalls, undefined);
+});
+
 let failed = 0;
 const skips = [];
 try {

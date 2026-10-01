@@ -5340,10 +5340,86 @@ function formatOpenCodeUsage(usage) {
   return `steps=${usage.steps} input=${usage.inputCount} output=${usage.outputCount} reasoning=${usage.reasoningCount} cache_read=${usage.cacheReadCount} cache_write=${usage.cacheWriteCount} cost=${cost}${cost === 0 ? " (provider reported no price)" : ""}`;
 }
 
+// Q-003: OpenCode reports token counts per model step (step_finish), not per tool call. A tool
+// call's cost is therefore estimated from what the stream does carry: the call's result enters
+// the prompt of the step after it, so the growth of the prompt size (input + cache read + cache
+// write) from one step to the next, less the assistant output of that step, is the size of that
+// step's tool results; it is split over the step's calls by result length. Every later step
+// sends the result again, so growth x later steps is the input the result cost. These are
+// estimates for ranking ("which call read the most"), not billing figures. Field names avoid
+// "token" and "input" for sanitizePersistedValue.
+function emptyToolWeights() {
+  return new Map();
+}
+
+function toolWeightSession(weights, sessionId) {
+  if (!weights.has(sessionId)) weights.set(sessionId, { pending: [], steps: [] });
+  return weights.get(sessionId);
+}
+
+function noteToolUse(weights, sessionId, part) {
+  const session = toolWeightSession(weights, sessionId);
+  if (session.pending.length >= 25) return;
+  const input = part?.state?.input && typeof part.state.input === "object" ? part.state.input : {};
+  const targetKey = ["pattern", "command", "filePath", "path", "url", "query", "description"].find((key) => typeof input[key] === "string" && input[key]);
+  const label = targetKey ? `${targetKey === "filePath" || targetKey === "path" ? "" : `${targetKey}: `}${input[targetKey]}${targetKey === "pattern" && typeof input.path === "string" && input.path ? ` in ${input.path}` : ""}` : "";
+  session.pending.push({
+    tool: String(part?.tool || "unknown").slice(0, 40),
+    target: redactSensitiveText(label).replace(/\s+/g, " ").slice(0, 120),
+    outputChars: String(part?.state?.output ?? part?.state?.error ?? "").length,
+  });
+}
+
+function noteStepFinish(weights, sessionId, tokens) {
+  const count = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
+  const session = toolWeightSession(weights, sessionId);
+  session.steps.push({
+    context: count(tokens?.input) + count(tokens?.cache?.read) + count(tokens?.cache?.write),
+    output: count(tokens?.output),
+    tools: session.pending,
+  });
+  session.pending = [];
+}
+
+function heaviestToolCalls(weights, limit = 3) {
+  const calls = [];
+  for (const session of weights.values()) {
+    const { steps } = session;
+    for (let index = 0; index < steps.length - 1; index += 1) {
+      const step = steps[index];
+      if (!step.tools.length) continue;
+      const growth = Math.max(0, steps[index + 1].context - step.context - step.output);
+      if (!growth) continue;
+      const totalChars = step.tools.reduce((sum, tool) => sum + tool.outputChars, 0);
+      const laterSteps = steps.length - 1 - index;
+      for (const tool of step.tools) {
+        const share = totalChars ? tool.outputChars / totalChars : 1 / step.tools.length;
+        const added = Math.round(growth * share);
+        if (added) calls.push({ tool: tool.tool, target: tool.target, addedContextCount: added, laterSteps, rereadInputCount: added * laterSteps });
+      }
+    }
+  }
+  return calls.sort((left, right) => right.rereadInputCount - left.rereadInputCount).slice(0, limit);
+}
+
+// Top calls over several runs of one job (read-only retries, a validation fix pass).
+function mergeHeavyToolCalls(...lists) {
+  return lists.flat().filter((call) => call && typeof call === "object")
+    .sort((left, right) => Number(right.rereadInputCount || 0) - Number(left.rereadInputCount || 0)).slice(0, 3);
+}
+
+function formatHeavyToolCalls(calls) {
+  if (!Array.isArray(calls) || !calls.length) return "";
+  return `Heaviest tool calls (estimated input re-read by later steps): ${calls
+    .map((call) => `${call.tool}${call.target ? ` ${call.target}` : ""} +${call.addedContextCount} context x ${call.laterSteps} steps = ~${call.rereadInputCount}`)
+    .join("; ")}`;
+}
+
 function inspectOpenCodeEventStream(stdout, stderr = "") {
   const stderrDiagnosticLines = providerDiagnosticLinesFromStderr(stderr);
   const stderrProviderErrorType = providerErrorTypeFromText(stderrDiagnosticLines.slice(-100).join("\n"));
   const usage = emptyOpenCodeUsage();
+  const toolWeights = emptyToolWeights();
   let providerErrorType = stderrProviderErrorType;
   let stdoutErrorDetected = false;
   const toolOutcomes = [];
@@ -5387,7 +5463,10 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
         continue;
       }
       // Not a turn boundary: step_finish follows the final text part, so it leaves lastEvent alone.
-      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) continue;
+      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) {
+        noteStepFinish(toolWeights, sessionId, event.part.tokens);
+        continue;
+      }
       if (event?.type === "text" && event?.part?.type === "text") {
         state.lastEvent = "incomplete_text";
         if (!event.part.time?.end) continue;
@@ -5415,6 +5494,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
             status: String(event?.part?.state?.status || "unknown"),
           });
         }
+        noteToolUse(toolWeights, sessionId, event.part);
       }
     } catch {
       invalidLines += 1;
@@ -5461,6 +5541,7 @@ function inspectOpenCodeEventStream(stdout, stderr = "") {
     // Each classified stderr line is one provider attempt that failed (OpenCode retries some itself).
     providerRetryWarningCount: stderrDiagnosticLines.length,
     usage,
+    heavyToolCalls: heaviestToolCalls(toolWeights),
     retryAfterMs: quotaNotice?.resetMs || retryAfterMsFromText(`${stderr}\n${stdout}`),
     runtimeObservedProvider: runtimeModelEvidence?.provider || "",
     runtimeObservedModel: runtimeModelEvidence?.model || "",
@@ -7368,6 +7449,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     providerWarningType: inspection.providerWarningType,
     providerRetryWarningCount: inspection.providerRetryWarningCount || 0,
     usage: inspection.usage,
+    heavyToolCalls: inspection.heavyToolCalls || [],
     retryAfterMs: inspection.retryAfterMs || 0,
     assistantFinalResponseDetected: inspection.finalResponseDetected,
     assistantResponseTruncated: inspection.finalTextTruncated,
@@ -7504,6 +7586,7 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
   let attemptsMade = 0;
   const childExecutionIntervals = [];
   let usageTotal = null;
+  let heavyToolCallsTotal = [];
   let providerRetryWarningTotal = 0;
   const policyStarted = nowMs();
   // The retry budget bounds retries; it must never shorten the first attempt below the
@@ -7526,8 +7609,10 @@ async function runOpenCodeWithPolicy(agent, prompt, cwd, dryRun, lockPlan, reque
     lastResult.childExecutionIntervals = [...childExecutionIntervals];
     // Every attempt used provider tokens; the last attempt's result reports all of them.
     usageTotal = sumOpenCodeUsage(usageTotal, lastResult.usage);
+    heavyToolCallsTotal = mergeHeavyToolCalls(heavyToolCallsTotal, lastResult.heavyToolCalls);
     providerRetryWarningTotal += lastResult.providerRetryWarningCount || 0;
     lastResult.usage = usageTotal;
+    lastResult.heavyToolCalls = heavyToolCallsTotal;
     lastResult.providerRetryWarningCount = providerRetryWarningTotal;
     lastResult.retryAttempt = attempt;
     lastResult.maxRetries = maxReadOnlyAgentRetries;
@@ -7612,6 +7697,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     `Provider warning type: ${result?.providerWarningType || "none"}`,
     `Provider error lines in OpenCode stderr (attempts OpenCode retried or failed): ${result?.providerRetryWarningCount || 0}`,
     `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
+    formatHeavyToolCalls(result?.heavyToolCalls) || null,
     `Configured provider: ${result?.configuredProvider || "unknown"}`,
     `Configured model: ${result?.configuredModel || "unknown"}`,
     `Configured variant: ${result?.configuredVariant || "unknown"}`,
@@ -7728,6 +7814,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
       : null,
     timing.length ? `Timing: ${timing.join(" ")}` : null,
     `Token usage: ${formatOpenCodeUsage(result?.usage)}`,
+    formatHeavyToolCalls(result?.heavyToolCalls) || null,
     result?.providerWarningType ? `Provider warning type: ${result.providerWarningType}` : null,
     result?.providerErrorType ? `Provider error type: ${result.providerErrorType}` : null,
     result?.providerCooldownUntil ? `Provider paused until: ${result.providerCooldownUntil} (new jobs on this provider fail at once until then)` : null,
@@ -16009,6 +16096,7 @@ function directRunView(run, artifacts = [], { detail = false } = {}) {
     providerWaitMs: run.providerWaitMs,
     providerRetryWarningCount: run.providerRetryWarnings,
     usage,
+    ...(usage?.steps ? { usageSummary: formatOpenCodeUsage(usage) } : {}),
     configuredModel: run.configuredModel || "",
     worktrees: artifacts.map((artifact) => retainedWorktreeView(artifact, { run })),
     ...resultView,
@@ -16054,7 +16142,7 @@ function diagnoseJobView(job) {
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
   "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
-  "providerRetryWarningCount", "usage", "phaseTimings",
+  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
 ];
@@ -16090,6 +16178,7 @@ function compactQueueJobLines(records) {
       timing.afterAgentMs ? `afterAgentMs=${timing.afterAgentMs}` : "",
       record.providerWaitMs ? `providerWaitMs=${record.providerWaitMs}` : "",
       record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
+      record.usage?.steps && record.usage.cacheReadCount ? `cacheRead=${record.usage.cacheReadCount}` : "",
       record.providerRetryWarningCount ? `providerErrorLines=${record.providerRetryWarningCount}` : "",
       record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
@@ -16117,7 +16206,13 @@ server.tool(
       : null;
     // record_json keeps the stage and timings of its last write; a running job's are derived now.
     const snapshot = persisted
-      ? { ...persisted, runStage: queueRunStage(persisted), ...queueAgentTiming(persisted) }
+      ? {
+        ...persisted,
+        runStage: queueRunStage(persisted),
+        ...queueAgentTiming(persisted),
+        // One readable line next to the usage counts: the totals a job read, so a very heavy one is noticed.
+        ...(persisted.usage?.steps ? { usageSummary: formatOpenCodeUsage(persisted.usage) } : {}),
+      }
       : null;
     if (!snapshot) {
       const lookupRoot = projectRoot || await resolveProjectStateRoot(process.cwd());
@@ -19537,6 +19632,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     providerWaitMs: record.providerWaitMs || 0,
     providerRetryWarningCount: record.providerRetryWarningCount || 0,
     usage: record.usage || null,
+    heavyToolCalls: record.heavyToolCalls || null,
     phaseTimings: record.phaseTimings || null,
     readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
@@ -21741,6 +21837,7 @@ async function startQueueRecord(record) {
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
+        heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
         phaseTimings: execution.result?.phaseTimings || null,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
