@@ -6,7 +6,12 @@
 // no free-memory floor for the queue, and no idle detection for a stalled agent.
 //   node tests/review-round5.js
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
+process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
+delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
+delete process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS;
+delete process.env.CODEX_OPENCODE_MIN_FREE_MEMORY_MB;
 const { mkdtemp, rm } = await import("node:fs/promises");
 const { tmpdir } = await import("node:os");
 const path = (await import("node:path")).default;
@@ -154,6 +159,145 @@ test("B-043: the existing retry-safety rules decide who retries (readers before 
   }, { enabled: true });
   assert.equal(eligible(), true);
   assert.equal(eligible({ toolOutcomes: [{ tool: "edit", status: "completed" }] }), false);
+});
+
+// B-044 ------------------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const writeScope = (paths) => ({ mode: "write", read: paths, write: paths, allowedEdits: paths, forbidden: [], shared: [], serialOnly: [], validationCommand: "" });
+
+// Agent discovery and the OpenCode run are replaced by the self-test hook (as in
+// tests/review-measurement.js); Git, worktrees, locks, the queue and SQLite state are real.
+function installRuntime({ onRun = async () => {}, outcome = () => ({ exitCode: 0, errorType: null, stdout: "Done.", assistantFinalResponseDetected: true }) } = {}) {
+  hooks.agentRuntimeTestHook = {
+    resolveAgent: async (requestedAgent, cwd, allowFallbackToBuild, subagentStrategy) => ({
+      requestedAgent, actualAgent: requestedAgent, requestedAgentMode: "primary", actualAgentMode: "primary",
+      fallbackUsed: false, proxyUsed: false, subagentStrategy, availableAgents: [requestedAgent], discoveryExitCode: 0,
+    }),
+    readAgentDebugMetadata: async (agent) => ({ ok: true, metadata: {
+      name: agent, mode: "primary", provider: "fixture", model: "model-a", variant: "high",
+      canEdit: agent === "builder", canDelegate: false, externalDirectoryDenied: true, webDenied: true,
+      bashAutomaticAllowSafe: true, protectedEditsDenied: true, permissionProfileSha256: `profile-${agent}`,
+    } }),
+    runOpenCodeWithPolicy: async (agent, prompt, cwd, dryRun, lockPlan) => {
+      const childStartedAtMs = Date.now();
+      if (!dryRun) await onRun({ agent, cwd, lockPlan });
+      return {
+        stderr: "", durationMs: 1, dryRun, childExecutionIntervals: [], configuredProvider: "fixture", configuredModel: "model-a",
+        childStartedAtMs, childFinishedAtMs: Date.now() + 1, usage: null, providerRetryWarningCount: 0,
+        ...(dryRun ? { exitCode: 0, errorType: null, stdout: "", assistantFinalResponseDetected: true } : outcome()),
+      };
+    },
+  };
+}
+
+async function waitForQueueJob(jobId) {
+  const deadline = Date.now() + 30000;
+  while (!["completed", "failed", "cancelled"].includes(internals.QUEUE_JOBS.get(jobId)?.status) && Date.now() < deadline) await sleep(50);
+  const status = internals.QUEUE_JOBS.get(jobId)?.status;
+  assert.ok(["completed", "failed", "cancelled"].includes(status), `queue job ${jobId} did not finish: ${status}`);
+  return internals.QUEUE_JOBS.get(jobId);
+}
+
+async function makeSourceRepo(label) {
+  const root = await makeRepo(label);
+  await internals.mkdir(path.join(root, "src"), { recursive: true });
+  await internals.writeFile(path.join(root, "src", "a.txt"), "a\n", "utf8");
+  await internals.runCommand("git", ["add", "-A"], root, 60000);
+  await internals.runCommand("git", ["commit", "-qm", "src"], root, 60000);
+  return root;
+}
+
+async function enqueueWriter(repo, extra = {}) {
+  hooks.queueModeOverride = "sqlite";
+  const enqueued = await callTool("enqueue_opencode_job", {
+    agent: "builder", task: "Edit src/a.txt.", cwd: repo, write: true, lockMode: "simple",
+    lockedPaths: ["src/a.txt"], allowedEdits: ["src/a.txt"], scopeContract: writeScope(["src/a.txt"]), ...extra,
+  });
+  const jobId = /Job ID: (\S+)/.exec(enqueued)?.[1];
+  assert.ok(jobId, enqueued);
+  return jobId;
+}
+
+async function dropRetainedWorktrees(repo, jobId) {
+  for (const item of await internals.listRetainedWorktreeArtifacts(repo, { jobId })) {
+    await internals.cleanupWorktree({ path: item.worktreePath, branch: item.branch, repoRoot: repo }, "always", true);
+  }
+}
+
+test("B-044: the timed-out writer note counts the files, names the retained worktree and ignores other jobs", () => {
+  const note = internals.timedOutWriterNote;
+  assert.equal(note({ errorType: "agent_timeout", changedFiles: ["a", "b", "c"], worktreeRetained: true }), "timed out after writing 3 changed file(s); worktree retained");
+  assert.equal(note({ errorType: "agent_timeout", changedFiles: ["a"] }), "timed out after writing 1 changed file(s)");
+  assert.equal(note({ timedOut: true, errorType: "opencode_rate_limited", changedFiles: ["a"], worktreeRetained: true }), "timed out after writing 1 changed file(s); worktree retained");
+  assert.equal(note({ errorType: "agent_idle_timeout", changedFiles: ["a", "b"], worktreeRetained: true }), "stopped as idle after writing 2 changed file(s); worktree retained");
+  // Nothing to say without files, or when the job did not time out.
+  assert.equal(note({ errorType: "agent_timeout", changedFiles: [], worktreeRetained: false }), "");
+  assert.equal(note({ errorType: "opencode_api_error", changedFiles: ["a"], worktreeRetained: true }), "");
+  assert.equal(note({}), "");
+});
+
+test("B-044: the single-result preamble and the compact lines say a timed-out writer wrote files", () => {
+  const resolution = { requestedAgent: "builder", actualAgent: "builder" };
+  const timedOut = {
+    exitCode: 124, timedOut: true, timeoutMs: 600000, errorType: "agent_timeout", dryRun: false, changedFiles: ["src/a.txt", "src/b.txt"],
+    worktree: { path: "C:/work/wt", removed: false, cleanup: "retained_for_review" }, assistantFinalResponseDetected: false,
+  };
+  const expected = "Timed out with changes: timed out after writing 2 changed file(s); worktree retained";
+  assert.ok(internals.compactJobLines({ resolution, result: timedOut }).includes(expected), internals.compactJobLines({ resolution, result: timedOut }).join("\n"));
+  assert.ok(internals.formatSingleResultParts({ resolution, result: timedOut, cwd: "C:/work", lockPlan: null }).preamble.includes(expected));
+  // A timeout that wrote nothing, a removed (empty) worktree and a job that did not time out stay as before.
+  const plain = internals.compactJobLines({ resolution, result: { ...timedOut, changedFiles: [], worktree: { path: "", removed: true } } }).join("\n");
+  assert.doesNotMatch(plain, /Timed out with changes/);
+  const finished = internals.compactJobLines({ resolution, result: { exitCode: 0, errorType: null, dryRun: false, changedFiles: ["src/a.txt"], assistantFinalResponseDetected: true } }).join("\n");
+  assert.doesNotMatch(finished, /Timed out with changes/);
+  const noWorktree = internals.compactJobLines({ resolution, result: { ...timedOut, worktree: undefined } }).join("\n");
+  assert.match(noWorktree, /Timed out with changes: timed out after writing 2 changed file\(s\)$/m);
+});
+
+test("B-044: a queued writer that times out after writing keeps its worktree and the job says so", async () => {
+  const repo = await makeSourceRepo("b044-queue");
+  installRuntime({
+    onRun: async ({ cwd }) => internals.writeFile(path.join(cwd, "src", "a.txt"), "half-finished edit\n", "utf8"),
+    outcome: () => ({ exitCode: 124, timedOut: true, timeoutMs: 600000, errorType: "agent_timeout", stdout: "", assistantFinalResponseDetected: false }),
+  });
+  const jobId = await enqueueWriter(repo);
+  try {
+    const record = await waitForQueueJob(jobId);
+    assert.equal(record.status, "failed");
+    assert.equal(record.errorType, "agent_timeout");
+    assert.deepEqual(record.changedFiles, ["src/a.txt"]);
+    assert.ok(record.worktreePath, "the worktree is retained");
+    assert.match(record.errorReason, /^timed out after writing 1 changed file\(s\); worktree retained/);
+    assert.equal(record.completionOutcome, "timed_out_with_changes");
+    const listing = await callTool("list_opencode_jobs", { cwd: repo });
+    assert.match(listing, new RegExp(`${jobId}[^\\n]*error=agent_timeout[^\\n]*outcome=timed_out_with_changes[^\\n]*note="timed out after writing 1 changed file\\(s\\); worktree retained"`));
+    const view = JSON.parse(await callTool("get_opencode_job", { jobId, cwd: repo }));
+    assert.equal(view.completionOutcome, "timed_out_with_changes");
+    assert.match(view.errorReason, /timed out after writing 1 changed file\(s\); worktree retained/);
+    assert.match(view.resultText, /Timed out with changes: timed out after writing 1 changed file\(s\); worktree retained/);
+    assert.match(view.worktreePath, /\S/);
+  } finally {
+    hooks.agentRuntimeTestHook = null;
+    await dropRetainedWorktrees(repo, jobId);
+  }
+});
+
+test("B-044: a writer that times out without writing anything is a plain timeout and leaves no worktree", async () => {
+  const repo = await makeSourceRepo("b044-empty");
+  installRuntime({ outcome: () => ({ exitCode: 124, timedOut: true, timeoutMs: 600000, errorType: "agent_timeout", stdout: "", assistantFinalResponseDetected: false }) });
+  const jobId = await enqueueWriter(repo);
+  try {
+    const record = await waitForQueueJob(jobId);
+    assert.equal(record.errorType, "agent_timeout");
+    assert.equal(record.completionOutcome || "", "");
+    assert.doesNotMatch(record.errorReason, /after writing/);
+    assert.equal(record.worktreePath || "", "");
+    assert.doesNotMatch(await callTool("list_opencode_jobs", { cwd: repo }), /note="/);
+  } finally {
+    hooks.agentRuntimeTestHook = null;
+    await dropRetainedWorktrees(repo, jobId);
+  }
 });
 
 let failed = 0;

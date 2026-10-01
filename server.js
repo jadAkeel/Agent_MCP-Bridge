@@ -7520,6 +7520,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     result?.timedOut ? `Agent timeout: ${resolution.actualAgent || resolution.requestedAgent}` : null,
     `Timeout ms: ${result?.timeoutMs ?? "not specified"}`,
     `Timed out: ${result?.timedOut ? "yes" : "no"}`,
+    timedOutWriterLine(result),
     `Read-only unavailable: ${result?.readOnlyUnavailable ? "yes" : "no"}`,
     `Retry attempts used: ${result?.retryAttempt ?? 0}`,
     `Max retries: ${result?.maxRetries ?? 0}`,
@@ -7559,6 +7560,33 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
 function formatSingleResult(args) {
   const { preamble, report, stderr } = formatSingleResultParts(args);
   return [preamble, report, stderr].join("\n");
+}
+
+// B-044: a writer that hit its timeout after changing files looked like any other timed-out job
+// ("Timed out: yes"), and the operator could take it for lost work. Its worktree is retained
+// (changed output is never removed), so the summary lines say what was written and where it is
+// kept. `idle` is a writer stopped by the idle watchdog (agent_idle_timeout) rather than the
+// run clock.
+function timedOutWriterNote({ errorType = "", timedOut = false, idleTimedOut = false, changedFiles = [], worktreeRetained = false } = {}) {
+  const count = Array.isArray(changedFiles) ? changedFiles.length : 0;
+  const idle = idleTimedOut || errorType === "agent_idle_timeout";
+  if (!count || !(idle || timedOut || errorType === "agent_timeout")) return "";
+  return `${idle ? "stopped as idle" : "timed out"} after writing ${count} changed file(s)${worktreeRetained ? "; worktree retained" : ""}`;
+}
+
+function timedOutWriterEvidence(result) {
+  return {
+    errorType: result?.errorType || "",
+    timedOut: Boolean(result?.timedOut),
+    idleTimedOut: Boolean(result?.idleTimedOut),
+    changedFiles: result?.changedFiles || [],
+    worktreeRetained: Boolean(result?.worktree?.path) && !result.worktree.removed,
+  };
+}
+
+function timedOutWriterLine(result) {
+  const note = timedOutWriterNote(timedOutWriterEvidence(result));
+  return note ? `Timed out with changes: ${note}` : null;
 }
 
 const COMPACT_FILE_LIST_LIMIT = 40;
@@ -7615,6 +7643,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
     result?.assistantResponseTruncated ? "Assistant response truncated: yes" : null,
     result?.rawOutputTruncated ? "Raw process output truncated: yes" : null,
     result?.timedOut ? `Timed out: yes (timeout ms ${result.timeoutMs ?? "not specified"})` : null,
+    timedOutWriterLine(result),
     result?.readOnlyUnavailable ? "Read-only unavailable: yes" : null,
     result?.retryAttempt ? `Retry attempts used: ${result.retryAttempt} of ${result.maxRetries ?? 0}` : null,
     result && result.exitCode !== 0 && result.exitCode !== undefined ? `Exit code: ${result.exitCode}` : null,
@@ -15951,6 +15980,11 @@ function essentialQueueJobView(snapshot) {
   return view;
 }
 
+function queueTimedOutWriterNote(record) {
+  if (record?.status !== "failed" || record.mode !== "write") return "";
+  return timedOutWriterNote({ errorType: record.errorType, changedFiles: record.changedFiles, worktreeRetained: Boolean(record.worktreePath) });
+}
+
 function compactQueueJobLines(records) {
   if (!records.length) return "(no jobs)";
   return records.map((record) => {
@@ -15973,6 +16007,7 @@ function compactQueueJobLines(records) {
       record.errorType ? `error=${record.errorType}` : "",
       record.completionOutcome ? `outcome=${record.completionOutcome}` : "",
       (record.changedFiles || []).length ? `changed=${record.changedFiles.join(",")}` : "",
+      queueTimedOutWriterNote(record) ? `note="${queueTimedOutWriterNote(record)}"` : "",
     ].filter(Boolean);
     return `- ${parts.join(" ")}`;
   }).join("\n");
@@ -19526,6 +19561,10 @@ function enforceQueueResultEvidence(record) {
     // Still a success ("nothing needed" is legitimate), but a writer that changed nothing is
     // flagged so a list of finished batch jobs does not hide it among the real outputs.
     record.completionOutcome = "completed_no_changes";
+  } else if (record.status === "failed" && record.mode === "write" && !record.completionOutcome
+    && (record.errorType === "agent_timeout" || record.errorType === "agent_idle_timeout") && (record.changedFiles || []).length) {
+    // B-044: failed, but not empty-handed: the worktree holds changes to inspect or integrate.
+    record.completionOutcome = "timed_out_with_changes";
   }
   return record;
 }
@@ -21295,7 +21334,7 @@ async function startQueueRecord(record) {
         heartbeatAt: "",
         leaseExpiresAt: "",
         errorType,
-        errorReason: errorType ? summarizeStderr(execution.result?.stderr) || errorType : "",
+        errorReason: errorType ? queueFailureReason(execution, errorType) : "",
         changedFiles: execution.result?.changedFiles || [],
         dirtyFiles: execution.result?.dirtyFiles || [],
         overlappingFiles: execution.result?.overlappingFiles || [],
@@ -21354,6 +21393,19 @@ async function startQueueRecord(record) {
   })();
   superviseQueueWorker(record, workerPromise);
   return true;
+}
+
+// The stored reason of a failed queue job: the agent's stderr summary, or the error type when it
+// printed nothing. B-044: a timed-out writer that left changed files in a retained worktree says so
+// first, so the operator integrates (or inspects) it instead of discarding the job.
+function queueFailureReason(execution, errorType) {
+  const stderrSummary = summarizeStderr(execution.result?.stderr);
+  const note = timedOutWriterNote({
+    ...timedOutWriterEvidence(execution.result),
+    errorType,
+    worktreeRetained: Boolean(execution.worktree?.path),
+  });
+  return note ? [note, stderrSummary].filter(Boolean).join(". ") : stderrSummary || errorType;
 }
 
 // `progressed` is false when a pass advanced no record: pending records that could not be
@@ -25913,6 +25965,7 @@ export const __selfTest = {
     syntheticProviderQuotaNotice,
     // tests/review-round5.js
     queueCapacityReport,
+    timedOutWriterNote,
     // tests/review2-a.js
     beginBridgeStartupRecovery,
     readPositiveIntEnv,
