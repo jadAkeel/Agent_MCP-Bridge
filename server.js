@@ -736,6 +736,7 @@ const scopeContractSchema = z
     timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
     modelRequirement: modelRequirementSchema.optional().describe("Pin provider/model[@variant] for this job. It must be in CODEX_OPENCODE_MODEL_ALLOWLIST or match the managed profile."),
+    selfCheckCommands: z.array(z.string().min(1).max(500)).max(8).optional().describe("Write jobs (builder/debugger) only: exact commands the agent may run itself to check its work, e.g. \"node tools/validate.cjs out/x.json\". Each must pass the validationCommand rules (CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST, no shell, npx or inline eval) and be written without wildcards, quotes or shell operators; a script it runs must not be in allowedEdits."),
   })
   .strict();
 
@@ -1091,6 +1092,9 @@ function buildOpenCodeEnv(extra = {}) {
     env[`GIT_CONFIG_VALUE_${inheritedConfigCount + offset}`] = value;
   });
   env.GIT_CONFIG_COUNT = String(inheritedConfigCount + 3);
+  // B-066: the running job's self-check allow rules (bridge-built, never from the environment).
+  const overlay = activePermissionOverlay();
+  if (overlay?.configContent) env.OPENCODE_CONFIG_CONTENT = overlay.configContent;
   return env;
 }
 
@@ -4505,7 +4509,10 @@ function normalizeAgentDebugMetadata(parsed, expectedName = "", { isolatedRuntim
     .filter((rule) => rule.action === "deny")
     .map((rule) => rule.pattern);
   const bash = permissionDefaultAndOverrides(permissions, "bash");
-  const bashAutomaticAllowUnsafe = bash.overrides.filter((rule) => rule.action === "allow" && !SAFE_AGENT_BASH_ALLOW_PATTERNS.has(rule.pattern));
+  // B-066: the running job's exact self-check commands are as safe as the git diagnostics here; any
+  // other allow rule still makes the profile unsafe.
+  const overlayBashAllow = activePermissionOverlay()?.bashAllow || null;
+  const bashAutomaticAllowUnsafe = bash.overrides.filter((rule) => rule.action === "allow" && !SAFE_AGENT_BASH_ALLOW_PATTERNS.has(rule.pattern) && !overlayBashAllow?.has(rule.pattern));
   const task = permissionDefaultAndOverrides(permissions, "task");
   const taskAllowedPatterns = task.overrides.filter((rule) => rule.action === "allow").map((rule) => rule.pattern.toLowerCase());
   const taskDelegationAllowlistSafe = task.defaultAction === "deny"
@@ -4736,7 +4743,9 @@ function agentMetadataCacheKey(agent, cwd, worktreeIdentity = null) {
   const place = worktreeIdentity?.repoRoot && /^[0-9a-f]{40,64}$/i.test(String(worktreeIdentity.baseTree || ""))
     ? `worktree\0${attestationCwdKey(worktreeIdentity.repoRoot)}\0${String(worktreeIdentity.baseTree).toLowerCase()}`
     : attestationCwdKey(cwd);
-  return `agent-metadata\0${String(agent)}\0${place}`;
+  // B-066: a job with self-check rules attests a different effective profile; never share it.
+  const overlay = activePermissionOverlay();
+  return `agent-metadata\0${String(agent)}\0${place}${overlay ? `\0overlay:${overlay.sha256}` : ""}`;
 }
 
 async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null, worktreeIdentity = null } = {}) {
@@ -7065,6 +7074,8 @@ function normalizeScopeContract(job) {
 
   const normalized = {
     ...(raw.modelRequirement !== undefined ? { modelRequirement: modelRequirementSchema.parse(raw.modelRequirement) } : {}),
+    // B-066: kept as written (validated by selfCheckCommandsError, matched exactly by OpenCode).
+    ...(raw.selfCheckCommands !== undefined ? { selfCheckCommands: Array.isArray(raw.selfCheckCommands) ? raw.selfCheckCommands.map((item) => String(item).trim()) : raw.selfCheckCommands } : {}),
     agent: String(raw.agent || job.agent || "").trim(),
     role: String(raw.role || "").trim(),
     mode: normalizeScopeMode(raw.mode),
@@ -7345,6 +7356,10 @@ function formatScopeContractForPrompt(scopeContract, spell = (values) => normali
     `Shared/frozen paths: ${scopeContract.shared.length ? list(scopeContract.shared) : "none"}`,
     `Serial-only paths: ${scopeContract.serialOnly.length ? list(scopeContract.serialOnly) : "none"}`,
     `Validation command: ${scopeContract.validationCommand || "not specified"}`,
+    ...(Array.isArray(scopeContract.selfCheckCommands) && scopeContract.selfCheckCommands.length ? [
+      "Self-check commands you may run with your shell tool (type each exactly as written, on its own, from the working directory; fix what it reports and run it again before you finish):",
+      ...scopeContract.selfCheckCommands.map((command) => `- ${command}`),
+    ] : []),
     `Allowed actions: ${scopeContract.actions.length ? scopeContract.actions.join(", ") : "not specified"}`,
     `Validation changedFilesMustBeWithinWriteScope: ${scopeContract.validation.changedFilesMustBeWithinWriteScope ? "yes" : "no"}`,
     `Validation forbiddenFilesMustNotChange: ${scopeContract.validation.forbiddenFilesMustNotChange ? "yes" : "no"}`,
@@ -19872,6 +19887,14 @@ function validateParallelWritePlan(jobs) {
     }
     const queueOnly = queueOnlyOptionsError(job);
     if (queueOnly) return { ...queueOnly, lockPlans };
+    if (job.scopeContract?.selfCheckCommands !== undefined) {
+      return {
+        error: "selfCheckCommands is not supported by run_opencode_parallel: the per-run permission overlay is implemented for single and queued jobs only.",
+        errorType: "self_check_unsupported_in_parallel",
+        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove selfCheckCommands.",
+        lockPlans,
+      };
+    }
     if (job.validationFixPasses) {
       return {
         error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
@@ -20082,6 +20105,84 @@ function validateParallelWritePlan(jobs) {
   return { error: null, lockPlans };
 }
 
+// B-066: self-check commands. Builders have no shell beyond git diagnostics, so in round 3 a
+// builder could not run `node tools/validate.cjs` on the batch it wrote. A write job's Scope
+// Contract may now name exact commands the agent may run; the bridge adds them as exact bash
+// allow rules for that one run (OPENCODE_CONFIG_CONTENT, see jobPermissionOverlayStorage) and
+// attests them like the profile's own git rules. Each command meets the validationCommand rules,
+// is written as one plain command (no wildcard, quote, backslash or shell operator, so OpenCode's
+// exact match leaves nothing open), and the script an interpreter runs must not be an allowed
+// edit: the agent could otherwise rewrite it and run its own code.
+const SELF_CHECK_MAX_COMMANDS = 8;
+const SELF_CHECK_FORBIDDEN_CHARACTERS = /[*?[\]{}"'`$;&|<>()\\\r\n\t]/;
+const SELF_CHECK_INTERPRETERS = new Set(["node", "python", "python3", "py", "bun", "deno"]);
+
+function selfCheckCommandsError(job, lockPlan) {
+  const commands = lockPlan?.scopeContract?.selfCheckCommands ?? job?.scopeContract?.selfCheckCommands;
+  if (commands === undefined || commands === null) return null;
+  const refuse = (errorType, error) => ({ errorType, error, suggestedFix: "List exact commands such as \"node tools/validate.cjs out/x.json\" for a builder or debugger write job, or remove selfCheckCommands." });
+  if (!Array.isArray(commands) || !commands.length || commands.length > SELF_CHECK_MAX_COMMANDS) {
+    return refuse("self_check_invalid", `selfCheckCommands must list 1 to ${SELF_CHECK_MAX_COMMANDS} commands.`);
+  }
+  const agent = String(job?.agent || "").toLowerCase();
+  if (lockPlan?.lockType === "read" || job?.sanitizedWorkspace || !WRITE_CAPABLE_AGENTS.has(agent) || job?.orchestratorMode === "contractor") {
+    return refuse("self_check_not_applicable", "selfCheckCommands apply to builder and debugger write jobs only (read-only roles and sanitized readers have no shell; a contractor delegates its checks).");
+  }
+  const allowedEdits = normalizeLockPathList(lockPlan?.allowedEdits || job?.allowedEdits || []);
+  const editable = (candidate) => {
+    const normalized = normalizeLockPathList([candidate])[0] || "";
+    return Boolean(normalized) && allowedEdits.some((edit) => normalized === edit || normalized.startsWith(`${edit}/`));
+  };
+  const seen = new Set();
+  for (const raw of commands) {
+    const command = String(raw ?? "").trim();
+    if (!command || SELF_CHECK_FORBIDDEN_CHARACTERS.test(command) || /\s{2,}/.test(command)) {
+      return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} must be one plain command with single spaces: no wildcards, quotes, backslashes, shell operators or substitutions.`);
+    }
+    if (seen.has(command)) return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} is listed twice.`);
+    seen.add(command);
+    const parsed = command.split(" ");
+    if (/[\\/]/.test(parsed[0])) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)} must start with a bare executable name from CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST.`);
+    const trust = validationCommandTrustError(parsed);
+    if (trust) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)}: ${trust}`);
+    const executable = parsed[0].toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
+    if (SELF_CHECK_INTERPRETERS.has(executable)) {
+      const script = parsed.slice(1).find((argument) => !argument.startsWith("-"));
+      if (script && editable(script)) {
+        return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs ${script}, which this job may edit; the agent could change it and run its own code.`);
+      }
+    }
+    if (["npm", "pnpm", "yarn"].includes(executable) && editable("package.json")) {
+      return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs package.json scripts, and package.json is an allowed edit of this job.`);
+    }
+  }
+  return null;
+}
+
+// The per-run OpenCode permission overlay: an inline config that appends exact bash allow rules
+// to the agent's own rules (OpenCode merges OPENCODE_CONFIG_CONTENT after the agent files, so the
+// rules land after the profile's "*": deny and win for exactly these commands). It is set for one
+// job's execution with AsyncLocalStorage, so buildOpenCodeEnv, the attestation cache key and the
+// metadata check of that job, and only that job, see it.
+const jobPermissionOverlayStorage = new AsyncLocalStorage();
+
+function selfCheckPermissionOverlay(job) {
+  const commands = Array.isArray(job?.scopeContract?.selfCheckCommands) ? job.scopeContract.selfCheckCommands.map((item) => String(item).trim()).filter(Boolean) : [];
+  const agent = String(job?.agent || "").trim();
+  if (!commands.length || !agent) return null;
+  const configContent = JSON.stringify({ agent: { [agent]: { permission: { bash: Object.fromEntries(commands.map((command) => [command, "allow"])) } } } });
+  return {
+    agent,
+    bashAllow: new Set(commands),
+    configContent,
+    sha256: createHash("sha256").update(configContent).digest("hex"),
+  };
+}
+
+function activePermissionOverlay() {
+  return jobPermissionOverlayStorage.getStore() || null;
+}
+
 // B-064: options only the durable queue can honour (it requeues, waits and integrates after the
 // run); a direct or parallel run would silently ignore them, so they are refused there.
 function queueOnlyOptionsError(job) {
@@ -20167,6 +20268,8 @@ function validateSingleLockPlan(job) {
 
   const fixPassError = validationFixPassError(job, lockPlan);
   if (fixPassError) return { ...fixPassError, lockPlan };
+  const selfCheckError = selfCheckCommandsError(job, lockPlan);
+  if (selfCheckError) return { ...selfCheckError, lockPlan };
 
   const unsafeReason = unsafePathReason(planPathInputs, lockPlan.cwd);
   if (unsafeReason) {
@@ -20362,7 +20465,18 @@ function formatReadOnlyWorkspaceDrift(drift) {
   return `Checkout changed during this read-only run (the attested agent cannot edit; result kept): ${changed}${committed}. The review may describe the older version of these files.`;
 }
 
-async function executeOpenCodeJob(requestedJob, {
+// B-066: a job with self-check commands runs inside its permission overlay (see
+// jobPermissionOverlayStorage); every other job runs exactly as before.
+async function executeOpenCodeJob(requestedJob, context = {}) {
+  // validateSingleLockPlan (first thing inside) refuses invalid commands before anything spawns, so
+  // the overlay is only ever used for commands that passed selfCheckCommandsError.
+  const overlay = WRITE_CAPABLE_AGENTS.has(String(requestedJob?.agent || "").toLowerCase()) ? selfCheckPermissionOverlay(requestedJob) : null;
+  return overlay
+    ? jobPermissionOverlayStorage.run(overlay, () => executeOpenCodeJobInOverlay(requestedJob, context))
+    : executeOpenCodeJobInOverlay(requestedJob, context);
+}
+
+async function executeOpenCodeJobInOverlay(requestedJob, {
   toolStarted = nowMs(),
   jobId = null,
   fromQueue = false,
@@ -28664,6 +28778,10 @@ export const __selfTest = {
     chooseRetryModel,
     jobRetryPolicy,
     queueOnlyOptionsError,
+    formatScopeContractForPrompt,
+    jobPermissionOverlayStorage,
+    selfCheckCommandsError,
+    selfCheckPermissionOverlay,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
