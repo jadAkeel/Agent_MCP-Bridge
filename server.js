@@ -159,7 +159,11 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
 const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
 const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
-const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+// B-062: one cap on running agents across every provider and every bridge process (the round-6
+// orchestrator's max.txt). 0 = no cap; the per-provider limit still applies under it.
+const ENV_GLOBAL_WORKER_LIMIT = readNonNegativeIntEnv("CODEX_OPENCODE_GLOBAL_WORKER_LIMIT", 0);
+const MAX_GLOBAL_WORKER_LIMIT = 64;
+const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, updatedAt: "" };
 // B-060: the default free-memory floor. A fixed 1024 MB would hold the queue forever on a machine
 // with 1 GB or less, so it is capped at an eighth of total memory.
 const DEFAULT_MIN_FREE_MEMORY_MB = Math.max(0, Math.min(1024, Math.floor(totalmem() / (1024 * 1024) / 8)));
@@ -255,6 +259,7 @@ const CONFIG = Object.freeze({
   trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
   trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
   get providerConcurrencyLimit() { return RUNTIME_CONCURRENCY.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT; },
+  get globalWorkerLimit() { return RUNTIME_CONCURRENCY.globalWorkerLimit ?? ENV_GLOBAL_WORKER_LIMIT; },
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
   // How long a job may wait for a provider slot. The wait is not part of the agent's run
@@ -3399,6 +3404,8 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
 // applies them at its next scheduler pass or slot request, and a restart reloads them.
 const RUNTIME_PROVIDER_LIMIT_SETTING = "provider_concurrency_limit";
 const RUNTIME_QUEUE_LIMIT_SETTING = "queue_parallel_limit";
+// B-062: 0 is a valid stored value here (no cap, even when the environment sets one).
+const RUNTIME_GLOBAL_LIMIT_SETTING = "global_worker_limit";
 const RUNTIME_CONCURRENCY_REFRESH_MS = 5000;
 let runtimeConcurrencyRefreshedFor = "";
 let runtimeConcurrencyRefreshedAt = 0;
@@ -3412,17 +3419,29 @@ function runtimeConcurrencyLimitError(name, value) {
   return "";
 }
 
+function globalWorkerLimitError(value) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_GLOBAL_WORKER_LIMIT) {
+    return `globalWorkerLimit must be an integer from 0 (no cap) to ${MAX_GLOBAL_WORKER_LIMIT}; got ${JSON.stringify(value)}.`;
+  }
+  return "";
+}
+
 function readRuntimeConcurrencyRows(db) {
-  const settings = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+  const settings = { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, updatedAt: "" };
   let updatedAtMs = 0;
-  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?)")
-    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?, ?)")
+    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING, RUNTIME_GLOBAL_LIMIT_SETTING);
   for (const row of rows) {
     const value = Number(row.value);
     // A hand-edited row outside the accepted range is ignored, not applied.
-    if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
-    if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
-    else settings.queueParallelLimit = value;
+    if (row.name === RUNTIME_GLOBAL_LIMIT_SETTING) {
+      if (globalWorkerLimitError(value)) continue;
+      settings.globalWorkerLimit = value;
+    } else {
+      if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
+      if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
+      else settings.queueParallelLimit = value;
+    }
     updatedAtMs = Math.max(updatedAtMs, Number(row.updated_at) || 0);
   }
   if (updatedAtMs) settings.updatedAt = new Date(updatedAtMs).toISOString();
@@ -3430,19 +3449,24 @@ function readRuntimeConcurrencyRows(db) {
 }
 
 function applyRuntimeConcurrency(settings) {
+  const globalWorkerLimit = settings.globalWorkerLimit ?? null;
   const changed = RUNTIME_CONCURRENCY.providerLimit !== settings.providerLimit
-    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit;
+    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit
+    || RUNTIME_CONCURRENCY.globalWorkerLimit !== globalWorkerLimit;
   Object.assign(RUNTIME_CONCURRENCY, {
     providerLimit: settings.providerLimit,
     queueParallelLimit: settings.queueParallelLimit,
+    globalWorkerLimit,
     updatedAt: settings.updatedAt || "",
   });
   if (changed) {
     logEvent("info", "concurrency.runtime_limits_applied", {
       providerLimit: CONFIG.providerConcurrencyLimit,
       queueParallelLimit: CONFIG.queueParallelLimit,
+      globalWorkerLimit: CONFIG.globalWorkerLimit,
       providerOverride: settings.providerLimit !== null,
       queueOverride: settings.queueParallelLimit !== null,
+      globalOverride: globalWorkerLimit !== null,
     });
   }
   return changed;
@@ -3476,22 +3500,25 @@ function describeConcurrencyLimits() {
   return {
     provider: describe(CONFIG.providerConcurrencyLimit, ENV_PROVIDER_CONCURRENCY_LIMIT, RUNTIME_CONCURRENCY.providerLimit),
     queue: describe(CONFIG.queueParallelLimit, ENV_QUEUE_PARALLEL_LIMIT, RUNTIME_CONCURRENCY.queueParallelLimit),
+    global: describe(CONFIG.globalWorkerLimit === 0 ? "0 (no cap)" : CONFIG.globalWorkerLimit, ENV_GLOBAL_WORKER_LIMIT, RUNTIME_CONCURRENCY.globalWorkerLimit),
   };
 }
 
 // Sets (or, with reset, clears) the persisted overrides and applies them to this process. Running
 // jobs are untouched: a lower limit only keeps new jobs from starting until enough have finished.
-async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset = false } = {}) {
+async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, globalWorkerLimit, reset = false } = {}) {
   const hasProvider = providerLimit !== undefined && providerLimit !== null;
   const hasQueue = queueParallelLimit !== undefined && queueParallelLimit !== null;
-  if (reset && (hasProvider || hasQueue)) {
-    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit or queueParallelLimit." };
+  const hasGlobal = globalWorkerLimit !== undefined && globalWorkerLimit !== null;
+  if (reset && (hasProvider || hasQueue || hasGlobal)) {
+    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit, queueParallelLimit or globalWorkerLimit." };
   }
-  if (!reset && !hasProvider && !hasQueue) {
-    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit and/or queueParallelLimit, or reset: true to return to the environment values." };
+  if (!reset && !hasProvider && !hasQueue && !hasGlobal) {
+    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit, queueParallelLimit and/or globalWorkerLimit, or reset: true to return to the environment values." };
   }
   const invalid = (hasProvider ? runtimeConcurrencyLimitError("providerLimit", providerLimit) : "")
-    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "");
+    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "")
+    || (hasGlobal ? globalWorkerLimitError(globalWorkerLimit) : "");
   if (invalid) return { ok: false, errorType: "concurrency_invalid", error: invalid };
 
   let db = null;
@@ -3504,7 +3531,7 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
     const effectiveProviderBefore = before.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
     const now = Date.now();
     if (reset) {
-      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING, RUNTIME_GLOBAL_LIMIT_SETTING);
     } else {
       const upsert = db.prepare(`
         INSERT INTO runtime_settings (name, value, updated_at) VALUES (?, ?, ?)
@@ -3512,6 +3539,7 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
       `);
       if (hasProvider) upsert.run(RUNTIME_PROVIDER_LIMIT_SETTING, providerLimit, now);
       if (hasQueue) upsert.run(RUNTIME_QUEUE_LIMIT_SETTING, queueParallelLimit, now);
+      if (hasGlobal) upsert.run(RUNTIME_GLOBAL_LIMIT_SETTING, globalWorkerLimit, now);
     }
     const after = readRuntimeConcurrencyRows(db);
     const effectiveProviderAfter = after.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
@@ -3526,12 +3554,13 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
       providerLimit: effectiveProviderBefore,
       queueParallelLimit: before.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT,
     };
+    const previousGlobalWorkerLimit = before.globalWorkerLimit ?? ENV_GLOBAL_WORKER_LIMIT;
     applyRuntimeConcurrency(after);
     runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
     runtimeConcurrencyRefreshedAt = Date.now();
     // A raised queue limit can start jobs that were waiting for a free worker.
     scheduleQueue();
-    return { ok: true, previous, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit }, reset: Boolean(reset) };
+    return { ok: true, previous, previousGlobalWorkerLimit, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit, globalWorkerLimit: CONFIG.globalWorkerLimit }, reset: Boolean(reset) };
   } catch (error) {
     if (transactionOpen) {
       try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
@@ -3550,6 +3579,7 @@ async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, si
   const deadlineAt = started + waitBudgetMs;
   let observedHolders = 0;
   let observedCapacity = CONFIG.providerConcurrencyLimit;
+  let observedGlobal = null;
   while (Date.now() < deadlineAt) {
     await reclaimProvenGoneProviderQuarantines();
     if (signal?.aborted) {
@@ -3606,7 +3636,13 @@ async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, si
       }
       observedHolders = active;
       observedCapacity = effectiveCapacity;
-      if (active < effectiveCapacity) {
+      // B-062: the global worker cap counts every held slot in this state directory, on every
+      // provider key and from every bridge process (quarantined slots too: their process tree may
+      // still run). It only ever holds a start back; held slots are never taken away.
+      const globalLimit = CONFIG.globalWorkerLimit;
+      const globalHeld = globalLimit > 0 ? Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases").get()?.count || 0) : 0;
+      observedGlobal = globalLimit > 0 ? { held: globalHeld, limit: globalLimit } : null;
+      if (active < effectiveCapacity && (!(globalLimit > 0) || globalHeld < globalLimit)) {
         const lease = {
           id: `${BRIDGE_INSTANCE_ID}-${randomBytes(6).toString("hex")}`,
           providerKey,
@@ -3644,10 +3680,11 @@ async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, si
   return {
     ok: false,
     errorType: "provider_slot_wait_timeout",
-    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs}). The agent was not started.`,
+    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs})${observedGlobal && observedGlobal.held >= observedGlobal.limit ? `; the global worker cap was full (${observedGlobal.held} of ${observedGlobal.limit} workers running on all providers, CODEX_OPENCODE_GLOBAL_WORKER_LIMIT)` : ""}. The agent was not started.`,
     waitedMs: Date.now() - started,
     holders: observedHolders,
     capacity: observedCapacity,
+    globalWorkers: observedGlobal,
   };
 }
 
@@ -3734,6 +3771,92 @@ async function recordRateLimitPause({ pauseKey, reason = "", now = Date.now() })
     }
     logEvent("error", "provider.cooldown_record_failed", { providerKey: pauseKey, error: error.message || String(error) });
     return { ok: false, recorded: false, error: error.message || String(error) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// B-062: pause_opencode_provider / resume_opencode_provider. The target is "provider" (every model
+// of it: the slot key) or "provider/model" (the B-061 model key). The model part may hold "/"
+// (openrouter/anthropic/...), so only the first "/" splits.
+function providerPauseTarget(target) {
+  const raw = String(target || "").trim();
+  const slash = raw.indexOf("/");
+  const provider = (slash < 0 ? raw : raw.slice(0, slash)).trim();
+  const model = slash < 0 ? "" : raw.slice(slash + 1).trim();
+  if (!provider || !MODEL_IDENTIFIER_PATTERN.test(provider) || (slash >= 0 && (!model || !MODEL_NAME_PATTERN.test(model)))) {
+    return { ok: false, error: `provider must be "provider" or "provider/model" (for example opencode or opencode/muse-spark-1.3-contributor-free); got ${JSON.stringify(raw)}.` };
+  }
+  const normalizedProvider = provider.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  return model
+    ? { ok: true, key: modelPauseKeyForMetadata({ provider, model }), provider: normalizedProvider, model, modelPrefix: "" }
+    : { ok: true, key: providerKeyForMetadata({ provider }), provider: normalizedProvider, model: "", modelPrefix: `${CONFIG.providerConcurrencyKey}:${normalizedProvider}/` };
+}
+
+async function pauseProvider({ provider, until, minutes, reason = "", now = Date.now() } = {}) {
+  const target = providerPauseTarget(provider);
+  if (!target.ok) return { ok: false, errorType: "provider_pause_invalid", error: target.error };
+  const hasUntil = until !== undefined && until !== null && String(until).trim() !== "";
+  const hasMinutes = minutes !== undefined && minutes !== null;
+  if (hasUntil === hasMinutes) {
+    return { ok: false, errorType: "provider_pause_invalid", error: "Pass exactly one of until (an ISO time) or minutes." };
+  }
+  let untilAt = 0;
+  if (hasUntil) {
+    untilAt = Date.parse(String(until));
+    if (!Number.isFinite(untilAt) || untilAt <= now) return { ok: false, errorType: "provider_pause_invalid", error: `until must be an ISO time in the future; got ${JSON.stringify(String(until))}.` };
+  } else {
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) return { ok: false, errorType: "provider_pause_invalid", error: `minutes must be an integer from 1 to 1440; got ${JSON.stringify(minutes)}.` };
+    untilAt = now + minutes * 60_000;
+  }
+  if (untilAt - now > PROVIDER_COOLDOWN_MAX_MS) return { ok: false, errorType: "provider_pause_invalid", error: "A pause can last at most 24 hours." };
+  let db = null;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    // An operator's pause replaces whatever is there, shorter or longer: the operator decides.
+    db.prepare(`
+      INSERT INTO provider_cooldowns (provider_key, until_at, error_type, reason, set_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider_key) DO UPDATE SET until_at = excluded.until_at, error_type = excluded.error_type, reason = excluded.reason, set_at = excluded.set_at
+    `).run(target.key, untilAt, "provider_paused", redactSensitiveText(`paused by the operator${reason ? `: ${reason}` : ""}`).slice(0, 300), now);
+    logEvent("info", "provider.paused_by_operator", { providerKey: target.key, untilAt: new Date(untilAt).toISOString() });
+    return { ok: true, key: target.key, until: new Date(untilAt).toISOString(), target };
+  } catch (error) {
+    return { ok: false, errorType: "provider_pause_failed", error: redactSensitiveText(error?.message || String(error)) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// Removes the pause of the target; for a whole provider also the pauses of its models, and the
+// rate-limit strike counts of everything it removes (the operator says the provider is fine).
+async function resumeProvider({ provider } = {}) {
+  const target = providerPauseTarget(provider);
+  if (!target.ok) return { ok: false, errorType: "provider_pause_invalid", error: target.error };
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const like = target.modelPrefix ? `${target.modelPrefix.replace(/[\\%_]/g, (item) => `\\${item}`)}%` : null;
+    const rows = like
+      ? db.prepare("SELECT provider_key, until_at, error_type FROM provider_cooldowns WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'").all(target.key, like)
+      : db.prepare("SELECT provider_key, until_at, error_type FROM provider_cooldowns WHERE provider_key = ?").all(target.key);
+    for (const statement of like
+      ? ["DELETE FROM provider_cooldowns WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'", "DELETE FROM provider_pause_strikes WHERE pause_key = ? OR pause_key LIKE ? ESCAPE '\\'"]
+      : ["DELETE FROM provider_cooldowns WHERE provider_key = ?", "DELETE FROM provider_pause_strikes WHERE pause_key = ?"]) {
+      db.prepare(statement).run(...(like ? [target.key, like] : [target.key]));
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    const removed = rows.map((row) => ({ providerKey: row.provider_key, until: new Date(Number(row.until_at)).toISOString(), errorType: row.error_type }));
+    logEvent("info", "provider.resumed_by_operator", { providerKey: target.key, removed: removed.length });
+    return { ok: true, key: target.key, removed, target };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    return { ok: false, errorType: "provider_pause_failed", error: redactSensitiveText(error?.message || String(error)) };
   } finally {
     if (db) closeDb(db);
   }
@@ -4209,7 +4332,9 @@ async function providerCapacitySnapshot() {
       errorType: row.error_type,
       reason: row.reason || "",
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns };
+    // B-062: what the global worker cap counts (every held slot, every key).
+    const allLeaseCount = Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases").get()?.count || 0);
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns, allLeaseCount };
   } catch (error) {
     return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], cooldowns: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
@@ -16744,12 +16869,13 @@ server.tool(
             ...(queueCapacity.warning ? [queueCapacity.warning] : []),
             ...queueMemoryStatusLines(),
             agentIdleTimeoutStatusLine(),
+            `Global worker limit (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT, all providers and bridge processes): ${describeConcurrencyLimits().global}; workers running now: ${Number(providerCapacity.allLeaseCount || 0)}`,
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
             ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId} (${lease.providerKey}): pid=${lease.ownerProcessId}, ${lease.quarantined ? "quarantined" : `remainingMs=${lease.remainingMs}`}, heartbeat=${lease.heartbeatAt || "none"}`),
             `Paused providers: ${(providerCapacity.cooldowns || []).length ? "" : "none"}`,
-            ...(providerCapacity.cooldowns || []).map((item) => `- ${item.providerKey}: paused until ${item.until} (${item.errorType}${item.reason ? `: ${item.reason}` : ""}); new jobs fail at once instead of starting`),
+            ...(providerCapacity.cooldowns || []).map((item) => `- ${item.providerKey}: paused until ${item.until} (${item.errorType}${item.reason ? `: ${item.reason}` : ""}); new jobs fail at once instead of starting; resume_opencode_provider ends it early`),
             `Bridge instance id: ${BRIDGE_INSTANCE_ID}`,
             "Default OpenCode orchestrator mode: planning-only",
             `Explicit user-authorized OpenCode contractor mode: ${/^[a-f0-9]{64}$/.test(effectiveContractorAuthorizationSha256()) ? "capability configured" : "disabled (capability not configured)"}`,
@@ -17760,6 +17886,7 @@ function formatConcurrencyChange(change) {
     change.reset ? "OpenCode concurrency limits reset to the environment values." : "OpenCode concurrency limits updated.",
     `Provider slots per provider: ${described.provider}; was ${change.previous.providerLimit}`,
     `Queue parallel limit (this process): ${described.queue}; was ${change.previous.queueParallelLimit}`,
+    `Global worker limit (all providers and bridge processes): ${described.global}; was ${change.previousGlobalWorkerLimit === 0 ? "0 (no cap)" : change.previousGlobalWorkerLimit}`,
     "Running jobs keep their slots; a lower limit only holds back new starts until enough jobs have finished.",
     `Persisted in ${path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite")}: other bridge processes pick it up at their next scheduler pass or slot request, and a restart keeps it until reset: true.`,
   ].join("\n");
@@ -17827,14 +17954,15 @@ server.tool(
 
 server.tool(
   "set_opencode_concurrency",
-  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) and/or the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}. The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
+  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT), the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) and/or the global worker cap over all providers (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT, 0 = none) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT} (global 0 to ${MAX_GLOBAL_WORKER_LIMIT}). The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
   {
     providerLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Simultaneous model calls per provider, across all bridge processes."),
     queueParallelLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Queue jobs this bridge process runs at once (the provider limit still caps model calls)."),
-    reset: z.boolean().optional().describe("Clear both runtime overrides and return to the environment values. Do not combine with a limit."),
+    globalWorkerLimit: z.number().int().min(0).max(MAX_GLOBAL_WORKER_LIMIT).optional().describe("Agents running at once on ALL providers across all bridge processes (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT); 0 removes the cap."),
+    reset: z.boolean().optional().describe("Clear every runtime override and return to the environment values. Do not combine with a limit."),
   },
-  async ({ providerLimit, queueParallelLimit, reset = false }) => {
-    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset });
+  async ({ providerLimit, queueParallelLimit, globalWorkerLimit, reset = false }) => {
+    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, globalWorkerLimit, reset });
     if (!change.ok) {
       return {
         isError: true,
@@ -17842,11 +17970,71 @@ server.tool(
           headline: "Concurrency change rejected.",
           errorType: change.errorType,
           reason: change.error,
-          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, or reset: true.`,
+          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, globalWorkerLimit from 0 to ${MAX_GLOBAL_WORKER_LIMIT}, or reset: true.`,
         }) }],
       };
     }
     return { content: [{ type: "text", text: formatConcurrencyChange(change) }] };
+  }
+);
+
+// B-062: runtime pause of a provider or one of its models (orch/pause.json of the round-6
+// orchestrator). Stored with the automatic pauses in provider-concurrency.sqlite, so every bridge
+// process honours it at its next slot request and it survives a restart.
+server.tool(
+  "pause_opencode_provider",
+  "Pause a provider (\"opencode\") or one model (\"opencode/muse-spark-1.3-contributor-free\") until a time or for some minutes, in every bridge process. Running jobs keep going; new jobs on it fail at once with provider_paused (a job with a models list moves to its next model). Replaces any pause already on that key, shorter or longer. resume_opencode_provider ends it early.",
+  {
+    provider: z.string().min(1).describe("provider or provider/model, as in CODEX_OPENCODE_MODEL_ALLOWLIST without the @variant."),
+    until: z.string().optional().describe("ISO time the pause ends (at most 24 h ahead). Give until or minutes."),
+    minutes: z.number().int().min(1).max(24 * 60).optional().describe("Pause length in minutes. Give until or minutes."),
+    reason: z.string().max(200).optional().describe("Shown in get_opencode_bridge_status and in the error new jobs get."),
+  },
+  async ({ provider, until, minutes, reason = "" }) => {
+    const paused = await pauseProvider({ provider, until, minutes, reason });
+    if (!paused.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Provider pause rejected.",
+          errorType: paused.errorType,
+          reason: paused.error,
+          suggestedFix: "Pass provider as provider or provider/model and exactly one of until (ISO time, at most 24 h ahead) or minutes (1 to 1440).",
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: [
+      `Provider paused: ${paused.key}`,
+      `Until: ${paused.until}`,
+      paused.target.model ? `Scope: model ${paused.target.provider}/${paused.target.model} only` : `Scope: every model of ${paused.target.provider}${CONFIG.providerConcurrencyKeyExplicit ? ` (CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY is set, so every provider shares this key and this pause covers them all)` : ""}`,
+      "Running jobs keep their slots; new jobs on this key fail at once with provider_paused until then, in every bridge process.",
+    ].join("\n") }] };
+  }
+);
+
+server.tool(
+  "resume_opencode_provider",
+  "End the pause of a provider or provider/model early, whether an operator set it (pause_opencode_provider) or the bridge did (a quota reset time, a detected rate limit). For a whole provider it also clears the pauses of its models and their rate-limit backoff.",
+  {
+    provider: z.string().min(1).describe("provider or provider/model."),
+  },
+  async ({ provider }) => {
+    const resumed = await resumeProvider({ provider });
+    if (!resumed.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Provider resume rejected.",
+          errorType: resumed.errorType,
+          reason: resumed.error,
+          suggestedFix: "Pass provider as provider or provider/model.",
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: [
+      `Provider resumed: ${resumed.key}`,
+      `Pauses removed: ${resumed.removed.length ? resumed.removed.map((item) => `${item.providerKey} (was until ${item.until}, ${item.errorType})`).join("; ") : "none (nothing was paused)"}`,
+    ].join("\n") }] };
   }
 );
 
@@ -28142,6 +28330,11 @@ export const __selfTest = {
     rateLimitPauseReason,
     readOpenCodeLogPathEnv,
     recordRateLimitPause,
+    ENV_GLOBAL_WORKER_LIMIT,
+    MAX_GLOBAL_WORKER_LIMIT,
+    pauseProvider,
+    providerPauseTarget,
+    resumeProvider,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
