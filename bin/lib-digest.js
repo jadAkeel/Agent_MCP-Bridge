@@ -15,6 +15,12 @@
 // Directories are not entries of their own (an empty directory adds nothing). A symbolic link
 // or junction anywhere under lib/ (lib/ itself included) is refused, like listReleaseFiles in
 // server.js: following one would digest bytes that live outside the pinned tree.
+//
+// B-102: the bridge also runs a few files under bin/ (server.js and lib/ import them, and the
+// process supervisor is spawned for every command). They are entries of the same digest, with
+// their own "bin/..." paths, when they exist next to lib/; a missing one adds nothing (the
+// import would fail at startup anyway). tests/review-split-lib-pin.js checks that the import
+// closure of server.js stays inside server.js, lib/** and this list.
 
 import { createHash } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
@@ -25,11 +31,26 @@ const SERVER_PIN_ENV = "CODEX_OPENCODE_EXPECTED_SERVER_SHA256";
 const RELEASE_MANIFEST_PIN_ENV = "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256";
 const LIB_PIN_SYNC_COMMAND = "npm run release:activate -- --sync-clients";
 
+// The bin/ files the bridge executes at runtime (B-102): the relative-import closure of
+// server.js and lib/** outside those two, plus the supervisor every command runs under.
+const RUNTIME_BIN_FILES = Object.freeze([
+  "bin/builder-model-fallback.js",
+  "bin/direct-run-audit.js",
+  "bin/lib-digest.js",
+  "bin/main-module.js",
+  "bin/ops-log.js",
+  "bin/plugin-manifest-paths.js",
+  "bin/process-supervisor.js",
+  "bin/worktree-links.js",
+]);
+
 const sha256 = (content) => createHash("sha256").update(content).digest("hex");
 
-// Every regular file under <bridgeRoot>/lib as { path: "lib/...", sha256 }, sorted. Returns
-// null when lib/ does not exist (a bridge built before the split); throws for a link or an
-// unsupported entry.
+const byPath = (left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+
+// Every regular file under <bridgeRoot>/lib as { path: "lib/...", sha256 }, plus the
+// RUNTIME_BIN_FILES that exist, sorted. Returns null when lib/ does not exist (a bridge built
+// before the split); throws for a link or an unsupported entry.
 async function listLibFiles(bridgeRoot) {
   const root = path.resolve(bridgeRoot);
   const libDir = path.join(root, "lib");
@@ -57,7 +78,25 @@ async function listLibFiles(bridgeRoot) {
     }
   };
   await walk(libDir);
-  return files.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  for (const relative of RUNTIME_BIN_FILES) {
+    const absolute = path.join(root, ...relative.split("/"));
+    let entry;
+    try {
+      entry = await lstat(absolute);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (entry.isSymbolicLink()) throw new Error(`Symbolic links and junctions are not allowed for a pinned bin/ file: ${relative}`);
+    if (!entry.isFile()) throw new Error(`Unsupported filesystem entry for a pinned bin/ file: ${relative}`);
+    files.push({ path: relative, sha256: sha256(await readFile(absolute)) });
+  }
+  return files.sort(byPath);
+}
+
+// Whether a release-manifest path is part of the lib/ digest (B-102).
+function isLibDigestPath(relative) {
+  return String(relative || "").startsWith("lib/") || RUNTIME_BIN_FILES.includes(String(relative || ""));
 }
 
 // The digest of a file list in the format above (also used to recompute it from a release
@@ -113,6 +152,8 @@ async function libPinError(bridgeRoot, env = process.env) {
 export {
   LIB_PIN_ENV,
   LIB_PIN_SYNC_COMMAND,
+  RUNTIME_BIN_FILES,
+  isLibDigestPath,
   libDigest,
   libDigestOf,
   libPinError,

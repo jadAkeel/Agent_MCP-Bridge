@@ -65,7 +65,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { LEGACY_PUBLISH_ENTRIES, buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
-import { LIB_PIN_ENV, libDigest, libDigestOf } from "./lib-digest.js";
+import { LIB_PIN_ENV, isLibDigestPath, libDigest, libDigestOf } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
 import { recordCliFailure } from "./ops-log.js";
@@ -543,11 +543,12 @@ async function repinnableLibSha256(serverPath, env = {}) {
   if (!isReleaseDirectory(releaseDir)) return digest.sha256;
   const manifest = await readRepinnableManifest(releaseDir, env);
   const files = manifest?.files && typeof manifest.files === "object" ? manifest.files : {};
-  const listed = Object.keys(files).filter((relative) => relative.startsWith("lib/")).sort()
+  // B-102: the digest covers lib/** and the runtime bin/ files (bin/lib-digest.js RUNTIME_BIN_FILES).
+  const listed = Object.keys(files).filter(isLibDigestPath).sort()
     .map((relative) => ({ path: relative, sha256: String(files[relative] || "").trim().toLowerCase() }));
   const expected = libDigestOf(listed);
   if (digest.sha256 !== expected) {
-    throw new Error(`${path.join(releaseDir, "lib")} belongs to an immutable release, but its digest ${short(digest.sha256)} differs from the lib/ entries of ${RELEASE_MANIFEST} (${short(expected)}). Refusing to re-pin a modified release; build a new one with npm run release:activate.`);
+    throw new Error(`${path.join(releaseDir, "lib")} belongs to an immutable release, but its digest ${short(digest.sha256)} differs from the lib/ and runtime bin/ entries of ${RELEASE_MANIFEST} (${short(expected)}). Refusing to re-pin a modified release; build a new one with npm run release:activate.`);
   }
   return digest.sha256;
 }
@@ -569,7 +570,12 @@ async function refreshIntegrityPins(configPath, entry, { smoke = runHealthSmoke 
     }
   }
   const serverPath = String(entry.args?.[0] || "").trim();
-  if (serverPath && existsSync(serverPath)) {
+  // B-105: an entry whose server.js is gone cannot be re-pinned; saying "pins are current"
+  // would hide a broken install.
+  if (serverPath && !existsSync(serverPath)) {
+    throw new Error(`The ${SERVER_NAME} entry runs ${serverPath}, which does not exist; the integrity pins cannot be refreshed. Fix the entry (npm run setup) or activate a release.`);
+  }
+  if (serverPath) {
     const serverActual = await repinnableServerSha256(serverPath, entry.env);
     const pinned = String(entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 || "").trim().toLowerCase();
     if (pinned !== serverActual) {
@@ -786,8 +792,11 @@ async function readClaudeUserEntry(claudeConfigPath) {
   }
 }
 
-function claudeEntryFor(codexEntry) {
-  return { type: "stdio", command: codexEntry.command, args: codexEntry.args, env: codexEntry.env };
+// B-105: Claude-only keys of the existing entry (its own settings) survive an update; only the
+// four keys the Codex entry defines are replaced.
+function claudeEntryFor(codexEntry, current = null) {
+  const kept = current && typeof current === "object" && !Array.isArray(current) ? current : {};
+  return { ...kept, type: "stdio", command: codexEntry.command, args: codexEntry.args, env: codexEntry.env };
 }
 
 function rewriteClaudeConfig(text, entry) {
@@ -796,7 +805,7 @@ function rewriteClaudeConfig(text, entry) {
     || (document.mcpServers && (typeof document.mcpServers !== "object" || Array.isArray(document.mcpServers)))) {
     throw new Error("Claude user config must be a JSON object with an object mcpServers.");
   }
-  const desired = claudeEntryFor(entry);
+  const desired = claudeEntryFor(entry, document.mcpServers?.[SERVER_NAME]);
   if (sameClaudeEntry(document.mcpServers?.[SERVER_NAME], desired)) return text;
   document.mcpServers = { ...document.mcpServers, [SERVER_NAME]: desired };
   return `${JSON.stringify(document, null, 2)}\n`;
@@ -1731,7 +1740,12 @@ async function main() {
     process.stdout.write(`${clientToolTimeoutWarning(await readFile(options.configPath, "utf8"), activeEntry.env)}\n`);
     const claude = await syncClaudeCodeForOptions(options);
     process.stdout.write(`${claude.message}\n`);
-    if (!claude.ok) process.exitCode = 1;
+    if (!claude.ok) {
+      // B-105: the Codex entry was already re-pinned above; the two clients now disagree
+      // until the Claude step is retried.
+      process.stdout.write("The Codex entry is already re-pinned; Claude Code still has the previous pins. Fix the cause above and run npm run release:activate -- --sync-clients again.\n");
+      process.exitCode = 1;
+    }
     return;
   }
 
