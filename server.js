@@ -228,6 +228,8 @@ const CONFIG = Object.freeze({
   // B-065: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
   // requeued by the bridge that finds it, as one of its attempts. false leaves it interrupted.
   autoResumeInterrupted: readChoiceEnv("CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED", ["true", "false"], "true") === "true",
+  // B-067: false refuses every autoIntegrate job, for an operator who wants every patch reviewed.
+  autoIntegrateAllowed: readChoiceEnv("CODEX_OPENCODE_AUTO_INTEGRATE", ["true", "false"], "true") === "true",
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -772,6 +774,7 @@ const jobInputShape = {
   timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
   models: z.array(z.string().min(1).max(300)).min(1).max(8).optional().describe("enqueue_opencode_job only. Models to try in order, each provider/model[@variant] from CODEX_OPENCODE_MODEL_ALLOWLIST. After a provider failure (rate limit, pause, quota, 5xx), an idle stop, a timeout, no output or a failed validation the bridge requeues the job on the next model that is not paused; after maxAttempts it marks the job outcome=gave_up."),
   maxAttempts: z.number().int().min(1).max(10).optional().describe("enqueue_opencode_job only. Attempts in total, the first included (default 4 when models is given). Alone (without models) it retries on the same model."),
+  autoIntegrate: z.boolean().optional().describe("enqueue_opencode_job only, write jobs with a validationCommand. When the finished job only ADDED new files and its validation passed, the bridge integrates them (the same dry run, receipt, validation and rollback as integrate_opencode_worktree) and commits exactly those files with the target repository's last commit identity. Any other patch keeps the normal reviewed flow."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
   allowFallbackToBuild: z.boolean().optional(),
@@ -11424,7 +11427,9 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
 // `git diff --stat <base>` left out files the agent created (untracked in the worktree), so a
 // builder that wrote a new test file showed "1 file changed". The review patch already carries
 // every file, new ones included; count its lines instead.
-function diffStatFromPatch(patchText) {
+// B-067: the patch's files with their kind (created, deleted, binary), for the stat below and for
+// auto-integration, which lands a patch by itself only when every file in it is new.
+function patchFileEntries(patchText) {
   const files = [];
   let current = null;
   for (const line of String(patchText || "").split("\n")) {
@@ -11447,6 +11452,11 @@ function diffStatFromPatch(patchText) {
     if (line.startsWith("+")) current.added += 1;
     else if (line.startsWith("-")) current.removed += 1;
   }
+  return files;
+}
+
+function diffStatFromPatch(patchText) {
+  const files = patchFileEntries(patchText);
   if (!files.length) return "";
   const width = Math.max(...files.map((file) => file.path.length));
   const rows = files.map((file) => {
@@ -13932,6 +13942,7 @@ async function integratePatchWithoutSerialLock({
         patchPreview: previewMode === "stat" ? "" : secretLines.length ? redactLikelySecrets(patch.patch) : patch.patch,
         patchPreviewMaskedLines: secretLines,
         patchStat: diffStatFromPatch(patch.patch),
+        patchFiles: patchFileEntries(patch.patch).map((file) => ({ path: file.path, created: file.created, deleted: file.deleted, binary: file.binary })),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
         allowDirtyTarget: Boolean(allowDirtyTarget),
@@ -17607,7 +17618,7 @@ function diagnoseJobView(job) {
 }
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
-  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "retryAttempt", "maxAttempts", "attemptHistory", "startAfter", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "retryAttempt", "maxAttempts", "attemptHistory", "startAfter", "autoIntegration", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "lastActivityAt", "idleMs", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
   "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
@@ -17662,6 +17673,7 @@ function compactQueueJobLines(records) {
       record.durationMs ? `durationMs=${record.durationMs}` : "",
       record.errorType ? `error=${record.errorType}` : "",
       record.completionOutcome ? `outcome=${record.completionOutcome}` : "",
+      record.autoIntegration?.status ? `autoIntegration=${record.autoIntegration.status}${record.autoIntegration.commit ? `@${String(record.autoIntegration.commit).slice(0, 12)}` : ""}` : "",
       (record.changedFiles || []).length ? `changed=${record.changedFiles.join(",")}` : "",
       queueTimedOutWriterNote(record) ? `note="${queueTimedOutWriterNote(record)}"` : "",
     ].filter(Boolean);
@@ -21577,6 +21589,8 @@ function queueRecordSnapshot(record, includeResult = true) {
     maxAttempts: record.maxAttempts || 0,
     attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
     startAfter: record.startAfter || "",
+    // B-067: what the bridge did with an autoIntegrate job's patch.
+    autoIntegration: record.autoIntegration || null,
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -22757,6 +22771,8 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
       lockPlan,
     };
   }
+  const autoIntegrateError = autoIntegrateJobError(normalizedJob, lockPlan, parentJobId);
+  if (autoIntegrateError) return { ok: false, ...autoIntegrateError, lockPlan };
 
   const now = new Date().toISOString();
   const jobId = makeQueueJobId(job.agent);
@@ -23151,6 +23167,148 @@ function scheduleQueueRetryPolicy(cwd, jobId) {
       logEvent("warn", "queue.retry_policy_failed", { jobId, errorType: error?.errorType || "retry_policy_failed", summary: failureSummary(error?.message || String(error)) });
     });
   });
+}
+
+// B-067: auto-integration of new-file-only patches (the round-6 orchestrator's LANDED step). Up to
+// 300 batches each needed a dry run, an apply and a receipt. A queued writer that asks for it
+// (autoIntegrate: true) and finished with a passing validationCommand is integrated by the bridge
+// itself, but only when every file of its patch is new: the dry run and the receipt-bound apply
+// are the integrate_opencode_worktree engine (scope, secret and binary gates, serial lock,
+// journal, validation in the target, rollback, worktree cleanup), called back to back. The files
+// are then committed by explicit pathspec with the identity of the target's last commit. Jobs of
+// one repository are integrated one at a time (AUTO_INTEGRATION_CHAINS); any other patch is left
+// for the normal reviewed flow.
+function autoIntegrateJobError(job, lockPlan, parentJobId = "") {
+  if (job?.autoIntegrate === undefined || job.autoIntegrate === null || job.autoIntegrate === false) return null;
+  const refuse = (errorType, error, suggestedFix = "Remove autoIntegrate, or enqueue a write job with a validationCommand.") => ({ errorType, error, suggestedFix });
+  if (job.autoIntegrate !== true) return refuse("auto_integrate_invalid", "autoIntegrate must be true or false.");
+  if (!CONFIG.autoIntegrateAllowed) return refuse("auto_integrate_disabled", "The operator turned auto-integration off (CODEX_OPENCODE_AUTO_INTEGRATE=false); every patch goes through the reviewed integration.", "Remove autoIntegrate and integrate the worktree with integrate_opencode_worktree.");
+  if (parentJobId) return refuse("auto_integrate_not_applicable", "A pipeline integrates its jobs itself.");
+  if (lockPlan?.lockType === "read" || job.sanitizedWorkspace || job.dryRun) return refuse("auto_integrate_not_applicable", "autoIntegrate applies to write jobs that run (not read-only, sanitized or dry-run jobs).");
+  if (!String(lockPlan?.validationCommand || "").trim()) return refuse("auto_integrate_needs_validation", "autoIntegrate needs a validationCommand: a patch lands without review only after its validation passed in the worktree and passes again in the target.");
+  return null;
+}
+
+const AUTO_INTEGRATION_CHAINS = new Map();
+const AUTO_INTEGRATION_RETRYABLE_ERRORS = new Set(["integration_lock_conflict", "integration_preview_stale", "integration_recovery_pending"]);
+// A few quick rounds for a receipt that went stale between the two calls; a lock held by another
+// writer on the same paths (a builder still running on the folder) can last as long as that
+// builder, so the job then waits outside the repository's chain and tries again later, for up to
+// AUTO_INTEGRATION_LATER_MAX tries (an hour by default).
+const AUTO_INTEGRATION_ROUNDS = 3;
+const AUTO_INTEGRATION_LATER_MAX = 60;
+
+function autoIntegrationRetryDelayMs(round) {
+  const baseMs = process.argv.includes("--self-test") ? 25 : 5000;
+  return Math.min(baseMs * 12, baseMs * 2 ** round);
+}
+
+function autoIntegrationLaterDelayMs() {
+  return process.argv.includes("--self-test") ? 150 : 60_000;
+}
+
+// Commits exactly the integrated files, by pathspec (other changes of the checkout, staged or not,
+// stay as they are), as the author of the target's last commit. Unsigned: the bridge's git runs no
+// gpg program. A concurrent git (index.lock) is retried.
+async function commitAutoIntegratedFiles(root, files, message) {
+  const identity = await runCommand("git", ["log", "-1", "--format=%an%x00%ae"], root, 15_000);
+  const [name = "", email = ""] = String(identity.stdout || "").trim().split("\0");
+  if (identity.exitCode !== 0 || !name.trim() || !email.trim()) {
+    return { ok: false, errorType: "auto_integration_identity_missing", error: "The target repository's last commit has no author name and email to commit with." };
+  }
+  let last = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (attempt) await delayWithSignal(process.argv.includes("--self-test") ? 50 : 3000);
+    const add = await runCommand("git", ["add", "--", ...files], root, 60_000);
+    last = add.exitCode === 0
+      ? await runCommand("git", ["-c", `user.name=${name.trim()}`, "-c", `user.email=${email.trim()}`, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message, "--", ...files], root, 60_000)
+      : add;
+    if (last.exitCode === 0) {
+      const head = await runCommand("git", ["rev-parse", "HEAD"], root, 15_000);
+      return { ok: true, commit: String(head.stdout || "").trim(), author: `${name.trim()} <${email.trim()}>` };
+    }
+    if (!/index\.lock|unable to lock|cannot lock|File exists/i.test(`${last.stderr}`)) break;
+  }
+  return { ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(String(last?.stderr || "git commit failed")).slice(0, 500) };
+}
+
+async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", worktreePath, allowedEdits = [], forbiddenEdits = [], sharedFiles = [], serialOnly = [], validationCommand = "", laterAttempt = 0 }) {
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  const recordOutcome = async (fields) => {
+    const autoIntegration = { at: new Date().toISOString(), ...fields };
+    await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration });
+    return autoIntegration;
+  };
+  const failed = async (stage, result) => {
+    const outcome = await recordOutcome({ status: stage === "commit" ? "applied_not_committed" : "failed", stage, errorType: result?.errorType || "auto_integration_failed", error: redactSensitiveText(String(result?.error || "")).slice(0, 500), worktreePath: stage === "commit" ? "" : worktreePath });
+    logEvent("warn", "queue.auto_integration_failed", {
+      jobId,
+      agent,
+      model,
+      errorType: outcome.errorType,
+      summary: failureSummary(stage === "commit"
+        ? `The new files were integrated but not committed: ${outcome.error}. Commit them by hand.`
+        : `Auto-integration stopped at the ${stage}: ${outcome.error || outcome.errorType}. The worktree is kept for integrate_opencode_worktree.`),
+    });
+    return outcome;
+  };
+  const options = { cwd: projectRoot, worktreePath, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget: true, previewMode: "stat", cleanupAfterSuccess: true };
+  // A lock another job holds: wait outside the chain (scheduleAutoIntegration tries again later).
+  const waitLater = async (result) => {
+    if (result?.errorType !== "integration_lock_conflict" || laterAttempt >= AUTO_INTEGRATION_LATER_MAX) return null;
+    await recordOutcome({ status: "waiting_for_lock", tries: laterAttempt + 1, errorType: result.errorType, error: redactSensitiveText(String(result.error || "")).slice(0, 300) });
+    return { retryLater: true };
+  };
+  let applied = null;
+  let files = [];
+  for (let round = 0; round < AUTO_INTEGRATION_ROUNDS; round += 1) {
+    if (round) await delayWithSignal(autoIntegrationRetryDelayMs(round - 1));
+    const preview = await integratePatchSerially({ ...options, dryRun: true });
+    if (!preview.ok) {
+      if (AUTO_INTEGRATION_RETRYABLE_ERRORS.has(preview.errorType) && round < AUTO_INTEGRATION_ROUNDS - 1) continue;
+      return (await waitLater(preview)) || await failed("dry run", preview);
+    }
+    files = Array.isArray(preview.patchFiles) ? preview.patchFiles : [];
+    const newFilesOnly = files.length > 0 && files.every((file) => file.created && !file.deleted);
+    if (!newFilesOnly) {
+      const outcome = await recordOutcome({ status: "skipped_not_new_files", files: files.map((file) => file.path), reason: "The patch changes or deletes a file that already exists; integrate it after review with integrate_opencode_worktree." });
+      logEvent("info", "queue.auto_integration_skipped", { jobId, files: outcome.files.length });
+      return outcome;
+    }
+    applied = await integratePatchSerially({ ...options, dryRun: false, reviewed: true, previewReceipt: preview.previewReceipt });
+    if (applied.ok) break;
+    if (!AUTO_INTEGRATION_RETRYABLE_ERRORS.has(applied.errorType) || round === AUTO_INTEGRATION_ROUNDS - 1) return (await waitLater(applied)) || await failed("apply", applied);
+  }
+  if (!applied?.ok || applied.validationGate?.status !== "passed") {
+    return await failed("apply", applied || { errorType: "auto_integration_failed", error: "The apply did not report a passing validation." });
+  }
+  const paths = files.map((file) => file.path);
+  const committed = await commitAutoIntegratedFiles(projectRoot, paths, `Auto-integrate ${jobId}: ${paths.length} new file(s) by ${agent || "agent"}${model ? ` on ${model}` : ""}`);
+  if (!committed.ok) return await failed("commit", committed);
+  const cleanup = applied.sourceCleanup ? `${applied.sourceCleanup.cleanup}${applied.sourceCleanup.reason ? ` (${applied.sourceCleanup.reason})` : ""}` : "";
+  const outcome = await recordOutcome({ status: "committed", commit: committed.commit, files: paths, author: committed.author, worktreeCleanup: cleanup });
+  logEvent("info", "queue.auto_integrated", { jobId, files: paths.length, commit: committed.commit });
+  return outcome;
+}
+
+// One repository's auto-integrations run one after another, each with its commit, so the next
+// dry run sees a clean target and a committed HEAD.
+function scheduleAutoIntegration(details) {
+  const key = RepositoryRootSet.key(details.cwd);
+  const run = (AUTO_INTEGRATION_CHAINS.get(key) || Promise.resolve())
+    .then(() => autoIntegrateQueueJob(details))
+    .catch((error) => {
+      logEvent("warn", "queue.auto_integration_failed", { jobId: details.jobId, agent: details.agent || "", errorType: error?.errorType || "auto_integration_failed", summary: failureSummary(error?.message || String(error)) });
+      return null;
+    });
+  AUTO_INTEGRATION_CHAINS.set(key, run);
+  run.finally(() => { if (AUTO_INTEGRATION_CHAINS.get(key) === run) AUTO_INTEGRATION_CHAINS.delete(key); });
+  run.then((outcome) => {
+    if (!outcome?.retryLater) return;
+    const timer = setTimeout(() => scheduleAutoIntegration({ ...details, laterAttempt: Number(details.laterAttempt || 0) + 1 }), autoIntegrationLaterDelayMs());
+    timer.unref?.();
+  });
+  return run;
 }
 
 // Creates a new queue job from the stored request of a failed, cancelled, interrupted or
@@ -24099,7 +24257,24 @@ async function startQueueRecord(record) {
         childProcessStartedAt: containmentUnconfirmed ? record.childProcessStartedAt : "",
         containmentQuarantined: containmentUnconfirmed,
       };
-      await commitQueueTerminalRecord(record, terminalPatch);
+      const committedTerminal = await commitQueueTerminalRecord(record, terminalPatch);
+      // B-067: a finished writer that asked for it is integrated after its lock is released (the
+      // integration's serial lock would otherwise wait on the job's own write lock).
+      if (committedTerminal?.persisted && terminalPatch.status === "completed" && record.request?.autoIntegrate === true
+        && record.mode === "write" && !record.parentJobId && (terminalPatch.changedFiles || []).length && terminalPatch.worktreePath) {
+        scheduleAutoIntegration({
+          cwd: record.cwd,
+          jobId: record.jobId,
+          agent: record.agent || "",
+          model: terminalPatch.configuredModel ? `${terminalPatch.configuredProvider || "?"}/${terminalPatch.configuredModel}` : "",
+          worktreePath: terminalPatch.worktreePath,
+          allowedEdits: record.allowedEdits || [],
+          forbiddenEdits: record.request.forbiddenEdits || [],
+          sharedFiles: record.request.sharedFiles || [],
+          serialOnly: record.request.serialOnly || [],
+          validationCommand: String(record.request.validationCommand || record.request.scopeContract?.validationCommand || "").trim(),
+        });
+      }
     } finally {
       clearQueueLeaseFence(record);
       if (record.parentJobId && ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
@@ -28782,6 +28957,10 @@ export const __selfTest = {
     jobPermissionOverlayStorage,
     selfCheckCommandsError,
     selfCheckPermissionOverlay,
+    AUTO_INTEGRATION_CHAINS,
+    autoIntegrateJobError,
+    autoIntegrateQueueJob,
+    patchFileEntries,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
