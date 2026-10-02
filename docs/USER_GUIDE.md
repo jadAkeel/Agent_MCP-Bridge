@@ -382,7 +382,7 @@ Writer output is **never merged automatically**. Integration happens in two step
 Safety checks during integration:
 
 - If anything changed between preview and apply, the bridge refuses with `integration_preview_stale`. Preview again. The exception is a target whose HEAD only moved forward past commits that touch none of the patched paths: the receipt still applies and the result says `Target moved N commit(s) since preview; none touched the patched paths`.
-- Many disjoint worktrees (for example one new file each) can be previewed and applied together with `integrate_opencode_worktrees`: one receipt, and either every item lands or none does.
+- Many disjoint worktrees (for example one new file each) can be previewed and applied together with `integrate_opencode_worktrees`: one receipt, and either every item lands or none does. An item that changes a path you list in `serialOnly` (a lockfile, a migration) is not taken into a batch of two or more; integrate it alone.
 - Failed, partial, unreviewed or not-yet-integrated worktrees are **kept**, so you never lose work.
 - **Auto-integration (opt-in per job).** A queued writer enqueued with `autoIntegrate: true` (and a
   `validationCommand`) whose patch only **adds new files** is integrated by the bridge as soon as it
@@ -391,7 +391,8 @@ Safety checks during integration:
   made from a temporary index after checking that the files are the reviewed content; your own
   staged and unstaged work stays as it was. An integration that was waiting when the bridge
   stopped is resumed after the restart. A patch that changes or deletes an existing file
-  is left for the normal review (`autoIntegration=skipped_not_new_files` on the job). Set
+  is left for the normal review (`autoIntegration=skipped_not_new_files` on the job). A worktree
+  that changed after the job finished is not integrated (`autoIntegration=failed`). Set
   `CODEX_OPENCODE_AUTO_INTEGRATE=false` to refuse the option.
 - If an agent needs a new package, it stops and returns `DEPENDENCY_REQUIRED {...}`. Codex then:
   1. adds the dependency itself, after your review;
@@ -469,7 +470,11 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `queue_only_option` | `models`, `maxAttempts` or `autoIntegrate` was given to `run_opencode_agent` or `run_opencode_parallel`, which cannot honour them. | Use `enqueue_opencode_job`. |
 | `self_check_failed` | A self-check the bridge ran still failed after every fix pass (`Self-checks: failed ...` in the result). | Read its output in the result; fix the task or the check, or raise `selfCheckPasses` (at most 3). |
 | `self_check_invalid` / `self_check_untrusted` / `self_check_script_editable` | A `selfCheckCommands` entry is not one plain allowlisted command, or it would run a script the job may edit. | Write the exact command (no wildcard, quotes or shell operators), and keep the validator out of `allowedEdits`. |
-| `autoIntegration=failed` or `waiting_for_lock` on a job | The bridge could not land the new files itself (validation failed in your checkout, a conflict), or an in-place writer or another integration holds them. | `failed`: inspect the kept worktree and integrate it with `integrate_opencode_worktree`. `waiting_for_lock`: it retries every minute for an hour. |
+| `autoIntegration=failed` or `waiting_for_lock` on a job | The bridge could not land the new files itself (validation failed in your checkout, a conflict, the worktree changed after the job finished: `pipeline_source_identity_changed`, or an old record without the patch identity: `auto_integration_source_unattested`), or an in-place writer or another integration holds them. | `failed`: inspect the kept worktree and integrate it with `integrate_opencode_worktree`. `waiting_for_lock`: it retries every minute for an hour. |
+| `lock_type_reserved` | A job asked for `lockType: serial_integration` (or `serial`, `integration`): that is the bridge's own integration lock. | Use `lockType: write` (or `write: true`) with `lockedPaths`, `allowedEdits` and a Scope Contract. |
+| `validation_process_tree_unconfirmed` | The validation (or a self-check) command was stopped and the bridge could not confirm every process it started has ended. The job's lock stays quarantined, so the next writer of those paths waits. | Check that no leftover process (test runner, worker) is running; the quarantine is released once they are gone. |
+| `external_runner_guard_unverifiable` | agy ran, but git could not read your checkout before or after the run, so the bridge cannot tell whether agy wrote outside its worktree. agy is not paused. | Fix the checkout (run `git status` there), check it for stray changes, then retry. |
+| `serial_only_parallel_write` from `integrate_opencode_worktrees` | An item of a batch of two or more changes a path you listed in `serialOnly`. | Integrate that item alone with `integrate_opencode_worktree`, and the rest as a batch. |
 | `opencode_quota_exhausted` with "Provider ... is paused until ..." | An earlier job hit the provider's hard quota and the provider gave a reset time. Until then every new job on that provider fails at once, in every bridge process. `get_opencode_bridge_status` lists it under `Paused providers`. | Wait until the time shown, then enqueue again. An allowlisted model on another provider helps only when `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` is unset, so that each provider has its own key. |
 | `essential_output_truncated` | The output was too large to trust. | Narrow the task. |
 | `worktree_created_dirty` | A new worktree was not clean. It is kept as evidence. | Run `npm run gc` and inspect it. |

@@ -60,17 +60,21 @@ const job = (file, extra = {}) => ({
 const worktreeOf = new Map();
 hooks.queueJobExecutorTestHook = async (request) => {
   const planned = worktreeOf.get(request.task);
+  // B-114: like executeOpenCodeJob, the result carries the patch identity the job finished with.
+  const diff = await internals.collectWorktreeDiff({ path: planned.dir, baseCommit: "" });
+  // Something that changes the worktree after the job finished (a leftover process, a hand edit).
+  if (planned.afterFinish) await planned.afterFinish(planned.dir);
   return {
     response: { content: [{ type: "text", text: "REPORT: wrote the batch." }] },
-    result: { errorType: "", changedFiles: planned.changed, configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free" },
+    result: { errorType: "", changedFiles: planned.changed, configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free", worktree: { patchSha256: diff.patchSha256, sourceStateSha256: diff.sourceStateSha256 } },
     validation: { status: "passed" },
-    worktree: { path: planned.dir, branch: "", baseCommit: "", baseTree: "" },
+    worktree: { path: planned.dir, branch: "", baseCommit: diff.sourceBaseCommit, baseTree: "" },
   };
 };
-async function runAutoJob(file, edits, extra = {}) {
+async function runAutoJob(file, edits, extra = {}, afterFinish = null) {
   const dir = await builderWorktree(edits);
   const request = job(file, extra);
-  worktreeOf.set(request.task, { dir, changed: Object.keys(edits) });
+  worktreeOf.set(request.task, { dir, changed: Object.keys(edits), afterFinish });
   const enqueued = await enqueueQueueJob(request);
   assert.equal(enqueued.ok, true, `${enqueued.errorType}: ${enqueued.error}`);
   const jobId = enqueued.record.jobId;
@@ -187,7 +191,7 @@ test("Q-010: an in-place writer or another integration on the files makes the in
   assert.equal(enqueued.ok, true, enqueued.error);
   assert.ok(await waitFor(async () => (await durable(enqueued.record.jobId))?.status === "completed", 15_000));
   const before = await head();
-  const details = { cwd: repo, jobId: enqueued.record.jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-008.json"], validationCommand: VALIDATION };
+  const details = { cwd: repo, jobId: enqueued.record.jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-008.json"], validationCommand: VALIDATION, sourceRecord: await durable(enqueued.record.jobId) };
   const blocker = await acquireHardLock({ owner: "codex", agent: "builder", task: "edits the checkout in place", cwd: repo, lockType: "write", paths: ["out/batch-008.json"], ttlMs: 60_000, editsCheckout: true });
   assert.equal(blocker.ok, true, blocker.error);
   try {
@@ -315,6 +319,33 @@ test("B-074: a claim of a dead bridge process is taken over at startup; a live p
     closeDb(db);
   }
   assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 30_000), JSON.stringify((await durable(jobId))?.autoIntegration));
+});
+
+test("B-114: a worktree changed after the job finished is not integrated", async () => {
+  const before = await head();
+  const { record, dir } = await runAutoJob("out/batch-013.json", { "out/batch-013.json": "[13]\n" }, { lockedPaths: ["out/batch-013.json"] },
+    (worktree) => writeFile(path.join(worktree, "out", "batch-013.json"), "[13, \"changed after the job\"]\n", "utf8"));
+  assert.equal(record.status, "completed");
+  assert.equal(record.autoIntegration.status, "failed", JSON.stringify(record.autoIntegration));
+  assert.equal(record.autoIntegration.stage, "dry run");
+  assert.equal(record.autoIntegration.errorType, "pipeline_source_identity_changed");
+  assert.equal(await head(), before, "nothing was committed");
+  assert.equal(existsSync(path.join(repo, "out", "batch-013.json")), false, "nothing was applied");
+  assert.equal(existsSync(dir), true, "the worktree is kept for review");
+});
+
+test("B-114: a record without the source identity is not integrated", async () => {
+  const dir = await builderWorktree({ "out/batch-014.json": "[14]\n" });
+  const request = job("out/batch-014.json", { lockedPaths: ["out/batch-014.json"], autoIntegrate: undefined });
+  worktreeOf.set(request.task, { dir, changed: ["out/batch-014.json"] });
+  const enqueued = await enqueueQueueJob(request);
+  assert.ok(await waitFor(async () => (await durable(enqueued.record.jobId))?.status === "completed", 15_000));
+  const before = await head();
+  const outcome = await autoIntegrateQueueJob({ cwd: repo, jobId: enqueued.record.jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-014.json"], validationCommand: VALIDATION, sourceRecord: { worktreeBaseCommit: "", worktreePatchSha256: "", worktreeSourceStateSha256: "" } });
+  assert.equal(outcome.status, "failed", JSON.stringify(outcome));
+  assert.equal(outcome.errorType, "auto_integration_source_unattested");
+  assert.equal(await head(), before);
+  assert.equal(existsSync(path.join(repo, "out", "batch-014.json")), false);
 });
 
 test("Q-010: without autoIntegrate a finished writer is not touched", async () => {
