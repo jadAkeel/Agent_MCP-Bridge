@@ -275,8 +275,10 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
 - **Pause and resume** a provider or one model yourself with `pause_opencode_provider` /
   `resume_opencode_provider`; cap all agents on all providers with
   `set_opencode_concurrency({ globalWorkerLimit: 8 })`.
-- **Self-checks.** A builder may run exact commands you list in
-  `scopeContract.selfCheckCommands`, for example `node tools/validate.cjs out/x.json`.
+- **Self-checks.** The bridge runs the exact commands you list in
+  `scopeContract.selfCheckCommands` (for example `node tools/validate.cjs out/x.json`) in the
+  worktree after the agent finished, and gives the agent another run with a failing check's
+  output, up to `selfCheckPasses` (default 2). The agent itself still has no shell.
 - **Auto-integration.** With `autoIntegrate: true` a finished writer whose patch only adds new
   files is integrated and committed by the bridge (see [section 9](#9-reviewing-and-integrating-changes)).
 - **Memory and stalls.** The queue starts nothing while free memory is under 1 GB, and an agent
@@ -402,6 +404,7 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `outcome=gave_up` | A job with `models`/`maxAttempts` failed on every attempt; `attemptHistory` in `get_opencode_job` lists each attempt's model and error. | Read the attempts, fix the task or the models, then `requeue_opencode_job` (a manual requeue starts a fresh count). |
 | `writer_no_changes` | A writer with a retry policy finished without changing any file; under a policy that counts as no output and is retried. | Nothing, unless every attempt does it: then the task is unclear. |
 | `queue_only_option` | `models`, `maxAttempts` or `autoIntegrate` was given to `run_opencode_agent` or `run_opencode_parallel`, which cannot honour them. | Use `enqueue_opencode_job`. |
+| `self_check_failed` | A self-check the bridge ran still failed after every fix pass (`Self-checks: failed ...` in the result). | Read its output in the result; fix the task or the check, or raise `selfCheckPasses` (at most 3). |
 | `self_check_invalid` / `self_check_untrusted` / `self_check_script_editable` | A `selfCheckCommands` entry is not one plain allowlisted command, or it would run a script the job may edit. | Write the exact command (no wildcard, quotes or shell operators), and keep the validator out of `allowedEdits`. |
 | `autoIntegration=failed` or `waiting_for_lock` on a job | The bridge could not land the new files itself (validation failed in your checkout, a conflict), or an in-place writer or another integration holds them. | `failed`: inspect the kept worktree and integrate it with `integrate_opencode_worktree`. `waiting_for_lock`: it retries every minute for an hour. |
 | `opencode_quota_exhausted` with "Provider ... is paused until ..." | An earlier job hit the provider's hard quota and the provider gave a reset time. Until then every new job on that provider fails at once, in every bridge process. `get_opencode_bridge_status` lists it under `Paused providers`. | Wait until the time shown, then enqueue again. An allowlisted model on another provider helps only when `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` is unset, so that each provider has its own key. |
@@ -535,7 +538,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `requeue_opencode_job` | Run a failed, cancelled or interrupted job again as a new job from its stored request (optional new `model` from the allowlist, new `timeoutMs`). Completed and unfinished jobs are refused. |
 | | `set_opencode_concurrency` | Raise or lower the provider slot limit, the queue parallel limit and the global worker cap over all providers (`globalWorkerLimit`) without restarting (running jobs keep going). `reset: true` returns to the environment values. |
 | | `pause_opencode_provider` / `resume_opencode_provider` | Pause a provider or one model until a time or for some minutes, in every bridge process, and end a pause early (also an automatic one). |
-| | (job options) `models`, `maxAttempts`, `autoIntegrate`, `scopeContract.selfCheckCommands` | Fallback models and retries, auto-integration of new-file-only patches, and commands a builder may run itself; see [Long batches in the queue](#long-batches-in-the-queue). |
+| | (job options) `models`, `maxAttempts`, `autoIntegrate`, `scopeContract.selfCheckCommands`, `selfCheckPasses` | Fallback models and retries, auto-integration of new-file-only patches, and checks the bridge runs for a builder with fix passes; see [Long batches in the queue](#long-batches-in-the-queue). |
 | | `inspect_opencode_queue_recovery` | Recovery state after a crash. |
 | Pipelines | `create_multi_agent_pipeline` | Plan a multi-agent feature. |
 | | `run_multi_agent_pipeline` | Enqueue its jobs. |
