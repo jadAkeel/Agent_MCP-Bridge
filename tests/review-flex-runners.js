@@ -564,6 +564,22 @@ test("B-141: a path a bridge integration wrote during the run is not held agains
   }
 });
 
+test("B-116: a target checkout git cannot read after agy ran fails closed, without a pause", async () => {
+  // agy leaves the target's index unreadable: the after-capture fails, which proves nothing.
+  const index = nodePath.join(repo, ".git", "index");
+  const saved = readFileSync(index);
+  writeControl({ agy: "write-target", targetFile: index, writeFile: "src/a.txt", content: "a by agy\n" });
+  try {
+    const text = await run(runnerWriteJob(requirement("agy", "default")));
+    assert.equal(errorTypeOf(text), "external_runner_guard_unverifiable", text);
+    assert.match(text, /could not be checked after agy ran/);
+    assert.ok(!(await cooldownKeys()).has(`${KEY}:agy`), "nothing was seen, so agy is not paused");
+  } finally {
+    writeFileSync(index, saved);
+    await resumeAll();
+  }
+});
+
 test("Q-012: a runner that commits in its worktree fails as repository_head_changed_during_execution", async () => {
   writeControl({ codex: "commit", writeFile: "src/a.txt", content: "committed by codex\n" });
   const text = await run(runnerWriteJob(requirement("codex", "gpt-test")));

@@ -463,8 +463,15 @@ const CLI_REDACTIONS = [
   [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
   [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
   [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
+  // B-117: GitLab, Hugging Face, Google OAuth client secret, Slack app, SendGrid, PyPI.
+  [/\bglpat-[A-Za-z0-9_-]{20,}/g, "[gitlab token redacted]"],
+  [/\bhf_[A-Za-z0-9]{30,}/g, "[hugging face token redacted]"],
+  [/\bGOCSPX-[A-Za-z0-9_-]{20,}/g, "[google oauth client secret redacted]"],
+  [/\bxapp-[A-Za-z0-9-]{10,}/g, "[slack app token redacted]"],
+  [/\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g, "[sendgrid key redacted]"],
+  [/\bpypi-AgEI[A-Za-z0-9_-]{20,}/g, "[pypi token redacted]"],
   [/\b([a-z][a-z0-9+.-]{0,30}:\/\/[^\s:\/@]{1,256}:)[^\s\/@]{1,256}@/gi, "$1[redacted]@"],
-  [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
+  [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|accountkey|sharedaccesskey|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
   [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
 ];
 

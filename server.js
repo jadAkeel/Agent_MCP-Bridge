@@ -663,7 +663,7 @@ const jobInputShape = {
   cwd: z.string().min(1).describe("Absolute repository path."),
   write: z.boolean().optional().describe("True when the job may edit files. Write jobs need lockedPaths and allowedEdits."),
   lockMode: z.string().optional().describe("off (read-only), simple (one writer), or strict (parallel writers)."),
-  lockType: z.string().optional().describe("read, write, or serial_integration."),
+  lockType: z.string().optional().describe("read or write (serial_integration is reserved for the bridge's own integration and refused)."),
   lockedPaths: z.array(z.string()).optional().describe("Paths this job owns; apps/web/** normalizes to apps/web."),
   allowedEdits: z.array(z.string()).optional().describe("Files the job may change."),
   forbiddenEdits: z.array(z.string()).optional(),

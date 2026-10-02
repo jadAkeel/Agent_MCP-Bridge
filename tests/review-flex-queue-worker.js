@@ -314,12 +314,16 @@ async function runParent() {
       worktrees[`Write out/batch-${name}.json.`] = { dir, file: `out/batch-${name}.json` };
     }
     const previousExecutor = hooks.queueJobExecutorTestHook;
-    hooks.queueJobExecutorTestHook = async (request) => ({
-      response: { content: [{ type: "text", text: "REPORT: wrote the batch." }] },
-      result: { errorType: "", changedFiles: [worktrees[request.task].file], configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free" },
-      validation: { status: "passed" },
-      worktree: { path: worktrees[request.task].dir, branch: "", baseCommit: "", baseTree: "" },
-    });
+    hooks.queueJobExecutorTestHook = async (request) => {
+      // B-114: the result carries the patch identity the job finished with, as executeOpenCodeJob's does.
+      const diff = await internals.collectWorktreeDiff({ path: worktrees[request.task].dir, baseCommit: "" });
+      return {
+        response: { content: [{ type: "text", text: "REPORT: wrote the batch." }] },
+        result: { errorType: "", changedFiles: [worktrees[request.task].file], configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free", worktree: { patchSha256: diff.patchSha256, sourceStateSha256: diff.sourceStateSha256 } },
+        validation: { status: "passed" },
+        worktree: { path: worktrees[request.task].dir, branch: "", baseCommit: diff.sourceBaseCommit, baseTree: "" },
+      };
+    };
     try {
       const outcomes = [];
       for (const task of Object.keys(worktrees)) {
