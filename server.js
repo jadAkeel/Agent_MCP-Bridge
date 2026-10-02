@@ -5901,7 +5901,8 @@ function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "
     state.consecutive += 1;
     if (state.consecutive === 1) state.streakStartedAt = readAt;
     state.evidence = { source, kind: entry.kind, at: entry.timestamp, sessionId: entry.sessionID, providerID: entry.providerID, modelID: entry.modelID, detail: entry.detail };
-    if (state.consecutive >= hits && readAt - state.streakStartedAt >= minSpreadMs) {
+    // B-074: one hit has no spread; with hits 1 the operator asked to stop at the first line.
+    if (state.consecutive >= hits && (hits === 1 || readAt - state.streakStartedAt >= minSpreadMs)) {
       state.tripped = true;
       try { onTrip(state.evidence); } catch { /* The trip only asks for termination. */ }
     }
@@ -13266,8 +13267,12 @@ async function integratePatchSerially(options) {
       });
     }
     if (afterApplyEligible) {
-      result.afterApply = await options.afterApply.commit(result, { targetCwd, prepared: afterApplyPrepared })
-        .catch((error) => ({ ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(error?.message || String(error)) }));
+      // B-074: the journal operation committed, so result.ok stays true when the lease is lost
+      // afterwards; a commit made without the lock could race another integration, so none is made.
+      result.afterApply = stopIntegrationHeartbeat.signal.aborted
+        ? { ok: false, errorType: "integration_lease_lost", error: "The serial integration lease was lost after the patch was applied; the files are in the checkout but were not committed." }
+        : await options.afterApply.commit(result, { targetCwd, prepared: afterApplyPrepared })
+          .catch((error) => ({ ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(error?.message || String(error)) }));
     }
     if (result.ok && result.status === "applied" && options.batch) {
       await cleanupIntegratedBatchWorktreesWhileLocked({
@@ -21682,7 +21687,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
     retryAttempt: record.retryAttempt || 0,
     maxAttempts: record.maxAttempts || 0,
-    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
+    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS)) : [],
     startAfter: record.startAfter || "",
     slotWaitRequeues: record.slotWaitRequeues || 0,
     // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
@@ -23066,10 +23071,14 @@ const RETRY_POLICY_MAX_SLOT_WAITS = 12;
 async function removeEmptyRetryWorktree(projectRoot, summary) {
   const worktreePath = String(summary?.worktreePath || "");
   if (summary?.mode !== "write" || !worktreePath || (summary.changedFiles || []).length || !existsSync(worktreePath)) return { removed: false };
-  const status = await runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"], worktreePath, 30_000);
-  if (status.exitCode !== 0 || String(status.stdout || "").trim()) return { removed: false, reason: "the worktree has changes" };
+  // B-074: fail closed. `worktree remove --force` deletes ignored files too, so they count as
+  // content; and the base commit must be known and still be HEAD.
+  const baseCommit = String(summary.worktreeBaseCommit || "");
+  if (!/^[0-9a-f]{40,64}$/i.test(baseCommit)) return { removed: false, reason: "the worktree's base commit is not recorded" };
+  const status = await runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"], worktreePath, 30_000);
+  if (status.exitCode !== 0 || String(status.stdout || "").trim()) return { removed: false, reason: "the worktree has changes, untracked or ignored files" };
   const head = await runCommand("git", ["rev-parse", "HEAD"], worktreePath, 15_000);
-  if (summary.worktreeBaseCommit && head.stdout.trim() !== summary.worktreeBaseCommit) return { removed: false, reason: "the worktree has a commit of its own" };
+  if (head.exitCode !== 0 || head.stdout.trim().toLowerCase() !== baseCommit.toLowerCase()) return { removed: false, reason: "the worktree is not at its base commit" };
   const cleanup = await cleanupWorktree({ path: worktreePath, branch: summary.worktreeBranch || "", repoRoot: projectRoot }, "always", true).catch((error) => ({ cleanup: "failed", error: error?.message || String(error) }));
   return { removed: cleanup?.cleanup === "removed" || !existsSync(worktreePath), cleanup: cleanup?.cleanup || "" };
 }
@@ -23189,7 +23198,7 @@ async function patchTerminalQueueSummary(projectRoot, jobId, fields, { onlyIf = 
       let summary = {};
       try { summary = JSON.parse(row.record_json || "{}"); } catch { return { patched: false, reason: "the record is unreadable" }; }
       // B-069: a claim (auto-integration) is decided on the revision it is written on.
-      if (typeof onlyIf === "function" && !onlyIf(summary, row)) return { patched: false, reason: "condition", summary };
+      if (typeof onlyIf === "function" && !onlyIf(summary, row, db)) return { patched: false, reason: "condition", summary };
       const updatedAt = new Date().toISOString();
       const changed = db.prepare(`
         UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
@@ -23426,23 +23435,44 @@ function autoIntegrationCommitHooks({ jobId, agent = "", model = "", worktreePat
 const AUTO_INTEGRATION_FINAL_STATUSES = new Set(["committed", "skipped_not_new_files", "failed", "applied_not_committed"]);
 const AUTO_INTEGRATION_CLAIM_STALE_MS = 30 * 60_000;
 
+// B-074: the claimer of an auto-integration is gone when, like the recovery pass judges an owner,
+// its bridge_instances lease in this database is not live AND its process id (the first part of
+// BRIDGE_INSTANCE_ID) is not alive. A process that is still integrating keeps a live pid, so its
+// claim is never taken over; a crashed one is taken over at once instead of after 30 minutes.
+function autoIntegrationClaimerGone(db, claimedBy) {
+  const instanceId = String(claimedBy || "");
+  if (!instanceId) return true;
+  try {
+    const row = db.prepare("SELECT lease_expires_at FROM bridge_instances WHERE instance_id = ?").get(instanceId);
+    if (row && Date.parse(row.lease_expires_at || "") > Date.now()) return false;
+  } catch {
+    // No bridge_instances table: only the process id decides.
+  }
+  const pid = Number(/^(\d+)-/.exec(instanceId)?.[1] || 0);
+  return !processIsAlive(pid);
+}
+
 async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", worktreePath, allowedEdits = [], forbiddenEdits = [], sharedFiles = [], serialOnly = [], validationCommand = "", laterAttempt = 0 }) {
   const projectRoot = await resolveProjectStateRoot(cwd);
   // B-069: one bridge process integrates a job: a claim on the terminal row (a restart, or two
   // processes finding the same waiting job, must not integrate it twice).
   const claimedAt = new Date().toISOString();
   const claim = await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration: { status: "integrating", claimedBy: BRIDGE_INSTANCE_ID, at: claimedAt } }, {
-    onlyIf: (summary) => {
+    onlyIf: (summary, row, db) => {
       const current = summary.autoIntegration;
-      if (!current?.status || current.status === "waiting_for_lock") return true;
+      if (!current?.status) return true;
       if (AUTO_INTEGRATION_FINAL_STATUSES.has(current.status)) return false;
-      return current.claimedBy === BRIDGE_INSTANCE_ID || Date.now() - (Date.parse(current.at || "") || 0) > AUTO_INTEGRATION_CLAIM_STALE_MS;
+      return current.claimedBy === BRIDGE_INSTANCE_ID
+        || autoIntegrationClaimerGone(db, current.claimedBy)
+        || Date.now() - (Date.parse(current.at || "") || 0) > AUTO_INTEGRATION_CLAIM_STALE_MS;
     },
   });
   if (!claim.patched) return { status: "not_claimed", reason: claim.reason, current: claim.summary?.autoIntegration?.status || "" };
   const recordOutcome = async (fields) => {
-    const autoIntegration = { at: new Date().toISOString(), ...fields };
-    await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration });
+    const autoIntegration = { at: new Date().toISOString(), claimedBy: BRIDGE_INSTANCE_ID, ...fields };
+    await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration }, {
+      onlyIf: (summary) => !summary.autoIntegration?.claimedBy || summary.autoIntegration.claimedBy === BRIDGE_INSTANCE_ID,
+    });
     return autoIntegration;
   };
   const failed = async (stage, result) => {
@@ -29217,6 +29247,7 @@ export const __selfTest = {
     autoIntegrateJobError,
     autoIntegrateQueueJob,
     autoIntegrationCommitHooks,
+    autoIntegrationClaimerGone,
     rescheduleOpenAutoIntegrations,
     AUTO_INTEGRATION_RESCHEDULED,
     patchFileEntries,
