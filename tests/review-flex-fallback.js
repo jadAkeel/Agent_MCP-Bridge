@@ -181,9 +181,18 @@ test("Q-007: a writer that changed nothing counts as no output under a policy", 
 test("Q-007: when every model is paused the retry waits in the queue; a resume lets it start", async () => {
   calls.length = 0;
   let count = 0;
-  installExecutor(() => (++count === 1 ? { errorType: "provider_rate_limited" } : {}));
-  assert.equal((await pauseProvider({ provider: "opencode/muse-spark-1.3-contributor-free", minutes: 30 })).ok, true);
-  assert.equal((await pauseProvider({ provider: "google", minutes: 20 })).ok, true);
+  // The pauses start while attempt 1 runs: a job enqueued while every model is already paused
+  // waits at once instead (B-078, below).
+  hooks.queueJobExecutorTestHook = async (request) => {
+    const requirement = request.scopeContract?.modelRequirement || {};
+    calls.push({ task: request.task, model: `${requirement.provider}/${requirement.model}`, variant: requirement.variant || "" });
+    if (++count === 1) {
+      assert.equal((await pauseProvider({ provider: "opencode/muse-spark-1.3-contributor-free", minutes: 30 })).ok, true);
+      assert.equal((await pauseProvider({ provider: "google", minutes: 20 })).ok, true);
+      return execution({ errorType: "provider_rate_limited", configuredProvider: requirement.provider || "", configuredModel: requirement.model || "" });
+    }
+    return execution({ configuredProvider: requirement.provider || "", configuredModel: requirement.model || "" });
+  };
   const first = await enqueueQueueJob(readJob({ task: "everything paused", models: [MUSE, GEMINI] }));
   try {
     assert.ok(await waitFor(async () => Boolean((await durable(first.record.jobId))?.requeuedAs)));
@@ -234,6 +243,62 @@ test("B-071: a provider slot wait (the agent never started) is not an attempt", 
   assert.equal(last.retryAttempt, 1);
   assert.equal(last.slotWaitRequeues, 2);
   assert.match(last.attemptHistory[0], /provider_slot_wait_timeout \(not counted: the agent never started\)$/);
+});
+
+test("B-078: a new job whose every model is paused waits (startAfter) instead of failing its first attempt", async () => {
+  calls.length = 0;
+  installExecutor({});
+  assert.equal((await pauseProvider({ provider: "opencode/muse-spark-1.3-contributor-free", minutes: 30 })).ok, true);
+  assert.equal((await pauseProvider({ provider: "google", minutes: 20 })).ok, true);
+  try {
+    const input = readJob({ task: "paused at enqueue", models: [MUSE, GEMINI], maxAttempts: 1, idempotencyKey: "paused-at-enqueue" });
+    const job = await enqueueQueueJob(input);
+    assert.equal(job.ok, true, job.error);
+    const waitMs = Date.parse(job.record.startAfter || "") - Date.now();
+    assert.ok(waitMs > 18 * 60_000 && waitMs <= 20 * 60_000, `waits for the earliest pause end (google, 20 min): ${job.record.startAfter}`);
+    await sleep(300);
+    assert.equal(calls.length, 0, "nothing started while every model is paused (before: attempt 1 failed at the slot and, with maxAttempts 1, gave up)");
+    const record = await durable(job.record.jobId);
+    assert.equal(record.status, "pending");
+    assert.equal(record.scopeContract.modelRequirement.model, "muse-spark-1.3-contributor-free", "the request keeps its first model, so the idempotency fingerprint does not depend on the pauses");
+    assert.match(textOf(await callTool("list_opencode_jobs", { cwd: repo, limit: 50 })), new RegExp(`${job.record.jobId} .*stage=waiting_for_provider_pause`));
+    assert.equal((await enqueueQueueJob(input)).deduplicated, true, "the same input again deduplicates");
+    await resumeProvider({ provider: "google" });
+    QUEUE_JOBS.get(job.record.jobId).startAfter = "";
+    scheduleQueue();
+    assert.equal((await terminalOf(job.record.jobId)).status, "completed");
+  } finally {
+    await resumeProvider({ provider: "opencode" });
+    await resumeProvider({ provider: "google" });
+  }
+});
+
+test("B-078: a slot refused for a paused model is not an attempt, so the job does not give up without a real run", async () => {
+  calls.length = 0;
+  const until = new Date(Date.now() + 60_000).toISOString();
+  let museRuns = 0;
+  hooks.queueJobExecutorTestHook = async (request) => {
+    const requirement = request.scopeContract?.modelRequirement || {};
+    calls.push({ task: request.task, model: `${requirement.provider}/${requirement.model}` });
+    const reply = (result, text) => ({ response: { content: [{ type: "text", text }] }, result: { changedFiles: [], configuredProvider: requirement.provider, configuredModel: requirement.model, ...result }, validation: null, worktree: null });
+    // Attempt 1: the agent ran and hit a rate limit (a counted attempt, the model switches).
+    if (requirement.provider === "opencode" && ++museRuns === 1) return reply({ errorType: "provider_rate_limited" }, "Job failed.\nerrorType: provider_rate_limited");
+    // The next model was paused meanwhile: the slot request is refused, the agent never starts.
+    if (requirement.provider === "google") return reply({ errorType: "provider_paused", exitCode: "provider_capacity_unavailable", providerCooldownUntil: until }, "Job failed.\nerrorType: provider_paused");
+    return reply({ errorType: "" }, "REPORT: done.");
+  };
+  const first = await enqueueQueueJob(readJob({ task: "refused at the slot", models: [MUSE, GEMINI], maxAttempts: 2 }));
+  assert.equal(first.ok, true, first.error);
+  const { records, last } = await chain(first.record.jobId);
+  assert.deepEqual(calls.map((call) => call.model), ["opencode/muse-spark-1.3-contributor-free", "google/antigravity-gemini-3.8-flash", "opencode/muse-spark-1.3-contributor-free"]);
+  assert.equal(records[1].providerRefusedUntil, until, "the refusal is recorded as one");
+  assert.equal(last.status, "completed", "with maxAttempts 2 the job still got its second real run (before: gave_up after the refusal)");
+  assert.equal(last.retryAttempt, 2);
+  assert.equal(last.pauseWaitRequeues, 1);
+  assert.match(last.attemptHistory[1], /provider_paused \(not counted: the model was paused, the agent never started\)$/);
+  assert.equal(records.some((record) => record.completionOutcome === "gave_up"), false);
+  // A run that started and was rate limited records the pause it caused, but it is an attempt.
+  assert.equal(records[0].providerRefusedUntil || "", "");
 });
 
 test("B-072: models, maxAttempts and autoIntegrate are refused in the memory queue, which drops the request", async () => {

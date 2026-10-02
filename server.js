@@ -21687,9 +21687,13 @@ function queueRecordSnapshot(record, includeResult = true) {
     // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
     retryAttempt: record.retryAttempt || 0,
     maxAttempts: record.maxAttempts || 0,
-    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS)) : [],
+    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_HISTORY_MAX) : [],
     startAfter: record.startAfter || "",
     slotWaitRequeues: record.slotWaitRequeues || 0,
+    // B-078: requeues after a slot refusal for a paused provider/model (not attempts), and the
+    // pause end such a refusal reported (set only when the agent never started).
+    pauseWaitRequeues: record.pauseWaitRequeues || 0,
+    providerRefusedUntil: record.providerRefusedUntil || "",
     // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
     // (a restart reschedules completed jobs that asked and are not integrated yet).
     autoIntegration: record.autoIntegration || null,
@@ -22962,6 +22966,13 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
+  // B-078: a new job whose every model is paused waits for the first pause to end instead of
+  // failing its first attempt at the slot. The request keeps its first model (the idempotency
+  // fingerprint must not depend on the pauses of the moment); a requeue chose its own start.
+  if (!recordFields && retryPolicy.policy?.models?.length && !normalizedJob.dryRun) {
+    const first = await chooseRetryModel(retryPolicy.policy, 0).catch(() => ({ startAfter: "" }));
+    if (first.startAfter) record.startAfter = first.startAfter;
+  }
   if (!record.startAfter) delete record.startAfter;
 
   if (!persist) return { ok: true, record, prepared: true };
@@ -23065,6 +23076,10 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
 const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
 const RETRY_POLICY_MAX_ATTEMPTS = 10;
 const RETRY_POLICY_MAX_SLOT_WAITS = 12;
+// B-078: a slot request refused because the provider or model was paused (by the operator, a rate
+// limit or a quota) never started the agent either; such refusals are not attempts, up to this many.
+const RETRY_POLICY_MAX_PAUSE_WAITS = 24;
+const RETRY_POLICY_HISTORY_MAX = RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS + RETRY_POLICY_MAX_PAUSE_WAITS;
 
 // B-072: removes the worktree of a failed write attempt only when it holds nothing: no changed
 // file in the record, and git sees no change, untracked file or commit in it.
@@ -23251,7 +23266,14 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
   // RETRY_POLICY_MAX_SLOT_WAITS times (a cap held for hours must not loop forever).
   const slotWaits = Number(summary.slotWaitRequeues || 0);
   const uncountedSlotWait = errorType === "provider_slot_wait_timeout" && slotWaits < RETRY_POLICY_MAX_SLOT_WAITS;
-  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedSlotWait ? " (not counted: the agent never started)" : ""}`].slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS));
+  // B-078: the slot request was refused because the provider or model is paused (providerRefusedUntil
+  // is set only when the agent never started). Counting it let a job whose next model got paused,
+  // or whose models were all paused at enqueue, give up without one real run; it now waits instead.
+  const pauseWaits = Number(summary.pauseWaitRequeues || 0);
+  const uncountedPauseWait = !uncountedSlotWait && Boolean(summary.providerRefusedUntil) && pauseWaits < RETRY_POLICY_MAX_PAUSE_WAITS;
+  const uncounted = uncountedSlotWait || uncountedPauseWait;
+  const uncountedNote = uncountedSlotWait ? " (not counted: the agent never started)" : uncountedPauseWait ? " (not counted: the model was paused, the agent never started)" : "";
+  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedNote}`].slice(-RETRY_POLICY_HISTORY_MAX);
   const giveUp = async (why) => {
     await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
     logEvent("warn", "queue.job_gave_up", {
@@ -23263,16 +23285,17 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     });
     return { action: "gave_up", attempts: attempt, history };
   };
-  if (!uncountedSlotWait && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
-  const nextAttempt = uncountedSlotWait ? attempt : attempt + 1;
-  // The model order follows the counted attempts; a slot wait tries the next model all the same
-  // (another provider may have a free slot), without spending an attempt.
-  const next = await chooseRetryModel(checked.policy, uncountedSlotWait ? attempt + slotWaits : attempt, summary);
+  if (!uncounted && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
+  const nextAttempt = uncounted ? attempt : attempt + 1;
+  // The model order follows the counted attempts; a slot wait or a paused-model refusal tries the
+  // next model all the same (another provider may have a free slot or no pause), without spending
+  // an attempt; when every model is paused, chooseRetryModel makes the retry wait (startAfter).
+  const next = await chooseRetryModel(checked.policy, uncounted ? attempt + slotWaits + pauseWaits : attempt, summary);
   const requeued = await requeueQueueJob({
     cwd: projectRoot,
     jobId,
     model: next.spec || "",
-    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits },
+    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits, pauseWaitRequeues: uncountedPauseWait ? pauseWaits + 1 : pauseWaits },
   });
   // Q-008: a previous child that is still alive may still write its worktree; the job stays
   // interrupted (not gave_up) so the operator can stop the child and requeue it.
@@ -23286,12 +23309,12 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     agent: summary.agent || "",
     model: next.spec || retryPolicyModelLabel(summary),
     errorType,
-    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
+    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${uncountedPauseWait ? `; the paused-model refusal was not counted (${pauseWaits + 1} of ${RETRY_POLICY_MAX_PAUSE_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
   });
   // B-072: a failed write attempt that changed nothing leaves an empty worktree; the retry gets
   // its own, so the empty one is removed (a worktree with any change is kept for review).
   const emptyWorktree = row.status === "failed" ? await removeEmptyRetryWorktree(projectRoot, summary) : null;
-  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, emptyWorktree };
+  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, uncountedPauseWait, emptyWorktree };
 }
 
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
@@ -24526,6 +24549,8 @@ async function startQueueRecord(record) {
         dependencyRequest: execution.result?.dependencyRequest || null,
         ...queueResultFields(execution),
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
+        // B-078: the slot request was refused for a paused provider/model; the agent never ran.
+        providerRefusedUntil: execution.result?.exitCode === "provider_capacity_unavailable" ? String(execution.result?.providerCooldownUntil || "") : "",
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
         heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
