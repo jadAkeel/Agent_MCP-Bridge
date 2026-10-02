@@ -23376,8 +23376,22 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
         logEvent("warn", "queue.job_failed", {
           jobId: record.jobId,
           agent: record.agent || "",
+          // B-063: the issue log names the model a failure happened on.
+          model: patch.configuredModel ? `${patch.configuredProvider || "?"}/${patch.configuredModel}` : "",
           errorType: patch.errorType || "",
           summary: failureSummary(patch.errorReason || patch.errorType || "Queued job failed."),
+          durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
+        });
+      }
+      // B-063: a writer that "completed" without changing a file is the round-6 "no output file":
+      // a success for the queue, a failure for the batch. Logged so the issue log shows it.
+      if (lastResult.persisted && patch.status === "completed" && record.mode === "write" && patch.noChanges) {
+        logEvent("warn", "queue.job_no_output", {
+          jobId: record.jobId,
+          agent: record.agent || "",
+          model: patch.configuredModel ? `${patch.configuredProvider || "?"}/${patch.configuredModel}` : "",
+          errorType: "completed_no_changes",
+          summary: "The writer completed without changing any file (outcome=completed_no_changes).",
           durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
         });
       }

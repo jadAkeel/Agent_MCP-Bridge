@@ -66,10 +66,90 @@ function pruneOldLogs(directory, now = Date.now()) {
 // such flag, and there the lstat check before every write is the guard.
 const APPEND_FLAGS = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW || 0);
 
+// B-063: the issue log. Every job failure the owner used to collect by hand in
+// bridge-issues.log.md (rate limit, idle kill, timeout, invalid output, no output, a job that gave
+// up) also becomes one markdown line. It is derived from the same record that was just written to
+// the JSONL file, never from a second logging path: the JSONL stays the source of truth, and
+// `node bin/ops-log.js --issues` rebuilds the lines from it.
+const ISSUE_EVENTS = new Set([
+  "agent.run_failed",
+  "queue.job_failed",
+  "queue.job_no_output",
+  "queue.job_gave_up",
+  "queue.job_retried",
+  "queue.auto_integration_failed",
+  "provider.rate_limit_detected",
+]);
+
+function issueLogPath(stateDir, env = process.env) {
+  const raw = String(env.CODEX_OPENCODE_ISSUE_LOG || "").trim();
+  if (raw.toLowerCase() === "off") return "";
+  if (!raw) return path.join(logDirectory(stateDir), "issues.md");
+  return path.isAbsolute(raw) ? path.resolve(raw) : "";
+}
+
+// One line, no line breaks or pipes inside a field, so the file stays one line per failure.
+function issueMarkdownLine(record) {
+  if (!record || !ISSUE_EVENTS.has(record.event)) return "";
+  const clean = (value, max = 300) => String(value ?? "").replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+  const when = String(record.ts || "").replace("T", " ").slice(0, 16);
+  const subject = [record.jobId ? `job ${clean(record.jobId, 120)}` : record.runId ? `run ${clean(record.runId, 120)}` : record.tool ? `tool ${clean(record.tool, 80)}` : "",
+    [record.agent, record.model].filter(Boolean).map((item) => clean(item, 120)).join(" on ")].filter(Boolean).join(" ");
+  const fields = [
+    `${when} UTC`,
+    clean(record.event, 80),
+    clean(record.errorType || "-", 80),
+    subject || "-",
+    clean(record.summary || record.note || "", 400) || "-",
+  ];
+  return `- ${fields.join(" | ")}\n`;
+}
+
+function issueLinesFromRecords(records) {
+  return [...records].sort((left, right) => String(left.ts || "").localeCompare(String(right.ts || ""))).map(issueMarkdownLine).filter(Boolean);
+}
+
+// A runaway failure loop must not fill the disk through this file either.
+const ISSUE_LOG_MAX_BYTES = 20 * 1024 * 1024;
+
+function appendIssueLogLine(stateDir, record) {
+  try {
+    const line = issueMarkdownLine(record);
+    if (!line) return false;
+    const file = issueLogPath(stateDir);
+    if (!file) return false;
+    const directory = path.dirname(file);
+    // A custom file must sit in an existing folder; only the default folder is created (it is the
+    // operations log folder, already checked by the caller). Never through a link.
+    if (entryKind(directory) !== "directory") return false;
+    const fileKind = entryKind(file);
+    if (fileKind !== "missing" && fileKind !== "file") return false;
+    if (fileKind === "file" && lstatSync(file).size >= ISSUE_LOG_MAX_BYTES) return false;
+    const descriptor = openSync(file, APPEND_FLAGS, 0o600);
+    try {
+      if (!fstatSync(descriptor).isFile()) return false;
+      writeSync(descriptor, line, null, "utf8");
+    } finally {
+      closeSync(descriptor);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Never throws: the operations log must not turn a logged failure into a second one.
 // It never follows a link: if <state-dir>/logs or today's file is a junction or symlink, the
 // line is dropped (false) instead of being written, or pruning deleting, outside the state dir.
 function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
+  const written = appendJsonlLine(stateDir, record, { now });
+  // B-063: only a record the JSONL file holds may appear in the issue log (not one the daily cap
+  // replaced by its cap line).
+  if (written === "record") appendIssueLogLine(stateDir, record);
+  return Boolean(written);
+}
+
+function appendJsonlLine(stateDir, record, { now = new Date() } = {}) {
   try {
     const directory = logDirectory(stateDir);
     const day = dayOf(now);
@@ -91,8 +171,10 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
     }
     if (writerState.capped) return false;
     let line = `${JSON.stringify({ ...record, pid: process.pid })}\n`;
+    let written = "record";
     if (writerState.bytes + Buffer.byteLength(line) > DAILY_MAX_BYTES) {
       writerState.capped = true;
+      written = "cap";
       line = `${JSON.stringify({ ts: now.toISOString(), level: "warn", event: "ops_log.daily_cap_reached", maxBytes: DAILY_MAX_BYTES, pid: process.pid })}\n`;
     }
     const descriptor = openSync(file, APPEND_FLAGS, 0o600);
@@ -103,7 +185,7 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
       closeSync(descriptor);
     }
     writerState.bytes += Buffer.byteLength(line);
-    return true;
+    return written;
   } catch {
     return false;
   }
@@ -283,10 +365,11 @@ function formatIncidents({ days, read, groups, opencode }) {
 }
 
 function parseArguments(argv) {
-  const options = { incidents: false, selfTest: false, days: 7, json: false, stateDir: "" };
+  const options = { incidents: false, issues: false, selfTest: false, days: 7, json: false, stateDir: "" };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--incidents") options.incidents = true;
+    else if (argument === "--issues") options.issues = true;
     else if (argument === "--self-test") options.selfTest = true;
     else if (argument === "--json") options.json = true;
     else if (argument === "--days") {
@@ -376,8 +459,14 @@ function selfTest() {
 function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.selfTest) return selfTest();
-  if (!options.incidents) throw new Error("Usage: node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json] | --self-test");
+  if (!options.incidents && !options.issues) throw new Error("Usage: node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json] | --issues [--days 7] [--state-dir <absolute>] | --self-test");
   const stateDir = options.stateDir || defaultStateDirectory();
+  // B-063: the issue lines rebuilt from the JSONL file (the source of truth), oldest first.
+  if (options.issues) {
+    const read = readOpsLog(stateDir, { days: options.days });
+    process.stdout.write(issueLinesFromRecords(read.lines).join(""));
+    return;
+  }
   const read = readOpsLog(stateDir, { days: options.days });
   const groups = summarizeIncidents(read.lines);
   const opencode = opencodeDatabaseHealth();
@@ -394,4 +483,4 @@ if (isMainModule(import.meta.url)) {
   }
 }
 
-export { appendOpsLogLine, draftLogRow, formatIncidents, opencodeDatabaseHealth, readOpsLog, recordCliFailure, redactCliText, summarizeIncidents };
+export { appendOpsLogLine, draftLogRow, issueLinesFromRecords, issueLogPath, issueMarkdownLine, formatIncidents, opencodeDatabaseHealth, readOpsLog, recordCliFailure, redactCliText, summarizeIncidents };
