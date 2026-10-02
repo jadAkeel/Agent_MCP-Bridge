@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// B-063 (log.md, 2026-10-02): the automatic issue log. Every job failure (rate limit, idle kill,
+// Q-006 (log.md, 2026-10-02): the automatic issue log. Every job failure (rate limit, idle kill,
 // timeout, invalid output, no output, a job that gave up) becomes one markdown line in
 // CODEX_OPENCODE_ISSUE_LOG (default <state-dir>/logs/issues.md, "off" disables), derived from the
 // same record the operations log (bin/ops-log.js, B-047) just wrote; `node bin/ops-log.js --issues`
@@ -30,7 +30,7 @@ const readIssues = (file = issuesFile) => (existsSync(file) ? readFileSync(file,
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-063: one markdown line per failure record, and none for other events", () => {
+test("Q-006: one markdown line per failure record, and none for other events", () => {
   const line = opsLog.issueMarkdownLine({ ts: "2026-10-02T08:12:30.000Z", level: "warn", event: "queue.job_failed", jobId: "builder-1-ab", agent: "builder", model: "opencode/muse-spark-1.3-contributor-free", errorType: "agent_idle_timeout", summary: "stopped as idle\nafter | 10 min" });
   assert.equal(line, "- 2026-10-02 08:12 UTC | queue.job_failed | agent_idle_timeout | job builder-1-ab builder on opencode/muse-spark-1.3-contributor-free | stopped as idle after 10 min\n");
   assert.equal(opsLog.issueMarkdownLine({ ts: "2026-10-02T08:12:30.000Z", event: "queue.memory_hold_started" }), "", "not a failure");
@@ -40,7 +40,7 @@ test("B-063: one markdown line per failure record, and none for other events", (
   assert.equal(opsLog.issueLogPath("/state", { CODEX_OPENCODE_ISSUE_LOG: "relative.md" }), "", "a relative path is never written");
 });
 
-test("B-063: a failed queued job and a writer that changed nothing land in the issue log", async () => {
+test("Q-006: a failed queued job and a writer that changed nothing land in the issue log", async () => {
   hooks.queueJobExecutorTestHook = async (request) => request.write
     ? execution({ noChanges: true, configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free" })
     : execution({ errorType: "agent_idle_timeout", configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free" });
@@ -62,7 +62,7 @@ test("B-063: a failed queued job and a writer that changed nothing land in the i
   }
 });
 
-test("B-063: the lines are derived from the JSONL records, and --issues rebuilds them", async () => {
+test("Q-006: the lines are derived from the JSONL records, and --issues rebuilds them", async () => {
   logEvent("warn", "provider.rate_limit_detected", { jobId: "builder-9-cd", agent: "builder", model: "opencode/muse-spark-1.3-contributor-free", errorType: "provider_rate_limited", summary: "rate limit: 2 line(s)" });
   const { fileURLToPath } = await import("node:url");
   const opsLogScript = fileURLToPath(new URL("../bin/ops-log.js", import.meta.url));
@@ -77,7 +77,7 @@ test("B-063: the lines are derived from the JSONL records, and --issues rebuilds
   assert.match(jsonl, /queue\.memory_hold_started/);
 });
 
-test("B-063: a configured file is used, off writes none, and a link or missing folder is never written through", async () => {
+test("Q-006: a configured file is used, off writes none, and a link or missing folder is never written through", async () => {
   const custom = path.join(fixture.root, "custom-issues.md");
   process.env.CODEX_OPENCODE_ISSUE_LOG = custom;
   try {

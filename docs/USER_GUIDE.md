@@ -54,7 +54,7 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 | --- | --- | --- |
 | **Codex** | The AI you talk to. It is the orchestrator and the only one allowed to integrate changes. | The Codex app/CLI |
 | **Codex orchestrator profile** | The Codex agent you select for work, `principal-engineer-orchestrator`. | `codex/agents/*.toml`, installed into `~/.codex` |
-| **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 26 tools to its MCP clients, Codex and Claude Code. | This checkout, pinned by hash, or an immutable release folder (see [section 12](#12-updating-and-rolling-back)) |
+| **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 28 tools to its MCP clients, Codex and Claude Code. | This checkout, pinned by hash, or an immutable release folder (see [section 12](#12-updating-and-rolling-back)) |
 | **OpenCode** | The agent runtime that actually runs the helper agents. Version `1.18.32`: the plugin manifest (`openCodeVersion` in `opencode/plugin-integrity-manifest.json`) requires exactly that version for the Gemini profile. | Installed on `PATH` |
 | **OpenCode agents** | Role profiles such as `builder`, `reviewer` and `debugger`. Each has fixed permissions and a pinned model. | `opencode/agents/*.md`, copied to the runtime folder automatically when a release starts |
 | **Skills** | Reusable instruction packs the agents load, such as `code-review-checklist` and `debugging-investigation`. | `opencode/skills/` |
@@ -258,6 +258,47 @@ Three ways Codex can run parallel work:
 
 Pipelines are for genuinely large work. The bridge rejects a pipeline that is too small.
 
+### Long batches in the queue
+
+For a large batch of independent jobs (one output file each) the queue can run without you
+between jobs (log.md B-060, B-061, Q-005 to Q-010):
+
+- **Fallback models.** Give `enqueue_opencode_job` a `models` list (allowlisted
+  `provider/model[@variant]`, tried in order) and optionally `maxAttempts` (default 4). A job that
+  fails for a provider reason (rate limit, pause, quota, 5xx), stops as idle, times out, ends with
+  no answer, changes no file or fails its validation is requeued by the bridge on the next model
+  that is not paused. `list_opencode_jobs` shows `attempt=2/4 model=...`; after the last attempt
+  the job shows `outcome=gave_up`. Jobs with such a policy that a client restart interrupted are
+  resumed by the next bridge as their next attempt.
+- **Silent rate limits** are detected while the job runs (`provider_rate_limited`), and that
+  model is paused for 30 minutes, then 60.
+- **Pause and resume** a provider or one model yourself with `pause_opencode_provider` /
+  `resume_opencode_provider`; cap all agents on all providers with
+  `set_opencode_concurrency({ globalWorkerLimit: 8 })`.
+- **Self-checks.** A builder may run exact commands you list in
+  `scopeContract.selfCheckCommands`, for example `node tools/validate.cjs out/x.json`.
+- **Auto-integration.** With `autoIntegrate: true` a finished writer whose patch only adds new
+  files is integrated and committed by the bridge (see [section 9](#9-reviewing-and-integrating-changes)).
+- **Memory and stalls.** The queue starts nothing while free memory is under 1 GB, and an agent
+  silent for 10 minutes is stopped (both on by default).
+- **Issue log.** Every failure is one line in `<state-dir>\logs\issues.md` (section 10).
+
+Example job (one of many, each with its own file):
+
+```json
+{ "agent": "builder", "task": "Write batch 012 ...", "cwd": "C:\\path\\to\\repo", "write": true, "lockMode": "simple",
+  "lockedPaths": ["out/backend/batch-012.json"], "allowedEdits": ["out/backend/batch-012.json"],
+  "validationCommand": "node tools/validate.cjs out/backend/batch-012.json",
+  "models": ["opencode/muse-spark-1.3-contributor-free@high", "google/antigravity-gemini-3.8-flash@high"],
+  "autoIntegrate": true, "idempotencyKey": "backend-012",
+  "scopeContract": { "mode": "write", "read": ["BRIEF.md", "pools", "out/backend"], "write": ["out/backend/batch-012.json"],
+    "allowedEdits": ["out/backend/batch-012.json"], "forbidden": [".env"],
+    "validationCommand": "node tools/validate.cjs out/backend/batch-012.json",
+    "selfCheckCommands": ["node tools/validate.cjs out/backend/batch-012.json"] } }
+```
+
+The queue still runs only while a bridge process runs, and a bridge ends with its client.
+
 ---
 
 ## 9. Reviewing and integrating changes
@@ -280,6 +321,13 @@ Safety checks during integration:
 - If anything changed between preview and apply, the bridge refuses with `integration_preview_stale`. Preview again. The exception is a target whose HEAD only moved forward past commits that touch none of the patched paths: the receipt still applies and the result says `Target moved N commit(s) since preview; none touched the patched paths`.
 - Many disjoint worktrees (for example one new file each) can be previewed and applied together with `integrate_opencode_worktrees`: one receipt, and either every item lands or none does.
 - Failed, partial, unreviewed or not-yet-integrated worktrees are **kept**, so you never lose work.
+- **Auto-integration (opt-in per job).** A queued writer enqueued with `autoIntegrate: true` (and a
+  `validationCommand`) whose patch only **adds new files** is integrated by the bridge as soon as it
+  finishes: the same dry run, receipt, validation in your checkout and rollback as above, then one
+  commit of exactly those files with the author of your last commit (`Auto-integrate <job>: ...`;
+  unrelated uncommitted work stays uncommitted). A patch that changes or deletes an existing file
+  is left for the normal review (`autoIntegration=skipped_not_new_files` on the job). Set
+  `CODEX_OPENCODE_AUTO_INTEGRATE=false` to refuse the option.
 - If an agent needs a new package, it stops and returns `DEPENDENCY_REQUIRED {...}`. Codex then:
   1. adds the dependency itself, after your review;
   2. commits;
@@ -302,6 +350,7 @@ Run all of these from `<bridge-dir>`, your clone of the bridge repository (place
 | `npm run smoke:live:health` | Same as above, without the model call. | Quick check |
 | `npm run audit:state` | Read-only SQLite integrity report. | Investigating problems |
 | `npm run tui` | Terminal dashboard of jobs, pipelines, locks and worktrees. | Watching work live |
+| `npm run issues` (`-- --days 30`) | Prints the issue log lines (one per failure, below) rebuilt from the operations log. | After a batch |
 | `npm run incidents` (`-- --days 30`) | Groups the operations log (below) by event and error type, newest problems first, with the latest `summary` of each group, and prints a draft `log.md` row for each recurring one. Also warns when OpenCode's own database has grown too large. | **Weekly**, and after a bad day |
 | `npm run release:activate -- --prune` | Runs a normal release, then deletes old releases and config backups. It keeps the active release, the previous one, and the two newest backups. | When releases pile up |
 
@@ -312,6 +361,8 @@ Run all of these from `<bridge-dir>`, your clone of the bridge repository (place
 - every MCP request the SDK rejected, such as an unknown tool or invalid arguments (`mcp.request_failed`, with the JSON-RPC `code`), and MCP protocol errors (`mcp.protocol_error`);
 - a bridge crash (`process.uncaught_exception` / `process.unhandled_rejection` with the first stack lines, then `process.exited`), including a failed integrity check at startup;
 - failures of the `bin/` commands (`cli.<script>.failed` with `exitCode`): `npm run setup` (also a failed preflight and a refused write), `npm run doctor` (also "attention required"), `smoke:live`, `release:activate`, `test:release`, `gc`, `audit:state` and the runtime sync.
+
+**Issue log.** Every job failure (rate limit, idle stop, timeout, failed validation, no output, a retry, a job that gave up, a failed auto-integration) is also one markdown line in `<state-dir>\logs\issues.md`, derived from the same record: `- 2026-10-02 08:12 UTC | queue.job_failed | agent_idle_timeout | job builder-... builder on opencode/muse-spark-1.3-contributor-free | ...`. `CODEX_OPENCODE_ISSUE_LOG` names another file (absolute path, existing folder) or `off`. A file inside your repository makes the checkout dirty; keep it outside, or use `CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok`.
 
 Files older than 30 days are deleted, and a day's file stops at 20 MB per process. The writer never follows a link: if `logs` or a day's file is a junction or symlink, nothing is written or deleted through it. The client only shows the bridge's stderr, so this file is where a failure from the middle of a migration can be found afterwards. `npm run doctor` counts its recurring problems too. `CODEX_OPENCODE_OPS_LOG=off` turns it off (bridge and commands). To turn a recurring problem into a fix, check the draft row against the code, give it a real B-xxx id in `log.md`, and hand it to a fix session.
 
@@ -346,6 +397,13 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 | `queue_write_requires_worktree` | A queued write job needs worktree mode. | Keep `CODEX_OPENCODE_WORKTREE_MODE=write`. |
 | `agent_empty_final_response` | The agent exited without an answer. | Retry. If it repeats, run `npm run smoke:live`. |
 | `agent_timeout` / `agent_idle_timeout` with `outcome=timed_out_with_changes` | The agent ran out of time (or was silent past `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS`) after it had already changed files. The worktree is kept. | Inspect the worktree; integrate it if the change is complete, or `requeue_opencode_job` with a longer `timeoutMs`. |
+| `provider_rate_limited` | The agent's model kept answering "Rate limit exceeded" (or quota, or no funds) with no progress; the bridge stopped it and paused that provider/model for 30 min (then 60). `Paused providers` in `get_opencode_bridge_status` shows it. | Wait, use another model (`models` does this by itself), or `resume_opencode_provider` if you know the limit is gone. `CODEX_OPENCODE_RATE_LIMIT_HITS=0` turns the detection off. |
+| `provider_paused` | You (or another client) paused that provider or model with `pause_opencode_provider`. | `resume_opencode_provider`, or wait for the time shown. |
+| `outcome=gave_up` | A job with `models`/`maxAttempts` failed on every attempt; `attemptHistory` in `get_opencode_job` lists each attempt's model and error. | Read the attempts, fix the task or the models, then `requeue_opencode_job` (a manual requeue starts a fresh count). |
+| `writer_no_changes` | A writer with a retry policy finished without changing any file; under a policy that counts as no output and is retried. | Nothing, unless every attempt does it: then the task is unclear. |
+| `queue_only_option` | `models`, `maxAttempts` or `autoIntegrate` was given to `run_opencode_agent` or `run_opencode_parallel`, which cannot honour them. | Use `enqueue_opencode_job`. |
+| `self_check_invalid` / `self_check_untrusted` / `self_check_script_editable` | A `selfCheckCommands` entry is not one plain allowlisted command, or it would run a script the job may edit. | Write the exact command (no wildcard, quotes or shell operators), and keep the validator out of `allowedEdits`. |
+| `autoIntegration=failed` or `waiting_for_lock` on a job | The bridge could not land the new files itself (validation failed in your checkout, a conflict), or an in-place writer or another integration holds them. | `failed`: inspect the kept worktree and integrate it with `integrate_opencode_worktree`. `waiting_for_lock`: it retries every minute for an hour. |
 | `opencode_quota_exhausted` with "Provider ... is paused until ..." | An earlier job hit the provider's hard quota and the provider gave a reset time. Until then every new job on that provider fails at once, in every bridge process. `get_opencode_bridge_status` lists it under `Paused providers`. | Wait until the time shown, then enqueue again. An allowlisted model on another provider helps only when `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` is unset, so that each provider has its own key. |
 | `essential_output_truncated` | The output was too large to trust. | Narrow the task. |
 | `worktree_created_dirty` | A new worktree was not clean. It is kept as evidence. | Run `npm run gc` and inspect it. |
@@ -475,7 +533,9 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `cancel_opencode_job` | Cancel a queued or running job. |
 | | (job option) `validationFixPasses: 1` | A write job whose validation command failed gets one more agent run in the same worktree with the validation output (builders cannot run checks themselves), then validates again. |
 | | `requeue_opencode_job` | Run a failed, cancelled or interrupted job again as a new job from its stored request (optional new `model` from the allowlist, new `timeoutMs`). Completed and unfinished jobs are refused. |
-| | `set_opencode_concurrency` | Raise or lower the provider slot limit and the queue parallel limit without restarting (running jobs keep going). `reset: true` returns to the environment values. |
+| | `set_opencode_concurrency` | Raise or lower the provider slot limit, the queue parallel limit and the global worker cap over all providers (`globalWorkerLimit`) without restarting (running jobs keep going). `reset: true` returns to the environment values. |
+| | `pause_opencode_provider` / `resume_opencode_provider` | Pause a provider or one model until a time or for some minutes, in every bridge process, and end a pause early (also an automatic one). |
+| | (job options) `models`, `maxAttempts`, `autoIntegrate`, `scopeContract.selfCheckCommands` | Fallback models and retries, auto-integration of new-file-only patches, and commands a builder may run itself; see [Long batches in the queue](#long-batches-in-the-queue). |
 | | `inspect_opencode_queue_recovery` | Recovery state after a crash. |
 | Pipelines | `create_multi_agent_pipeline` | Plan a multi-agent feature. |
 | | `run_multi_agent_pipeline` | Enqueue its jobs. |
@@ -505,6 +565,8 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Worktrees live in the state folder, not inside your projects. |
 | `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable queue with restart recovery. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `4` | Maximum simultaneous model calls across all sessions. The built-in default is `2`. |
+| `CODEX_OPENCODE_GLOBAL_WORKER_LIMIT` | as your machine allows, e.g. `10` | Maximum agents running at once on all providers together. The built-in default is `0` (no cap). |
+| `CODEX_OPENCODE_MIN_FREE_MEMORY_MB` | default (`1024`) | The queue starts no new job below this much free memory. `0` turns it off. |
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git,npm,node,pnpm,yarn,python,pytest` | Programs a job's `validationCommand` may start. The built-in default is `git` only. |
 | `CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS` | default (30 min) | Reuses agent and plugin checks between jobs. Any change to an agent, skill, or config file resets it. `0` turns it off. |
 | `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | release hash | Pins the exact bridge build. It must match the release. |
@@ -521,7 +583,8 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS` | 20 min |
 | `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | 5 min |
 | `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` | 20 min (how long a job may wait for a provider slot) |
-| `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS` | off (`0`). When set, an agent that writes nothing to stdout or stderr for that long is stopped and the job fails as `agent_idle_timeout`; keep it at 10 minutes or more, because a long reasoning step or tool call is silent. |
+| `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS` | 10 min (`0` turns it off). An agent that writes nothing to stdout or stderr for that long is stopped and the job fails as `agent_idle_timeout`; keep it at 10 minutes or more, because a long reasoning step or tool call is silent. `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL=opencode/space-bunny-free=1200000` gives one model a longer limit. |
+| `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS` | 30 min, doubling to `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS` (60 min): the pause after a detected rate limit |
 
 The Codex `tool_timeout_sec` must cover the longest job the bridge allows. Codex gives up on a tool call after that time, and the job's result is lost even if the job is still running. The bound is:
 

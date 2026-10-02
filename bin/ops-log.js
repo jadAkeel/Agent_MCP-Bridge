@@ -66,7 +66,7 @@ function pruneOldLogs(directory, now = Date.now()) {
 // such flag, and there the lstat check before every write is the guard.
 const APPEND_FLAGS = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW || 0);
 
-// B-063: the issue log. Every job failure the owner used to collect by hand in
+// Q-006: the issue log. Every job failure the owner used to collect by hand in
 // bridge-issues.log.md (rate limit, idle kill, timeout, invalid output, no output, a job that gave
 // up) also becomes one markdown line. It is derived from the same record that was just written to
 // the JSONL file, never from a second logging path: the JSONL stays the source of truth, and
@@ -143,7 +143,7 @@ function appendIssueLogLine(stateDir, record) {
 // line is dropped (false) instead of being written, or pruning deleting, outside the state dir.
 function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
   const written = appendJsonlLine(stateDir, record, { now });
-  // B-063: only a record the JSONL file holds may appear in the issue log (not one the daily cap
+  // Q-006: only a record the JSONL file holds may appear in the issue log (not one the daily cap
   // replaced by its cap line).
   if (written === "record") appendIssueLogLine(stateDir, record);
   return Boolean(written);
@@ -461,7 +461,7 @@ function main() {
   if (options.selfTest) return selfTest();
   if (!options.incidents && !options.issues) throw new Error("Usage: node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json] | --issues [--days 7] [--state-dir <absolute>] | --self-test");
   const stateDir = options.stateDir || defaultStateDirectory();
-  // B-063: the issue lines rebuilt from the JSONL file (the source of truth), oldest first.
+  // Q-006: the issue lines rebuilt from the JSONL file (the source of truth), oldest first.
   if (options.issues) {
     const read = readOpsLog(stateDir, { days: options.days });
     process.stdout.write(issueLinesFromRecords(read.lines).join(""));

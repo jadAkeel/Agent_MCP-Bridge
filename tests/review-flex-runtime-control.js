@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// B-062 (log.md, 2026-10-02): runtime control without a restart. pause_opencode_provider /
+// Q-005 (log.md, 2026-10-02): runtime control without a restart. pause_opencode_provider /
 // resume_opencode_provider pause a provider or one model in every bridge process (stored with the
 // automatic pauses in provider-concurrency.sqlite), and set_opencode_concurrency gains a global
 // worker cap over all providers (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT). Slots are real SQLite leases
@@ -63,7 +63,7 @@ const slot = (providerKey, pauseKeys = [], timeoutMs = 2000) => acquireProviderL
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-062: the pause target is a provider (its slot key) or one provider/model", () => {
+test("Q-005: the pause target is a provider (its slot key) or one provider/model", () => {
   assert.deepEqual(providerPauseTarget("OpenCode"), { ok: true, key: opencodeKey, provider: "opencode", model: "", modelPrefix: `${base}:opencode/` });
   const model = providerPauseTarget(`opencode/${MUSE}`);
   assert.equal(model.key, museKey);
@@ -72,7 +72,7 @@ test("B-062: the pause target is a provider (its slot key) or one provider/model
   for (const bad of ["", "/x", "opencode/", "-x", "open code", "opencode/--attach"]) assert.equal(providerPauseTarget(bad).ok, false, bad);
 });
 
-test("B-062: pausing one model holds back that model only, and resume ends it early", async () => {
+test("Q-005: pausing one model holds back that model only, and resume ends it early", async () => {
   const paused = await callTool("pause_opencode_provider", { provider: `opencode/${MUSE}`, minutes: 30, reason: "Muse stalls above 4" });
   assert.notEqual(paused.isError, true, textOf(paused));
   assert.match(textOf(paused), new RegExp(`Provider paused: ${museKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
@@ -92,7 +92,7 @@ test("B-062: pausing one model holds back that model only, and resume ends it ea
   assert.match(textOf(await callTool("resume_opencode_provider", { provider: `opencode/${MUSE}` })), /Pauses removed: none \(nothing was paused\)/);
 });
 
-test("B-062: a provider pause covers every model; its resume also clears model pauses and the rate-limit backoff", async () => {
+test("Q-005: a provider pause covers every model; its resume also clears model pauses and the rate-limit backoff", async () => {
   const until = new Date(Date.now() + 20 * 60_000).toISOString();
   const paused = await callTool("pause_opencode_provider", { provider: "opencode", until });
   assert.notEqual(paused.isError, true, textOf(paused));
@@ -116,7 +116,7 @@ test("B-062: a provider pause covers every model; its resume also clears model p
   await callTool("resume_opencode_provider", { provider: "opencode" });
 });
 
-test("B-062: an operator pause replaces an automatic one, shorter or longer", async () => {
+test("Q-005: an operator pause replaces an automatic one, shorter or longer", async () => {
   const automatic = await recordRateLimitPause({ pauseKey: museKey, reason: "rate limit" });
   assert.equal(automatic.durationMs, 30 * 60_000);
   await callTool("pause_opencode_provider", { provider: `opencode/${MUSE}`, minutes: 5 });
@@ -127,7 +127,7 @@ test("B-062: an operator pause replaces an automatic one, shorter or longer", as
   await callTool("resume_opencode_provider", { provider: "opencode" });
 });
 
-test("B-062: invalid pause requests are refused and change nothing", async () => {
+test("Q-005: invalid pause requests are refused and change nothing", async () => {
   const cases = [
     { provider: "bad provider", minutes: 5 },
     { provider: "opencode" },
@@ -147,7 +147,7 @@ test("B-062: invalid pause requests are refused and change nothing", async () =>
   assert.equal((await providerCapacitySnapshot()).cooldowns.length, 0);
 });
 
-test("B-062: the global worker cap holds back a slot on any provider once that many agents run", async () => {
+test("Q-005: the global worker cap holds back a slot on any provider once that many agents run", async () => {
   assert.equal(ENV_GLOBAL_WORKER_LIMIT, 0, "no cap unless configured");
   assert.match(describeConcurrencyLimits().global, /^effective 0 \(no cap\) \(env 0\)$/);
   const changed = await callTool("set_opencode_concurrency", { globalWorkerLimit: 2 });
@@ -179,7 +179,7 @@ test("B-062: the global worker cap holds back a slot on any provider once that m
   assert.equal(CONFIG.globalWorkerLimit, ENV_GLOBAL_WORKER_LIMIT);
 });
 
-test("B-062: invalid global limits are refused; the old limits keep their messages", async () => {
+test("Q-005: invalid global limits are refused; the old limits keep their messages", async () => {
   for (const value of [-1, MAX_GLOBAL_WORKER_LIMIT + 1, 2.5, "4", true]) {
     const refused = await setRuntimeConcurrency({ globalWorkerLimit: value });
     assert.equal(refused.ok, false, JSON.stringify(value));
@@ -192,7 +192,7 @@ test("B-062: invalid global limits are refused; the old limits keep their messag
   assert.match(textOf(tool), /globalWorkerLimit from 0 to 64/);
 });
 
-test("B-062: get_opencode_bridge_status shows the global cap and every pause with how to end it", async () => {
+test("Q-005: get_opencode_bridge_status shows the global cap and every pause with how to end it", async () => {
   assert.equal((await setRuntimeConcurrency({ globalWorkerLimit: 3 })).ok, true);
   await callTool("pause_opencode_provider", { provider: `opencode/${MUSE}`, minutes: 10, reason: "status check" });
   try {

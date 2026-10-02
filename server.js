@@ -159,7 +159,7 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
 const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
 const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
-// B-062: one cap on running agents across every provider and every bridge process (the round-6
+// Q-005: one cap on running agents across every provider and every bridge process (the round-6
 // orchestrator's max.txt). 0 = no cap; the per-provider limit still applies under it.
 const ENV_GLOBAL_WORKER_LIMIT = readNonNegativeIntEnv("CODEX_OPENCODE_GLOBAL_WORKER_LIMIT", 0);
 const MAX_GLOBAL_WORKER_LIMIT = 64;
@@ -225,10 +225,10 @@ const CONFIG = Object.freeze({
   // the scan). Tests point it at a scratch fixture.
   openCodeLogPath: readOpenCodeLogPathEnv(),
   openCodeLogScanMs: readPositiveIntEnv("CODEX_OPENCODE_OPENCODE_LOG_SCAN_MS", 1000 * 15),
-  // B-065: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
+  // Q-008: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
   // requeued by the bridge that finds it, as one of its attempts. false leaves it interrupted.
   autoResumeInterrupted: readChoiceEnv("CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED", ["true", "false"], "true") === "true",
-  // B-067: false refuses every autoIntegrate job, for an operator who wants every patch reviewed.
+  // Q-010: false refuses every autoIntegrate job, for an operator who wants every patch reviewed.
   autoIntegrateAllowed: readChoiceEnv("CODEX_OPENCODE_AUTO_INTEGRATE", ["true", "false"], "true") === "true",
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
@@ -1095,7 +1095,7 @@ function buildOpenCodeEnv(extra = {}) {
     env[`GIT_CONFIG_VALUE_${inheritedConfigCount + offset}`] = value;
   });
   env.GIT_CONFIG_COUNT = String(inheritedConfigCount + 3);
-  // B-066: the running job's self-check allow rules (bridge-built, never from the environment).
+  // Q-009: the running job's self-check allow rules (bridge-built, never from the environment).
   const overlay = activePermissionOverlay();
   if (overlay?.configContent) env.OPENCODE_CONFIG_CONTENT = overlay.configContent;
   return env;
@@ -3416,7 +3416,7 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
 // applies them at its next scheduler pass or slot request, and a restart reloads them.
 const RUNTIME_PROVIDER_LIMIT_SETTING = "provider_concurrency_limit";
 const RUNTIME_QUEUE_LIMIT_SETTING = "queue_parallel_limit";
-// B-062: 0 is a valid stored value here (no cap, even when the environment sets one).
+// Q-005: 0 is a valid stored value here (no cap, even when the environment sets one).
 const RUNTIME_GLOBAL_LIMIT_SETTING = "global_worker_limit";
 const RUNTIME_CONCURRENCY_REFRESH_MS = 5000;
 let runtimeConcurrencyRefreshedFor = "";
@@ -3648,7 +3648,7 @@ async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, si
       }
       observedHolders = active;
       observedCapacity = effectiveCapacity;
-      // B-062: the global worker cap counts every held slot in this state directory, on every
+      // Q-005: the global worker cap counts every held slot in this state directory, on every
       // provider key and from every bridge process (quarantined slots too: their process tree may
       // still run). It only ever holds a start back; held slots are never taken away.
       const globalLimit = CONFIG.globalWorkerLimit;
@@ -3788,7 +3788,7 @@ async function recordRateLimitPause({ pauseKey, reason = "", now = Date.now() })
   }
 }
 
-// B-062: pause_opencode_provider / resume_opencode_provider. The target is "provider" (every model
+// Q-005: pause_opencode_provider / resume_opencode_provider. The target is "provider" (every model
 // of it: the slot key) or "provider/model" (the B-061 model key). The model part may hold "/"
 // (openrouter/anthropic/...), so only the first "/" splits.
 function providerPauseTarget(target) {
@@ -3863,7 +3863,7 @@ async function resumeProvider({ provider } = {}) {
     transactionOpen = false;
     const removed = rows.map((row) => ({ providerKey: row.provider_key, until: new Date(Number(row.until_at)).toISOString(), errorType: row.error_type }));
     logEvent("info", "provider.resumed_by_operator", { providerKey: target.key, removed: removed.length });
-    // B-064: retries of this process that wait for a pause to end may start now; one whose model is
+    // Q-007: retries of this process that wait for a pause to end may start now; one whose model is
     // still paused fails at its slot request and its retry policy picks again.
     let released = 0;
     for (const record of QUEUE_JOBS.values()) {
@@ -4354,7 +4354,7 @@ async function providerCapacitySnapshot() {
       errorType: row.error_type,
       reason: row.reason || "",
     }));
-    // B-062: what the global worker cap counts (every held slot, every key).
+    // Q-005: what the global worker cap counts (every held slot, every key).
     const allLeaseCount = Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases").get()?.count || 0);
     return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns, allLeaseCount };
   } catch (error) {
@@ -4512,7 +4512,7 @@ function normalizeAgentDebugMetadata(parsed, expectedName = "", { isolatedRuntim
     .filter((rule) => rule.action === "deny")
     .map((rule) => rule.pattern);
   const bash = permissionDefaultAndOverrides(permissions, "bash");
-  // B-066: the running job's exact self-check commands are as safe as the git diagnostics here; any
+  // Q-009: the running job's exact self-check commands are as safe as the git diagnostics here; any
   // other allow rule still makes the profile unsafe.
   const overlayBashAllow = activePermissionOverlay()?.bashAllow || null;
   const bashAutomaticAllowUnsafe = bash.overrides.filter((rule) => rule.action === "allow" && !SAFE_AGENT_BASH_ALLOW_PATTERNS.has(rule.pattern) && !overlayBashAllow?.has(rule.pattern));
@@ -4746,7 +4746,7 @@ function agentMetadataCacheKey(agent, cwd, worktreeIdentity = null) {
   const place = worktreeIdentity?.repoRoot && /^[0-9a-f]{40,64}$/i.test(String(worktreeIdentity.baseTree || ""))
     ? `worktree\0${attestationCwdKey(worktreeIdentity.repoRoot)}\0${String(worktreeIdentity.baseTree).toLowerCase()}`
     : attestationCwdKey(cwd);
-  // B-066: a job with self-check rules attests a different effective profile; never share it.
+  // Q-009: a job with self-check rules attests a different effective profile; never share it.
   const overlay = activePermissionOverlay();
   return `agent-metadata\0${String(agent)}\0${place}${overlay ? `\0overlay:${overlay.sha256}` : ""}`;
 }
@@ -7077,7 +7077,7 @@ function normalizeScopeContract(job) {
 
   const normalized = {
     ...(raw.modelRequirement !== undefined ? { modelRequirement: modelRequirementSchema.parse(raw.modelRequirement) } : {}),
-    // B-066: kept as written (validated by selfCheckCommandsError, matched exactly by OpenCode).
+    // Q-009: kept as written (validated by selfCheckCommandsError, matched exactly by OpenCode).
     ...(raw.selfCheckCommands !== undefined ? { selfCheckCommands: Array.isArray(raw.selfCheckCommands) ? raw.selfCheckCommands.map((item) => String(item).trim()) : raw.selfCheckCommands } : {}),
     agent: String(raw.agent || job.agent || "").trim(),
     role: String(raw.role || "").trim(),
@@ -11427,7 +11427,7 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
 // `git diff --stat <base>` left out files the agent created (untracked in the worktree), so a
 // builder that wrote a new test file showed "1 file changed". The review patch already carries
 // every file, new ones included; count its lines instead.
-// B-067: the patch's files with their kind (created, deleted, binary), for the stat below and for
+// Q-010: the patch's files with their kind (created, deleted, binary), for the stat below and for
 // auto-integration, which lands a patch by itself only when every file in it is new.
 function patchFileEntries(patchText) {
   const files = [];
@@ -14974,7 +14974,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       jobIds: reconciled,
     });
   }
-  // B-065: a job a restart interrupted is resumed as its next attempt when it has a retry policy
+  // Q-008: a job a restart interrupted is resumed as its next attempt when it has a retry policy
   // (applyQueueRetryPolicy decides; jobs without one stay interrupted for requeue_opencode_job).
   for (const item of interrupted) scheduleQueueRetryPolicy(item.cwd, item.jobId);
 
@@ -18042,7 +18042,7 @@ server.tool(
   }
 );
 
-// B-062: runtime pause of a provider or one of its models (orch/pause.json of the round-6
+// Q-005: runtime pause of a provider or one of its models (orch/pause.json of the round-6
 // orchestrator). Stored with the automatic pauses in provider-concurrency.sqlite, so every bridge
 // process honours it at its next slot request and it survives a restart.
 server.tool(
@@ -20117,7 +20117,7 @@ function validateParallelWritePlan(jobs) {
   return { error: null, lockPlans };
 }
 
-// B-066: self-check commands. Builders have no shell beyond git diagnostics, so in round 3 a
+// Q-009: self-check commands. Builders have no shell beyond git diagnostics, so in round 3 a
 // builder could not run `node tools/validate.cjs` on the batch it wrote. A write job's Scope
 // Contract may now name exact commands the agent may run; the bridge adds them as exact bash
 // allow rules for that one run (OPENCODE_CONFIG_CONTENT, see jobPermissionOverlayStorage) and
@@ -20195,7 +20195,7 @@ function activePermissionOverlay() {
   return jobPermissionOverlayStorage.getStore() || null;
 }
 
-// B-064: options only the durable queue can honour (it requeues, waits and integrates after the
+// Q-007: options only the durable queue can honour (it requeues, waits and integrates after the
 // run); a direct or parallel run would silently ignore them, so they are refused there.
 function queueOnlyOptionsError(job) {
   const named = ["models", "maxAttempts", "autoIntegrate"].filter((key) => job?.[key] !== undefined && job?.[key] !== null);
@@ -20477,7 +20477,7 @@ function formatReadOnlyWorkspaceDrift(drift) {
   return `Checkout changed during this read-only run (the attested agent cannot edit; result kept): ${changed}${committed}. The review may describe the older version of these files.`;
 }
 
-// B-066: a job with self-check commands runs inside its permission overlay (see
+// Q-009: a job with self-check commands runs inside its permission overlay (see
 // jobPermissionOverlayStorage); every other job runs exactly as before.
 async function executeOpenCodeJob(requestedJob, context = {}) {
   // validateSingleLockPlan (first thing inside) refuses invalid commands before anything spawns, so
@@ -21514,7 +21514,7 @@ function queueStartAfterPending(record, now = Date.now()) {
 
 function queueRunStage(record) {
   if (record.status !== "running") {
-    // B-064: a retry that waits for the provider/model pause of every candidate model to end.
+    // Q-007: a retry that waits for the provider/model pause of every candidate model to end.
     if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) return "waiting_for_provider_pause";
     // B-045: a pending job held back by the free-memory floor (jobs of this process only).
     return ["pending", "planned"].includes(record.status) && queueMemoryWaitingJobs.has(record.jobId)
@@ -21584,12 +21584,12 @@ function queueRecordSnapshot(record, includeResult = true) {
     requeuedAs: record.requeuedAs || "",
     requeueSequence: record.requeueSequence || 0,
     requeuedAt: record.requeuedAt || "",
-    // B-064: the retry policy's counters, the attempts so far and a retry's start time.
+    // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
     retryAttempt: record.retryAttempt || 0,
     maxAttempts: record.maxAttempts || 0,
     attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
     startAfter: record.startAfter || "",
-    // B-067: what the bridge did with an autoIntegrate job's patch.
+    // Q-010: what the bridge did with an autoIntegrate job's patch.
     autoIntegration: record.autoIntegration || null,
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
@@ -22739,7 +22739,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     };
   }
 
-  // B-064: a retry policy (models / maxAttempts) is checked first and pins the first model.
+  // Q-007: a retry policy (models / maxAttempts) is checked first and pins the first model.
   const retryPolicy = applyRetryPolicyToJob(job, parentJobId);
   if (!retryPolicy.ok) {
     return {
@@ -22852,7 +22852,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     childContainmentIdentity: "",
     containmentQuarantined: false,
     revision: 0,
-    // B-064: attempt counters of a retry policy (a requeue by the policy passes the next ones).
+    // Q-007: attempt counters of a retry policy (a requeue by the policy passes the next ones).
     ...(retryPolicy.policy ? { retryAttempt: 1, maxAttempts: retryPolicy.policy.maxAttempts } : {}),
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
@@ -22951,7 +22951,7 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
   }
 }
 
-// B-064: model fallback for queued jobs (the round-6 orchestrator's TOOL_ORDER + attempts). A job
+// Q-007: model fallback for queued jobs (the round-6 orchestrator's TOOL_ORDER + attempts). A job
 // that names `models` and/or `maxAttempts` carries a retry policy: when it fails for a reason
 // another model or another try can fix, the bridge requeues it itself through requeueQueueJob (the
 // same validation as requeue_opencode_job, the same lineage fields) on the next model that is not
@@ -22968,7 +22968,7 @@ const RETRY_POLICY_ERROR_TYPES = new Set([
   // The run: stalled, too slow, or ended without a usable result.
   "agent_idle_timeout", "agent_timeout", "agent_empty_final_response", "agent_exit_nonzero",
   "essential_output_truncated", "validation_command_failed", "writer_no_changes",
-  // B-065: the owner died while the job ran (a client restart).
+  // Q-008: the owner died while the job ran (a client restart).
   "queue_job_interrupted",
 ]);
 
@@ -23139,7 +23139,7 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     model: next.spec || "",
     recordFields: { retryAttempt: attempt + 1, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "" },
   });
-  // B-065: a previous child that is still alive may still write its worktree; the job stays
+  // Q-008: a previous child that is still alive may still write its worktree; the job stays
   // interrupted (not gave_up) so the operator can stop the child and requeue it.
   if (!requeued.ok && requeued.errorType === "requeue_orphan_child_alive") {
     logEvent("warn", "queue.retry_deferred", { jobId, agent: summary.agent || "", errorType: requeued.errorType, summary: failureSummary(requeued.error) });
@@ -23169,7 +23169,7 @@ function scheduleQueueRetryPolicy(cwd, jobId) {
   });
 }
 
-// B-067: auto-integration of new-file-only patches (the round-6 orchestrator's LANDED step). Up to
+// Q-010: auto-integration of new-file-only patches (the round-6 orchestrator's LANDED step). Up to
 // 300 batches each needed a dry run, an apply and a receipt. A queued writer that asks for it
 // (autoIntegrate: true) and finished with a passing validationCommand is integrated by the bridge
 // itself, but only when every file of its patch is new: the dry run and the receipt-bound apply
@@ -23421,7 +23421,7 @@ async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined, 
   const sequence = Number(summary.requeueSequence || 0) + 1;
   const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
   job.idempotencyKey = idempotencyKey;
-  // B-064: the retry policy passes the attempt counters and a start time; a manual requeue none.
+  // Q-007: the retry policy passes the attempt counters and a start time; a manual requeue none.
   const enqueued = await enqueueQueueJob(job, "", { recordFields: { ...(recordFields || {}), requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
   if (!enqueued.ok) {
     return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
@@ -23944,18 +23944,18 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
         logEvent("warn", "queue.job_failed", {
           jobId: record.jobId,
           agent: record.agent || "",
-          // B-063: the issue log names the model a failure happened on.
+          // Q-006: the issue log names the model a failure happened on.
           model: patch.configuredModel ? `${patch.configuredProvider || "?"}/${patch.configuredModel}` : "",
           errorType: patch.errorType || "",
           summary: failureSummary(patch.errorReason || patch.errorType || "Queued job failed."),
           durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
         });
       }
-      // B-064: a job with a retry policy is requeued on its next model (or marked gave_up).
+      // Q-007: a job with a retry policy is requeued on its next model (or marked gave_up).
       if (lastResult.persisted && patch.status === "failed" && (record.request?.models || record.request?.maxAttempts || record.retryAttempt)) {
         scheduleQueueRetryPolicy(record.cwd, record.jobId);
       }
-      // B-063: a writer that "completed" without changing a file is the round-6 "no output file":
+      // Q-006: a writer that "completed" without changing a file is the round-6 "no output file":
       // a success for the queue, a failure for the batch. Logged so the issue log shows it.
       if (lastResult.persisted && patch.status === "completed" && record.mode === "write" && patch.noChanges) {
         logEvent("warn", "queue.job_no_output", {
@@ -24208,7 +24208,7 @@ async function startQueueRecord(record) {
       }
 
       const containmentUnconfirmed = errorType === "process_tree_termination_unconfirmed";
-      // B-064: with a retry policy the caller said this job must produce something, so a writer
+      // Q-007: with a retry policy the caller said this job must produce something, so a writer
       // that changed no file is a failure (the round-6 "no output file") and is retried.
       const noOutputFailure = !errorType && record.mode === "write" && Boolean(execution.result?.noChanges)
         && Boolean(record.request?.models || record.request?.maxAttempts);
@@ -24258,7 +24258,7 @@ async function startQueueRecord(record) {
         containmentQuarantined: containmentUnconfirmed,
       };
       const committedTerminal = await commitQueueTerminalRecord(record, terminalPatch);
-      // B-067: a finished writer that asked for it is integrated after its lock is released (the
+      // Q-010: a finished writer that asked for it is integrated after its lock is released (the
       // integration's serial lock would otherwise wait on the job's own write lock).
       if (committedTerminal?.persisted && terminalPatch.status === "completed" && record.request?.autoIntegrate === true
         && record.mode === "write" && !record.parentJobId && (terminalPatch.changedFiles || []).length && terminalPatch.worktreePath) {
@@ -24414,7 +24414,7 @@ function scheduleQueue(delayMs = 0) {
 
           // B-045: planning and starting wait for memory; the job stays pending (no durable write per poll).
           if (holdStarts) continue;
-          // B-064: a retry whose every model is paused waits for the first pause to end.
+          // Q-007: a retry whose every model is paused waits for the first pause to end.
           if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) continue;
 
           if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
@@ -28928,7 +28928,7 @@ export const __selfTest = {
     requeueQueueJob,
     runtimeConcurrencyLimitError,
     setRuntimeConcurrency,
-    // tests/review-flex-*.js (flexible scheduling, B-060..)
+    // tests/review-flex-*.js (flexible scheduling, B-060, B-061, Q-005..Q-010)
     DEFAULT_MIN_FREE_MEMORY_MB,
     agentIdleTimeoutForModel,
     agentIdleTimeoutStatusLine,

@@ -1,5 +1,5 @@
 // Shared scratch fixture for the tests/review-flex-*.js files (flexible scheduling, log.md
-// B-060..). The caller sets its environment and imports ../server.js first (the bridge reads its
+// B-060, B-061, Q-005..Q-010). The caller sets its environment and imports ../server.js first (the bridge reads its
 // environment at import), then passes __selfTest here. Everything lives in one scratch folder: a
 // git repository, the bridge state directory and the worktree root; nothing touches the operator's
 // state, clients or OpenCode files.

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-// B-065 (log.md, 2026-10-02): surviving a bridge restart. A bridge's agent processes do not outlive
+// Q-008 (log.md, 2026-10-02): surviving a bridge restart. A bridge's agent processes do not outlive
 // it (the process supervisor ends the payload when its parent's pipe closes or its heartbeat
 // stops), so a job that was running when its client restarted is found by the next bridge as
 // `interrupted`. With a retry policy (models / maxAttempts) that bridge now resumes it as its next
-// attempt through the retry policy (B-064), with the job's own full timeout; without a policy, or
+// attempt through the retry policy (Q-007), with the job's own full timeout; without a policy, or
 // with CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED=false, it stays interrupted for requeue_opencode_job.
 // The dead owner is simulated on the durable row in a scratch state directory.
 //   node tests/review-flex-resume.js
@@ -55,7 +55,7 @@ async function interruptedByDeadOwner(job) {
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-065: a policy job that a restart interrupted is resumed as its next attempt with its full timeout", async () => {
+test("Q-008: a policy job that a restart interrupted is resumed as its next attempt with its full timeout", async () => {
   requests.length = 0;
   const jobId = await interruptedByDeadOwner(readJob({ task: "resume me", models: [MUSE, GEMINI], timeoutMs: 1_234_000 }));
   assert.ok(await waitFor(async () => Boolean((await durable(jobId))?.requeuedAs)), "requeued by the retry policy");
@@ -72,7 +72,7 @@ test("B-065: a policy job that a restart interrupted is resumed as its next atte
   assert.equal(request.scopeContract.modelRequirement.model, "antigravity-gemini-3.8-flash", "the next model in order");
 });
 
-test("B-065: a job without a policy stays interrupted for requeue_opencode_job", async () => {
+test("Q-008: a job without a policy stays interrupted for requeue_opencode_job", async () => {
   requests.length = 0;
   const jobId = await interruptedByDeadOwner(readJob({ task: "no policy" }));
   await sleep(500);
@@ -82,7 +82,7 @@ test("B-065: a job without a policy stays interrupted for requeue_opencode_job",
   assert.equal(requests.length, 0);
 });
 
-test("B-065: CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED=false leaves a policy job interrupted", async () => {
+test("Q-008: CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED=false leaves a policy job interrupted", async () => {
   assert.equal(CONFIG.autoResumeInterrupted, true, "on by default");
   hooks.autoResumeInterruptedOverride = false;
   try {
@@ -97,7 +97,7 @@ test("B-065: CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED=false leaves a policy job in
   }
 });
 
-test("B-065: the resume counts against maxAttempts, so a job that keeps being interrupted gives up", async () => {
+test("Q-008: the resume counts against maxAttempts, so a job that keeps being interrupted gives up", async () => {
   const jobId = await interruptedByDeadOwner(readJob({ task: "interrupted at the last attempt", models: [MUSE], maxAttempts: 1 }));
   assert.ok(await waitFor(async () => (await durable(jobId))?.completionOutcome === "gave_up"));
   assert.equal((await durable(jobId)).requeuedAs || "", "");

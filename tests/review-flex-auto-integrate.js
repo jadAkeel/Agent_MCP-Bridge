@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// B-067 (log.md, 2026-10-02): auto-integration of new-file-only patches. A queued writer with
+// Q-010 (log.md, 2026-10-02): auto-integration of new-file-only patches. A queued writer with
 // autoIntegrate: true whose finished patch only adds files is integrated by the bridge itself
 // (dry run + receipt-bound apply of the integrate_opencode_worktree engine, validation in the
 // target, rollback) and committed by pathspec with the identity of the target's last commit; any
@@ -84,7 +84,7 @@ const head = async () => (await git(["rev-parse", "HEAD"])).trim();
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-067: the option is checked at enqueue and refused where it cannot work", async () => {
+test("Q-010: the option is checked at enqueue and refused where it cannot work", async () => {
   assert.equal(autoIntegrateJobError({ autoIntegrate: false }, {}), null);
   assert.equal(autoIntegrateJobError({ write: true }, { lockType: "write", validationCommand: VALIDATION }), null);
   const reader = await enqueueQueueJob({ agent: "reviewer", task: "read", cwd: repo, write: false, lockMode: "off", scopeContract: { mode: "read", read: ["src/a.txt"] }, autoIntegrate: true });
@@ -97,7 +97,7 @@ test("B-067: the option is checked at enqueue and refused where it cannot work",
   assert.match(direct, /errorType: queue_only_option/);
 });
 
-test("B-067: the patch file list tells new files from changed ones", () => {
+test("Q-010: the patch file list tells new files from changed ones", () => {
   const patch = [
     "diff --git a/out/new.json b/out/new.json", "new file mode 100644", "index 0000000..1111111", "--- /dev/null", "+++ b/out/new.json", "@@ -0,0 +1 @@", "+[]",
     "diff --git a/src/a.txt b/src/a.txt", "index 2222222..3333333 100644", "--- a/src/a.txt", "+++ b/src/a.txt", "@@ -1 +1 @@", "-a", "+b",
@@ -105,7 +105,7 @@ test("B-067: the patch file list tells new files from changed ones", () => {
   assert.deepEqual(patchFileEntries(patch).map((file) => [file.path, file.created, file.deleted]), [["out/new.json", true, false], ["src/a.txt", false, false]]);
 });
 
-test("B-067: a new-file-only patch is integrated and committed with the target's last commit identity", async () => {
+test("Q-010: a new-file-only patch is integrated and committed with the target's last commit identity", async () => {
   const before = await head();
   const { record, dir } = await runAutoJob("out/batch-001.json", { "out/batch-001.json": "[1, 2, 3]\n" });
   assert.equal(record.status, "completed");
@@ -125,7 +125,7 @@ test("B-067: a new-file-only patch is integrated and committed with the target's
   assert.match(list, new RegExp(`${record.jobId} .*autoIntegration=committed@${after.slice(0, 12)}`));
 });
 
-test("B-067: unrelated uncommitted work in the target stays uncommitted", async () => {
+test("Q-010: unrelated uncommitted work in the target stays uncommitted", async () => {
   await writeFile(path.join(repo, "src", "a.txt"), "local edit\n", "utf8");
   try {
     const { record } = await runAutoJob("out/batch-002.json", { "out/batch-002.json": "[4]\n" });
@@ -137,7 +137,7 @@ test("B-067: unrelated uncommitted work in the target stays uncommitted", async 
   }
 });
 
-test("B-067: a patch that changes an existing file is left for the reviewed flow", async () => {
+test("Q-010: a patch that changes an existing file is left for the reviewed flow", async () => {
   const before = await head();
   const { record, dir } = await runAutoJob("src/b.txt", { "src/b.txt": "changed\n" }, { lockedPaths: ["src"] });
   assert.equal(record.autoIntegration.status, "skipped_not_new_files");
@@ -147,7 +147,7 @@ test("B-067: a patch that changes an existing file is left for the reviewed flow
   assert.equal(existsSync(dir), true, "the worktree is kept for integrate_opencode_worktree");
 });
 
-test("B-067: a validation that fails in the target rolls the files back and keeps the worktree", async () => {
+test("Q-010: a validation that fails in the target rolls the files back and keeps the worktree", async () => {
   const before = await head();
   const { record, dir } = await runAutoJob("out/batch-003.json", { "out/batch-003.json": "BAD\n" });
   assert.equal(record.status, "completed", "the job itself stays completed");
@@ -160,7 +160,7 @@ test("B-067: a validation that fails in the target rolls the files back and keep
   assert.match(issues(), new RegExp(`\\| queue\\.auto_integration_failed \\| \\S+ \\| job ${record.jobId} builder on opencode/muse-spark-1\\.3-contributor-free \\| Auto-integration stopped at the apply`));
 });
 
-test("B-067: jobs of one repository integrate one after another, each with its own commit", async () => {
+test("Q-010: jobs of one repository integrate one after another, each with its own commit", async () => {
   const before = await head();
   const runs = await Promise.all([
     runAutoJob("out/batch-004.json", { "out/batch-004.json": "[4]\n" }, { lockedPaths: ["out/batch-004.json"] }),
@@ -174,7 +174,7 @@ test("B-067: jobs of one repository integrate one after another, each with its o
   assert.equal((await git(["status", "--porcelain"])).trim(), "");
 });
 
-test("B-067: an in-place writer or another integration on the files makes the integration wait, then land", async () => {
+test("Q-010: an in-place writer or another integration on the files makes the integration wait, then land", async () => {
   const { acquireHardLock, releaseHardLock } = internals;
   // A finished writer without autoIntegrate gives the terminal job row the outcome is written to.
   const dir = await builderWorktree({ "out/batch-008.json": "[8]\n" });
@@ -200,7 +200,7 @@ test("B-067: an in-place writer or another integration on the files makes the in
   assert.equal((await git(["show", "--name-only", "--format=", "HEAD"])).trim(), "out/batch-008.json");
 });
 
-test("B-067: without autoIntegrate a finished writer is not touched", async () => {
+test("Q-010: without autoIntegrate a finished writer is not touched", async () => {
   const before = await head();
   const dir = await builderWorktree({ "out/batch-007.json": "[7]\n" });
   const request = job("out/batch-007.json", { autoIntegrate: undefined });

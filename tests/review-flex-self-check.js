@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// B-066 (log.md, 2026-10-02): self-check commands for builders. In round 3 a builder could not run
+// Q-009 (log.md, 2026-10-02): self-check commands for builders. In round 3 a builder could not run
 // `node tools/validate.cjs` on the batch it wrote (its bash permission allows git diagnostics only).
 // A write job's Scope Contract may now list exact commands; the bridge adds them as exact bash
 // allow rules for that one run (OPENCODE_CONFIG_CONTENT, scoped with AsyncLocalStorage) and
@@ -54,12 +54,12 @@ const tests = [];
 const skips = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-066: exact, allowlisted commands are accepted for a builder write job", () => {
+test("Q-009: exact, allowlisted commands are accepted for a builder write job", () => {
   assert.equal(planError(selfCheckJob([CHECK, "node tools/check-links.cjs out/batch-001.json", "git diff --check"])).error, null);
   assert.equal(selfCheckCommandsError({ agent: "builder" }, { lockType: "write", scopeContract: {} }), null, "no commands, no check");
 });
 
-test("B-066: every command that could open the shell further is refused", () => {
+test("Q-009: every command that could open the shell further is refused", () => {
   const cases = [
     [["node tools/*.cjs"], "self_check_invalid"],
     [["node tools/validate.cjs \"out/batch-001.json\""], "self_check_invalid"],
@@ -92,7 +92,7 @@ test("B-066: every command that could open the shell further is refused", () => 
   assert.equal(planError(reader).errorType, "self_check_not_applicable");
 });
 
-test("B-066: enqueue and run_opencode_parallel apply the same rules", async () => {
+test("Q-009: enqueue and run_opencode_parallel apply the same rules", async () => {
   const refused = await enqueueQueueJob(selfCheckJob(["node tools/validate.cjs out/*.json"]));
   assert.equal(refused.ok, false);
   assert.equal(refused.errorType, "self_check_invalid");
@@ -100,14 +100,14 @@ test("B-066: enqueue and run_opencode_parallel apply the same rules", async () =
   assert.match(parallel, /self_check_unsupported_in_parallel/);
 });
 
-test("B-066: the agent prompt lists the commands", () => {
+test("Q-009: the agent prompt lists the commands", () => {
   const contract = normalizeScopeContract(selfCheckJob([CHECK]));
   const prompt = formatScopeContractForPrompt(contract);
   assert.match(prompt, /Self-check commands you may run with your shell tool \(type each exactly as written, on its own, from the working directory; fix what it reports and run it again before you finish\):\n- node tools\/validate\.cjs out\/batch-001\.json/);
   assert.doesNotMatch(formatScopeContractForPrompt(normalizeScopeContract(writeJob("src/a.txt"))), /Self-check/);
 });
 
-test("B-066: the overlay reaches only the job that has it: env, attestation cache key, metadata check", async () => {
+test("Q-009: the overlay reaches only the job that has it: env, attestation cache key, metadata check", async () => {
   const overlay = selfCheckPermissionOverlay(selfCheckJob([CHECK]));
   assert.deepEqual(JSON.parse(overlay.configContent), { agent: { builder: { permission: { bash: { [CHECK]: "allow" } } } } });
   assert.equal(buildOpenCodeEnv().OPENCODE_CONFIG_CONTENT, undefined, "outside a job nothing is set, and the operator's value is stripped");
@@ -143,7 +143,7 @@ test("B-066: the overlay reaches only the job that has it: env, attestation cach
   assert.equal(buildOpenCodeEnv().OPENCODE_CONFIG_CONTENT, undefined);
 });
 
-test("B-066: the installed OpenCode appends the job's rules after the profile's deny-all", async () => {
+test("Q-009: the installed OpenCode appends the job's rules after the profile's deny-all", async () => {
   const version = await runCommand("opencode", ["--version"], process.cwd(), 30_000).catch(() => ({ exitCode: 1 }));
   if (version.exitCode !== 0) throw new SkipTest("OpenCode is not on PATH; the merge order is checked only with a real OpenCode", { optional: true });
   const home = path.join(fixture.root, "oc-home");

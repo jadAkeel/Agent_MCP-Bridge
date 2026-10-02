@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// B-064 (log.md, 2026-10-02): model fallback. A queued job may give `models` (and `maxAttempts`);
+// Q-007 (log.md, 2026-10-02): model fallback. A queued job may give `models` (and `maxAttempts`);
 // after a provider failure, an idle stop, a timeout or no output the bridge requeues it itself on
 // the next model that is not paused, records the attempts, and marks the last one outcome=gave_up.
 // The real scheduler, SQLite queue, encrypted requests and requeue run in a scratch state
@@ -61,7 +61,7 @@ async function chain(firstJobId, timeoutMs = 20_000) {
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("B-064: models and maxAttempts are validated at enqueue", async () => {
+test("Q-007: models and maxAttempts are validated at enqueue", async () => {
   const refuse = async (extra, errorType, pattern) => {
     const result = await enqueueQueueJob(readJob({ task: `refuse ${JSON.stringify(extra)}`, ...extra }));
     assert.equal(result.ok, false, JSON.stringify(extra));
@@ -81,7 +81,7 @@ test("B-064: models and maxAttempts are validated at enqueue", async () => {
   assert.equal(jobRetryPolicy({ agent: "reviewer", maxAttempts: 2 }).policy.models.length, 0);
 });
 
-test("B-064: the options are refused where nothing could honour them", async () => {
+test("Q-007: the options are refused where nothing could honour them", async () => {
   assert.equal(queueOnlyOptionsError({}), null);
   const direct = textOf(await callTool("run_opencode_agent", readJob({ models: [MUSE], dryRun: true })));
   assert.match(direct, /errorType: queue_only_option/);
@@ -90,7 +90,7 @@ test("B-064: the options are refused where nothing could honour them", async () 
   assert.match(parallel, /queue_only_option/);
 });
 
-test("B-064: a provider failure moves the job to the next model, and the attempts are recorded", async () => {
+test("Q-007: a provider failure moves the job to the next model, and the attempts are recorded", async () => {
   calls.length = 0;
   installExecutor((model) => (model === "opencode/muse-spark-1.3-contributor-free" ? { errorType: "provider_rate_limited" } : {}));
   const first = await enqueueQueueJob(readJob({ task: "fallback to the next model", models: [MUSE, GEMINI] }));
@@ -116,7 +116,7 @@ test("B-064: a provider failure moves the job to the next model, and the attempt
   assert.match(issues(), /\| queue\.job_retried \| provider_rate_limited \| job \S+ reviewer on google\/antigravity-gemini-3\.8-flash@high \| Attempt 2 of 4 after provider_rate_limited on opencode\/muse-spark-1\.3-contributor-free/);
 });
 
-test("B-064: after maxAttempts the last job is marked gave_up, with every attempt listed", async () => {
+test("Q-007: after maxAttempts the last job is marked gave_up, with every attempt listed", async () => {
   calls.length = 0;
   installExecutor({ errorType: "agent_idle_timeout" });
   const first = await enqueueQueueJob(readJob({ task: "always stalls", models: [MUSE, GEMINI], maxAttempts: 3 }));
@@ -137,7 +137,7 @@ test("B-064: after maxAttempts the last job is marked gave_up, with every attemp
   assert.match(issues(), /\| queue\.job_gave_up \| agent_idle_timeout \| job \S+ reviewer on opencode\/muse-spark-1\.3-contributor-free \| Gave up after 3 of 3 attempt\(s\)\. Attempts: /);
 });
 
-test("B-064: maxAttempts alone retries on the same model; a failure no model can fix is not retried", async () => {
+test("Q-007: maxAttempts alone retries on the same model; a failure no model can fix is not retried", async () => {
   calls.length = 0;
   let count = 0;
   installExecutor(() => (++count === 1 ? { errorType: "agent_timeout" } : {}));
@@ -157,7 +157,7 @@ test("B-064: maxAttempts alone retries on the same model; a failure no model can
   assert.equal(after.completionOutcome || "", "");
 });
 
-test("B-064: a writer that changed nothing counts as no output under a policy", async () => {
+test("Q-007: a writer that changed nothing counts as no output under a policy", async () => {
   calls.length = 0;
   let count = 0;
   installExecutor(() => (++count === 1 ? { noChanges: true } : { changedFiles: ["src/a.txt"] }));
@@ -175,7 +175,7 @@ test("B-064: a writer that changed nothing counts as no output under a policy", 
   assert.equal(plainRecord.status, "completed");
 });
 
-test("B-064: when every model is paused the retry waits in the queue; a resume lets it start", async () => {
+test("Q-007: when every model is paused the retry waits in the queue; a resume lets it start", async () => {
   calls.length = 0;
   let count = 0;
   installExecutor(() => (++count === 1 ? { errorType: "provider_rate_limited" } : {}));
@@ -204,7 +204,7 @@ test("B-064: when every model is paused the retry waits in the queue; a resume l
   }
 });
 
-test("B-064: a job the scheduler holds keeps its waiting time across a restart of the record", async () => {
+test("Q-007: a job the scheduler holds keeps its waiting time across a restart of the record", async () => {
   // The startAfter field is part of the durable summary, so a bridge that resumes the pending job
   // after a restart waits as well.
   installExecutor({});
