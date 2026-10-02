@@ -9,7 +9,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -135,8 +135,23 @@ const REQUIRED_MANAGED_SKILLS = Object.freeze([
   "test-failure-diagnosis",
 ]);
 const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
+// B-073: a self-test run without CODEX_OPENCODE_STATE_DIR gets a per-process temporary state
+// directory, never the operator's ~/.codex/codex-opencode-mcp. Suites that set only
+// hooks.stateDirectoryOverride fell back to the operator's directory whenever a timer fired after
+// their cleanup reset the override (job rows, empty databases and schema changes landed there).
+// The variable is set too, so a child process started with this environment shares the folder.
+const SELF_TEST_TEMP_STATE_DIR = process.argv.some((argument) => String(argument).startsWith("--self-test"))
+  && !String(process.env.CODEX_OPENCODE_STATE_DIR || "").trim()
+  ? mkdtempSync(path.join(tmpdir(), `codex-opencode-selftest-state-${process.pid}-`))
+  : "";
+if (SELF_TEST_TEMP_STATE_DIR) {
+  process.env.CODEX_OPENCODE_STATE_DIR = SELF_TEST_TEMP_STATE_DIR;
+  process.once("exit", () => {
+    try { rmSync(SELF_TEST_TEMP_STATE_DIR, { recursive: true, force: true }); } catch { /* Best effort; it is in the temp folder. */ }
+  });
+}
 const GLOBAL_BRIDGE_STATE_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
+  String(SELF_TEST_TEMP_STATE_DIR || process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
 );
 const DISABLED_GIT_HOOKS_PATH = path.join(
   GLOBAL_BRIDGE_STATE_DIR,
@@ -159,7 +174,14 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
 const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
 const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
-const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+// Q-005: one cap on running agents across every provider and every bridge process (the round-6
+// orchestrator's max.txt). 0 = no cap; the per-provider limit still applies under it.
+const ENV_GLOBAL_WORKER_LIMIT = readNonNegativeIntEnv("CODEX_OPENCODE_GLOBAL_WORKER_LIMIT", 0);
+const MAX_GLOBAL_WORKER_LIMIT = 64;
+const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, updatedAt: "" };
+// B-060: the default free-memory floor. A fixed 1024 MB would hold the queue forever on a machine
+// with 1 GB or less, so it is capped at an eighth of total memory.
+const DEFAULT_MIN_FREE_MEMORY_MB = Math.max(0, Math.min(1024, Math.floor(totalmem() / (1024 * 1024) / 8)));
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -194,13 +216,35 @@ const CONFIG = Object.freeze({
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
   get queueParallelLimit() { return RUNTIME_CONCURRENCY.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT; },
   // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
-  // (twenty agent processes, their worktrees and test runs exhausted a laptop).
-  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", 0),
+  // (twenty agent processes, their worktrees and test runs exhausted a laptop). B-060: on by
+  // default (1024 MB, at most an eighth of the machine's memory), because 10 builders took the
+  // owner's machine to 0.4 GB free while the floor was off.
+  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", DEFAULT_MIN_FREE_MEMORY_MB),
   // B-046: 0 disables. An agent that writes nothing to stdout or stderr for this long is stopped
   // through the process-tree supervisor and fails as agent_idle_timeout (a stalled provider stream
   // held a slot for 20+ minutes). Output arrives per finished step, so keep this well above the
-  // longest tool call or reasoning pause a healthy agent has.
-  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 0),
+  // longest tool call or reasoning pause a healthy agent has. B-060: 10 minutes by default (the
+  // round-6 orchestrator's watchdog); CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL sets other
+  // limits for models that write a whole file in one long silent step.
+  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 1000 * 60 * 10),
+  agentIdleTimeoutByModel: readModelDurationMapEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL"),
+  // B-061: OpenCode retries "Rate limit exceeded" by itself, silently on stdout, for as long as the
+  // run timeout allows. This many rate-limit lines for the job's model with no stdout output in
+  // between end the run as provider_rate_limited (0 turns the detection off).
+  rateLimitHits: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_HITS", 2),
+  // The pause a detected rate limit puts on that provider/model; it doubles on the next one up to
+  // the maximum (30, then 60 minutes, as the round-6 orchestrator did). 0 records no pause.
+  rateLimitPauseMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS", 1000 * 60 * 30),
+  rateLimitPauseMaxMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS", 1000 * 60 * 60),
+  // The OpenCode log file scanned for those lines in addition to the job's own stderr ("off" stops
+  // the scan). Tests point it at a scratch fixture.
+  openCodeLogPath: readOpenCodeLogPathEnv(),
+  openCodeLogScanMs: readPositiveIntEnv("CODEX_OPENCODE_OPENCODE_LOG_SCAN_MS", 1000 * 15),
+  // Q-008: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
+  // requeued by the bridge that finds it, as one of its attempts. false leaves it interrupted.
+  autoResumeInterrupted: readChoiceEnv("CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED", ["true", "false"], "true") === "true",
+  // Q-010: false refuses every autoIntegrate job, for an operator who wants every patch reviewed.
+  autoIntegrateAllowed: readChoiceEnv("CODEX_OPENCODE_AUTO_INTEGRATE", ["true", "false"], "true") === "true",
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -235,6 +279,7 @@ const CONFIG = Object.freeze({
   trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
   trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
   get providerConcurrencyLimit() { return RUNTIME_CONCURRENCY.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT; },
+  get globalWorkerLimit() { return RUNTIME_CONCURRENCY.globalWorkerLimit ?? ENV_GLOBAL_WORKER_LIMIT; },
   attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
   providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
   // How long a job may wait for a provider slot. The wait is not part of the agent's run
@@ -435,8 +480,30 @@ function currentFreeMemoryBytes() {
   return freemem();
 }
 
+// B-060: the floor is on by default, but a self-test run must not depend on how much memory the
+// machine running the suite has free: there the default applies only when the variable is set.
+const MIN_FREE_MEMORY_ENV_SET = String(process.env.CODEX_OPENCODE_MIN_FREE_MEMORY_MB ?? "").trim() !== "";
+
+function effectiveMinFreeMemoryMb() {
+  if (minFreeMemoryMbOverride !== null && minFreeMemoryMbOverride !== undefined) return minFreeMemoryMbOverride;
+  if (!MIN_FREE_MEMORY_ENV_SET && process.argv.includes("--self-test")) return 0;
+  return CONFIG.minFreeMemoryMb;
+}
+
+// B-060: the idle limit of one run: the per-model entry of CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL
+// for the model that actually runs (override included), else CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS.
+function agentIdleTimeoutForModel(metadata = null) {
+  const key = `${String(metadata?.provider || "").toLowerCase()}/${String(metadata?.model || "").toLowerCase()}`;
+  return CONFIG.agentIdleTimeoutByModel.has(key) ? CONFIG.agentIdleTimeoutByModel.get(key) : CONFIG.agentIdleTimeoutMs;
+}
+
+function agentIdleTimeoutStatusLine() {
+  const perModel = [...CONFIG.agentIdleTimeoutByModel.entries()].map(([model, ms]) => `${model}=${ms} ms`);
+  return `Agent idle timeout (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS): ${CONFIG.agentIdleTimeoutMs > 0 ? `${CONFIG.agentIdleTimeoutMs} ms` : "disabled (0)"}; per model (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL): ${perModel.length ? perModel.join(", ") : "none"}`;
+}
+
 function queueMemoryGate() {
-  const floorMb = minFreeMemoryMbOverride ?? CONFIG.minFreeMemoryMb;
+  const floorMb = effectiveMinFreeMemoryMb();
   const freeMb = Math.floor(currentFreeMemoryBytes() / (1024 * 1024));
   const totalMb = Math.floor(totalmem() / (1024 * 1024));
   return { floorMb, freeMb, totalMb, blocked: floorMb > 0 && freeMb < floorMb };
@@ -686,6 +753,7 @@ const scopeContractSchema = z
     timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
     timeoutPolicy: scopeTimeoutPolicySchema.optional(),
     modelRequirement: modelRequirementSchema.optional().describe("Pin provider/model[@variant] for this job. It must be in CODEX_OPENCODE_MODEL_ALLOWLIST or match the managed profile."),
+    selfCheckCommands: z.array(z.string().min(1).max(500)).max(8).optional().describe("Write jobs (builder/debugger) only: exact commands the BRIDGE runs in the worktree after the agent finished, before validationCommand, e.g. \"node tools/validate.cjs out/x.json\". A failing one gives the agent another run with its output (selfCheckPasses). The agent itself gets no shell. Each must pass the validationCommand rules (CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST, no shell, npx or inline eval) and be written without wildcards, quotes or shell operators; a script it runs must not be in allowedEdits."),
   })
   .strict();
 
@@ -717,8 +785,12 @@ const jobInputShape = {
   sharedFiles: z.array(z.string()).optional(),
   serialOnly: z.array(z.string()).optional(),
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
+  selfCheckPasses: z.number().int().min(0).max(3).optional().describe("With scopeContract.selfCheckCommands: how many more agent runs a failing self-check may get, each with the check's output (default 2, at most 3; 0 = none). Not available in run_opencode_parallel."),
   validationFixPasses: z.number().int().min(0).max(1).optional().describe("0 (default) or 1. A write job cannot run its own checks (builders have no shell), so with 1 a failed validationCommand gives the agent one more run in the same worktree with the validation output, then validates again. Uses the rest of the job timeout; scope and lock rules apply unchanged. Not available in run_opencode_parallel."),
   timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
+  models: z.array(z.string().min(1).max(300)).min(1).max(8).optional().describe("enqueue_opencode_job only. Models to try in order, each provider/model[@variant] from CODEX_OPENCODE_MODEL_ALLOWLIST. After a provider failure (rate limit, pause, quota, 5xx), an idle stop, a timeout, no output or a failed validation the bridge requeues the job on the next model that is not paused; after maxAttempts it marks the job outcome=gave_up."),
+  maxAttempts: z.number().int().min(1).max(10).optional().describe("enqueue_opencode_job only. Attempts in total, the first included (default 4 when models is given). Alone (without models) it retries on the same model."),
+  autoIntegrate: z.boolean().optional().describe("enqueue_opencode_job only, write jobs with a validationCommand. When the finished job only ADDED new files and its validation passed, the bridge integrates them (the same dry run, receipt, validation and rollback as integrate_opencode_worktree) and commits exactly those files with the target repository's last commit identity. Any other patch keeps the normal reviewed flow."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
   allowFallbackToBuild: z.boolean().optional(),
@@ -808,6 +880,36 @@ function assertSupportedCallerModel() {
   throw new Error(
     "CODEX_OPENCODE_CALLER_MODEL only supports trusted_stdio. Shared or multiplexed callers require an external per-project capability/authentication boundary and are rejected by this bridge."
   );
+}
+
+// B-060: "provider/model=ms,provider/model=ms". A model that writes its whole output in one long
+// silent step (Space Bunny, Nemotron) needs a longer idle limit than the default; one global value
+// either killed those or let a stalled Muse run hold its slot. Invalid entries stop the bridge at
+// startup, like every other malformed setting.
+function readModelDurationMapEnv(name) {
+  const raw = process.env[name];
+  const map = new Map();
+  if (raw === undefined || raw === null || !String(raw).trim()) return map;
+  for (const entry of String(raw).split(",").map((item) => item.trim()).filter(Boolean)) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9._:-]*)\/([A-Za-z0-9][A-Za-z0-9._:/-]*)=(\d+)$/.exec(entry);
+    const value = match ? Number(match[3]) : NaN;
+    if (!match || !Number.isSafeInteger(value) || value > MAX_TIMER_MS) {
+      throw new Error(`${name} must be a comma-separated list of provider/model=milliseconds (each at most ${MAX_TIMER_MS}); got ${JSON.stringify(entry)}.`);
+    }
+    map.set(`${match[1].toLowerCase()}/${match[2].toLowerCase()}`, value);
+  }
+  return map;
+}
+
+// B-061: CODEX_OPENCODE_OPENCODE_LOG_PATH, default <OpenCode data dir>/log/opencode.log (bridge
+// children write there too: they run with --print-logs, which writes the file and stderr). "off"
+// disables the file scan; anything else must be an absolute path.
+function readOpenCodeLogPathEnv() {
+  const raw = String(process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH || "").trim();
+  if (!raw) return path.join(DEFAULT_OPENCODE_DATA_DIR, "log", "opencode.log");
+  if (raw.toLowerCase() === "off") return "";
+  if (!path.isAbsolute(raw)) throw new Error(`CODEX_OPENCODE_OPENCODE_LOG_PATH must be an absolute path or off; got ${JSON.stringify(raw)}.`);
+  return path.resolve(raw);
 }
 
 function readCsvEnv(name, fallback = []) {
@@ -2164,6 +2266,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
   // it has written nothing for that long.
   onActivity = null,
   idleTimeoutMs = 0,
+  // B-061: { hits, provider, model, agent, logPath, scanMs }: stop the payload as rate_limited once
+  // that many rate-limit lines of its model arrive with no stdout output in between.
+  rateLimitWatch = null,
   supervisorScriptForTest = "",
 } = {}) {
   return new Promise((resolve) => {
@@ -2196,6 +2301,10 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let cancellationErrorType = "";
     let providerTerminated = false;
     let idleTimedOut = false;
+    let rateLimited = false;
+    const rateWatcher = rateLimitWatch && Number(rateLimitWatch.hits) > 0
+      ? createRateLimitWatcher({ ...rateLimitWatch, startedAtMs: Date.now(), onTrip: () => requestTermination("rate_limited") })
+      : null;
     let lastActivityMs = 0;
     let idleTimer = null;
     let startupTimer = null;
@@ -2230,6 +2339,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     });
 
     const clearTimers = () => {
+      rateWatcher?.stop();
       if (startupTimer) clearTimeout(startupTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (idleTimer) clearTimeout(idleTimer);
@@ -2254,6 +2364,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       if (stderrTruncated) {
         result.stderr = `${result.stderr.slice(0, Math.floor(CONFIG.maxProcessOutputChars / 2))}\n... [stderr truncated by bridge; terminal tail preserved] ...\n${stderrTail}`;
       }
+      result.rateLimited = rateLimited;
+      result.rateLimitHits = rateWatcher?.state.hits || 0;
+      result.rateLimitEvidence = rateWatcher?.state.evidence || null;
       result.stdoutChars = stdoutChars;
       result.stderrChars = stderrChars;
       result.stdoutSha256 = stdoutHash.digest("hex");
@@ -2303,6 +2416,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       terminationReason = reason;
       if (reason === "timeout") timedOut = true;
       if (reason === "provider_error") providerTerminated = true;
+      if (reason === "rate_limited") rateLimited = true;
       // An idle stop is a timeout for everything downstream (exit 124, retry rules); idleTimedOut tells which.
       if (reason === "idle_timeout") { idleTimedOut = true; timedOut = true; }
       if (!launchSent) {
@@ -2378,6 +2492,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
       noteActivity();
       armIdleTimer();
+      rateWatcher?.start();
       heartbeatTimer = setInterval(() => {
         if (heartbeatInFlight || settled || terminationRequested) return;
         heartbeatInFlight = true;
@@ -2432,7 +2547,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         ? 130
         : timedOut
           ? 124
-          : providerTerminated
+          : providerTerminated || rateLimited
             ? 1
             : Number.isInteger(event.payloadExitCode)
               ? event.payloadExitCode
@@ -2543,6 +2658,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
       const lines = stdoutLineBuffer.split(/\r?\n/);
       stdoutLineBuffer = lines.pop() || "";
+      rateWatcher?.stdoutText(text);
       if (terminateOnProviderError && !providerTerminated) {
         for (const line of lines) {
           try {
@@ -2572,6 +2688,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       stderrLineBuffer += text;
       const lines = stderrLineBuffer.split(/\r?\n/);
       stderrLineBuffer = (lines.pop() || "").slice(-64 * 1024);
+      if (rateWatcher) for (const line of lines) rateWatcher.stderrLine(line);
       const recentErrorLines = lines
         .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
         .filter((line) => /level\s*=\s*ERROR|\berror\b\s*[:=.]|APIError|CreditsError|HTTP\s+[45]\d\d/i.test(line))
@@ -3277,6 +3394,11 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
           value INTEGER NOT NULL,
           updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_pause_strikes (
+          pause_key TEXT PRIMARY KEY,
+          strikes INTEGER NOT NULL,
+          last_strike_at INTEGER NOT NULL
+        );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
       ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
@@ -3307,6 +3429,8 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
 // applies them at its next scheduler pass or slot request, and a restart reloads them.
 const RUNTIME_PROVIDER_LIMIT_SETTING = "provider_concurrency_limit";
 const RUNTIME_QUEUE_LIMIT_SETTING = "queue_parallel_limit";
+// Q-005: 0 is a valid stored value here (no cap, even when the environment sets one).
+const RUNTIME_GLOBAL_LIMIT_SETTING = "global_worker_limit";
 const RUNTIME_CONCURRENCY_REFRESH_MS = 5000;
 let runtimeConcurrencyRefreshedFor = "";
 let runtimeConcurrencyRefreshedAt = 0;
@@ -3320,17 +3444,29 @@ function runtimeConcurrencyLimitError(name, value) {
   return "";
 }
 
+function globalWorkerLimitError(value) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_GLOBAL_WORKER_LIMIT) {
+    return `globalWorkerLimit must be an integer from 0 (no cap) to ${MAX_GLOBAL_WORKER_LIMIT}; got ${JSON.stringify(value)}.`;
+  }
+  return "";
+}
+
 function readRuntimeConcurrencyRows(db) {
-  const settings = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+  const settings = { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, updatedAt: "" };
   let updatedAtMs = 0;
-  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?)")
-    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+  const rows = db.prepare("SELECT name, value, updated_at FROM runtime_settings WHERE name IN (?, ?, ?)")
+    .all(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING, RUNTIME_GLOBAL_LIMIT_SETTING);
   for (const row of rows) {
     const value = Number(row.value);
     // A hand-edited row outside the accepted range is ignored, not applied.
-    if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
-    if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
-    else settings.queueParallelLimit = value;
+    if (row.name === RUNTIME_GLOBAL_LIMIT_SETTING) {
+      if (globalWorkerLimitError(value)) continue;
+      settings.globalWorkerLimit = value;
+    } else {
+      if (!Number.isInteger(value) || value < 1 || value > MAX_RUNTIME_CONCURRENCY_LIMIT) continue;
+      if (row.name === RUNTIME_PROVIDER_LIMIT_SETTING) settings.providerLimit = value;
+      else settings.queueParallelLimit = value;
+    }
     updatedAtMs = Math.max(updatedAtMs, Number(row.updated_at) || 0);
   }
   if (updatedAtMs) settings.updatedAt = new Date(updatedAtMs).toISOString();
@@ -3338,19 +3474,24 @@ function readRuntimeConcurrencyRows(db) {
 }
 
 function applyRuntimeConcurrency(settings) {
+  const globalWorkerLimit = settings.globalWorkerLimit ?? null;
   const changed = RUNTIME_CONCURRENCY.providerLimit !== settings.providerLimit
-    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit;
+    || RUNTIME_CONCURRENCY.queueParallelLimit !== settings.queueParallelLimit
+    || RUNTIME_CONCURRENCY.globalWorkerLimit !== globalWorkerLimit;
   Object.assign(RUNTIME_CONCURRENCY, {
     providerLimit: settings.providerLimit,
     queueParallelLimit: settings.queueParallelLimit,
+    globalWorkerLimit,
     updatedAt: settings.updatedAt || "",
   });
   if (changed) {
     logEvent("info", "concurrency.runtime_limits_applied", {
       providerLimit: CONFIG.providerConcurrencyLimit,
       queueParallelLimit: CONFIG.queueParallelLimit,
+      globalWorkerLimit: CONFIG.globalWorkerLimit,
       providerOverride: settings.providerLimit !== null,
       queueOverride: settings.queueParallelLimit !== null,
+      globalOverride: globalWorkerLimit !== null,
     });
   }
   return changed;
@@ -3384,22 +3525,25 @@ function describeConcurrencyLimits() {
   return {
     provider: describe(CONFIG.providerConcurrencyLimit, ENV_PROVIDER_CONCURRENCY_LIMIT, RUNTIME_CONCURRENCY.providerLimit),
     queue: describe(CONFIG.queueParallelLimit, ENV_QUEUE_PARALLEL_LIMIT, RUNTIME_CONCURRENCY.queueParallelLimit),
+    global: describe(CONFIG.globalWorkerLimit === 0 ? "0 (no cap)" : CONFIG.globalWorkerLimit, ENV_GLOBAL_WORKER_LIMIT, RUNTIME_CONCURRENCY.globalWorkerLimit),
   };
 }
 
 // Sets (or, with reset, clears) the persisted overrides and applies them to this process. Running
 // jobs are untouched: a lower limit only keeps new jobs from starting until enough have finished.
-async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset = false } = {}) {
+async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, globalWorkerLimit, reset = false } = {}) {
   const hasProvider = providerLimit !== undefined && providerLimit !== null;
   const hasQueue = queueParallelLimit !== undefined && queueParallelLimit !== null;
-  if (reset && (hasProvider || hasQueue)) {
-    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit or queueParallelLimit." };
+  const hasGlobal = globalWorkerLimit !== undefined && globalWorkerLimit !== null;
+  if (reset && (hasProvider || hasQueue || hasGlobal)) {
+    return { ok: false, errorType: "concurrency_invalid", error: "reset clears the overrides; do not combine it with providerLimit, queueParallelLimit or globalWorkerLimit." };
   }
-  if (!reset && !hasProvider && !hasQueue) {
-    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit and/or queueParallelLimit, or reset: true to return to the environment values." };
+  if (!reset && !hasProvider && !hasQueue && !hasGlobal) {
+    return { ok: false, errorType: "concurrency_invalid", error: "Pass providerLimit, queueParallelLimit and/or globalWorkerLimit, or reset: true to return to the environment values." };
   }
   const invalid = (hasProvider ? runtimeConcurrencyLimitError("providerLimit", providerLimit) : "")
-    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "");
+    || (hasQueue ? runtimeConcurrencyLimitError("queueParallelLimit", queueParallelLimit) : "")
+    || (hasGlobal ? globalWorkerLimitError(globalWorkerLimit) : "");
   if (invalid) return { ok: false, errorType: "concurrency_invalid", error: invalid };
 
   let db = null;
@@ -3412,7 +3556,7 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
     const effectiveProviderBefore = before.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
     const now = Date.now();
     if (reset) {
-      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING);
+      db.prepare("DELETE FROM runtime_settings WHERE name IN (?, ?, ?)").run(RUNTIME_PROVIDER_LIMIT_SETTING, RUNTIME_QUEUE_LIMIT_SETTING, RUNTIME_GLOBAL_LIMIT_SETTING);
     } else {
       const upsert = db.prepare(`
         INSERT INTO runtime_settings (name, value, updated_at) VALUES (?, ?, ?)
@@ -3420,6 +3564,7 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
       `);
       if (hasProvider) upsert.run(RUNTIME_PROVIDER_LIMIT_SETTING, providerLimit, now);
       if (hasQueue) upsert.run(RUNTIME_QUEUE_LIMIT_SETTING, queueParallelLimit, now);
+      if (hasGlobal) upsert.run(RUNTIME_GLOBAL_LIMIT_SETTING, globalWorkerLimit, now);
     }
     const after = readRuntimeConcurrencyRows(db);
     const effectiveProviderAfter = after.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT;
@@ -3434,12 +3579,13 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
       providerLimit: effectiveProviderBefore,
       queueParallelLimit: before.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT,
     };
+    const previousGlobalWorkerLimit = before.globalWorkerLimit ?? ENV_GLOBAL_WORKER_LIMIT;
     applyRuntimeConcurrency(after);
     runtimeConcurrencyRefreshedFor = effectiveBridgeStateDirectory();
     runtimeConcurrencyRefreshedAt = Date.now();
     // A raised queue limit can start jobs that were waiting for a free worker.
     scheduleQueue();
-    return { ok: true, previous, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit }, reset: Boolean(reset) };
+    return { ok: true, previous, previousGlobalWorkerLimit, current: { providerLimit: CONFIG.providerConcurrencyLimit, queueParallelLimit: CONFIG.queueParallelLimit, globalWorkerLimit: CONFIG.globalWorkerLimit }, reset: Boolean(reset) };
   } catch (error) {
     if (transactionOpen) {
       try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
@@ -3450,12 +3596,15 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
   }
 }
 
-async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
+async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, signal = null }) {
+  // B-061: a pause can sit on the provider key itself or on a provider/model key under it.
+  const cooldownKeys = [...new Set([providerKey, ...(Array.isArray(pauseKeys) ? pauseKeys : [])].filter(Boolean))];
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
   const deadlineAt = started + waitBudgetMs;
   let observedHolders = 0;
   let observedCapacity = CONFIG.providerConcurrencyLimit;
+  let observedGlobal = null;
   while (Date.now() < deadlineAt) {
     await reclaimProvenGoneProviderQuarantines();
     if (signal?.aborted) {
@@ -3475,14 +3624,15 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       runtimeConcurrencyRefreshedAt = Date.now();
       // A provider whose quota ran out fails new jobs at once instead of starting agents that
       // can only burn their wait budget (or the quota of the next account) until the reset.
-      const cooldown = db.prepare("SELECT until_at, error_type, reason FROM provider_cooldowns WHERE provider_key = ?").get(providerKey);
+      const cooldown = db.prepare(`SELECT provider_key, until_at, error_type, reason FROM provider_cooldowns WHERE provider_key IN (${cooldownKeys.map(() => "?").join(", ")}) ORDER BY until_at DESC LIMIT 1`).get(...cooldownKeys);
       if (cooldown) {
         db.exec("ROLLBACK");
         const untilAt = Number(cooldown.until_at);
         return {
           ok: false,
           errorType: String(cooldown.error_type || "opencode_quota_exhausted"),
-          error: `Provider ${providerKey} is paused until ${new Date(untilAt).toISOString()} (${cooldown.error_type}${cooldown.reason ? `: ${cooldown.reason}` : ""}). The agent was not started; enqueue the job again after that time.`,
+          error: `Provider ${cooldown.provider_key || providerKey} is paused until ${new Date(untilAt).toISOString()} (${cooldown.error_type}${cooldown.reason ? `: ${cooldown.reason}` : ""}). The agent was not started; enqueue the job again after that time.`,
+          pausedKey: String(cooldown.provider_key || providerKey),
           waitedMs: Date.now() - started,
           holders: observedHolders,
           capacity: observedCapacity,
@@ -3511,7 +3661,13 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       }
       observedHolders = active;
       observedCapacity = effectiveCapacity;
-      if (active < effectiveCapacity) {
+      // Q-005: the global worker cap counts every held slot in this state directory, on every
+      // provider key and from every bridge process (quarantined slots too: their process tree may
+      // still run). It only ever holds a start back; held slots are never taken away.
+      const globalLimit = CONFIG.globalWorkerLimit;
+      const globalHeld = globalLimit > 0 ? Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases").get()?.count || 0) : 0;
+      observedGlobal = globalLimit > 0 ? { held: globalHeld, limit: globalLimit } : null;
+      if (active < effectiveCapacity && (!(globalLimit > 0) || globalHeld < globalLimit)) {
         const lease = {
           id: `${BRIDGE_INSTANCE_ID}-${randomBytes(6).toString("hex")}`,
           providerKey,
@@ -3549,10 +3705,11 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
   return {
     ok: false,
     errorType: "provider_slot_wait_timeout",
-    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs}). The agent was not started.`,
+    error: `Waited ${Date.now() - started} ms for a provider slot on ${providerKey}: ${observedHolders} of ${observedCapacity} slots stayed held for the whole wait budget (CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=${waitBudgetMs})${observedGlobal && observedGlobal.held >= observedGlobal.limit ? `; the global worker cap was full (${observedGlobal.held} of ${observedGlobal.limit} workers running on all providers, CODEX_OPENCODE_GLOBAL_WORKER_LIMIT)` : ""}. The agent was not started.`,
     waitedMs: Date.now() - started,
     holders: observedHolders,
     capacity: observedCapacity,
+    globalWorkers: observedGlobal,
   };
 }
 
@@ -3586,6 +3743,155 @@ async function recordProviderCooldown({ providerKey, durationMs, errorType, reas
   } catch (error) {
     logEvent("error", "provider.cooldown_record_failed", { providerKey, error: error.message || String(error) });
     return { ok: false, recorded: false, error: error.message || String(error) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// B-061: the pause a detected rate limit puts on one provider/model. A pause still running is kept
+// as it is (the parallel jobs that trip on the same rate limit add no strike); otherwise the strike
+// count grows and the pause doubles from CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS up to
+// CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS. A strike older than twice the maximum is forgotten, so a
+// model that behaved for hours starts again at the first step.
+async function recordRateLimitPause({ pauseKey, reason = "", now = Date.now() }) {
+  if (!pauseKey || !(CONFIG.rateLimitPauseMs > 0)) return { ok: true, recorded: false };
+  const baseMs = CONFIG.rateLimitPauseMs;
+  const maxMs = Math.max(baseMs, CONFIG.rateLimitPauseMaxMs);
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const active = db.prepare("SELECT until_at FROM provider_cooldowns WHERE provider_key = ? AND until_at > ?").get(pauseKey, now);
+    const strikeRow = db.prepare("SELECT strikes, last_strike_at FROM provider_pause_strikes WHERE pause_key = ?").get(pauseKey);
+    if (active) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      return { ok: true, recorded: true, reused: true, untilAt: Number(active.until_at), strikes: Number(strikeRow?.strikes || 1) };
+    }
+    const recent = strikeRow && now - Number(strikeRow.last_strike_at || 0) < 2 * maxMs;
+    const strikes = recent ? Number(strikeRow.strikes || 0) + 1 : 1;
+    const durationMs = Math.min(maxMs, PROVIDER_COOLDOWN_MAX_MS, baseMs * 2 ** Math.min(20, strikes - 1));
+    const untilAt = now + durationMs;
+    db.prepare(`
+      INSERT INTO provider_pause_strikes (pause_key, strikes, last_strike_at) VALUES (?, ?, ?)
+      ON CONFLICT(pause_key) DO UPDATE SET strikes = excluded.strikes, last_strike_at = excluded.last_strike_at
+    `).run(pauseKey, strikes, now);
+    db.prepare(`
+      INSERT INTO provider_cooldowns (provider_key, until_at, error_type, reason, set_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider_key) DO UPDATE SET
+        until_at = MAX(provider_cooldowns.until_at, excluded.until_at),
+        error_type = excluded.error_type,
+        reason = excluded.reason,
+        set_at = excluded.set_at
+    `).run(pauseKey, untilAt, "provider_rate_limited", redactSensitiveText(String(reason || "")).slice(0, 300), now);
+    db.exec("COMMIT");
+    transactionOpen = false;
+    logEvent("warn", "provider.cooldown_recorded", { providerKey: pauseKey, untilAt: new Date(untilAt).toISOString(), errorType: "provider_rate_limited", strikes });
+    return { ok: true, recorded: true, reused: false, untilAt, strikes, durationMs };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    logEvent("error", "provider.cooldown_record_failed", { providerKey: pauseKey, error: error.message || String(error) });
+    return { ok: false, recorded: false, error: error.message || String(error) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// Q-005: pause_opencode_provider / resume_opencode_provider. The target is "provider" (every model
+// of it: the slot key) or "provider/model" (the B-061 model key). The model part may hold "/"
+// (openrouter/anthropic/...), so only the first "/" splits.
+function providerPauseTarget(target) {
+  const raw = String(target || "").trim();
+  const slash = raw.indexOf("/");
+  const provider = (slash < 0 ? raw : raw.slice(0, slash)).trim();
+  const model = slash < 0 ? "" : raw.slice(slash + 1).trim();
+  if (!provider || !MODEL_IDENTIFIER_PATTERN.test(provider) || (slash >= 0 && (!model || !MODEL_NAME_PATTERN.test(model)))) {
+    return { ok: false, error: `provider must be "provider" or "provider/model" (for example opencode or opencode/muse-spark-1.3-contributor-free); got ${JSON.stringify(raw)}.` };
+  }
+  const normalizedProvider = provider.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  return model
+    ? { ok: true, key: modelPauseKeyForMetadata({ provider, model }), provider: normalizedProvider, model, modelPrefix: "" }
+    : { ok: true, key: providerKeyForMetadata({ provider }), provider: normalizedProvider, model: "", modelPrefix: `${CONFIG.providerConcurrencyKey}:${normalizedProvider}/` };
+}
+
+async function pauseProvider({ provider, until, minutes, reason = "", now = Date.now() } = {}) {
+  const target = providerPauseTarget(provider);
+  if (!target.ok) return { ok: false, errorType: "provider_pause_invalid", error: target.error };
+  const hasUntil = until !== undefined && until !== null && String(until).trim() !== "";
+  const hasMinutes = minutes !== undefined && minutes !== null;
+  if (hasUntil === hasMinutes) {
+    return { ok: false, errorType: "provider_pause_invalid", error: "Pass exactly one of until (an ISO time) or minutes." };
+  }
+  let untilAt = 0;
+  if (hasUntil) {
+    untilAt = Date.parse(String(until));
+    if (!Number.isFinite(untilAt) || untilAt <= now) return { ok: false, errorType: "provider_pause_invalid", error: `until must be an ISO time in the future; got ${JSON.stringify(String(until))}.` };
+  } else {
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) return { ok: false, errorType: "provider_pause_invalid", error: `minutes must be an integer from 1 to 1440; got ${JSON.stringify(minutes)}.` };
+    untilAt = now + minutes * 60_000;
+  }
+  if (untilAt - now > PROVIDER_COOLDOWN_MAX_MS) return { ok: false, errorType: "provider_pause_invalid", error: "A pause can last at most 24 hours." };
+  let db = null;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    // An operator's pause replaces whatever is there, shorter or longer: the operator decides.
+    db.prepare(`
+      INSERT INTO provider_cooldowns (provider_key, until_at, error_type, reason, set_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider_key) DO UPDATE SET until_at = excluded.until_at, error_type = excluded.error_type, reason = excluded.reason, set_at = excluded.set_at
+    `).run(target.key, untilAt, "provider_paused", redactSensitiveText(`paused by the operator${reason ? `: ${reason}` : ""}`).slice(0, 300), now);
+    logEvent("info", "provider.paused_by_operator", { providerKey: target.key, untilAt: new Date(untilAt).toISOString() });
+    return { ok: true, key: target.key, until: new Date(untilAt).toISOString(), target };
+  } catch (error) {
+    return { ok: false, errorType: "provider_pause_failed", error: redactSensitiveText(error?.message || String(error)) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// Removes the pause of the target; for a whole provider also the pauses of its models, and the
+// rate-limit strike counts of everything it removes (the operator says the provider is fine).
+async function resumeProvider({ provider } = {}) {
+  const target = providerPauseTarget(provider);
+  if (!target.ok) return { ok: false, errorType: "provider_pause_invalid", error: target.error };
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const like = target.modelPrefix ? `${target.modelPrefix.replace(/[\\%_]/g, (item) => `\\${item}`)}%` : null;
+    const rows = like
+      ? db.prepare("SELECT provider_key, until_at, error_type FROM provider_cooldowns WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'").all(target.key, like)
+      : db.prepare("SELECT provider_key, until_at, error_type FROM provider_cooldowns WHERE provider_key = ?").all(target.key);
+    for (const statement of like
+      ? ["DELETE FROM provider_cooldowns WHERE provider_key = ? OR provider_key LIKE ? ESCAPE '\\'", "DELETE FROM provider_pause_strikes WHERE pause_key = ? OR pause_key LIKE ? ESCAPE '\\'"]
+      : ["DELETE FROM provider_cooldowns WHERE provider_key = ?", "DELETE FROM provider_pause_strikes WHERE pause_key = ?"]) {
+      db.prepare(statement).run(...(like ? [target.key, like] : [target.key]));
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    const removed = rows.map((row) => ({ providerKey: row.provider_key, until: new Date(Number(row.until_at)).toISOString(), errorType: row.error_type }));
+    logEvent("info", "provider.resumed_by_operator", { providerKey: target.key, removed: removed.length });
+    // Q-007: retries of this process that wait for a pause to end may start now; one whose model is
+    // still paused fails at its slot request and its retry policy picks again.
+    let released = 0;
+    for (const record of QUEUE_JOBS.values()) {
+      if (["pending", "planned"].includes(record.status) && record.startAfter) {
+        delete record.startAfter;
+        released += 1;
+      }
+    }
+    if (released) scheduleQueue();
+    return { ok: true, key: target.key, removed, target };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    return { ok: false, errorType: "provider_pause_failed", error: redactSensitiveText(error?.message || String(error)) };
   } finally {
     if (db) closeDb(db);
   }
@@ -3988,6 +4294,15 @@ function providerKeyForMetadata(metadata = null) {
     : `${CONFIG.providerConcurrencyKey}:${provider}`;
 }
 
+// B-061: the pause key of one provider/model, "<account key>:<provider>/<model>". It lives under the
+// same "<key>:" prefix as the per-provider slot keys, so status and diagnose list it with them.
+function modelPauseKeyForMetadata(metadata = null) {
+  const provider = String(metadata?.provider || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  const model = String(metadata?.model || "").trim();
+  if (!provider || !model || !MODEL_NAME_PATTERN.test(model)) return "";
+  return `${CONFIG.providerConcurrencyKey}:${provider}/${model}`;
+}
+
 // LIKE pattern for "<key>:<provider>" rows; "_" and "%" in the operator key are literals.
 function providerKeyLikePattern(baseKey) {
   return `${String(baseKey).replace(/[\\%_]/g, (item) => `\\${item}`)}:%`;
@@ -4052,7 +4367,9 @@ async function providerCapacitySnapshot() {
       errorType: row.error_type,
       reason: row.reason || "",
     }));
-    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns };
+    // Q-005: what the global worker cap counts (every held slot, every key).
+    const allLeaseCount = Number(db.prepare("SELECT COUNT(*) AS count FROM provider_leases").get()?.count || 0);
+    return { ok: true, providerKey: CONFIG.providerConcurrencyKey, capacity: capacityFor(CONFIG.providerConcurrencyKey), limits: describeConcurrencyLimits(), keys, leases, cooldowns, allLeaseCount };
   } catch (error) {
     return { ok: false, providerKey: CONFIG.providerConcurrencyKey, capacity: CONFIG.providerConcurrencyLimit, keys: [], leases: [], cooldowns: [], error: redactSensitiveText(error.message || String(error)) };
   } finally {
@@ -5493,6 +5810,157 @@ const GATEWAY_TIMEOUT_TEXT_PATTERN = /\b504\b|\bgateway[\s-]+time[\s-]?(?:d[\s-]
 const GATEWAY_DIAGNOSTIC_LINE_PATTERN = /\[50[0234]\]|\bupstream[\s-]+idle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 const GATEWAY_FAILURE_MESSAGE_PATTERN =/\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 
+// B-061: OpenCode's log lines are logfmt: `timestamp=2026-10-01T08:25:56.490Z level=ERROR run=...
+// message="stream error" providerID=opencode modelID=muse-spark-1.3-contributor-free
+// session.id=ses_... small=false agent=builder mode=all error.error="AI_APICallError: Rate limit
+// exceeded. Please retry after a brief wait."`. The same line reaches the job's stderr (the bridge
+// runs OpenCode with --print-logs) and ~/.local/share/opencode/log/opencode.log.
+function parseOpenCodeLogLine(line) {
+  const text = String(line || "");
+  if (!/\btimestamp=\S/.test(text) && !/\bmodelID=\S/.test(text)) return null;
+  const fields = {};
+  for (const match of text.matchAll(/([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|[^\s"]*)/g)) {
+    const raw = match[2];
+    let value = raw;
+    if (raw.startsWith("\"")) {
+      try { value = JSON.parse(raw); } catch { value = raw.slice(1, -1); }
+    }
+    if (!(match[1] in fields)) fields[match[1]] = String(value);
+  }
+  const timestamp = fields.timestamp || "";
+  const detail = Object.entries(fields)
+    .filter(([key]) => key === "message" || key === "error" || key.startsWith("error."))
+    .map(([, value]) => value)
+    .join(" ")
+    .slice(0, 2000);
+  return {
+    timestamp,
+    timestampMs: Date.parse(timestamp) || 0,
+    level: fields.level || "",
+    providerID: fields.providerID || "",
+    modelID: fields.modelID || "",
+    sessionID: fields["session.id"] || fields.sessionID || "",
+    agent: fields.agent || "",
+    small: fields.small === "true",
+    detail,
+  };
+}
+
+const RATE_LIMIT_LOG_PATTERN = /rate.?limit|too many requests|\b429\b|quota|insufficient account funds|RESOURCE_EXHAUSTED/i;
+
+// A rate-limit, quota or no-funds line of the main model. The title agent's small model fails on
+// its own account ("small=true agent=title ... Insufficient account funds") and says nothing about
+// the job's model, so those lines are ignored.
+function openCodeRateLimitHit(line) {
+  if (!RATE_LIMIT_LOG_PATTERN.test(String(line || ""))) return null;
+  const entry = parseOpenCodeLogLine(line);
+  if (!entry || entry.small || entry.agent.toLowerCase() === "title") return null;
+  if (!RATE_LIMIT_LOG_PATTERN.test(entry.detail)) return null;
+  const kind = /insufficient account funds/i.test(entry.detail) ? "funds" : /quota|RESOURCE_EXHAUSTED/i.test(entry.detail) ? "quota" : "rate_limit";
+  return { ...entry, kind, detail: redactSensitiveText(entry.detail).slice(0, 300) };
+}
+
+// Watches one agent run for silent rate limiting: rate-limit lines of the run's model on its own
+// stderr, and (when a log path is set) in OpenCode's log file. A file line names its session; once
+// the run's own session id is known (the first stdout event carries it) only that session counts,
+// before that the provider, model and agent must match and the line must be newer than the run.
+// Any stdout output means the agent is making progress and resets the count, so a run that
+// recovers between retries is never stopped.
+// B-070: two rules against a false pause. A log-file line counts only once the run's own session
+// id is known and the line names that session (before that, the job's stderr is the only source:
+// a line of another session on the same model, two of them in one scan, used to stop the run and
+// pause the model for everyone). And the hits of a streak must span reads at least minSpreadMs
+// apart (default 5 s): a burst delivered by one read, or several reads in the same moment, is one
+// observation, while OpenCode's real retries are seconds to minutes apart.
+const RATE_LIMIT_MIN_SPREAD_MS = 5000;
+
+function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "", logPath = "", scanMs = 15000, startedAtMs = Date.now(), minSpreadMs = RATE_LIMIT_MIN_SPREAD_MS, onTrip = () => {} } = {}) {
+  const state = { hits: 0, consecutive: 0, streakStartedAt: 0, sessionId: "", evidence: null, tripped: false, offset: -1, remainder: "", timer: null, scanning: false };
+  const seen = new Set();
+  const wantedProvider = String(provider || "").toLowerCase();
+  const wantedModel = String(model || "").toLowerCase();
+  const wantedAgent = String(agent || "").toLowerCase();
+  const modelMatches = (entry) => (!entry.modelID || entry.modelID.toLowerCase() === wantedModel)
+    && (!entry.providerID || !wantedProvider || entry.providerID.toLowerCase() === wantedProvider);
+  const consider = (entry, source, readAt = Date.now()) => {
+    if (!entry || state.tripped || !(hits > 0)) return;
+    if (source === "file") {
+      if (entry.timestampMs && entry.timestampMs < startedAtMs - 1000) return;
+      if (!state.sessionId || entry.sessionID !== state.sessionId) return;
+      if (!modelMatches(entry)) return;
+      if (wantedAgent && entry.agent && entry.agent.toLowerCase() !== wantedAgent) return;
+    } else if (!modelMatches(entry)) {
+      return;
+    }
+    // The same line arrives on stderr and in the file; count it once.
+    const key = `${entry.timestamp}|${entry.sessionID}|${entry.detail}`;
+    if (seen.has(key)) return;
+    if (seen.size > 500) seen.clear();
+    seen.add(key);
+    state.hits += 1;
+    state.consecutive += 1;
+    if (state.consecutive === 1) state.streakStartedAt = readAt;
+    state.evidence = { source, kind: entry.kind, at: entry.timestamp, sessionId: entry.sessionID, providerID: entry.providerID, modelID: entry.modelID, detail: entry.detail };
+    if (state.consecutive >= hits && readAt - state.streakStartedAt >= minSpreadMs) {
+      state.tripped = true;
+      try { onTrip(state.evidence); } catch { /* The trip only asks for termination. */ }
+    }
+  };
+  const scanFile = async () => {
+    if (!logPath || state.scanning || state.tripped) return;
+    state.scanning = true;
+    let handle = null;
+    try {
+      const details = await stat(logPath);
+      if (state.offset < 0 || details.size < state.offset) {
+        // First look (only lines written from now on count), or the file was rotated/truncated.
+        state.offset = state.offset < 0 ? details.size : 0;
+        state.remainder = "";
+        if (state.offset === details.size) return;
+      }
+      const length = Math.min(details.size - state.offset, 1024 * 1024);
+      if (length <= 0) return;
+      handle = await open(logPath, "r");
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, state.offset);
+      state.offset += bytesRead;
+      const lines = `${state.remainder}${buffer.subarray(0, bytesRead).toString("utf8")}`.split(/\r?\n/);
+      state.remainder = (lines.pop() || "").slice(-64 * 1024);
+      const readAt = Date.now();
+      for (const text of lines) consider(openCodeRateLimitHit(text), "file", readAt);
+    } catch {
+      // A missing or unreadable log file only means there is nothing to scan.
+    } finally {
+      state.scanning = false;
+      if (handle) await handle.close().catch(() => {});
+    }
+  };
+  return {
+    state,
+    start() {
+      if (!logPath || !(hits > 0) || state.timer) return;
+      void scanFile();
+      state.timer = setInterval(() => { void scanFile(); }, Math.max(50, scanMs));
+      state.timer.unref?.();
+    },
+    stop() {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = null;
+    },
+    scanNow: scanFile,
+    stderrLine(line) {
+      consider(openCodeRateLimitHit(line), "stderr");
+    },
+    stdoutText(text) {
+      if (!state.sessionId) {
+        const match = /"sessionID"\s*:\s*"([^"]{1,200})"/.exec(String(text || ""));
+        if (match) state.sessionId = match[1];
+      }
+      if (String(text || "").trim()) state.consecutive = 0;
+    },
+  };
+}
+
 function providerErrorTypeFromText(value) {
   const text = String(value || "");
   if (!text.trim()) {
@@ -6624,6 +7092,8 @@ function normalizeScopeContract(job) {
 
   const normalized = {
     ...(raw.modelRequirement !== undefined ? { modelRequirement: modelRequirementSchema.parse(raw.modelRequirement) } : {}),
+    // Q-009: kept as written (validated by selfCheckCommandsError, matched exactly by OpenCode).
+    ...(raw.selfCheckCommands !== undefined ? { selfCheckCommands: Array.isArray(raw.selfCheckCommands) ? raw.selfCheckCommands.map((item) => String(item).trim()) : raw.selfCheckCommands } : {}),
     agent: String(raw.agent || job.agent || "").trim(),
     role: String(raw.role || "").trim(),
     mode: normalizeScopeMode(raw.mode),
@@ -6904,6 +7374,10 @@ function formatScopeContractForPrompt(scopeContract, spell = (values) => normali
     `Shared/frozen paths: ${scopeContract.shared.length ? list(scopeContract.shared) : "none"}`,
     `Serial-only paths: ${scopeContract.serialOnly.length ? list(scopeContract.serialOnly) : "none"}`,
     `Validation command: ${scopeContract.validationCommand || "not specified"}`,
+    ...(Array.isArray(scopeContract.selfCheckCommands) && scopeContract.selfCheckCommands.length ? [
+      "Self-checks: when you finish, the bridge runs these commands in your working directory (you cannot run them). If one fails, you get another run with its output; fix what it reports then:",
+      ...scopeContract.selfCheckCommands.map((command) => `- ${command}`),
+    ] : []),
     `Allowed actions: ${scopeContract.actions.length ? scopeContract.actions.join(", ") : "not specified"}`,
     `Validation changedFilesMustBeWithinWriteScope: ${scopeContract.validation.changedFilesMustBeWithinWriteScope ? "yes" : "no"}`,
     `Validation forbiddenFilesMustNotChange: ${scopeContract.validation.forbiddenFilesMustNotChange ? "yes" : "no"}`,
@@ -7267,6 +7741,24 @@ function isTimeoutResult(result) {
   return result?.timedOut || result?.exitCode === 124 || result?.exitCode === "timeout";
 }
 
+// B-061: a run the rate-limit watcher stopped is provider_rate_limited, whatever OpenCode's own exit
+// looked like (it was killed while retrying). The evidence line is kept for the result and the log.
+function applyRateLimitOutcome(runResult, spawnResult) {
+  if (!spawnResult?.rateLimited) return runResult;
+  runResult.rateLimited = true;
+  runResult.rateLimitHits = Number(spawnResult.rateLimitHits || 0);
+  runResult.rateLimitEvidence = spawnResult.rateLimitEvidence || null;
+  runResult.providerErrorType = "provider_rate_limited";
+  runResult.openCodeApiErrorDetected = true;
+  return runResult;
+}
+
+function rateLimitPauseReason(runResult) {
+  const evidence = runResult?.rateLimitEvidence || {};
+  const kind = evidence.kind === "funds" ? "no account funds" : evidence.kind === "quota" ? "quota" : "rate limit";
+  return `${kind}: ${Number(runResult?.rateLimitHits || 0)} line(s) for ${evidence.providerID || runResult?.configuredProvider || "?"}/${evidence.modelID || runResult?.configuredModel || "?"} with no agent output in between (${evidence.source || "stderr"}${evidence.detail ? `: ${evidence.detail}` : ""})`;
+}
+
 function classifyResultError(result) {
   if (!result) {
     return null;
@@ -7499,6 +7991,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   // builder's Gemini fallback) the managed profile's provider is not the one spawned, and
   // counting the run against it over-subscribed the real provider.
   const providerKey = providerKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
+  // B-061: a rate-limit pause is recorded per provider/model; a slot request checks both keys.
+  const modelPauseKey = modelPauseKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
   // The slot wait has its own budget. It used to come out of the run timeout, so a builder
   // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
   const preSlotMs = Math.round(nowMs() - started);
@@ -7506,7 +8000,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   if (slotWaitJobId) providerSlotWaitingJobs.set(slotWaitJobId, { providerKey, since: new Date().toISOString() });
   let providerLease;
   try {
-    providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
+    providerLease = await acquireProviderLease({ providerKey, pauseKeys: modelPauseKey ? [modelPauseKey] : [], timeoutMs: CONFIG.providerWaitMaxMs, signal });
   } finally {
     if (slotWaitJobId) providerSlotWaitingJobs.delete(slotWaitJobId);
   }
@@ -7729,6 +8223,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   let isolatedRuntimeCleanup = { ok: true, error: "" };
   let containmentUnconfirmed = false;
   let providerQuarantine = null;
+  const runIdleTimeoutMs = agentIdleTimeoutForModel(configuredMetadata);
   const finalAttestationMs = Math.round(nowMs() - runStarted);
   const spawnCalledWallMs = Date.now();
   try {
@@ -7745,7 +8240,15 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
         beforeHeartbeat: renewSupervisorAuthority,
         // B-046: queue jobs show their last output; the idle watchdog is off unless configured.
         onActivity: slotWaitJobId ? (atMs) => noteAgentActivity(slotWaitJobId, atMs) : null,
-        idleTimeoutMs: CONFIG.agentIdleTimeoutMs,
+        idleTimeoutMs: runIdleTimeoutMs,
+        rateLimitWatch: CONFIG.rateLimitHits > 0 && configuredMetadata?.model ? {
+          hits: CONFIG.rateLimitHits,
+          provider: configuredMetadata.provider || "",
+          model: configuredMetadata.model,
+          agent,
+          logPath: CONFIG.openCodeLogPath,
+          scanMs: CONFIG.openCodeLogScanMs,
+        } : null,
       }
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
@@ -7800,7 +8303,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     timeoutMs,
     timedOut: isTimeoutResult(result),
     idleTimedOut: Boolean(result.idleTimedOut),
-    idleTimeoutMs: result.idleTimedOut ? CONFIG.agentIdleTimeoutMs : 0,
+    idleTimeoutMs: result.idleTimedOut ? runIdleTimeoutMs : 0,
     cancelled: Boolean(result.cancelled),
     cancellationErrorType: result.cancellationErrorType || "",
     providerTerminated: Boolean(result.providerTerminated),
@@ -7870,9 +8373,29 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const dependencyRequest = parseDependencyRequest(runResult.stdout);
   runResult.dependencyRequest = dependencyRequest.request;
   runResult.dependencyRequestError = dependencyRequest.error;
+  // B-061: stopped by the rate-limit watcher. A cancellation or a containment failure still wins
+  // (classifyResultError checks those first).
+  applyRateLimitOutcome(runResult, result);
   runResult.errorType = classifyResultError(runResult);
   if (!runResult.errorType && runtimeModelEvidencePresent && !runResult.modelAttested) {
     runResult.errorType = "opencode_model_mismatch";
+  }
+  if (runResult.errorType === "provider_rate_limited") {
+    const pause = await recordRateLimitPause({
+      pauseKey: modelPauseKey,
+      reason: rateLimitPauseReason(runResult),
+    });
+    if (pause.recorded) runResult.providerCooldownUntil = new Date(pause.untilAt).toISOString();
+    runResult.rateLimitPause = pause.recorded ? { until: runResult.providerCooldownUntil, strikes: pause.strikes, pauseKey: modelPauseKey, reused: Boolean(pause.reused) } : null;
+    logEvent("warn", "provider.rate_limit_detected", {
+      jobId: slotWaitJobId,
+      agent,
+      model: `${configuredMetadata?.provider || ""}/${configuredMetadata?.model || ""}`,
+      errorType: "provider_rate_limited",
+      hits: runResult.rateLimitHits,
+      pausedUntil: runResult.providerCooldownUntil || "",
+      summary: failureSummary(rateLimitPauseReason(runResult)),
+    });
   }
   if (runResult.errorType === "opencode_quota_exhausted" && runResult.retryAfterMs > 0) {
     const cooldown = await recordProviderCooldown({
@@ -8102,6 +8625,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     `Timeout ms: ${result?.timeoutMs ?? "not specified"}`,
     `Timed out: ${result?.timedOut ? "yes" : "no"}`,
     result?.idleTimedOut ? `Agent idle timeout: the agent wrote no output for ${result.idleTimeoutMs} ms (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS) and was stopped` : null,
+    result?.rateLimited ? `Rate limit detected: ${rateLimitPauseReason(result)}; the agent was stopped (CODEX_OPENCODE_RATE_LIMIT_HITS)${result.rateLimitPause ? `, ${result.rateLimitPause.pauseKey} paused until ${result.rateLimitPause.until} (pause ${result.rateLimitPause.strikes})` : ""}` : null,
     timedOutWriterLine(result),
     `Read-only unavailable: ${result?.readOnlyUnavailable ? "yes" : "no"}`,
     `Retry attempts used: ${result?.retryAttempt ?? 0}`,
@@ -8227,6 +8751,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
     result?.rawOutputTruncated ? "Raw process output truncated: yes" : null,
     result?.timedOut ? `Timed out: yes (timeout ms ${result.timeoutMs ?? "not specified"})` : null,
     result?.idleTimedOut ? `Idle timeout: yes (no output for ${result.idleTimeoutMs} ms)` : null,
+    result?.rateLimited ? `Rate limit detected: yes (${Number(result.rateLimitHits || 0)} line(s)${result.rateLimitPause ? `; paused until ${result.rateLimitPause.until}` : ""})` : null,
     timedOutWriterLine(result),
     result?.readOnlyUnavailable ? "Read-only unavailable: yes" : null,
     result?.retryAttempt ? `Retry attempts used: ${result.retryAttempt} of ${result.maxRetries ?? 0}` : null,
@@ -10917,7 +11442,9 @@ async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allow
 // `git diff --stat <base>` left out files the agent created (untracked in the worktree), so a
 // builder that wrote a new test file showed "1 file changed". The review patch already carries
 // every file, new ones included; count its lines instead.
-function diffStatFromPatch(patchText) {
+// Q-010: the patch's files with their kind (created, deleted, binary), for the stat below and for
+// auto-integration, which lands a patch by itself only when every file in it is new.
+function patchFileEntries(patchText) {
   const files = [];
   let current = null;
   for (const line of String(patchText || "").split("\n")) {
@@ -10940,6 +11467,11 @@ function diffStatFromPatch(patchText) {
     if (line.startsWith("+")) current.added += 1;
     else if (line.startsWith("-")) current.removed += 1;
   }
+  return files;
+}
+
+function diffStatFromPatch(patchText) {
+  const files = patchFileEntries(patchText);
   if (!files.length) return "";
   const width = Math.max(...files.map((file) => file.path.length));
   const rows = files.map((file) => {
@@ -12714,6 +13246,16 @@ async function integratePatchSerially(options) {
         error: stopIntegrationHeartbeat.signal.reason?.message || "The serial integration lease was lost before completion could be accepted.",
       };
     }
+    // B-069: an auto-integration's commit hooks, inside this lock, after the journal operation
+    // committed and validation passed: prepare before the cleanup (it reads the source worktree),
+    // commit after it (the cleanup checks that the target is still exactly as integrated).
+    const afterApplyEligible = Boolean(options.afterApply) && result.ok && result.status === "applied"
+      && result.journalStatus === "committed" && result.validationGate?.status === "passed" && !options.batch;
+    let afterApplyPrepared = null;
+    if (afterApplyEligible) {
+      afterApplyPrepared = await options.afterApply.prepare(result, { targetCwd })
+        .catch((error) => ({ ok: false, errorType: "auto_integration_prepare_failed", error: redactSensitiveText(error?.message || String(error)) }));
+    }
     if (result.ok && options.cleanupAfterSuccess && options.worktreePath) {
       await cleanupIntegratedWorktreeWhileLocked({
         result,
@@ -12722,6 +13264,10 @@ async function integratePatchSerially(options) {
         deferCleanup: Boolean(options.deferCleanup),
         beforeCleanupHook: options.beforeCleanupHook,
       });
+    }
+    if (afterApplyEligible) {
+      result.afterApply = await options.afterApply.commit(result, { targetCwd, prepared: afterApplyPrepared })
+        .catch((error) => ({ ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(error?.message || String(error)) }));
     }
     if (result.ok && result.status === "applied" && options.batch) {
       await cleanupIntegratedBatchWorktreesWhileLocked({
@@ -13425,6 +13971,7 @@ async function integratePatchWithoutSerialLock({
         patchPreview: previewMode === "stat" ? "" : secretLines.length ? redactLikelySecrets(patch.patch) : patch.patch,
         patchPreviewMaskedLines: secretLines,
         patchStat: diffStatFromPatch(patch.patch),
+        patchFiles: patchFileEntries(patch.patch).map((file) => ({ path: file.path, created: file.created, deleted: file.deleted, binary: file.binary })),
         patchPreviewTruncated: false,
         preExistingTargetChanges: targetChanges,
         allowDirtyTarget: Boolean(allowDirtyTarget),
@@ -14334,12 +14881,13 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
   const placeholders = nonTerminalStatuses.map(() => "?").join(", ");
   const finishedAt = new Date(now).toISOString();
   const reconciled = [];
+  const interrupted = [];
   let transactionOpen = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
     const rows = db.prepare(
-      `SELECT job_id, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
+      `SELECT job_id, cwd, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
               heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at,
               request_encrypted, revision, record_json
        FROM opencode_jobs
@@ -14437,6 +14985,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       if (Number(changed.changes || 0) > 0) {
         propagatePipelineTerminalInTransaction(db, row.job_id, terminalStatus, finishedAt);
         reconciled.push(row.job_id);
+        if (terminalStatus === "interrupted" && row.request_encrypted) interrupted.push({ jobId: row.job_id, cwd: row.cwd || snapshot.cwd || "" });
       }
     }
     db.exec("COMMIT");
@@ -14454,6 +15003,9 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       jobIds: reconciled,
     });
   }
+  // Q-008: a job a restart interrupted is resumed as its next attempt when it has a retry policy
+  // (applyQueueRetryPolicy decides; jobs without one stay interrupted for requeue_opencode_job).
+  for (const item of interrupted) scheduleQueueRetryPolicy(item.cwd, item.jobId);
 
   return reconciled;
 }
@@ -16391,12 +16943,14 @@ server.tool(
             `Parallel call job limit (CODEX_OPENCODE_PARALLEL_LIMIT): ${queueCapacity.parallelCallLimit} job(s) per run_opencode_parallel call (does not bound the queue)`,
             ...(queueCapacity.warning ? [queueCapacity.warning] : []),
             ...queueMemoryStatusLines(),
+            agentIdleTimeoutStatusLine(),
+            `Global worker limit (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT, all providers and bridge processes): ${describeConcurrencyLimits().global}; workers running now: ${Number(providerCapacity.allLeaseCount || 0)}`,
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
             ...providerCapacity.leases.map((lease) => `- provider lease ${lease.leaseId} (${lease.providerKey}): pid=${lease.ownerProcessId}, ${lease.quarantined ? "quarantined" : `remainingMs=${lease.remainingMs}`}, heartbeat=${lease.heartbeatAt || "none"}`),
             `Paused providers: ${(providerCapacity.cooldowns || []).length ? "" : "none"}`,
-            ...(providerCapacity.cooldowns || []).map((item) => `- ${item.providerKey}: paused until ${item.until} (${item.errorType}${item.reason ? `: ${item.reason}` : ""}); new jobs fail at once instead of starting`),
+            ...(providerCapacity.cooldowns || []).map((item) => `- ${item.providerKey}: paused until ${item.until} (${item.errorType}${item.reason ? `: ${item.reason}` : ""}); new jobs fail at once instead of starting; resume_opencode_provider ends it early`),
             `Bridge instance id: ${BRIDGE_INSTANCE_ID}`,
             "Default OpenCode orchestrator mode: planning-only",
             `Explicit user-authorized OpenCode contractor mode: ${/^[a-f0-9]{64}$/.test(effectiveContractorAuthorizationSha256()) ? "capability configured" : "disabled (capability not configured)"}`,
@@ -16794,9 +17348,24 @@ server.tool(
     serialOnly,
     validationCommand,
     validationFixPasses,
+    selfCheckPasses,
     delegation,
+    models,
+    maxAttempts,
+    autoIntegrate,
   }) => {
     const toolStarted = nowMs();
+    const queueOnly = queueOnlyOptionsError({ models, maxAttempts, autoIntegrate });
+    if (queueOnly) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Execution rejected.",
+        errorType: queueOnly.errorType,
+        reason: queueOnly.error,
+        requestedAgent: agent,
+        actualAgent: "none",
+        suggestedFix: queueOnly.suggestedFix,
+      }) }] };
+    }
     const requestedJob = {
       agent,
       task,
@@ -16830,6 +17399,7 @@ server.tool(
       serialOnly,
       validationCommand,
       validationFixPasses,
+      selfCheckPasses,
       delegation,
     };
     const directRunId = makeQueueJobId(agent);
@@ -17079,9 +17649,9 @@ function diagnoseJobView(job) {
 }
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
-  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "retryAttempt", "maxAttempts", "attemptHistory", "startAfter", "autoIntegration", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "lastActivityAt", "idleMs", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
-  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "phaseTimings",
+  "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "selfCheck", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
   "dependencyRequest", "readOnlyHeadMove", "resultTextChars", "resultTextTruncated", "resultText", "resultDetailTextChars",
 ];
@@ -17115,6 +17685,9 @@ function compactQueueJobLines(records) {
       record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
       record.requeuedFrom ? `requeuedFrom=${record.requeuedFrom}` : "",
       record.requeuedAs ? `requeuedAs=${record.requeuedAs}` : "",
+      record.maxAttempts ? `attempt=${record.retryAttempt || 1}/${record.maxAttempts}` : "",
+      record.maxAttempts && record.scopeContract?.modelRequirement?.model ? `model=${record.scopeContract.modelRequirement.provider}/${record.scopeContract.modelRequirement.model}` : "",
+      queueStartAfterPending(record) ? `startAfter=${record.startAfter}` : "",
       `agent=${record.agent || "?"}`,
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
@@ -17126,11 +17699,13 @@ function compactQueueJobLines(records) {
       record.usage?.steps ? `tokens=${record.usage.inputCount}in/${record.usage.outputCount}out` : "",
       record.usage?.steps && record.usage.cacheReadCount ? `cacheRead=${record.usage.cacheReadCount}` : "",
       record.validationFixPass ? `fixPass=${record.validationFixPass.used ? `used(${record.validationFixPass.finalValidation})` : "skipped"}` : "",
+      record.selfCheck ? `selfCheck=${record.selfCheck.final}(${record.selfCheck.passesUsed}/${record.selfCheck.passesAllowed})` : "",
       record.providerRetryWarningCount ? `providerErrorLines=${record.providerRetryWarningCount}` : "",
       record.readOnlyHeadMove ? `headMoved=${record.readOnlyHeadMove.readScopeTouched?.length ? "read-scope" : "outside-read-scope"}` : "",
       record.durationMs ? `durationMs=${record.durationMs}` : "",
       record.errorType ? `error=${record.errorType}` : "",
       record.completionOutcome ? `outcome=${record.completionOutcome}` : "",
+      record.autoIntegration?.status ? `autoIntegration=${record.autoIntegration.status}${record.autoIntegration.commit ? `@${String(record.autoIntegration.commit).slice(0, 12)}` : ""}` : "",
       (record.changedFiles || []).length ? `changed=${record.changedFiles.join(",")}` : "",
       queueTimedOutWriterNote(record) ? `note="${queueTimedOutWriterNote(record)}"` : "",
     ].filter(Boolean);
@@ -17407,6 +17982,7 @@ function formatConcurrencyChange(change) {
     change.reset ? "OpenCode concurrency limits reset to the environment values." : "OpenCode concurrency limits updated.",
     `Provider slots per provider: ${described.provider}; was ${change.previous.providerLimit}`,
     `Queue parallel limit (this process): ${described.queue}; was ${change.previous.queueParallelLimit}`,
+    `Global worker limit (all providers and bridge processes): ${described.global}; was ${change.previousGlobalWorkerLimit === 0 ? "0 (no cap)" : change.previousGlobalWorkerLimit}`,
     "Running jobs keep their slots; a lower limit only holds back new starts until enough jobs have finished.",
     `Persisted in ${path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite")}: other bridge processes pick it up at their next scheduler pass or slot request, and a restart keeps it until reset: true.`,
   ].join("\n");
@@ -17474,14 +18050,15 @@ server.tool(
 
 server.tool(
   "set_opencode_concurrency",
-  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT) and/or the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}. The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
+  `Change the provider slot limit (CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT), the queue parallel limit (CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT) and/or the global worker cap over all providers (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT, 0 = none) of the running bridge without a restart, so running jobs are not interrupted. Values are 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT} (global 0 to ${MAX_GLOBAL_WORKER_LIMIT}). The change is persisted until reset: true returns to the environment values. Lowering never kills running jobs; it only holds back new starts.`,
   {
     providerLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Simultaneous model calls per provider, across all bridge processes."),
     queueParallelLimit: z.number().int().min(1).max(MAX_RUNTIME_CONCURRENCY_LIMIT).optional().describe("Queue jobs this bridge process runs at once (the provider limit still caps model calls)."),
-    reset: z.boolean().optional().describe("Clear both runtime overrides and return to the environment values. Do not combine with a limit."),
+    globalWorkerLimit: z.number().int().min(0).max(MAX_GLOBAL_WORKER_LIMIT).optional().describe("Agents running at once on ALL providers across all bridge processes (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT); 0 removes the cap."),
+    reset: z.boolean().optional().describe("Clear every runtime override and return to the environment values. Do not combine with a limit."),
   },
-  async ({ providerLimit, queueParallelLimit, reset = false }) => {
-    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset });
+  async ({ providerLimit, queueParallelLimit, globalWorkerLimit, reset = false }) => {
+    const change = await setRuntimeConcurrency({ providerLimit, queueParallelLimit, globalWorkerLimit, reset });
     if (!change.ok) {
       return {
         isError: true,
@@ -17489,11 +18066,71 @@ server.tool(
           headline: "Concurrency change rejected.",
           errorType: change.errorType,
           reason: change.error,
-          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, or reset: true.`,
+          suggestedFix: `Pass providerLimit and/or queueParallelLimit as integers from 1 to ${MAX_RUNTIME_CONCURRENCY_LIMIT}, globalWorkerLimit from 0 to ${MAX_GLOBAL_WORKER_LIMIT}, or reset: true.`,
         }) }],
       };
     }
     return { content: [{ type: "text", text: formatConcurrencyChange(change) }] };
+  }
+);
+
+// Q-005: runtime pause of a provider or one of its models (orch/pause.json of the round-6
+// orchestrator). Stored with the automatic pauses in provider-concurrency.sqlite, so every bridge
+// process honours it at its next slot request and it survives a restart.
+server.tool(
+  "pause_opencode_provider",
+  "Pause a provider (\"opencode\") or one model (\"opencode/muse-spark-1.3-contributor-free\") until a time or for some minutes, in every bridge process. Running jobs keep going; new jobs on it fail at once with provider_paused (a job with a models list moves to its next model). Replaces any pause already on that key, shorter or longer. resume_opencode_provider ends it early.",
+  {
+    provider: z.string().min(1).describe("provider or provider/model, as in CODEX_OPENCODE_MODEL_ALLOWLIST without the @variant."),
+    until: z.string().optional().describe("ISO time the pause ends (at most 24 h ahead). Give until or minutes."),
+    minutes: z.number().int().min(1).max(24 * 60).optional().describe("Pause length in minutes. Give until or minutes."),
+    reason: z.string().max(200).optional().describe("Shown in get_opencode_bridge_status and in the error new jobs get."),
+  },
+  async ({ provider, until, minutes, reason = "" }) => {
+    const paused = await pauseProvider({ provider, until, minutes, reason });
+    if (!paused.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Provider pause rejected.",
+          errorType: paused.errorType,
+          reason: paused.error,
+          suggestedFix: "Pass provider as provider or provider/model and exactly one of until (ISO time, at most 24 h ahead) or minutes (1 to 1440).",
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: [
+      `Provider paused: ${paused.key}`,
+      `Until: ${paused.until}`,
+      paused.target.model ? `Scope: model ${paused.target.provider}/${paused.target.model} only` : `Scope: every model of ${paused.target.provider}${CONFIG.providerConcurrencyKeyExplicit ? ` (CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY is set, so every provider shares this key and this pause covers them all)` : ""}`,
+      "Running jobs keep their slots; new jobs on this key fail at once with provider_paused until then, in every bridge process.",
+    ].join("\n") }] };
+  }
+);
+
+server.tool(
+  "resume_opencode_provider",
+  "End the pause of a provider or provider/model early, whether an operator set it (pause_opencode_provider) or the bridge did (a quota reset time, a detected rate limit). For a whole provider it also clears the pauses of its models and their rate-limit backoff.",
+  {
+    provider: z.string().min(1).describe("provider or provider/model."),
+  },
+  async ({ provider }) => {
+    const resumed = await resumeProvider({ provider });
+    if (!resumed.ok) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatToolRefusal({
+          headline: "Provider resume rejected.",
+          errorType: resumed.errorType,
+          reason: resumed.error,
+          suggestedFix: "Pass provider as provider or provider/model.",
+        }) }],
+      };
+    }
+    return { content: [{ type: "text", text: [
+      `Provider resumed: ${resumed.key}`,
+      `Pauses removed: ${resumed.removed.length ? resumed.removed.map((item) => `${item.providerKey} (was until ${item.until}, ${item.errorType})`).join("; ") : "none (nothing was paused)"}`,
+    ].join("\n") }] };
   }
 );
 
@@ -19292,6 +19929,16 @@ function validateParallelWritePlan(jobs) {
     if (sanitizedError) {
       return { ...sanitizedError, lockPlans };
     }
+    const queueOnly = queueOnlyOptionsError(job);
+    if (queueOnly) return { ...queueOnly, lockPlans };
+    if (job.scopeContract?.selfCheckCommands !== undefined) {
+      return {
+        error: "selfCheckCommands is not supported by run_opencode_parallel: the self-check passes are implemented for single and queued jobs only.",
+        errorType: "self_check_unsupported_in_parallel",
+        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove selfCheckCommands.",
+        lockPlans,
+      };
+    }
     if (job.validationFixPasses) {
       return {
         error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
@@ -19502,6 +20149,84 @@ function validateParallelWritePlan(jobs) {
   return { error: null, lockPlans };
 }
 
+// Q-009, B-068: self-check commands. Builders have no shell beyond git diagnostics, so in round 3 a
+// builder could not run `node tools/validate.cjs` on the batch it wrote. A write job's Scope
+// Contract may name exact commands that the BRIDGE runs in the worktree after the agent finished
+// (before validationCommand, with the same trust rules and the process supervisor); a failing one
+// gives the agent another run with its output (selfCheckPasses, default 2, at most 3). The agent
+// itself gets no new permission: B-068 removed the first version, which let the agent run these
+// commands through exact bash allow rules, because edits are not restricted while the agent runs
+// (it could rewrite the script, run it as the bridge user, and put it back). Each command is still
+// one plain command (no wildcard, quote, backslash or shell operator) whose executable passes the
+// validationCommand rules, and a script an interpreter runs must not be an allowed edit.
+const SELF_CHECK_MAX_COMMANDS = 8;
+const SELF_CHECK_FORBIDDEN_CHARACTERS = /[*?[\]{}"'`$;&|<>()\\\r\n\t]/;
+const SELF_CHECK_INTERPRETERS = new Set(["node", "python", "python3", "py", "bun", "deno"]);
+
+const SELF_CHECK_DEFAULT_PASSES = 2;
+const SELF_CHECK_MAX_PASSES = 3;
+
+function selfCheckCommandsError(job, lockPlan) {
+  const commands = lockPlan?.scopeContract?.selfCheckCommands ?? job?.scopeContract?.selfCheckCommands;
+  const refuse = (errorType, error) => ({ errorType, error, suggestedFix: "List exact commands such as \"node tools/validate.cjs out/x.json\" for a builder or debugger write job, or remove selfCheckCommands." });
+  const passes = job?.selfCheckPasses;
+  if (passes !== undefined && passes !== null) {
+    if (typeof passes !== "number" || !Number.isInteger(passes) || passes < 0 || passes > SELF_CHECK_MAX_PASSES) {
+      return refuse("self_check_invalid", `selfCheckPasses must be an integer from 0 to ${SELF_CHECK_MAX_PASSES}; got ${JSON.stringify(passes)}.`);
+    }
+    if (commands === undefined || commands === null) return refuse("self_check_not_applicable", "selfCheckPasses needs scopeContract.selfCheckCommands: the passes run after a self-check failed.");
+  }
+  if (commands === undefined || commands === null) return null;
+  if (!Array.isArray(commands) || !commands.length || commands.length > SELF_CHECK_MAX_COMMANDS) {
+    return refuse("self_check_invalid", `selfCheckCommands must list 1 to ${SELF_CHECK_MAX_COMMANDS} commands.`);
+  }
+  const agent = String(job?.agent || "").toLowerCase();
+  if (lockPlan?.lockType === "read" || job?.sanitizedWorkspace || !WRITE_CAPABLE_AGENTS.has(agent) || job?.orchestratorMode === "contractor") {
+    return refuse("self_check_not_applicable", "selfCheckCommands apply to builder and debugger write jobs only (read-only roles and sanitized readers have no shell; a contractor delegates its checks).");
+  }
+  const allowedEdits = normalizeLockPathList(lockPlan?.allowedEdits || job?.allowedEdits || []);
+  const editable = (candidate) => {
+    const normalized = normalizeLockPathList([candidate])[0] || "";
+    return Boolean(normalized) && allowedEdits.some((edit) => normalized === edit || normalized.startsWith(`${edit}/`));
+  };
+  const seen = new Set();
+  for (const raw of commands) {
+    const command = String(raw ?? "").trim();
+    if (!command || SELF_CHECK_FORBIDDEN_CHARACTERS.test(command) || /\s{2,}/.test(command)) {
+      return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} must be one plain command with single spaces: no wildcards, quotes, backslashes, shell operators or substitutions.`);
+    }
+    if (seen.has(command)) return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} is listed twice.`);
+    seen.add(command);
+    const parsed = command.split(" ");
+    if (/[\\/]/.test(parsed[0])) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)} must start with a bare executable name from CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST.`);
+    const trust = validationCommandTrustError(parsed);
+    if (trust) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)}: ${trust}`);
+    const executable = parsed[0].toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
+    if (SELF_CHECK_INTERPRETERS.has(executable)) {
+      const script = parsed.slice(1).find((argument) => !argument.startsWith("-"));
+      if (script && editable(script)) {
+        return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs ${script}, which this job may edit; the agent could change it and run its own code.`);
+      }
+    }
+    if (["npm", "pnpm", "yarn"].includes(executable) && editable("package.json")) {
+      return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs package.json scripts, and package.json is an allowed edit of this job.`);
+    }
+  }
+  return null;
+}
+
+// Q-007: options only the durable queue can honour (it requeues, waits and integrates after the
+// run); a direct or parallel run would silently ignore them, so they are refused there.
+function queueOnlyOptionsError(job) {
+  const named = ["models", "maxAttempts", "autoIntegrate"].filter((key) => job?.[key] !== undefined && job?.[key] !== null);
+  if (!named.length) return null;
+  return {
+    errorType: "queue_only_option",
+    error: `${named.join(", ")} ${named.length === 1 ? "is" : "are"} honoured by enqueue_opencode_job only: the queue retries, waits for paused models and integrates after the run; this tool would ignore ${named.length === 1 ? "it" : "them"}.`,
+    suggestedFix: "Enqueue the job with enqueue_opencode_job, or remove the option.",
+  };
+}
+
 // Q-004: validationFixPasses is 0 or 1 and only means something for a write job whose
 // validationCommand the bridge runs; anything else would be an option that silently does nothing.
 function validationFixPassError(job, lockPlan) {
@@ -19575,6 +20300,8 @@ function validateSingleLockPlan(job) {
 
   const fixPassError = validationFixPassError(job, lockPlan);
   if (fixPassError) return { ...fixPassError, lockPlan };
+  const selfCheckError = selfCheckCommandsError(job, lockPlan);
+  if (selfCheckError) return { ...selfCheckError, lockPlan };
 
   const unsafeReason = unsafePathReason(planPathInputs, lockPlan.cwd);
   if (unsafeReason) {
@@ -19701,6 +20428,46 @@ function buildValidationFixPrompt(prompt, validationGate) {
     validationGate.stdout ? `Validation stdout:\n${clip(validationGate.stdout)}` : null,
     validationGate.stderr ? `Validation stderr:\n${clip(validationGate.stderr)}` : null,
   ].filter((line) => line !== null).join("\n");
+}
+
+// B-068: the prompt of a self-check pass: the job's own prompt plus the failing check's output.
+function buildSelfCheckFixPrompt(prompt, gate, pass, passesAllowed) {
+  const clip = (value) => String(value || "").slice(0, VALIDATION_FIX_OUTPUT_CHARS);
+  return [
+    prompt,
+    "",
+    `SELF-CHECK FIX PASS ${pass} of ${passesAllowed}`,
+    "Your changes so far are in this working tree. The bridge ran the job's self-check commands and this one FAILED. You cannot run commands; the bridge runs every self-check again after this pass.",
+    "Fix only what the output below shows, with the same Scope Contract and allowed edits as before: do not edit other files, do not widen the scope, do not weaken or skip the check.",
+    "If the failure cannot be fixed inside the allowed edits, change nothing and say why in your final report. Answer in the same report format as before.",
+    "",
+    `Self-check command: ${gate.command}`,
+    `Self-check exit code: ${gate.exitCode}`,
+    gate.stdout ? `Self-check stdout:\n${clip(gate.stdout)}` : null,
+    gate.stderr ? `Self-check stderr:\n${clip(gate.stderr)}` : null,
+  ].filter((line) => line !== null).join("\n");
+}
+
+function selfCheckFailureSummary(gate) {
+  return { command: gate.command, exitCode: gate.exitCode, excerpt: truncateText([gate.stderr, gate.stdout].filter(Boolean).join("\n"), 600) };
+}
+
+// "" when a failed self-check gets another pass, else why not (as for the Q-004 fix pass).
+function selfCheckPassSkipReason({ result, validation, validationGate, aborted = false, remainingMs = 0 }) {
+  if (validationGate.errorType !== "self_check_failed") return `the self-check did not run to a result (${validationGate.errorType || validationGate.status})`;
+  if (!Number.isInteger(validationGate.exitCode)) return `the self-check ended without an exit code (${validationGate.exitCode})`;
+  if (result.errorType !== "self_check_failed" || validation.disallowedFiles.length) return `the run also ended with ${result.errorType !== "self_check_failed" ? result.errorType : "changes outside the allowed edits"}`;
+  if (aborted) return "the job was cancelled or lost its lock";
+  if (remainingMs < VALIDATION_FIX_MIN_REMAINING_MS) return `only ${Math.max(0, Math.round(remainingMs / 1000))} s of the job timeout are left (a pass needs ${VALIDATION_FIX_MIN_REMAINING_MS / 1000} s)`;
+  return "";
+}
+
+function formatSelfCheck(selfCheck) {
+  if (!selfCheck) return "";
+  const head = selfCheck.final === "failed"
+    ? `Self-checks: failed (${selfCheck.failedCommand}, exit code ${selfCheck.failedExitCode})`
+    : `Self-checks: ${selfCheck.final}`;
+  return `${head}; fix passes used ${selfCheck.passesUsed} of ${selfCheck.passesAllowed}${selfCheck.firstFailure ? `; first failure: ${selfCheck.firstFailure.command} exit code ${selfCheck.firstFailure.exitCode}` : ""}${selfCheck.skipped ? `; no further pass: ${selfCheck.skipped}` : ""}`;
 }
 
 // "" when the failed validation gets its pass, else why not. A command that never ran, a
@@ -20353,6 +21120,9 @@ async function executeOpenCodeJob(requestedJob, {
         ),
       };
     };
+    const selfCheckCommands = Array.isArray(lockPlan.scopeContract?.selfCheckCommands) && lockPlan.lockType !== "read"
+      ? lockPlan.scopeContract.selfCheckCommands.map((item) => String(item).trim()).filter(Boolean)
+      : [];
     const runAgent = (agentPrompt, runTimeoutMs) => jobAgentRuntime().runOpenCodeWithPolicy(
       resolution.actualAgent,
       agentPrompt,
@@ -20440,6 +21210,21 @@ async function executeOpenCodeJob(requestedJob, {
         result.stderr = [result.stderr, scopeFilesystemViolation.error].filter(Boolean).join("\n");
       }
       phaseClock.mark("postAgentChecks");
+      // B-068: the bridge runs the job's self-check commands first, like validationCommand (same
+      // trust rules, same supervisor and timeout); the first failing one stands in for the
+      // validation gate, so the self-check pass below can hand its output to the agent.
+      if (selfCheckCommands.length && !dryRun && !manifestProtected && !validation.disallowedFiles.length && !result.errorType) {
+        result.selfChecksRan = true;
+        for (const command of selfCheckCommands) {
+          const check = await runValidationGate({ command, cwd: executionCwd, dryRun, timeoutMs: CONFIG.validationCommandTimeoutMs, signal: executionSignal });
+          if (check.status !== "passed") {
+            const selfCheckGate = { ...check, selfCheck: true, errorType: check.errorType === "validation_command_failed" ? "self_check_failed" : check.errorType || "self_check_failed" };
+            result.errorType = selfCheckGate.errorType;
+            phaseClock.mark("validation");
+            return { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate: selfCheckGate };
+          }
+        }
+      }
       const validationGate = manifestProtected
         ? { status: sanitizedAfter?.ok ? "passed_manifest" : "failed_manifest", command: "", exitCode: sanitizedAfter?.ok ? 0 : 1, durationMs: 0, stdout: "", stderr: sanitizedAfter?.error || "", errorType: sanitizedAfter?.ok ? null : sanitizedAfter?.errorType }
         : !validation.disallowedFiles.length && !result.errorType
@@ -20460,11 +21245,39 @@ async function executeOpenCodeJob(requestedJob, {
       return { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate };
     };
     let { result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(await runAgent(prompt, lockPlan.timeoutMs));
+    // B-068: a failed self-check gives the agent another run in the same worktree with the check's
+    // output, up to selfCheckPasses (default 2); every run is judged by the same checks, and the
+    // self-checks (then validationCommand) run again after each.
+    if (selfCheckCommands.length && !dryRun) {
+      const passesAllowed = Number.isInteger(requestedJob.selfCheckPasses) ? requestedJob.selfCheckPasses : SELF_CHECK_DEFAULT_PASSES;
+      const firstFailure = validationGate.selfCheck ? selfCheckFailureSummary(validationGate) : null;
+      let passesUsed = 0;
+      let skipped = "";
+      while (validationGate.selfCheck && validationGate.status === "failed" && passesUsed < passesAllowed) {
+        const remainingMs = Math.floor(timeoutForAgent(resolution.actualAgent, lockPlan, lockPlan.timeoutMs) - agentProcessMsOf(result));
+        const fixPrompt = buildSelfCheckFixPrompt(prompt, validationGate, passesUsed + 1, passesAllowed);
+        skipped = selfCheckPassSkipReason({ result, validation, validationGate, aborted: Boolean(executionSignal?.aborted), remainingMs })
+          || openCodeCommandLineLengthError(OPENCODE_EXE, openCodeRunArgs(resolution.actualAgent, fixPrompt, null));
+        if (skipped) break;
+        const fixedRun = await runAgent(fixPrompt, remainingMs);
+        ({ result, afterFiles, afterFilesForValidation, executionHeadAfterAgent, validation, validationGate } = await evaluateAgentRun(mergeValidationFixRuns(result, fixedRun)));
+        passesUsed += 1;
+      }
+      result.selfCheck = {
+        commands: selfCheckCommands,
+        passesAllowed,
+        passesUsed,
+        firstFailure,
+        final: validationGate.selfCheck ? "failed" : result.selfChecksRan ? "passed" : "not_run",
+        ...(validationGate.selfCheck ? { failedCommand: validationGate.command, failedExitCode: validationGate.exitCode } : {}),
+        ...(skipped ? { skipped } : {}),
+      };
+    }
     // Q-004: a builder cannot run its own checks, so a job that asked for validationFixPasses: 1
     // gets one more run in the same worktree when its validation command failed, with the
     // validation output, inside what is left of the job timeout. The second run is judged by the
     // same checks and the validation command runs again; the job fails as before if it still fails.
-    if (Number(requestedJob.validationFixPasses) === 1 && !dryRun && validationGate.status === "failed") {
+    if (Number(requestedJob.validationFixPasses) === 1 && !dryRun && validationGate.status === "failed" && !validationGate.selfCheck) {
       const firstValidation = {
         exitCode: validationGate.exitCode,
         durationMs: validationGate.durationMs || 0,
@@ -20673,7 +21486,7 @@ async function executeOpenCodeJob(requestedJob, {
     const lockLines = [`Temporary lock acquired: ${hardLockSummary(acquiredLock)}`, `Temporary lock released: ${lockRelease.text}`];
     const singleParts = formatSingleResultParts({ resolution, result, cwd: executionCwd, lockPlan });
     const driftLine = formatReadOnlyWorkspaceDrift(result.readOnlyWorkspaceDrift);
-    const validationGateText = [formatValidationFixPass(result.validationFixPass), formatValidationGateResult(validationGate)].filter(Boolean).join("\n");
+    const validationGateText = [formatSelfCheck(result.selfCheck), formatValidationFixPass(result.validationFixPass), formatValidationGateResult(validationGate)].filter(Boolean).join("\n");
     // Stored view (queue result text, run audit): the same text without the patch preview, fitted
     // to the result limit report-first. The lock lines are safety evidence, so they stay in the
     // shortened stand-in for the preamble.
@@ -20789,8 +21602,15 @@ async function executeOpenCodeJob(requestedJob, {
 // A queued job is "running" from the moment a worker claims it, but it may then wait minutes for
 // a provider slot before the agent starts, so status alone cannot tell waiting from working and
 // durationMs includes the wait. runStage and agentRunMs separate the two.
+function queueStartAfterPending(record, now = Date.now()) {
+  const at = Date.parse(record?.startAfter || "");
+  return Number.isFinite(at) && at > now;
+}
+
 function queueRunStage(record) {
   if (record.status !== "running") {
+    // Q-007: a retry that waits for the provider/model pause of every candidate model to end.
+    if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) return "waiting_for_provider_pause";
     // B-045: a pending job held back by the free-memory floor (jobs of this process only).
     return ["pending", "planned"].includes(record.status) && queueMemoryWaitingJobs.has(record.jobId)
       ? "waiting_for_memory"
@@ -20859,6 +21679,16 @@ function queueRecordSnapshot(record, includeResult = true) {
     requeuedAs: record.requeuedAs || "",
     requeueSequence: record.requeueSequence || 0,
     requeuedAt: record.requeuedAt || "",
+    // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
+    retryAttempt: record.retryAttempt || 0,
+    maxAttempts: record.maxAttempts || 0,
+    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
+    startAfter: record.startAfter || "",
+    slotWaitRequeues: record.slotWaitRequeues || 0,
+    // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
+    // (a restart reschedules completed jobs that asked and are not integrated yet).
+    autoIntegration: record.autoIntegration || null,
+    autoIntegrateRequested: Boolean(record.autoIntegrateRequested),
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -20889,6 +21719,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     usage: record.usage || null,
     heavyToolCalls: record.heavyToolCalls || null,
     validationFixPass: record.validationFixPass || null,
+    selfCheck: record.selfCheck || null,
     phaseTimings: record.phaseTimings || null,
     readOnlyHeadMove: record.readOnlyHeadMove || null,
     retryCount: record.retryCount || 0,
@@ -22007,6 +22838,17 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     };
   }
 
+  // Q-007: a retry policy (models / maxAttempts) is checked first and pins the first model.
+  const retryPolicy = applyRetryPolicyToJob(job, parentJobId);
+  if (!retryPolicy.ok) {
+    return {
+      ok: false,
+      errorType: retryPolicy.errorType,
+      error: retryPolicy.error,
+      suggestedFix: retryPolicy.suggestedFix || "Fix models/maxAttempts (provider/model[@variant] entries from CODEX_OPENCODE_MODEL_ALLOWLIST, 1 to 10 attempts) and enqueue again.",
+    };
+  }
+  job = retryPolicy.job;
   const normalizedJob = await normalizeJobCwd(job);
   const { error, errorType, suggestedFix, lockPlan, serialOnlyMatches = [] } = validateSingleLockPlan(normalizedJob);
   if (error || (hasWriteIntent(normalizedJob) && lockPlan.lockType === "read")) {
@@ -22028,6 +22870,8 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
       lockPlan,
     };
   }
+  const autoIntegrateError = autoIntegrateJobError(normalizedJob, lockPlan, parentJobId);
+  if (autoIntegrateError) return { ok: false, ...autoIntegrateError, lockPlan };
 
   const now = new Date().toISOString();
   const jobId = makeQueueJobId(job.agent);
@@ -22107,9 +22951,13 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     childContainmentIdentity: "",
     containmentQuarantined: false,
     revision: 0,
+    // Q-007: attempt counters of a retry policy (a requeue by the policy passes the next ones).
+    ...(retryPolicy.policy ? { retryAttempt: 1, maxAttempts: retryPolicy.policy.maxAttempts } : {}),
+    ...(normalizedJob.autoIntegrate === true ? { autoIntegrateRequested: true } : {}),
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
+  if (!record.startAfter) delete record.startAfter;
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -22203,11 +23051,527 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
   }
 }
 
+// Q-007: model fallback for queued jobs (the round-6 orchestrator's TOOL_ORDER + attempts). A job
+// that names `models` and/or `maxAttempts` carries a retry policy: when it fails for a reason
+// another model or another try can fix, the bridge requeues it itself through requeueQueueJob (the
+// same validation as requeue_opencode_job, the same lineage fields) on the next model that is not
+// paused, and after maxAttempts it marks the last job outcome=gave_up. The policy lives in the
+// stored encrypted request, so it survives a restart and a requeue keeps it.
+const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
+const RETRY_POLICY_MAX_ATTEMPTS = 10;
+const RETRY_POLICY_MAX_SLOT_WAITS = 12;
+
+// B-072: removes the worktree of a failed write attempt only when it holds nothing: no changed
+// file in the record, and git sees no change, untracked file or commit in it.
+async function removeEmptyRetryWorktree(projectRoot, summary) {
+  const worktreePath = String(summary?.worktreePath || "");
+  if (summary?.mode !== "write" || !worktreePath || (summary.changedFiles || []).length || !existsSync(worktreePath)) return { removed: false };
+  const status = await runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"], worktreePath, 30_000);
+  if (status.exitCode !== 0 || String(status.stdout || "").trim()) return { removed: false, reason: "the worktree has changes" };
+  const head = await runCommand("git", ["rev-parse", "HEAD"], worktreePath, 15_000);
+  if (summary.worktreeBaseCommit && head.stdout.trim() !== summary.worktreeBaseCommit) return { removed: false, reason: "the worktree has a commit of its own" };
+  const cleanup = await cleanupWorktree({ path: worktreePath, branch: summary.worktreeBranch || "", repoRoot: projectRoot }, "always", true).catch((error) => ({ cleanup: "failed", error: error?.message || String(error) }));
+  return { removed: cleanup?.cleanup === "removed" || !existsSync(worktreePath), cleanup: cleanup?.cleanup || "" };
+}
+const RETRY_POLICY_ERROR_TYPES = new Set([
+  // The provider: limits, pauses, quotas and outages another model (or a later try) avoids.
+  "provider_rate_limited", "provider_paused", "provider_slot_wait_timeout",
+  "opencode_rate_limited", "opencode_quota_exhausted", "opencode_billing_error", "opencode_auth_error",
+  "opencode_model_error", "opencode_transient_provider_error", "opencode_provider_unavailable",
+  "opencode_transport_error", "opencode_api_error", "opencode_native_fallback", "opencode_stream_malformed",
+  // The run: stalled, too slow, or ended without a usable result.
+  "agent_idle_timeout", "agent_timeout", "agent_empty_final_response", "agent_exit_nonzero",
+  "essential_output_truncated", "validation_command_failed", "self_check_failed", "writer_no_changes",
+  // Q-008: the owner died while the job ran (a client restart).
+  "queue_job_interrupted",
+]);
+
+function retryPolicyRequirement(parsed) {
+  return { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
+}
+
+function retryPolicyModelSpec(parsed) {
+  return `${parsed.provider}/${parsed.model}${parsed.variant ? `@${parsed.variant}` : ""}`;
+}
+
+// { ok, policy } with policy null when the job asks for none; refusals name what is wrong.
+function jobRetryPolicy(job) {
+  const models = Array.isArray(job?.models) ? job.models : [];
+  const hasModels = job?.models !== undefined && job?.models !== null;
+  const hasMax = job?.maxAttempts !== undefined && job?.maxAttempts !== null;
+  if (!hasModels && !hasMax) return { ok: true, policy: null };
+  if (hasModels && (!Array.isArray(job.models) || !models.length || models.length > 8)) {
+    return { ok: false, errorType: "retry_policy_invalid", error: "models must be a list of 1 to 8 provider/model[@variant] entries." };
+  }
+  if (hasMax && (typeof job.maxAttempts !== "number" || !Number.isInteger(job.maxAttempts) || job.maxAttempts < 1 || job.maxAttempts > RETRY_POLICY_MAX_ATTEMPTS)) {
+    return { ok: false, errorType: "retry_policy_invalid", error: `maxAttempts must be an integer from 1 to ${RETRY_POLICY_MAX_ATTEMPTS}; got ${JSON.stringify(job.maxAttempts)}.` };
+  }
+  const parsed = [];
+  for (const entry of models) {
+    const item = parseModelAllowlistEntry(entry);
+    if (!item) return { ok: false, errorType: "retry_policy_invalid", error: `models entry ${JSON.stringify(entry)} is not in provider/model[@variant] form.` };
+    if (!allowlistedModelOverride(retryPolicyRequirement(item), job?.agent)) {
+      const allowlist = activeModelOverrideAllowlist();
+      return {
+        ok: false,
+        errorType: "retry_policy_model_not_allowlisted",
+        error: `models entry ${retryPolicyModelSpec(item)} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or agent ${job?.agent || "?"} cannot be overridden.`,
+        suggestedFix: "List only allowlisted models, or ask the operator to add the model to CODEX_OPENCODE_MODEL_ALLOWLIST.",
+      };
+    }
+    parsed.push({ ...item, spec: retryPolicyModelSpec(item) });
+  }
+  return { ok: true, policy: { models: parsed, maxAttempts: hasMax ? job.maxAttempts : RETRY_POLICY_DEFAULT_ATTEMPTS } };
+}
+
+// Applied by enqueueQueueJob: refuses a policy where it cannot work and pins the first model.
+function applyRetryPolicyToJob(job, parentJobId = "") {
+  const checked = jobRetryPolicy(job);
+  if (!checked.ok || !checked.policy) return { ...checked, job };
+  // B-072: retries are requeues of the stored request, which only the SQLite queue keeps.
+  if (effectiveQueueMode() !== "sqlite") return { ok: false, errorType: "retry_policy_not_applicable", error: `models/maxAttempts need CODEX_OPENCODE_QUEUE_MODE=sqlite (the queue mode is ${effectiveQueueMode()}): a retry is a requeue of the stored request, which the other modes drop.` };
+  if (parentJobId) return { ok: false, errorType: "retry_policy_not_applicable", error: "A pipeline job is retried by its pipeline, not by models/maxAttempts." };
+  if (job.sanitizedWorkspace) return { ok: false, errorType: "retry_policy_not_applicable", error: "A sanitized-workspace job always runs the bridge's reader model; models/maxAttempts do not apply." };
+  if (job.orchestratorMode === "contractor") return { ok: false, errorType: "retry_policy_not_applicable", error: "A contractor job cannot be replayed (its authorization token is never stored), so it cannot be retried." };
+  const { models } = checked.policy;
+  const requirement = job.scopeContract?.modelRequirement;
+  if (models.length && requirement) {
+    const matches = models.some((item) => item.provider === requirement.provider && item.model === requirement.model && (!requirement.variant || requirement.variant === item.variant));
+    if (!matches) return { ok: false, errorType: "retry_policy_invalid", error: `scopeContract.modelRequirement ${requirement.provider}/${requirement.model} is not one of models; give the model order in models only.` };
+    return { ok: true, policy: checked.policy, job };
+  }
+  if (!models.length) return { ok: true, policy: checked.policy, job };
+  const scopeContract = { ...(job.scopeContract || { mode: hasWriteIntent(job) ? "write" : "read" }) };
+  const previous = scopeContract.modelRequirement;
+  scopeContract.modelRequirement = { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...retryPolicyRequirement(models[0]) };
+  return { ok: true, policy: checked.policy, job: { ...job, scopeContract } };
+}
+
+// Active pauses by key (until, epoch ms), from the shared provider database.
+async function activeProviderPauses() {
+  const snapshot = await providerCapacitySnapshot();
+  const pauses = new Map();
+  for (const item of snapshot.cooldowns || []) {
+    if (Number(item.remainingMs) > 0) pauses.set(item.providerKey, Date.parse(item.until));
+  }
+  return pauses;
+}
+
+// The model of attempt `attempt + 1`: the next one in order that is not paused (by its provider or
+// by itself). When every one is paused, the one whose pause ends first, with startAfter set to that
+// time, so the attempt waits in the queue instead of failing at once and burning an attempt.
+async function chooseRetryModel(policy, attempt, failed = {}) {
+  const pauses = await activeProviderPauses();
+  const pausedUntil = (provider, model) => Math.max(
+    pauses.get(providerKeyForMetadata({ provider })) || 0,
+    model ? pauses.get(modelPauseKeyForMetadata({ provider, model })) || 0 : 0,
+  );
+  const candidates = policy.models.length
+    ? policy.models.map((_, index) => policy.models[(attempt + index) % policy.models.length])
+    : [{ spec: "", provider: failed.configuredProvider || "", model: failed.configuredModel || "" }];
+  let best = null;
+  for (const candidate of candidates) {
+    const until = candidate.provider ? pausedUntil(candidate.provider, candidate.model) : 0;
+    if (!until || until <= Date.now()) return { spec: candidate.spec, startAfter: "" };
+    if (!best || until < best.until) best = { spec: candidate.spec, until };
+  }
+  return { spec: best.spec, startAfter: new Date(best.until).toISOString() };
+}
+
+// A guarded update of a terminal row's summary (as markQueueJobRequeued does): the owner never
+// rewrites a terminal row, so this only races another such update and retries on the revision.
+async function patchTerminalQueueSummary(projectRoot, jobId, fields, { onlyIf = null } = {}) {
+  const db = await openLockDb(projectRoot);
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { patched: false, reason: "the job is not terminal" };
+      let summary = {};
+      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { patched: false, reason: "the record is unreadable" }; }
+      // B-069: a claim (auto-integration) is decided on the revision it is written on.
+      if (typeof onlyIf === "function" && !onlyIf(summary, row)) return { patched: false, reason: "condition", summary };
+      const updatedAt = new Date().toISOString();
+      const changed = db.prepare(`
+        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
+        WHERE job_id = ? AND revision = ? AND status = ?
+      `).run(JSON.stringify(sanitizePersistedValue({ ...summary, ...fields, revision: Number(row.revision || 0) + 1 })), updatedAt, jobId, Number(row.revision || 0), row.status);
+      if (Number(changed.changes || 0) === 1) {
+        const live = QUEUE_JOBS.get(jobId);
+        if (live) Object.assign(live, fields);
+        return { patched: true };
+      }
+    }
+    return { patched: false, reason: "the record kept changing" };
+  } finally {
+    closeDb(db);
+  }
+}
+
+const retryPolicyModelLabel = (summary) => (summary?.configuredModel ? `${summary.configuredProvider || "?"}/${summary.configuredModel}` : summary?.scopeContract?.modelRequirement?.model ? `${summary.scopeContract.modelRequirement.provider}/${summary.scopeContract.modelRequirement.model}` : "profile model");
+
+// Runs after a job of a retry policy reached failed or interrupted. Returns what it did.
+async function applyQueueRetryPolicy({ cwd, jobId }) {
+  if (effectiveQueueMode() !== "sqlite" || !jobId) return { action: "none" };
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  const db = await openLockDb(projectRoot);
+  let row;
+  try {
+    row = db.prepare("SELECT status, record_json, request_encrypted FROM opencode_jobs WHERE job_id = ?").get(jobId);
+  } finally {
+    closeDb(db);
+  }
+  if (!row || !["failed", "interrupted"].includes(row.status) || !row.request_encrypted) return { action: "none" };
+  let summary = {};
+  try { summary = JSON.parse(row.record_json || "{}"); } catch { return { action: "none" }; }
+  if (summary.requeuedAs || summary.completionOutcome === "gave_up" || summary.parentJobId) return { action: "none" };
+  let request;
+  try {
+    request = await decryptQueueRequest(row.request_encrypted, jobId);
+  } catch {
+    return { action: "none" };
+  }
+  const checked = jobRetryPolicy(request);
+  if (!checked.ok || !checked.policy) return { action: "none" };
+  const errorType = row.status === "interrupted" ? "queue_job_interrupted" : String(summary.errorType || "");
+  if (!RETRY_POLICY_ERROR_TYPES.has(errorType)) return { action: "not_eligible", errorType };
+  if (errorType === "queue_job_interrupted" && !(autoResumeInterruptedOverride ?? CONFIG.autoResumeInterrupted)) return { action: "resume_disabled" };
+  const attempt = Math.max(1, Number(summary.retryAttempt || 1));
+  const maxAttempts = checked.policy.maxAttempts;
+  // B-071: a job that timed out waiting for a provider slot (the global worker cap or a full
+  // provider) never started its agent, so it is requeued without counting an attempt, up to
+  // RETRY_POLICY_MAX_SLOT_WAITS times (a cap held for hours must not loop forever).
+  const slotWaits = Number(summary.slotWaitRequeues || 0);
+  const uncountedSlotWait = errorType === "provider_slot_wait_timeout" && slotWaits < RETRY_POLICY_MAX_SLOT_WAITS;
+  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedSlotWait ? " (not counted: the agent never started)" : ""}`].slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS));
+  const giveUp = async (why) => {
+    await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
+    logEvent("warn", "queue.job_gave_up", {
+      jobId,
+      agent: summary.agent || "",
+      model: retryPolicyModelLabel(summary),
+      errorType,
+      summary: failureSummary(`${why} Attempts: ${history.join("; ")}`),
+    });
+    return { action: "gave_up", attempts: attempt, history };
+  };
+  if (!uncountedSlotWait && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
+  const nextAttempt = uncountedSlotWait ? attempt : attempt + 1;
+  // The model order follows the counted attempts; a slot wait tries the next model all the same
+  // (another provider may have a free slot), without spending an attempt.
+  const next = await chooseRetryModel(checked.policy, uncountedSlotWait ? attempt + slotWaits : attempt, summary);
+  const requeued = await requeueQueueJob({
+    cwd: projectRoot,
+    jobId,
+    model: next.spec || "",
+    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits },
+  });
+  // Q-008: a previous child that is still alive may still write its worktree; the job stays
+  // interrupted (not gave_up) so the operator can stop the child and requeue it.
+  if (!requeued.ok && requeued.errorType === "requeue_orphan_child_alive") {
+    logEvent("warn", "queue.retry_deferred", { jobId, agent: summary.agent || "", errorType: requeued.errorType, summary: failureSummary(requeued.error) });
+    return { action: "deferred", errorType: requeued.errorType };
+  }
+  if (!requeued.ok) return await giveUp(`The retry could not be enqueued (${requeued.errorType}: ${requeued.error}).`);
+  logEvent("warn", "queue.job_retried", {
+    jobId: requeued.record.jobId,
+    agent: summary.agent || "",
+    model: next.spec || retryPolicyModelLabel(summary),
+    errorType,
+    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
+  });
+  // B-072: a failed write attempt that changed nothing leaves an empty worktree; the retry gets
+  // its own, so the empty one is removed (a worktree with any change is kept for review).
+  const emptyWorktree = row.status === "failed" ? await removeEmptyRetryWorktree(projectRoot, summary) : null;
+  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, emptyWorktree };
+}
+
+// Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
+let autoResumeInterruptedOverride = null;
+
+// Never blocks or fails the caller (a terminal commit, a recovery pass): the policy runs after it.
+function scheduleQueueRetryPolicy(cwd, jobId) {
+  if (!jobId || effectiveQueueMode() !== "sqlite") return;
+  setImmediate(() => {
+    applyQueueRetryPolicy({ cwd, jobId }).catch((error) => {
+      logEvent("warn", "queue.retry_policy_failed", { jobId, errorType: error?.errorType || "retry_policy_failed", summary: failureSummary(error?.message || String(error)) });
+    });
+  });
+}
+
+// Q-010: auto-integration of new-file-only patches (the round-6 orchestrator's LANDED step). Up to
+// 300 batches each needed a dry run, an apply and a receipt. A queued writer that asks for it
+// (autoIntegrate: true) and finished with a passing validationCommand is integrated by the bridge
+// itself, but only when every file of its patch is new: the dry run and the receipt-bound apply
+// are the integrate_opencode_worktree engine (scope, secret and binary gates, serial lock,
+// journal, validation in the target, rollback, worktree cleanup), called back to back. The files
+// are then committed by explicit pathspec with the identity of the target's last commit. Jobs of
+// one repository are integrated one at a time (AUTO_INTEGRATION_CHAINS); any other patch is left
+// for the normal reviewed flow.
+function autoIntegrateJobError(job, lockPlan, parentJobId = "") {
+  if (job?.autoIntegrate === undefined || job.autoIntegrate === null || job.autoIntegrate === false) return null;
+  const refuse = (errorType, error, suggestedFix = "Remove autoIntegrate, or enqueue a write job with a validationCommand.") => ({ errorType, error, suggestedFix });
+  if (job.autoIntegrate !== true) return refuse("auto_integrate_invalid", "autoIntegrate must be true or false.");
+  if (effectiveQueueMode() !== "sqlite") return refuse("auto_integrate_not_applicable", `autoIntegrate needs CODEX_OPENCODE_QUEUE_MODE=sqlite (the queue mode is ${effectiveQueueMode()}): its outcome is recorded on the durable job.`);
+  if (!CONFIG.autoIntegrateAllowed) return refuse("auto_integrate_disabled", "The operator turned auto-integration off (CODEX_OPENCODE_AUTO_INTEGRATE=false); every patch goes through the reviewed integration.", "Remove autoIntegrate and integrate the worktree with integrate_opencode_worktree.");
+  if (parentJobId) return refuse("auto_integrate_not_applicable", "A pipeline integrates its jobs itself.");
+  if (lockPlan?.lockType === "read" || job.sanitizedWorkspace || job.dryRun) return refuse("auto_integrate_not_applicable", "autoIntegrate applies to write jobs that run (not read-only, sanitized or dry-run jobs).");
+  if (!String(lockPlan?.validationCommand || "").trim()) return refuse("auto_integrate_needs_validation", "autoIntegrate needs a validationCommand: a patch lands without review only after its validation passed in the worktree and passes again in the target.");
+  return null;
+}
+
+const AUTO_INTEGRATION_CHAINS = new Map();
+const AUTO_INTEGRATION_RETRYABLE_ERRORS = new Set(["integration_lock_conflict", "integration_preview_stale", "integration_recovery_pending"]);
+// A few quick rounds for a receipt that went stale between the two calls; a lock held by another
+// writer on the same paths (a builder still running on the folder) can last as long as that
+// builder, so the job then waits outside the repository's chain and tries again later, for up to
+// AUTO_INTEGRATION_LATER_MAX tries (an hour by default).
+const AUTO_INTEGRATION_ROUNDS = 3;
+const AUTO_INTEGRATION_LATER_MAX = 60;
+
+function autoIntegrationRetryDelayMs(round) {
+  const baseMs = process.argv.includes("--self-test") ? 25 : 5000;
+  return Math.min(baseMs * 12, baseMs * 2 ** round);
+}
+
+function autoIntegrationLaterDelayMs() {
+  return process.argv.includes("--self-test") ? 150 : 60_000;
+}
+
+// B-069: the commit of an auto-integration, made INSIDE the integration's serial lock (the
+// engine calls these hooks after its journal operation committed and validation passed): `prepare`
+// runs before the worktree cleanup and hashes each applied file of the reviewed source worktree
+// (the engine just re-verified it against the receipt) with the target's attributes; `commit`
+// runs after the cleanup, hashes the same paths in the target (git hash-object -w --path), refuses
+// any difference, builds the tree in a temporary index (GIT_INDEX_FILE: the owner's index is not
+// used for it), creates the commit with commit-tree as the author of the target's last commit and
+// moves HEAD with update-ref against the expected old HEAD. Only then are exactly these paths set
+// in the owner's index to the committed blobs (git update-index --cacheinfo), so `git status`
+// agrees with HEAD; nothing else in the index or the working tree is touched. The paths are the
+// engine's changedFiles (read with -z), never re-parsed patch headers.
+const AUTO_INTEGRATION_EMPTY_INDEX_RETRIES = 5;
+
+function autoIntegrationCommitHooks({ jobId, agent = "", model = "", worktreePath }) {
+  const git = (args, cwd, env = null) => runCommand("git", args, cwd, 60_000, env);
+  return {
+    async prepare(result, { targetCwd }) {
+      const files = [];
+      for (const relative of result.changedFiles || []) {
+        const sourceFile = path.join(worktreePath, ...String(relative).split("/"));
+        const details = await lstat(sourceFile).catch(() => null);
+        if (!details?.isFile()) return { ok: false, errorType: "auto_integration_source_unreadable", error: `The source file ${relative} is not a regular file.` };
+        const hashed = await git(["hash-object", "--path", relative, sourceFile], targetCwd);
+        if (hashed.exitCode !== 0) return { ok: false, errorType: "auto_integration_hash_failed", error: redactSensitiveText(hashed.stderr).slice(0, 300) };
+        const executable = process.platform !== "win32" && (details.mode & 0o111) !== 0;
+        files.push({ path: relative, blob: hashed.stdout.trim(), mode: executable ? "100755" : "100644" });
+      }
+      return files.length ? { ok: true, files } : { ok: false, errorType: "auto_integration_no_files", error: "The integration reported no changed files." };
+    },
+    async commit(result, { targetCwd, prepared }) {
+      if (!prepared?.ok) return prepared || { ok: false, errorType: "auto_integration_not_prepared", error: "The source files were not hashed before cleanup." };
+      for (const file of prepared.files) {
+        const targetFile = path.join(targetCwd, ...file.path.split("/"));
+        const written = await git(["hash-object", "-w", "--path", file.path, targetFile], targetCwd);
+        if (written.exitCode !== 0) return { ok: false, errorType: "auto_integration_hash_failed", error: redactSensitiveText(written.stderr).slice(0, 300) };
+        if (written.stdout.trim() !== file.blob) {
+          return { ok: false, errorType: "auto_integration_content_mismatch", error: `${file.path} in the checkout is not the reviewed content (blob ${written.stdout.trim().slice(0, 12)}, expected ${file.blob.slice(0, 12)}); nothing was committed.` };
+        }
+      }
+      const identity = await git(["log", "-1", "--format=%an%x00%ae"], targetCwd);
+      const [name = "", email = ""] = String(identity.stdout || "").trim().split("\0");
+      if (identity.exitCode !== 0 || !name.trim() || !email.trim()) {
+        return { ok: false, errorType: "auto_integration_identity_missing", error: "The target repository's last commit has no author name and email to commit with." };
+      }
+      const oldHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"], targetCwd)).stdout.trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(oldHead)) return { ok: false, errorType: "auto_integration_head_unreadable", error: "The target HEAD could not be read." };
+      const scratch = await mkdtemp(path.join(tmpdir(), "codex-auto-integrate-index-"));
+      try {
+        const indexEnv = { GIT_INDEX_FILE: path.join(scratch, "index") };
+        const steps = [["read-tree", oldHead], ...prepared.files.map((file) => ["update-index", "--add", "--cacheinfo", `${file.mode},${file.blob},${file.path}`])];
+        for (const step of steps) {
+          const done = await git(step, targetCwd, indexEnv);
+          if (done.exitCode !== 0) return { ok: false, errorType: "auto_integration_index_failed", error: redactSensitiveText(done.stderr).slice(0, 300) };
+        }
+        const tree = (await git(["write-tree"], targetCwd, indexEnv)).stdout.trim();
+        if (!/^[0-9a-f]{40,64}$/i.test(tree)) return { ok: false, errorType: "auto_integration_index_failed", error: "git write-tree returned no tree." };
+        const message = `Auto-integrate ${jobId}: ${prepared.files.length} new file(s) by ${agent || "agent"}${model ? ` on ${model}` : ""}`;
+        const created = await git(["-c", `user.name=${name.trim()}`, "-c", `user.email=${email.trim()}`, "commit-tree", tree, "-p", oldHead, "-m", message], targetCwd);
+        const commit = created.stdout.trim();
+        if (created.exitCode !== 0 || !/^[0-9a-f]{40,64}$/i.test(commit)) return { ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(created.stderr).slice(0, 300) };
+        const moved = await git(["update-ref", "-m", `auto-integrate ${jobId}`, "HEAD", commit, oldHead], targetCwd);
+        if (moved.exitCode !== 0) return { ok: false, errorType: "auto_integration_head_moved", error: `HEAD moved while committing; nothing was committed (${redactSensitiveText(moved.stderr).slice(0, 200)}).` };
+        // The owner's index: exactly these paths, to the committed blobs (a concurrent git is retried).
+        let indexed = null;
+        for (let attempt = 0; attempt < AUTO_INTEGRATION_EMPTY_INDEX_RETRIES; attempt += 1) {
+          if (attempt) await delayWithSignal(process.argv.includes("--self-test") ? 50 : 3000);
+          indexed = await git(["update-index", "--add", ...prepared.files.flatMap((file) => ["--cacheinfo", `${file.mode},${file.blob},${file.path}`])], targetCwd);
+          if (indexed.exitCode === 0 || !/index\.lock|unable to lock|cannot lock|File exists/i.test(indexed.stderr)) break;
+        }
+        return {
+          ok: true,
+          commit,
+          parent: oldHead,
+          files: prepared.files.map((file) => file.path),
+          // Only the name is kept in the queue record (get_opencode_job returns it); never the email.
+          authorName: name.trim(),
+          indexUpdated: indexed?.exitCode === 0,
+          ...(indexed?.exitCode === 0 ? {} : { indexWarning: `The commit is in place, but the index entries of these paths could not be updated (${redactSensitiveText(indexed?.stderr || "").slice(0, 200)}); run git status and git reset -- <paths> if they show as staged deletions.` }),
+        };
+      } finally {
+        await rm(scratch, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+  };
+}
+
+const AUTO_INTEGRATION_FINAL_STATUSES = new Set(["committed", "skipped_not_new_files", "failed", "applied_not_committed"]);
+const AUTO_INTEGRATION_CLAIM_STALE_MS = 30 * 60_000;
+
+async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", worktreePath, allowedEdits = [], forbiddenEdits = [], sharedFiles = [], serialOnly = [], validationCommand = "", laterAttempt = 0 }) {
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  // B-069: one bridge process integrates a job: a claim on the terminal row (a restart, or two
+  // processes finding the same waiting job, must not integrate it twice).
+  const claimedAt = new Date().toISOString();
+  const claim = await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration: { status: "integrating", claimedBy: BRIDGE_INSTANCE_ID, at: claimedAt } }, {
+    onlyIf: (summary) => {
+      const current = summary.autoIntegration;
+      if (!current?.status || current.status === "waiting_for_lock") return true;
+      if (AUTO_INTEGRATION_FINAL_STATUSES.has(current.status)) return false;
+      return current.claimedBy === BRIDGE_INSTANCE_ID || Date.now() - (Date.parse(current.at || "") || 0) > AUTO_INTEGRATION_CLAIM_STALE_MS;
+    },
+  });
+  if (!claim.patched) return { status: "not_claimed", reason: claim.reason, current: claim.summary?.autoIntegration?.status || "" };
+  const recordOutcome = async (fields) => {
+    const autoIntegration = { at: new Date().toISOString(), ...fields };
+    await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration });
+    return autoIntegration;
+  };
+  const failed = async (stage, result) => {
+    const outcome = await recordOutcome({ status: stage === "commit" ? "applied_not_committed" : "failed", stage, errorType: result?.errorType || "auto_integration_failed", error: redactSensitiveText(String(result?.error || "")).slice(0, 500), worktreePath: stage === "commit" ? "" : worktreePath });
+    logEvent("warn", "queue.auto_integration_failed", {
+      jobId,
+      agent,
+      model,
+      errorType: outcome.errorType,
+      summary: failureSummary(stage === "commit"
+        ? `The new files were integrated but not committed: ${outcome.error}. Commit them by hand.`
+        : `Auto-integration stopped at the ${stage}: ${outcome.error || outcome.errorType}. The worktree is kept for integrate_opencode_worktree.`),
+    });
+    return outcome;
+  };
+  const options = { cwd: projectRoot, worktreePath, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget: true, previewMode: "stat", cleanupAfterSuccess: true };
+  // A lock another job holds: wait outside the chain (scheduleAutoIntegration tries again later).
+  const waitLater = async (result) => {
+    if (result?.errorType !== "integration_lock_conflict" || laterAttempt >= AUTO_INTEGRATION_LATER_MAX) return null;
+    await recordOutcome({ status: "waiting_for_lock", tries: laterAttempt + 1, errorType: result.errorType, error: redactSensitiveText(String(result.error || "")).slice(0, 300) });
+    return { retryLater: true };
+  };
+  let applied = null;
+  for (let round = 0; round < AUTO_INTEGRATION_ROUNDS; round += 1) {
+    if (round) await delayWithSignal(autoIntegrationRetryDelayMs(round - 1));
+    const preview = await integratePatchSerially({ ...options, dryRun: true });
+    if (!preview.ok) {
+      if (AUTO_INTEGRATION_RETRYABLE_ERRORS.has(preview.errorType) && round < AUTO_INTEGRATION_ROUNDS - 1) continue;
+      return (await waitLater(preview)) || await failed("dry run", preview);
+    }
+    const files = Array.isArray(preview.patchFiles) ? preview.patchFiles : [];
+    const newFilesOnly = files.length > 0 && files.every((file) => file.created && !file.deleted);
+    if (!newFilesOnly) {
+      const outcome = await recordOutcome({ status: "skipped_not_new_files", files: files.map((file) => file.path), reason: "The patch changes or deletes a file that already exists; integrate it after review with integrate_opencode_worktree." });
+      logEvent("info", "queue.auto_integration_skipped", { jobId, files: outcome.files.length });
+      return outcome;
+    }
+    applied = await integratePatchSerially({ ...options, dryRun: false, reviewed: true, previewReceipt: preview.previewReceipt, afterApply: autoIntegrationCommitHooks({ jobId, agent, model, worktreePath }) });
+    if (applied.ok) break;
+    if (!AUTO_INTEGRATION_RETRYABLE_ERRORS.has(applied.errorType) || round === AUTO_INTEGRATION_ROUNDS - 1) return (await waitLater(applied)) || await failed("apply", applied);
+  }
+  if (!applied?.ok || applied.validationGate?.status !== "passed") {
+    return await failed("apply", applied || { errorType: "auto_integration_failed", error: "The apply did not report a passing validation." });
+  }
+  const committed = applied.afterApply || { ok: false, errorType: "auto_integration_commit_missing", error: "The integration ran no commit step." };
+  if (!committed.ok) return await failed("commit", committed);
+  const cleanup = applied.sourceCleanup ? `${applied.sourceCleanup.cleanup}${applied.sourceCleanup.reason ? ` (${applied.sourceCleanup.reason})` : ""}` : "";
+  const outcome = await recordOutcome({ status: "committed", commit: committed.commit, files: committed.files, author: committed.authorName, worktreeCleanup: cleanup, ...(committed.indexWarning ? { indexWarning: committed.indexWarning } : {}) });
+  logEvent("info", "queue.auto_integrated", { jobId, files: committed.files.length, commit: committed.commit });
+  return outcome;
+}
+
+// B-069: after a restart, a completed autoIntegrate job whose integration never finished (it was
+// waiting for a lock, or the bridge died first) is scheduled again. Each job once per process; the
+// claim in autoIntegrateQueueJob keeps two processes from integrating it twice.
+const AUTO_INTEGRATION_RESCHEDULED = new Set();
+
+async function rescheduleOpenAutoIntegrations(db) {
+  if (!CONFIG.autoIntegrateAllowed) return 0;
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT job_id, cwd, request_encrypted, record_json FROM opencode_jobs
+      WHERE status = 'completed' AND json_valid(record_json)
+        AND json_extract(record_json, '$.autoIntegrateRequested') = 1
+        AND (json_extract(record_json, '$.autoIntegration.status') IS NULL
+          OR json_extract(record_json, '$.autoIntegration.status') IN ('waiting_for_lock', 'integrating'))
+    `).all();
+  } catch {
+    return 0;
+  }
+  let scheduled = 0;
+  for (const row of rows) {
+    if (AUTO_INTEGRATION_RESCHEDULED.has(row.job_id) || !row.request_encrypted) continue;
+    AUTO_INTEGRATION_RESCHEDULED.add(row.job_id);
+    let summary = {};
+    let request = null;
+    try {
+      summary = JSON.parse(row.record_json || "{}");
+      request = await decryptQueueRequest(row.request_encrypted, row.job_id);
+    } catch {
+      continue;
+    }
+    if (request?.autoIntegrate !== true || !summary.worktreePath || !(summary.changedFiles || []).length || !existsSync(summary.worktreePath)) continue;
+    scheduleAutoIntegration({
+      cwd: row.cwd || summary.cwd,
+      jobId: row.job_id,
+      agent: summary.agent || "",
+      model: summary.configuredModel ? `${summary.configuredProvider || "?"}/${summary.configuredModel}` : "",
+      worktreePath: summary.worktreePath,
+      allowedEdits: summary.allowedEdits || [],
+      forbiddenEdits: request.forbiddenEdits || [],
+      sharedFiles: request.sharedFiles || [],
+      serialOnly: request.serialOnly || [],
+      validationCommand: String(request.validationCommand || request.scopeContract?.validationCommand || "").trim(),
+    });
+    scheduled += 1;
+  }
+  if (scheduled) logEvent("info", "queue.auto_integration_rescheduled", { count: scheduled });
+  return scheduled;
+}
+
+// One repository's auto-integrations run one after another, each with its commit, so the next
+// dry run sees a clean target and a committed HEAD.
+function scheduleAutoIntegration(details) {
+  // This process handles the job now; the restart scan (rescheduleOpenAutoIntegrations) skips it.
+  AUTO_INTEGRATION_RESCHEDULED.add(details.jobId);
+  const key = RepositoryRootSet.key(details.cwd);
+  const run = (AUTO_INTEGRATION_CHAINS.get(key) || Promise.resolve())
+    .then(() => autoIntegrateQueueJob(details))
+    .catch((error) => {
+      logEvent("warn", "queue.auto_integration_failed", { jobId: details.jobId, agent: details.agent || "", errorType: error?.errorType || "auto_integration_failed", summary: failureSummary(error?.message || String(error)) });
+      return null;
+    });
+  AUTO_INTEGRATION_CHAINS.set(key, run);
+  run.finally(() => { if (AUTO_INTEGRATION_CHAINS.get(key) === run) AUTO_INTEGRATION_CHAINS.delete(key); });
+  run.then((outcome) => {
+    if (!outcome?.retryLater) return;
+    const timer = setTimeout(() => scheduleAutoIntegration({ ...details, laterAttempt: Number(details.laterAttempt || 0) + 1 }), autoIntegrationLaterDelayMs());
+    timer.unref?.();
+  });
+  return run;
+}
+
 // Creates a new queue job from the stored request of a failed, cancelled, interrupted or
 // not_resumable one. The request goes through enqueueQueueJob, the path enqueue_opencode_job uses
 // (lock plan, Scope Contract rules, worktree requirement, fingerprint, idempotency), after a
 // zod check against the current job input schema; nothing is replayed unchecked.
-async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }) {
+async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined, recordFields = null }) {
   if (typeof jobId !== "string" || !jobId.trim()) return requeueRefusal("requeue_invalid_arguments", "jobId must be a non-empty string.");
   if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_AGENT_TIMEOUT_MS)) {
     return requeueRefusal("requeue_invalid_arguments", `timeoutMs must be a positive integer of at most ${MAX_AGENT_TIMEOUT_MS} ms; got ${JSON.stringify(timeoutMs)}.`);
@@ -22313,7 +23677,8 @@ async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }
   const sequence = Number(summary.requeueSequence || 0) + 1;
   const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
   job.idempotencyKey = idempotencyKey;
-  const enqueued = await enqueueQueueJob(job, "", { recordFields: { requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
+  // Q-007: the retry policy passes the attempt counters and a start time; a manual requeue none.
+  const enqueued = await enqueueQueueJob(job, "", { recordFields: { ...(recordFields || {}), requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
   if (!enqueued.ok) {
     return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
   }
@@ -22835,8 +24200,26 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
         logEvent("warn", "queue.job_failed", {
           jobId: record.jobId,
           agent: record.agent || "",
+          // Q-006: the issue log names the model a failure happened on.
+          model: patch.configuredModel ? `${patch.configuredProvider || "?"}/${patch.configuredModel}` : "",
           errorType: patch.errorType || "",
           summary: failureSummary(patch.errorReason || patch.errorType || "Queued job failed."),
+          durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
+        });
+      }
+      // Q-007: a job with a retry policy is requeued on its next model (or marked gave_up).
+      if (lastResult.persisted && patch.status === "failed" && (record.request?.models || record.request?.maxAttempts || record.retryAttempt)) {
+        scheduleQueueRetryPolicy(record.cwd, record.jobId);
+      }
+      // Q-006: a writer that "completed" without changing a file is the round-6 "no output file":
+      // a success for the queue, a failure for the batch. Logged so the issue log shows it.
+      if (lastResult.persisted && patch.status === "completed" && record.mode === "write" && patch.noChanges) {
+        logEvent("warn", "queue.job_no_output", {
+          jobId: record.jobId,
+          agent: record.agent || "",
+          model: patch.configuredModel ? `${patch.configuredProvider || "?"}/${patch.configuredModel}` : "",
+          errorType: "completed_no_changes",
+          summary: "The writer completed without changing any file (outcome=completed_no_changes).",
           durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
         });
       }
@@ -23081,14 +24464,21 @@ async function startQueueRecord(record) {
       }
 
       const containmentUnconfirmed = errorType === "process_tree_termination_unconfirmed";
+      // Q-007: with a retry policy the caller said this job must produce something, so a writer
+      // that changed no file is a failure (the round-6 "no output file") and is retried.
+      const noOutputFailure = !errorType && record.mode === "write" && Boolean(execution.result?.noChanges)
+        && Boolean(record.request?.models || record.request?.maxAttempts);
+      const terminalErrorType = noOutputFailure ? "writer_no_changes" : errorType;
       terminalPatch = terminalPatch || {
-        status: errorType ? "failed" : "completed",
+        status: terminalErrorType ? "failed" : "completed",
         finishedAt: new Date().toISOString(),
         durationMs: nowMs() - started,
         heartbeatAt: "",
         leaseExpiresAt: "",
-        errorType,
-        errorReason: errorType ? queueFailureReason(execution, errorType) : "",
+        errorType: terminalErrorType,
+        errorReason: noOutputFailure
+          ? "The writer finished without changing any file; with a retry policy (models/maxAttempts) that counts as no output."
+          : errorType ? queueFailureReason(execution, errorType) : "",
         changedFiles: execution.result?.changedFiles || [],
         dirtyFiles: execution.result?.dirtyFiles || [],
         overlappingFiles: execution.result?.overlappingFiles || [],
@@ -23110,6 +24500,7 @@ async function startQueueRecord(record) {
         usage: execution.result?.usage || null,
         heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
         validationFixPass: execution.result?.validationFixPass || null,
+        selfCheck: execution.result?.selfCheck || null,
         phaseTimings: execution.result?.phaseTimings || null,
         readOnlyHeadMove: execution.result?.readOnlyHeadMove || null,
         worktreePath: execution.worktree?.path || "",
@@ -23123,7 +24514,24 @@ async function startQueueRecord(record) {
         childProcessStartedAt: containmentUnconfirmed ? record.childProcessStartedAt : "",
         containmentQuarantined: containmentUnconfirmed,
       };
-      await commitQueueTerminalRecord(record, terminalPatch);
+      const committedTerminal = await commitQueueTerminalRecord(record, terminalPatch);
+      // Q-010: a finished writer that asked for it is integrated after its lock is released (the
+      // integration's serial lock would otherwise wait on the job's own write lock).
+      if (committedTerminal?.persisted && terminalPatch.status === "completed" && record.request?.autoIntegrate === true
+        && record.mode === "write" && !record.parentJobId && (terminalPatch.changedFiles || []).length && terminalPatch.worktreePath) {
+        scheduleAutoIntegration({
+          cwd: record.cwd,
+          jobId: record.jobId,
+          agent: record.agent || "",
+          model: terminalPatch.configuredModel ? `${terminalPatch.configuredProvider || "?"}/${terminalPatch.configuredModel}` : "",
+          worktreePath: terminalPatch.worktreePath,
+          allowedEdits: record.allowedEdits || [],
+          forbiddenEdits: record.request.forbiddenEdits || [],
+          sharedFiles: record.request.sharedFiles || [],
+          serialOnly: record.request.serialOnly || [],
+          validationCommand: String(record.request.validationCommand || record.request.scopeContract?.validationCommand || "").trim(),
+        });
+      }
     } finally {
       clearQueueLeaseFence(record);
       if (record.parentJobId && ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(record.status)) {
@@ -23263,6 +24671,8 @@ function scheduleQueue(delayMs = 0) {
 
           // B-045: planning and starting wait for memory; the job stays pending (no durable write per poll).
           if (holdStarts) continue;
+          // Q-007: a retry whose every model is paused waits for the first pause to end.
+          if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) continue;
 
           if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
           if (record.status === "blocked") {
@@ -27165,6 +28575,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       KNOWN_STATE_DB_PATHS.add(dbPath);
       if (!queuePersistenceEnabled) continue;
       reconcileStaleQueueRecords(db);
+      await rescheduleOpenAutoIntegrations(db);
       if (db.prepare(`
         SELECT 1 FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
@@ -27775,6 +29186,42 @@ export const __selfTest = {
     requeueQueueJob,
     runtimeConcurrencyLimitError,
     setRuntimeConcurrency,
+    // tests/review-flex-*.js (flexible scheduling, B-060, B-061, Q-005..Q-010)
+    DEFAULT_MIN_FREE_MEMORY_MB,
+    agentIdleTimeoutForModel,
+    agentIdleTimeoutStatusLine,
+    effectiveMinFreeMemoryMb,
+    readModelDurationMapEnv,
+    applyRateLimitOutcome,
+    createRateLimitWatcher,
+    modelPauseKeyForMetadata,
+    openCodeRateLimitHit,
+    parseOpenCodeLogLine,
+    rateLimitPauseReason,
+    readOpenCodeLogPathEnv,
+    recordRateLimitPause,
+    ENV_GLOBAL_WORKER_LIMIT,
+    MAX_GLOBAL_WORKER_LIMIT,
+    pauseProvider,
+    providerPauseTarget,
+    resumeProvider,
+    RETRY_POLICY_ERROR_TYPES,
+    applyQueueRetryPolicy,
+    applyRetryPolicyToJob,
+    chooseRetryModel,
+    jobRetryPolicy,
+    queueOnlyOptionsError,
+    formatScopeContractForPrompt,
+    selfCheckCommandsError,
+    AUTO_INTEGRATION_CHAINS,
+    autoIntegrateJobError,
+    autoIntegrateQueueJob,
+    autoIntegrationCommitHooks,
+    rescheduleOpenAutoIntegrations,
+    AUTO_INTEGRATION_RESCHEDULED,
+    patchFileEntries,
+    SELF_TEST_TEMP_STATE_DIR,
+    effectiveBridgeStateDirectory,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -27811,6 +29258,8 @@ export const __selfTest = {
     set freeMemoryBytesTestHook(value) { freeMemoryBytesTestHook = value; },
     get minFreeMemoryMbOverride() { return minFreeMemoryMbOverride; },
     set minFreeMemoryMbOverride(value) { minFreeMemoryMbOverride = value; },
+    get autoResumeInterruptedOverride() { return autoResumeInterruptedOverride; },
+    set autoResumeInterruptedOverride(value) { autoResumeInterruptedOverride = process.argv.includes("--self-test") ? value : null; },
   },
 };
 

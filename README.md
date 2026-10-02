@@ -11,6 +11,7 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 - **Review before merge.** The client previews the exact patch, then integrates it with a single-use receipt.
 - **Parallel work.** Independent jobs run at the same time, capped by a provider limit.
 - **Durability.** Jobs, locks, and results survive crashes in per-project SQLite state.
+- **Long batches.** Queued jobs can name fallback models and attempts, detect silent rate limits and pause that model, wait for free memory, stop stalled agents, run exact self-check commands, and land new-file-only patches with a commit by themselves; providers can be paused and all agents capped at runtime ([USER_GUIDE section 8](docs/USER_GUIDE.md#long-batches-in-the-queue)).
 
 ## Requirements
 
@@ -59,12 +60,13 @@ Run these from `<bridge-dir>`.
 | `npm run gc` / `npm run gc:apply` | List or remove leftover worktrees and dead databases |
 | `npm run tui` | Terminal dashboard for pipelines and jobs |
 | `npm run incidents` | Summarize recurring warnings and errors from the operations log |
+| `npm run issues` | Print the issue log: one line per job failure, rebuilt from the operations log |
 | `npm run release:activate -- --sync-clients` | Re-pin the `server.js` and plugin-manifest hashes and copy the Codex entry to Claude Code |
 | `npm run release:activate` | Run the release gate, build, activate, and verify a new release in one step |
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
-Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them.
+Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them, and every job failure is also one line of `<state-dir>/logs/issues.md`.
 
 ## Status
 

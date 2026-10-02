@@ -427,6 +427,11 @@ async function connectClient(name, stateDir, { fakeOpenCode, worktreeRoot, extra
       CODEX_OPENCODE_WORKTREE_MODE: "write",
       CODEX_OPENCODE_WORKTREE_ROOT: worktreeRoot,
       CODEX_OPENCODE_WORKTREE_CLEANUP: "never",
+      // B-060 turned the free-memory floor on by default; this harness runs fake agents, and its
+      // result must not depend on how much memory the machine running it has free.
+      CODEX_OPENCODE_MIN_FREE_MEMORY_MB: "0",
+      // B-061: the fake agents must never be matched against the operator's real OpenCode log.
+      CODEX_OPENCODE_OPENCODE_LOG_PATH: "off",
       ...extraEnv,
     },
   });

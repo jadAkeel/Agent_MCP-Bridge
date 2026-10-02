@@ -338,8 +338,10 @@ async function withMemory({ floorMb, freeMb }, action) {
   }
 }
 
-test("B-045: the memory gate is off by default and blocks only below the floor", async () => {
-  assert.equal(internals.CONFIG.minFreeMemoryMb, 0, "disabled unless CODEX_OPENCODE_MIN_FREE_MEMORY_MB is set");
+test("B-045: the memory gate is off in a self-test run without the variable and blocks only below the floor", async () => {
+  // B-060 turned the floor on by default (CONFIG); a self-test run without the variable keeps it at 0
+  // so the suite does not depend on the machine's free memory (tests/review-flex-defaults.js).
+  assert.equal(internals.queueMemoryGate().floorMb, 0, "a self-test without CODEX_OPENCODE_MIN_FREE_MEMORY_MB has no floor");
   assert.equal(internals.queueMemoryGate().blocked, false);
   await withMemory({ floorMb: 0, freeMb: 10 }, () => assert.equal(internals.queueMemoryGate().blocked, false));
   await withMemory({ floorMb: 2048, freeMb: 1000 }, () => {
@@ -500,7 +502,8 @@ test("B-046: output keeps an agent alive, and the watchdog is off at 0", async (
   const off = await internals.runSpawnCommand(process.execPath, ["-e", "setTimeout(() => {}, 1500)"], process.cwd(), 60_000, null, { idleTimeoutMs: 0 });
   assert.equal(off.idleTimedOut, false);
   assert.equal(off.exitCode, 0);
-  assert.equal(internals.CONFIG.agentIdleTimeoutMs, 0, "disabled unless CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS is set");
+  // B-060: the watchdog is on by default (10 minutes); tests/review-flex-defaults.js covers the default.
+  assert.equal(internals.CONFIG.agentIdleTimeoutMs, 600_000, "10 minutes unless CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS is set");
 });
 
 test("B-046: the idle result is reported like a timeout but named agent_idle_timeout", () => {
