@@ -97,7 +97,9 @@ function issueMarkdownLine(record) {
   const clean = (value, max = 300) => String(value ?? "").replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
   const when = String(record.ts || "").replace("T", " ").slice(0, 16);
   const subject = [record.jobId ? `job ${clean(record.jobId, 120)}` : record.runId ? `run ${clean(record.runId, 120)}` : record.tool ? `tool ${clean(record.tool, 80)}` : "",
-    [record.agent, record.model].filter(Boolean).map((item) => clean(item, 120)).join(" on ")].filter(Boolean).join(" ");
+    [record.agent, record.model].filter(Boolean).map((item) => clean(item, 120)).join(" on "),
+    // Q-012: the external runner (codex, agy) a failure happened on; absent for OpenCode runs.
+    record.runner ? `(runner ${clean(record.runner, 40)})` : ""].filter(Boolean).join(" ");
   const fields = [
     `${when} UTC`,
     clean(record.event, 80),
