@@ -21684,6 +21684,7 @@ function queueRecordSnapshot(record, includeResult = true) {
     maxAttempts: record.maxAttempts || 0,
     attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
     startAfter: record.startAfter || "",
+    slotWaitRequeues: record.slotWaitRequeues || 0,
     // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
     // (a restart reschedules completed jobs that asked and are not integrated yet).
     autoIntegration: record.autoIntegration || null,
@@ -23058,6 +23059,20 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
 // stored encrypted request, so it survives a restart and a requeue keeps it.
 const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
 const RETRY_POLICY_MAX_ATTEMPTS = 10;
+const RETRY_POLICY_MAX_SLOT_WAITS = 12;
+
+// B-072: removes the worktree of a failed write attempt only when it holds nothing: no changed
+// file in the record, and git sees no change, untracked file or commit in it.
+async function removeEmptyRetryWorktree(projectRoot, summary) {
+  const worktreePath = String(summary?.worktreePath || "");
+  if (summary?.mode !== "write" || !worktreePath || (summary.changedFiles || []).length || !existsSync(worktreePath)) return { removed: false };
+  const status = await runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"], worktreePath, 30_000);
+  if (status.exitCode !== 0 || String(status.stdout || "").trim()) return { removed: false, reason: "the worktree has changes" };
+  const head = await runCommand("git", ["rev-parse", "HEAD"], worktreePath, 15_000);
+  if (summary.worktreeBaseCommit && head.stdout.trim() !== summary.worktreeBaseCommit) return { removed: false, reason: "the worktree has a commit of its own" };
+  const cleanup = await cleanupWorktree({ path: worktreePath, branch: summary.worktreeBranch || "", repoRoot: projectRoot }, "always", true).catch((error) => ({ cleanup: "failed", error: error?.message || String(error) }));
+  return { removed: cleanup?.cleanup === "removed" || !existsSync(worktreePath), cleanup: cleanup?.cleanup || "" };
+}
 const RETRY_POLICY_ERROR_TYPES = new Set([
   // The provider: limits, pauses, quotas and outages another model (or a later try) avoids.
   "provider_rate_limited", "provider_paused", "provider_slot_wait_timeout",
@@ -23113,6 +23128,8 @@ function jobRetryPolicy(job) {
 function applyRetryPolicyToJob(job, parentJobId = "") {
   const checked = jobRetryPolicy(job);
   if (!checked.ok || !checked.policy) return { ...checked, job };
+  // B-072: retries are requeues of the stored request, which only the SQLite queue keeps.
+  if (effectiveQueueMode() !== "sqlite") return { ok: false, errorType: "retry_policy_not_applicable", error: `models/maxAttempts need CODEX_OPENCODE_QUEUE_MODE=sqlite (the queue mode is ${effectiveQueueMode()}): a retry is a requeue of the stored request, which the other modes drop.` };
   if (parentJobId) return { ok: false, errorType: "retry_policy_not_applicable", error: "A pipeline job is retried by its pipeline, not by models/maxAttempts." };
   if (job.sanitizedWorkspace) return { ok: false, errorType: "retry_policy_not_applicable", error: "A sanitized-workspace job always runs the bridge's reader model; models/maxAttempts do not apply." };
   if (job.orchestratorMode === "contractor") return { ok: false, errorType: "retry_policy_not_applicable", error: "A contractor job cannot be replayed (its authorization token is never stored), so it cannot be retried." };
@@ -23220,7 +23237,12 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
   if (errorType === "queue_job_interrupted" && !(autoResumeInterruptedOverride ?? CONFIG.autoResumeInterrupted)) return { action: "resume_disabled" };
   const attempt = Math.max(1, Number(summary.retryAttempt || 1));
   const maxAttempts = checked.policy.maxAttempts;
-  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}`].slice(-RETRY_POLICY_MAX_ATTEMPTS);
+  // B-071: a job that timed out waiting for a provider slot (the global worker cap or a full
+  // provider) never started its agent, so it is requeued without counting an attempt, up to
+  // RETRY_POLICY_MAX_SLOT_WAITS times (a cap held for hours must not loop forever).
+  const slotWaits = Number(summary.slotWaitRequeues || 0);
+  const uncountedSlotWait = errorType === "provider_slot_wait_timeout" && slotWaits < RETRY_POLICY_MAX_SLOT_WAITS;
+  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedSlotWait ? " (not counted: the agent never started)" : ""}`].slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS));
   const giveUp = async (why) => {
     await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
     logEvent("warn", "queue.job_gave_up", {
@@ -23232,13 +23254,16 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     });
     return { action: "gave_up", attempts: attempt, history };
   };
-  if (attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
-  const next = await chooseRetryModel(checked.policy, attempt, summary);
+  if (!uncountedSlotWait && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
+  const nextAttempt = uncountedSlotWait ? attempt : attempt + 1;
+  // The model order follows the counted attempts; a slot wait tries the next model all the same
+  // (another provider may have a free slot), without spending an attempt.
+  const next = await chooseRetryModel(checked.policy, uncountedSlotWait ? attempt + slotWaits : attempt, summary);
   const requeued = await requeueQueueJob({
     cwd: projectRoot,
     jobId,
     model: next.spec || "",
-    recordFields: { retryAttempt: attempt + 1, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "" },
+    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits },
   });
   // Q-008: a previous child that is still alive may still write its worktree; the job stays
   // interrupted (not gave_up) so the operator can stop the child and requeue it.
@@ -23252,9 +23277,12 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     agent: summary.agent || "",
     model: next.spec || retryPolicyModelLabel(summary),
     errorType,
-    summary: failureSummary(`Attempt ${attempt + 1} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
+    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
   });
-  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: attempt + 1 };
+  // B-072: a failed write attempt that changed nothing leaves an empty worktree; the retry gets
+  // its own, so the empty one is removed (a worktree with any change is kept for review).
+  const emptyWorktree = row.status === "failed" ? await removeEmptyRetryWorktree(projectRoot, summary) : null;
+  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, emptyWorktree };
 }
 
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
@@ -23283,6 +23311,7 @@ function autoIntegrateJobError(job, lockPlan, parentJobId = "") {
   if (job?.autoIntegrate === undefined || job.autoIntegrate === null || job.autoIntegrate === false) return null;
   const refuse = (errorType, error, suggestedFix = "Remove autoIntegrate, or enqueue a write job with a validationCommand.") => ({ errorType, error, suggestedFix });
   if (job.autoIntegrate !== true) return refuse("auto_integrate_invalid", "autoIntegrate must be true or false.");
+  if (effectiveQueueMode() !== "sqlite") return refuse("auto_integrate_not_applicable", `autoIntegrate needs CODEX_OPENCODE_QUEUE_MODE=sqlite (the queue mode is ${effectiveQueueMode()}): its outcome is recorded on the durable job.`);
   if (!CONFIG.autoIntegrateAllowed) return refuse("auto_integrate_disabled", "The operator turned auto-integration off (CODEX_OPENCODE_AUTO_INTEGRATE=false); every patch goes through the reviewed integration.", "Remove autoIntegrate and integrate the worktree with integrate_opencode_worktree.");
   if (parentJobId) return refuse("auto_integrate_not_applicable", "A pipeline integrates its jobs itself.");
   if (lockPlan?.lockType === "read" || job.sanitizedWorkspace || job.dryRun) return refuse("auto_integrate_not_applicable", "autoIntegrate applies to write jobs that run (not read-only, sanitized or dry-run jobs).");

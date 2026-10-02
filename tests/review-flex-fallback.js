@@ -222,4 +222,57 @@ test("Q-007: a job the scheduler holds keeps its waiting time across a restart o
   assert.equal((await terminalOf(job.record.jobId)).status, "completed");
 });
 
+test("B-071: a provider slot wait (the agent never started) is not an attempt", async () => {
+  calls.length = 0;
+  let count = 0;
+  installExecutor(() => (++count <= 2 ? { errorType: "provider_slot_wait_timeout" } : {}));
+  const first = await enqueueQueueJob(readJob({ task: "waits for a slot twice", models: [MUSE], maxAttempts: 1 }));
+  assert.equal(first.ok, true, first.error);
+  const { records, last } = await chain(first.record.jobId);
+  assert.equal(records.length, 3, "two uncounted slot waits, then the one real attempt");
+  assert.equal(last.status, "completed", "with maxAttempts 1 the job still ran instead of giving up");
+  assert.equal(last.retryAttempt, 1);
+  assert.equal(last.slotWaitRequeues, 2);
+  assert.match(last.attemptHistory[0], /provider_slot_wait_timeout \(not counted: the agent never started\)$/);
+});
+
+test("B-072: models, maxAttempts and autoIntegrate are refused in the memory queue, which drops the request", async () => {
+  hooks.queueModeOverride = "memory";
+  try {
+    const policy = await enqueueQueueJob(readJob({ task: "memory queue policy", models: [MUSE] }));
+    assert.equal(policy.ok, false);
+    assert.equal(policy.errorType, "retry_policy_not_applicable");
+    assert.match(policy.error, /need CODEX_OPENCODE_QUEUE_MODE=sqlite/);
+    const integrate = await enqueueQueueJob(writeJob("src/a.txt", { task: "memory queue integrate", autoIntegrate: true }));
+    assert.equal(integrate.ok, false);
+    assert.equal(integrate.errorType, "auto_integrate_not_applicable");
+  } finally {
+    hooks.queueModeOverride = "sqlite";
+  }
+});
+
+test("B-072: a requeued write attempt that changed nothing has its empty worktree removed; one with a change keeps it", async () => {
+  const { existsSync, writeFileSync } = await import("node:fs");
+  const emptyDir = path.join(fixture.root, "wt-empty");
+  const dirtyDir = path.join(fixture.root, "wt-dirty");
+  await fixture.git(["worktree", "add", "-q", "-b", "agent/builder/empty-attempt", emptyDir, "HEAD"]);
+  await fixture.git(["worktree", "add", "-q", "-b", "agent/builder/dirty-attempt", dirtyDir, "HEAD"]);
+  writeFileSync(path.join(dirtyDir, "src", "notes.txt"), "half done\n");
+  const plans = { "empty attempt": emptyDir, "dirty attempt": dirtyDir };
+  const counts = {};
+  hooks.queueJobExecutorTestHook = async (request) => {
+    counts[request.task] = (counts[request.task] || 0) + 1;
+    return counts[request.task] === 1
+      ? { response: { content: [{ type: "text", text: "Job failed.\nerrorType: agent_idle_timeout" }] }, result: { errorType: "agent_idle_timeout", changedFiles: [] }, validation: null, worktree: { path: plans[request.task], branch: request.task === "empty attempt" ? "agent/builder/empty-attempt" : "agent/builder/dirty-attempt", baseCommit: "", baseTree: "" } }
+      : execution({ changedFiles: ["src/a.txt"] });
+  };
+  for (const task of Object.keys(plans)) {
+    const first = await enqueueQueueJob(writeJob("src/a.txt", { task, models: [MUSE] }));
+    assert.equal(first.ok, true, first.error);
+    await chain(first.record.jobId);
+  }
+  assert.equal(existsSync(emptyDir), false, "the empty worktree of the failed attempt was removed");
+  assert.equal(existsSync(dirtyDir), true, "a worktree with an untracked file is kept for review");
+});
+
 await runFlexTests({ isolatedStateDir, file: "tests/review-flex-fallback.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "model fallback" });
