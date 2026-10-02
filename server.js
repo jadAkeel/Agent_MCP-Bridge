@@ -225,6 +225,9 @@ const CONFIG = Object.freeze({
   // the scan). Tests point it at a scratch fixture.
   openCodeLogPath: readOpenCodeLogPathEnv(),
   openCodeLogScanMs: readPositiveIntEnv("CODEX_OPENCODE_OPENCODE_LOG_SCAN_MS", 1000 * 15),
+  // B-065: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
+  // requeued by the bridge that finds it, as one of its attempts. false leaves it interrupted.
+  autoResumeInterrupted: readChoiceEnv("CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED", ["true", "false"], "true") === "true",
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -766,6 +769,8 @@ const jobInputShape = {
   validationCommand: z.string().optional().describe("Command run after the agent, e.g. npm test. Checked before the agent starts."),
   validationFixPasses: z.number().int().min(0).max(1).optional().describe("0 (default) or 1. A write job cannot run its own checks (builders have no shell), so with 1 a failed validationCommand gives the agent one more run in the same worktree with the validation output, then validates again. Uses the rest of the job timeout; scope and lock rules apply unchanged. Not available in run_opencode_parallel."),
   timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional().describe("Agent run timeout in ms (at most 24 h). Waiting for a provider slot is not counted."),
+  models: z.array(z.string().min(1).max(300)).min(1).max(8).optional().describe("enqueue_opencode_job only. Models to try in order, each provider/model[@variant] from CODEX_OPENCODE_MODEL_ALLOWLIST. After a provider failure (rate limit, pause, quota, 5xx), an idle stop, a timeout, no output or a failed validation the bridge requeues the job on the next model that is not paused; after maxAttempts it marks the job outcome=gave_up."),
+  maxAttempts: z.number().int().min(1).max(10).optional().describe("enqueue_opencode_job only. Attempts in total, the first included (default 4 when models is given). Alone (without models) it retries on the same model."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
   allowFallbackToBuild: z.boolean().optional(),
@@ -3851,6 +3856,16 @@ async function resumeProvider({ provider } = {}) {
     transactionOpen = false;
     const removed = rows.map((row) => ({ providerKey: row.provider_key, until: new Date(Number(row.until_at)).toISOString(), errorType: row.error_type }));
     logEvent("info", "provider.resumed_by_operator", { providerKey: target.key, removed: removed.length });
+    // B-064: retries of this process that wait for a pause to end may start now; one whose model is
+    // still paused fails at its slot request and its retry policy picks again.
+    let released = 0;
+    for (const record of QUEUE_JOBS.values()) {
+      if (["pending", "planned"].includes(record.status) && record.startAfter) {
+        delete record.startAfter;
+        released += 1;
+      }
+    }
+    if (released) scheduleQueue();
     return { ok: true, key: target.key, removed, target };
   } catch (error) {
     if (transactionOpen) {
@@ -14811,12 +14826,13 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
   const placeholders = nonTerminalStatuses.map(() => "?").join(", ");
   const finishedAt = new Date(now).toISOString();
   const reconciled = [];
+  const interrupted = [];
   let transactionOpen = false;
   try {
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
     const rows = db.prepare(
-      `SELECT job_id, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
+      `SELECT job_id, cwd, status, created_at, started_at, owner_instance_id, owner_process_id, owner_generation,
               heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at,
               request_encrypted, revision, record_json
        FROM opencode_jobs
@@ -14914,6 +14930,7 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       if (Number(changed.changes || 0) > 0) {
         propagatePipelineTerminalInTransaction(db, row.job_id, terminalStatus, finishedAt);
         reconciled.push(row.job_id);
+        if (terminalStatus === "interrupted" && row.request_encrypted) interrupted.push({ jobId: row.job_id, cwd: row.cwd || snapshot.cwd || "" });
       }
     }
     db.exec("COMMIT");
@@ -14931,6 +14948,9 @@ function reconcileStaleQueueRecords(db, now = Date.now()) {
       jobIds: reconciled,
     });
   }
+  // B-065: a job a restart interrupted is resumed as its next attempt when it has a retry policy
+  // (applyQueueRetryPolicy decides; jobs without one stay interrupted for requeue_opencode_job).
+  for (const item of interrupted) scheduleQueueRetryPolicy(item.cwd, item.jobId);
 
   return reconciled;
 }
@@ -17274,8 +17294,22 @@ server.tool(
     validationCommand,
     validationFixPasses,
     delegation,
+    models,
+    maxAttempts,
+    autoIntegrate,
   }) => {
     const toolStarted = nowMs();
+    const queueOnly = queueOnlyOptionsError({ models, maxAttempts, autoIntegrate });
+    if (queueOnly) {
+      return { content: [{ type: "text", text: formatRejectedExecution({
+        headline: "Execution rejected.",
+        errorType: queueOnly.errorType,
+        reason: queueOnly.error,
+        requestedAgent: agent,
+        actualAgent: "none",
+        suggestedFix: queueOnly.suggestedFix,
+      }) }] };
+    }
     const requestedJob = {
       agent,
       task,
@@ -17558,7 +17592,7 @@ function diagnoseJobView(job) {
 }
 
 const ESSENTIAL_QUEUE_JOB_FIELDS = [
-  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
+  "jobId", "idempotencyKey", "requeuedFrom", "requeuedAs", "retryAttempt", "maxAttempts", "attemptHistory", "startAfter", "agent", "mode", "status", "runStage", "createdAt", "startedAt",
   "agentStartedAt", "lastActivityAt", "idleMs", "finishedAt", "durationMs", "agentRunMs", "waitBeforeAgentMs", "afterAgentMs", "providerWaitMs",
   "providerRetryWarningCount", "usage", "usageSummary", "heavyToolCalls", "validationFixPass", "phaseTimings",
   "errorType", "errorReason", "completionOutcome", "changedFiles", "worktreePath", "worktreeBranch",
@@ -17594,6 +17628,9 @@ function compactQueueJobLines(records) {
       record.idempotencyKey ? `key=${record.idempotencyKey}` : "",
       record.requeuedFrom ? `requeuedFrom=${record.requeuedFrom}` : "",
       record.requeuedAs ? `requeuedAs=${record.requeuedAs}` : "",
+      record.maxAttempts ? `attempt=${record.retryAttempt || 1}/${record.maxAttempts}` : "",
+      record.maxAttempts && record.scopeContract?.modelRequirement?.model ? `model=${record.scopeContract.modelRequirement.provider}/${record.scopeContract.modelRequirement.model}` : "",
+      queueStartAfterPending(record) ? `startAfter=${record.startAfter}` : "",
       `agent=${record.agent || "?"}`,
       `status=${record.status || "?"}`,
       stage && stage !== record.status ? `stage=${stage}` : "",
@@ -19833,6 +19870,8 @@ function validateParallelWritePlan(jobs) {
     if (sanitizedError) {
       return { ...sanitizedError, lockPlans };
     }
+    const queueOnly = queueOnlyOptionsError(job);
+    if (queueOnly) return { ...queueOnly, lockPlans };
     if (job.validationFixPasses) {
       return {
         error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
@@ -20041,6 +20080,18 @@ function validateParallelWritePlan(jobs) {
   }
 
   return { error: null, lockPlans };
+}
+
+// B-064: options only the durable queue can honour (it requeues, waits and integrates after the
+// run); a direct or parallel run would silently ignore them, so they are refused there.
+function queueOnlyOptionsError(job) {
+  const named = ["models", "maxAttempts", "autoIntegrate"].filter((key) => job?.[key] !== undefined && job?.[key] !== null);
+  if (!named.length) return null;
+  return {
+    errorType: "queue_only_option",
+    error: `${named.join(", ")} ${named.length === 1 ? "is" : "are"} honoured by enqueue_opencode_job only: the queue retries, waits for paused models and integrates after the run; this tool would ignore ${named.length === 1 ? "it" : "them"}.`,
+    suggestedFix: "Enqueue the job with enqueue_opencode_job, or remove the option.",
+  };
 }
 
 // Q-004: validationFixPasses is 0 or 1 and only means something for a write job whose
@@ -21330,8 +21381,15 @@ async function executeOpenCodeJob(requestedJob, {
 // A queued job is "running" from the moment a worker claims it, but it may then wait minutes for
 // a provider slot before the agent starts, so status alone cannot tell waiting from working and
 // durationMs includes the wait. runStage and agentRunMs separate the two.
+function queueStartAfterPending(record, now = Date.now()) {
+  const at = Date.parse(record?.startAfter || "");
+  return Number.isFinite(at) && at > now;
+}
+
 function queueRunStage(record) {
   if (record.status !== "running") {
+    // B-064: a retry that waits for the provider/model pause of every candidate model to end.
+    if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) return "waiting_for_provider_pause";
     // B-045: a pending job held back by the free-memory floor (jobs of this process only).
     return ["pending", "planned"].includes(record.status) && queueMemoryWaitingJobs.has(record.jobId)
       ? "waiting_for_memory"
@@ -21400,6 +21458,11 @@ function queueRecordSnapshot(record, includeResult = true) {
     requeuedAs: record.requeuedAs || "",
     requeueSequence: record.requeueSequence || 0,
     requeuedAt: record.requeuedAt || "",
+    // B-064: the retry policy's counters, the attempts so far and a retry's start time.
+    retryAttempt: record.retryAttempt || 0,
+    maxAttempts: record.maxAttempts || 0,
+    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
+    startAfter: record.startAfter || "",
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -22548,6 +22611,17 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     };
   }
 
+  // B-064: a retry policy (models / maxAttempts) is checked first and pins the first model.
+  const retryPolicy = applyRetryPolicyToJob(job, parentJobId);
+  if (!retryPolicy.ok) {
+    return {
+      ok: false,
+      errorType: retryPolicy.errorType,
+      error: retryPolicy.error,
+      suggestedFix: retryPolicy.suggestedFix || "Fix models/maxAttempts (provider/model[@variant] entries from CODEX_OPENCODE_MODEL_ALLOWLIST, 1 to 10 attempts) and enqueue again.",
+    };
+  }
+  job = retryPolicy.job;
   const normalizedJob = await normalizeJobCwd(job);
   const { error, errorType, suggestedFix, lockPlan, serialOnlyMatches = [] } = validateSingleLockPlan(normalizedJob);
   if (error || (hasWriteIntent(normalizedJob) && lockPlan.lockType === "read")) {
@@ -22648,9 +22722,12 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     childContainmentIdentity: "",
     containmentQuarantined: false,
     revision: 0,
+    // B-064: attempt counters of a retry policy (a requeue by the policy passes the next ones).
+    ...(retryPolicy.policy ? { retryAttempt: 1, maxAttempts: retryPolicy.policy.maxAttempts } : {}),
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
+  if (!record.startAfter) delete record.startAfter;
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -22744,11 +22821,220 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
   }
 }
 
+// B-064: model fallback for queued jobs (the round-6 orchestrator's TOOL_ORDER + attempts). A job
+// that names `models` and/or `maxAttempts` carries a retry policy: when it fails for a reason
+// another model or another try can fix, the bridge requeues it itself through requeueQueueJob (the
+// same validation as requeue_opencode_job, the same lineage fields) on the next model that is not
+// paused, and after maxAttempts it marks the last job outcome=gave_up. The policy lives in the
+// stored encrypted request, so it survives a restart and a requeue keeps it.
+const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
+const RETRY_POLICY_MAX_ATTEMPTS = 10;
+const RETRY_POLICY_ERROR_TYPES = new Set([
+  // The provider: limits, pauses, quotas and outages another model (or a later try) avoids.
+  "provider_rate_limited", "provider_paused", "provider_slot_wait_timeout",
+  "opencode_rate_limited", "opencode_quota_exhausted", "opencode_billing_error", "opencode_auth_error",
+  "opencode_model_error", "opencode_transient_provider_error", "opencode_provider_unavailable",
+  "opencode_transport_error", "opencode_api_error", "opencode_native_fallback", "opencode_stream_malformed",
+  // The run: stalled, too slow, or ended without a usable result.
+  "agent_idle_timeout", "agent_timeout", "agent_empty_final_response", "agent_exit_nonzero",
+  "essential_output_truncated", "validation_command_failed", "writer_no_changes",
+  // B-065: the owner died while the job ran (a client restart).
+  "queue_job_interrupted",
+]);
+
+function retryPolicyRequirement(parsed) {
+  return { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
+}
+
+function retryPolicyModelSpec(parsed) {
+  return `${parsed.provider}/${parsed.model}${parsed.variant ? `@${parsed.variant}` : ""}`;
+}
+
+// { ok, policy } with policy null when the job asks for none; refusals name what is wrong.
+function jobRetryPolicy(job) {
+  const models = Array.isArray(job?.models) ? job.models : [];
+  const hasModels = job?.models !== undefined && job?.models !== null;
+  const hasMax = job?.maxAttempts !== undefined && job?.maxAttempts !== null;
+  if (!hasModels && !hasMax) return { ok: true, policy: null };
+  if (hasModels && (!Array.isArray(job.models) || !models.length || models.length > 8)) {
+    return { ok: false, errorType: "retry_policy_invalid", error: "models must be a list of 1 to 8 provider/model[@variant] entries." };
+  }
+  if (hasMax && (typeof job.maxAttempts !== "number" || !Number.isInteger(job.maxAttempts) || job.maxAttempts < 1 || job.maxAttempts > RETRY_POLICY_MAX_ATTEMPTS)) {
+    return { ok: false, errorType: "retry_policy_invalid", error: `maxAttempts must be an integer from 1 to ${RETRY_POLICY_MAX_ATTEMPTS}; got ${JSON.stringify(job.maxAttempts)}.` };
+  }
+  const parsed = [];
+  for (const entry of models) {
+    const item = parseModelAllowlistEntry(entry);
+    if (!item) return { ok: false, errorType: "retry_policy_invalid", error: `models entry ${JSON.stringify(entry)} is not in provider/model[@variant] form.` };
+    if (!allowlistedModelOverride(retryPolicyRequirement(item), job?.agent)) {
+      const allowlist = activeModelOverrideAllowlist();
+      return {
+        ok: false,
+        errorType: "retry_policy_model_not_allowlisted",
+        error: `models entry ${retryPolicyModelSpec(item)} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or agent ${job?.agent || "?"} cannot be overridden.`,
+        suggestedFix: "List only allowlisted models, or ask the operator to add the model to CODEX_OPENCODE_MODEL_ALLOWLIST.",
+      };
+    }
+    parsed.push({ ...item, spec: retryPolicyModelSpec(item) });
+  }
+  return { ok: true, policy: { models: parsed, maxAttempts: hasMax ? job.maxAttempts : RETRY_POLICY_DEFAULT_ATTEMPTS } };
+}
+
+// Applied by enqueueQueueJob: refuses a policy where it cannot work and pins the first model.
+function applyRetryPolicyToJob(job, parentJobId = "") {
+  const checked = jobRetryPolicy(job);
+  if (!checked.ok || !checked.policy) return { ...checked, job };
+  if (parentJobId) return { ok: false, errorType: "retry_policy_not_applicable", error: "A pipeline job is retried by its pipeline, not by models/maxAttempts." };
+  if (job.sanitizedWorkspace) return { ok: false, errorType: "retry_policy_not_applicable", error: "A sanitized-workspace job always runs the bridge's reader model; models/maxAttempts do not apply." };
+  if (job.orchestratorMode === "contractor") return { ok: false, errorType: "retry_policy_not_applicable", error: "A contractor job cannot be replayed (its authorization token is never stored), so it cannot be retried." };
+  const { models } = checked.policy;
+  const requirement = job.scopeContract?.modelRequirement;
+  if (models.length && requirement) {
+    const matches = models.some((item) => item.provider === requirement.provider && item.model === requirement.model && (!requirement.variant || requirement.variant === item.variant));
+    if (!matches) return { ok: false, errorType: "retry_policy_invalid", error: `scopeContract.modelRequirement ${requirement.provider}/${requirement.model} is not one of models; give the model order in models only.` };
+    return { ok: true, policy: checked.policy, job };
+  }
+  if (!models.length) return { ok: true, policy: checked.policy, job };
+  const scopeContract = { ...(job.scopeContract || { mode: hasWriteIntent(job) ? "write" : "read" }) };
+  const previous = scopeContract.modelRequirement;
+  scopeContract.modelRequirement = { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...retryPolicyRequirement(models[0]) };
+  return { ok: true, policy: checked.policy, job: { ...job, scopeContract } };
+}
+
+// Active pauses by key (until, epoch ms), from the shared provider database.
+async function activeProviderPauses() {
+  const snapshot = await providerCapacitySnapshot();
+  const pauses = new Map();
+  for (const item of snapshot.cooldowns || []) {
+    if (Number(item.remainingMs) > 0) pauses.set(item.providerKey, Date.parse(item.until));
+  }
+  return pauses;
+}
+
+// The model of attempt `attempt + 1`: the next one in order that is not paused (by its provider or
+// by itself). When every one is paused, the one whose pause ends first, with startAfter set to that
+// time, so the attempt waits in the queue instead of failing at once and burning an attempt.
+async function chooseRetryModel(policy, attempt, failed = {}) {
+  const pauses = await activeProviderPauses();
+  const pausedUntil = (provider, model) => Math.max(
+    pauses.get(providerKeyForMetadata({ provider })) || 0,
+    model ? pauses.get(modelPauseKeyForMetadata({ provider, model })) || 0 : 0,
+  );
+  const candidates = policy.models.length
+    ? policy.models.map((_, index) => policy.models[(attempt + index) % policy.models.length])
+    : [{ spec: "", provider: failed.configuredProvider || "", model: failed.configuredModel || "" }];
+  let best = null;
+  for (const candidate of candidates) {
+    const until = candidate.provider ? pausedUntil(candidate.provider, candidate.model) : 0;
+    if (!until || until <= Date.now()) return { spec: candidate.spec, startAfter: "" };
+    if (!best || until < best.until) best = { spec: candidate.spec, until };
+  }
+  return { spec: best.spec, startAfter: new Date(best.until).toISOString() };
+}
+
+// A guarded update of a terminal row's summary (as markQueueJobRequeued does): the owner never
+// rewrites a terminal row, so this only races another such update and retries on the revision.
+async function patchTerminalQueueSummary(projectRoot, jobId, fields) {
+  const db = await openLockDb(projectRoot);
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { patched: false, reason: "the job is not terminal" };
+      let summary = {};
+      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { patched: false, reason: "the record is unreadable" }; }
+      const updatedAt = new Date().toISOString();
+      const changed = db.prepare(`
+        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
+        WHERE job_id = ? AND revision = ? AND status = ?
+      `).run(JSON.stringify(sanitizePersistedValue({ ...summary, ...fields, revision: Number(row.revision || 0) + 1 })), updatedAt, jobId, Number(row.revision || 0), row.status);
+      if (Number(changed.changes || 0) === 1) {
+        const live = QUEUE_JOBS.get(jobId);
+        if (live) Object.assign(live, fields);
+        return { patched: true };
+      }
+    }
+    return { patched: false, reason: "the record kept changing" };
+  } finally {
+    closeDb(db);
+  }
+}
+
+const retryPolicyModelLabel = (summary) => (summary?.configuredModel ? `${summary.configuredProvider || "?"}/${summary.configuredModel}` : summary?.scopeContract?.modelRequirement?.model ? `${summary.scopeContract.modelRequirement.provider}/${summary.scopeContract.modelRequirement.model}` : "profile model");
+
+// Runs after a job of a retry policy reached failed or interrupted. Returns what it did.
+async function applyQueueRetryPolicy({ cwd, jobId }) {
+  if (effectiveQueueMode() !== "sqlite" || !jobId) return { action: "none" };
+  const projectRoot = await resolveProjectStateRoot(cwd);
+  const db = await openLockDb(projectRoot);
+  let row;
+  try {
+    row = db.prepare("SELECT status, record_json, request_encrypted FROM opencode_jobs WHERE job_id = ?").get(jobId);
+  } finally {
+    closeDb(db);
+  }
+  if (!row || !["failed", "interrupted"].includes(row.status) || !row.request_encrypted) return { action: "none" };
+  let summary = {};
+  try { summary = JSON.parse(row.record_json || "{}"); } catch { return { action: "none" }; }
+  if (summary.requeuedAs || summary.completionOutcome === "gave_up" || summary.parentJobId) return { action: "none" };
+  let request;
+  try {
+    request = await decryptQueueRequest(row.request_encrypted, jobId);
+  } catch {
+    return { action: "none" };
+  }
+  const checked = jobRetryPolicy(request);
+  if (!checked.ok || !checked.policy) return { action: "none" };
+  const errorType = row.status === "interrupted" ? "queue_job_interrupted" : String(summary.errorType || "");
+  if (!RETRY_POLICY_ERROR_TYPES.has(errorType)) return { action: "not_eligible", errorType };
+  if (errorType === "queue_job_interrupted" && !CONFIG.autoResumeInterrupted) return { action: "resume_disabled" };
+  const attempt = Math.max(1, Number(summary.retryAttempt || 1));
+  const maxAttempts = checked.policy.maxAttempts;
+  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}`].slice(-RETRY_POLICY_MAX_ATTEMPTS);
+  const giveUp = async (why) => {
+    await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
+    logEvent("warn", "queue.job_gave_up", {
+      jobId,
+      agent: summary.agent || "",
+      model: retryPolicyModelLabel(summary),
+      errorType,
+      summary: failureSummary(`${why} Attempts: ${history.join("; ")}`),
+    });
+    return { action: "gave_up", attempts: attempt, history };
+  };
+  if (attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
+  const next = await chooseRetryModel(checked.policy, attempt, summary);
+  const requeued = await requeueQueueJob({
+    cwd: projectRoot,
+    jobId,
+    model: next.spec || "",
+    recordFields: { retryAttempt: attempt + 1, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "" },
+  });
+  if (!requeued.ok) return await giveUp(`The retry could not be enqueued (${requeued.errorType}: ${requeued.error}).`);
+  logEvent("warn", "queue.job_retried", {
+    jobId: requeued.record.jobId,
+    agent: summary.agent || "",
+    model: next.spec || retryPolicyModelLabel(summary),
+    errorType,
+    summary: failureSummary(`Attempt ${attempt + 1} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
+  });
+  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: attempt + 1 };
+}
+
+// Never blocks or fails the caller (a terminal commit, a recovery pass): the policy runs after it.
+function scheduleQueueRetryPolicy(cwd, jobId) {
+  if (!jobId || effectiveQueueMode() !== "sqlite") return;
+  setImmediate(() => {
+    applyQueueRetryPolicy({ cwd, jobId }).catch((error) => {
+      logEvent("warn", "queue.retry_policy_failed", { jobId, errorType: error?.errorType || "retry_policy_failed", summary: failureSummary(error?.message || String(error)) });
+    });
+  });
+}
+
 // Creates a new queue job from the stored request of a failed, cancelled, interrupted or
 // not_resumable one. The request goes through enqueueQueueJob, the path enqueue_opencode_job uses
 // (lock plan, Scope Contract rules, worktree requirement, fingerprint, idempotency), after a
 // zod check against the current job input schema; nothing is replayed unchecked.
-async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }) {
+async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined, recordFields = null }) {
   if (typeof jobId !== "string" || !jobId.trim()) return requeueRefusal("requeue_invalid_arguments", "jobId must be a non-empty string.");
   if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_AGENT_TIMEOUT_MS)) {
     return requeueRefusal("requeue_invalid_arguments", `timeoutMs must be a positive integer of at most ${MAX_AGENT_TIMEOUT_MS} ms; got ${JSON.stringify(timeoutMs)}.`);
@@ -22854,7 +23140,8 @@ async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined }
   const sequence = Number(summary.requeueSequence || 0) + 1;
   const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
   job.idempotencyKey = idempotencyKey;
-  const enqueued = await enqueueQueueJob(job, "", { recordFields: { requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
+  // B-064: the retry policy passes the attempt counters and a start time; a manual requeue none.
+  const enqueued = await enqueueQueueJob(job, "", { recordFields: { ...(recordFields || {}), requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
   if (!enqueued.ok) {
     return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
   }
@@ -23383,6 +23670,10 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
           durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
         });
       }
+      // B-064: a job with a retry policy is requeued on its next model (or marked gave_up).
+      if (lastResult.persisted && patch.status === "failed" && (record.request?.models || record.request?.maxAttempts || record.retryAttempt)) {
+        scheduleQueueRetryPolicy(record.cwd, record.jobId);
+      }
       // B-063: a writer that "completed" without changing a file is the round-6 "no output file":
       // a success for the queue, a failure for the batch. Logged so the issue log shows it.
       if (lastResult.persisted && patch.status === "completed" && record.mode === "write" && patch.noChanges) {
@@ -23636,14 +23927,21 @@ async function startQueueRecord(record) {
       }
 
       const containmentUnconfirmed = errorType === "process_tree_termination_unconfirmed";
+      // B-064: with a retry policy the caller said this job must produce something, so a writer
+      // that changed no file is a failure (the round-6 "no output file") and is retried.
+      const noOutputFailure = !errorType && record.mode === "write" && Boolean(execution.result?.noChanges)
+        && Boolean(record.request?.models || record.request?.maxAttempts);
+      const terminalErrorType = noOutputFailure ? "writer_no_changes" : errorType;
       terminalPatch = terminalPatch || {
-        status: errorType ? "failed" : "completed",
+        status: terminalErrorType ? "failed" : "completed",
         finishedAt: new Date().toISOString(),
         durationMs: nowMs() - started,
         heartbeatAt: "",
         leaseExpiresAt: "",
-        errorType,
-        errorReason: errorType ? queueFailureReason(execution, errorType) : "",
+        errorType: terminalErrorType,
+        errorReason: noOutputFailure
+          ? "The writer finished without changing any file; with a retry policy (models/maxAttempts) that counts as no output."
+          : errorType ? queueFailureReason(execution, errorType) : "",
         changedFiles: execution.result?.changedFiles || [],
         dirtyFiles: execution.result?.dirtyFiles || [],
         overlappingFiles: execution.result?.overlappingFiles || [],
@@ -23818,6 +24116,8 @@ function scheduleQueue(delayMs = 0) {
 
           // B-045: planning and starting wait for memory; the job stays pending (no durable write per poll).
           if (holdStarts) continue;
+          // B-064: a retry whose every model is paused waits for the first pause to end.
+          if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) continue;
 
           if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
           if (record.status === "blocked") {
@@ -28349,6 +28649,12 @@ export const __selfTest = {
     pauseProvider,
     providerPauseTarget,
     resumeProvider,
+    RETRY_POLICY_ERROR_TYPES,
+    applyQueueRetryPolicy,
+    applyRetryPolicyToJob,
+    chooseRetryModel,
+    jobRetryPolicy,
+    queueOnlyOptionsError,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
