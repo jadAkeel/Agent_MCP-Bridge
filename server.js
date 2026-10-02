@@ -5866,24 +5866,29 @@ function openCodeRateLimitHit(line) {
 // before that the provider, model and agent must match and the line must be newer than the run.
 // Any stdout output means the agent is making progress and resets the count, so a run that
 // recovers between retries is never stopped.
-function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "", logPath = "", scanMs = 15000, startedAtMs = Date.now(), onTrip = () => {} } = {}) {
-  const state = { hits: 0, consecutive: 0, sessionId: "", evidence: null, tripped: false, offset: -1, remainder: "", timer: null, scanning: false };
+// B-070: two rules against a false pause. A log-file line counts only once the run's own session
+// id is known and the line names that session (before that, the job's stderr is the only source:
+// a line of another session on the same model, two of them in one scan, used to stop the run and
+// pause the model for everyone). And the hits of a streak must span reads at least minSpreadMs
+// apart (default 5 s): a burst delivered by one read, or several reads in the same moment, is one
+// observation, while OpenCode's real retries are seconds to minutes apart.
+const RATE_LIMIT_MIN_SPREAD_MS = 5000;
+
+function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "", logPath = "", scanMs = 15000, startedAtMs = Date.now(), minSpreadMs = RATE_LIMIT_MIN_SPREAD_MS, onTrip = () => {} } = {}) {
+  const state = { hits: 0, consecutive: 0, streakStartedAt: 0, sessionId: "", evidence: null, tripped: false, offset: -1, remainder: "", timer: null, scanning: false };
   const seen = new Set();
   const wantedProvider = String(provider || "").toLowerCase();
   const wantedModel = String(model || "").toLowerCase();
   const wantedAgent = String(agent || "").toLowerCase();
   const modelMatches = (entry) => (!entry.modelID || entry.modelID.toLowerCase() === wantedModel)
     && (!entry.providerID || !wantedProvider || entry.providerID.toLowerCase() === wantedProvider);
-  const consider = (entry, source) => {
+  const consider = (entry, source, readAt = Date.now()) => {
     if (!entry || state.tripped || !(hits > 0)) return;
     if (source === "file") {
       if (entry.timestampMs && entry.timestampMs < startedAtMs - 1000) return;
-      if (state.sessionId && entry.sessionID) {
-        if (entry.sessionID !== state.sessionId) return;
-      } else {
-        if (!entry.modelID || !modelMatches(entry)) return;
-        if (wantedAgent && entry.agent && entry.agent.toLowerCase() !== wantedAgent) return;
-      }
+      if (!state.sessionId || entry.sessionID !== state.sessionId) return;
+      if (!modelMatches(entry)) return;
+      if (wantedAgent && entry.agent && entry.agent.toLowerCase() !== wantedAgent) return;
     } else if (!modelMatches(entry)) {
       return;
     }
@@ -5894,8 +5899,9 @@ function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "
     seen.add(key);
     state.hits += 1;
     state.consecutive += 1;
+    if (state.consecutive === 1) state.streakStartedAt = readAt;
     state.evidence = { source, kind: entry.kind, at: entry.timestamp, sessionId: entry.sessionID, providerID: entry.providerID, modelID: entry.modelID, detail: entry.detail };
-    if (state.consecutive >= hits) {
+    if (state.consecutive >= hits && readAt - state.streakStartedAt >= minSpreadMs) {
       state.tripped = true;
       try { onTrip(state.evidence); } catch { /* The trip only asks for termination. */ }
     }
@@ -5920,7 +5926,8 @@ function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "
       state.offset += bytesRead;
       const lines = `${state.remainder}${buffer.subarray(0, bytesRead).toString("utf8")}`.split(/\r?\n/);
       state.remainder = (lines.pop() || "").slice(-64 * 1024);
-      for (const text of lines) consider(openCodeRateLimitHit(text), "file");
+      const readAt = Date.now();
+      for (const text of lines) consider(openCodeRateLimitHit(text), "file", readAt);
     } catch {
       // A missing or unreadable log file only means there is nothing to scan.
     } finally {

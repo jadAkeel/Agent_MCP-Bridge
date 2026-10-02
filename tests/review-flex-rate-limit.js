@@ -71,10 +71,12 @@ if (mode === "silent-hits") { for (let i = 0; i < 6; i += 1) { process.stderr.wr
 if (mode === "progress") { for (let i = 0; i < 3; i += 1) { process.stderr.write(line()); await sleep(120); process.stdout.write(JSON.stringify({ type: "step_finish", sessionID: "ses_A" }) + "\\n"); await sleep(120); } }
 if (mode === "other-model") { for (let i = 0; i < 4; i += 1) { process.stderr.write(line("antigravity-gemini-3.8-flash")); await sleep(120); } }
 if (mode === "silent") { await sleep(Number(arg) || 4000); }
+if (mode === "burst") { for (let i = 0; i < 6; i += 1) process.stderr.write(line()); await sleep(1500); }
 if (mode === "session") { process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "ses_MINE" }) + "\\n"); await sleep(Number(arg) || 8000); }
 `, "utf8");
 
-const watch = (extra = {}) => ({ hits: 2, provider: "opencode", model: MUSE, agent: "builder", logPath: "", scanMs: 100, ...extra });
+// minSpreadMs 100: the children print their lines 150 ms apart (the bridge default is 5 s, B-070).
+const watch = (extra = {}) => ({ hits: 2, provider: "opencode", model: MUSE, agent: "builder", logPath: "", scanMs: 100, minSpreadMs: 100, ...extra });
 const spawnChild = (mode, arg = "", options = {}) => runSpawnCommand(process.execPath, [childScript, mode, String(arg)], scratch, 60_000, null, options);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -129,20 +131,32 @@ test("B-061: rate-limit lines of another model do not count, and 0 hits turns th
   assert.equal(off.rateLimitHits, 0);
 });
 
-test("B-061: the log file scanner trips a silent run on new lines of its model and ignores the rest", async () => {
+test("B-070: before the run's session is known, log-file lines never count (another session's limit must not pause the model)", async () => {
   await writeFile(logPath, `${logLine({ at: new Date(Date.now() - 60_000) })}\n`, "utf8");
-  const running = spawnChild("silent", 6000, { rateLimitWatch: watch({ logPath }) });
+  const running = spawnChild("silent", 3000, { rateLimitWatch: watch({ logPath }) });
   await sleep(600);
-  // Older than the run, another model, another agent: none of these count.
-  await appendFile(logPath, `${logLine({ at: new Date(Date.now() - 120_000) })}\n${logLine({ model: "antigravity-gemini-3.8-flash" })}\n${logLine({ agent: "reviewer", session: "ses_R" })}\n`, "utf8");
-  await sleep(500);
-  await appendFile(logPath, `${logLine({ session: "ses_X" })}\n`, "utf8");
-  await sleep(150);
+  // Same model, same agent, new lines, two of them in one scan: still another session's.
+  await appendFile(logPath, `${logLine({ session: "ses_X" })}\n${logLine({ session: "ses_X", at: new Date(Date.now() + 1) })}\n`, "utf8");
+  await sleep(300);
   await appendFile(logPath, `${logLine({ session: "ses_X" })}\n`, "utf8");
   const result = await running;
-  assert.equal(result.rateLimited, true, "two new lines of the run's model with no output in between");
-  assert.equal(result.rateLimitEvidence.source, "file");
-  assert.equal(result.rateLimitHits, 2);
+  assert.equal(result.rateLimited, false);
+  assert.equal(result.rateLimitHits, 0);
+});
+
+test("B-070: a burst delivered at once is one observation; the default needs hits 5 s apart", async () => {
+  const burst = await spawnChild("burst", "", { rateLimitWatch: watch({ minSpreadMs: undefined }) });
+  assert.equal(burst.rateLimited, false, "six lines within a moment do not stop the run");
+  assert.ok(burst.rateLimitHits >= 1, "the lines were seen (identical ones count once)");
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch({ minSpreadMs: 300 }), onTrip: () => { trips += 1; } });
+  watcher.stderrLine(logLine({ at: new Date(Date.now() - 2) }));
+  watcher.stderrLine(logLine({ at: new Date(Date.now() - 1) }));
+  assert.equal(trips, 0, "two hits in the same moment");
+  await sleep(350);
+  watcher.stderrLine(logLine());
+  assert.equal(trips, 1, "a later read completes the streak");
+  watcher.stop();
 });
 
 test("B-061: once the run's session is known only that session's lines count", async () => {
@@ -165,7 +179,8 @@ test("B-061: once the run's session is known only that session's lines count", a
 test("B-061: the watcher counts a line seen on stderr and in the file once, and survives a rotated file", async () => {
   await writeFile(logPath, "x\n".repeat(50), "utf8");
   let trips = 0;
-  const watcher = createRateLimitWatcher({ ...watch({ logPath, hits: 3 }), onTrip: () => { trips += 1; } });
+  const watcher = createRateLimitWatcher({ ...watch({ logPath, hits: 3, minSpreadMs: 0 }), onTrip: () => { trips += 1; } });
+  watcher.stdoutText(JSON.stringify({ type: "step_start", sessionID: "ses_A" }));
   await watcher.scanNow();
   const shared = logLine();
   watcher.stderrLine(shared);
