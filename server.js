@@ -170,6 +170,7 @@ import { createIntegrationPreviewRuntime } from "./lib/integration-preview.js";
 import { createQueueLeaseRuntime } from "./lib/queue/leases.js";
 import { createExecuteJobRuntime } from "./lib/execute-job.js";
 import { createOrchestratorPolicyRuntime } from "./lib/orchestrator-policy.js";
+import { createJobDiscoveryRuntime } from "./lib/job-discovery.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -490,7 +491,6 @@ let queueCancellationTestHook = null;
 let pipelineGateExecutorTestHook = null;
 // Self-test only: stands in for agent discovery, attestation and the OpenCode run so the job
 // and parallel paths can be exercised against a real Git checkout without a provider.
-let agentRuntimeTestHook = null;
 
 const server = new McpServer({
   name: "codex-opencode-bridge",
@@ -6460,61 +6460,7 @@ const { normalizeLockType, normalizeLockMode, createLockPlan, directExecutionLoc
   validationCommandTrustError,
 });
 
-
-
-
-
-
-function sanitizedDiscoveryContext(job = {}) {
-  const forcePure = Boolean(job.sanitizedWorkspace);
-  return {
-    forcePure,
-    routeToSanitizedAgent: forcePure,
-    // Manifest verification must precede this call. Attest the exact cwd whose
-    // effective project/agent configuration the subsequent run will use.
-    discoveryCwd: job.cwd,
-  };
-}
-
-async function verifySanitizedJobsBeforeDiscovery(jobs, phase) {
-  const verifications = [];
-  for (let index = 0; index < jobs.length; index += 1) {
-    const contract = jobs[index]?.sanitizedWorkspace;
-    if (!contract) continue;
-    const verification = await verifySanitizedWorkspace(contract, phase);
-    verifications[index] = verification;
-    if (!verification.ok) {
-      return { ok: false, index, verification, verifications };
-    }
-  }
-  return { ok: true, index: -1, verification: null, verifications };
-}
-
-
-function parallelProviderKeys(resolutions = [], metadataResults = [], lockPlans = []) {
-  return resolutions.map((resolution, index) => {
-    const metadata = metadataResults[index]?.metadata || null;
-    if (!metadata) return "";
-    const override = allowlistedModelOverride(lockPlans[index]?.scopeContract?.modelRequirement, resolution?.actualAgent || lockPlans[index]?.agent);
-    return providerKeyForMetadata(applyModelOverrideToMetadata(metadata, override));
-  });
-}
-
-
-
-
-
-
-
-
-function jobAgentRuntime() {
-  const hook = process.argv.includes("--self-test") ? agentRuntimeTestHook : null;
-  return {
-    resolveAgent: hook?.resolveAgent || resolveAgent,
-    readAgentDebugMetadata: hook?.readAgentDebugMetadata || readAgentDebugMetadata,
-    runOpenCodeWithPolicy: hook?.runOpenCodeWithPolicy || runOpenCodeWithPolicy,
-  };
-}
+const { sanitizedDiscoveryContext, verifySanitizedJobsBeforeDiscovery, parallelProviderKeys, jobAgentRuntime, getAgentRuntimeTestHook, setAgentRuntimeTestHook } = createJobDiscoveryRuntime({ allowlistedModelOverride, applyModelOverrideToMetadata, providerKeyForMetadata, readAgentDebugMetadata, resolveAgent, runOpenCodeWithPolicy, verifySanitizedWorkspace });
 
 const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProcessMsOf, buildValidationFixPrompt, buildSelfCheckFixPrompt, selfCheckFailureSummary, selfCheckPassSkipReason, formatSelfCheck, validationFixPassSkipReason, mergeValidationFixRuns, formatValidationFixPass, readOnlyEditsDeniedByAttestation, readOnlyWorkspaceDrift, formatReadOnlyWorkspaceDrift, executeOpenCodeJob } = createExecuteJobRuntime({ CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, OPENCODE_EXE, SELF_CHECK_DEFAULT_PASSES, VALIDATION_PREFLIGHT_FIX, abortSignalErrorType, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, attestContractorNestedAgents, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, combineAbortSignals, compactJobLines, conflictPathsFromConflict, containmentRecord, createPhaseClock, createWorktreeForJob, directExecutionLockConflictDetails, dirtyCheckpointDetails, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, hasWriteIntent, jobAgentRuntime, logEvent, makeQueueJobId, mergeHeavyToolCalls, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, patchPreviewOmittedLine, quarantineHardLock, readAgentDefinition, readOnlyHeadMove, readOnlyRoutingPolicyError, recordChangedFiles, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, shouldUseWorktree, startHardLockHeartbeat, timeoutForAgent, truncateText, updateRetainedWorktreeMeasurement, validateChangedFilesForPlan, validateSingleLockPlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifySanitizedWorkspace });
 
@@ -13171,8 +13117,8 @@ export const __selfTest = {
     set queuePersistTestHook(value) { queuePersistTestHook = value; },
     get bridgeStartupRecovery() { return bridgeStartupRecovery; },
     set bridgeStartupRecovery(value) { bridgeStartupRecovery = value; },
-    get agentRuntimeTestHook() { return agentRuntimeTestHook; },
-    set agentRuntimeTestHook(value) { agentRuntimeTestHook = value; },
+    get agentRuntimeTestHook() { return getAgentRuntimeTestHook(); },
+    set agentRuntimeTestHook(value) { setAgentRuntimeTestHook(value); },
     get freeMemoryBytesTestHook() { return freeMemoryBytesTestHook; },
     set freeMemoryBytesTestHook(value) { freeMemoryBytesTestHook = value; },
     get minFreeMemoryMbOverride() { return minFreeMemoryMbOverride; },
