@@ -160,6 +160,9 @@ const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVID
 const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
 const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
 const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, updatedAt: "" };
+// B-060: the default free-memory floor. A fixed 1024 MB would hold the queue forever on a machine
+// with 1 GB or less, so it is capped at an eighth of total memory.
+const DEFAULT_MIN_FREE_MEMORY_MB = Math.max(0, Math.min(1024, Math.floor(totalmem() / (1024 * 1024) / 8)));
 const CONFIG = Object.freeze({
   readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
   writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
@@ -194,13 +197,18 @@ const CONFIG = Object.freeze({
   queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
   get queueParallelLimit() { return RUNTIME_CONCURRENCY.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT; },
   // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
-  // (twenty agent processes, their worktrees and test runs exhausted a laptop).
-  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", 0),
+  // (twenty agent processes, their worktrees and test runs exhausted a laptop). B-060: on by
+  // default (1024 MB, at most an eighth of the machine's memory), because 10 builders took the
+  // owner's machine to 0.4 GB free while the floor was off.
+  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", DEFAULT_MIN_FREE_MEMORY_MB),
   // B-046: 0 disables. An agent that writes nothing to stdout or stderr for this long is stopped
   // through the process-tree supervisor and fails as agent_idle_timeout (a stalled provider stream
   // held a slot for 20+ minutes). Output arrives per finished step, so keep this well above the
-  // longest tool call or reasoning pause a healthy agent has.
-  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 0),
+  // longest tool call or reasoning pause a healthy agent has. B-060: 10 minutes by default (the
+  // round-6 orchestrator's watchdog); CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL sets other
+  // limits for models that write a whole file in one long silent step.
+  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 1000 * 60 * 10),
+  agentIdleTimeoutByModel: readModelDurationMapEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL"),
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -435,8 +443,30 @@ function currentFreeMemoryBytes() {
   return freemem();
 }
 
+// B-060: the floor is on by default, but a self-test run must not depend on how much memory the
+// machine running the suite has free: there the default applies only when the variable is set.
+const MIN_FREE_MEMORY_ENV_SET = String(process.env.CODEX_OPENCODE_MIN_FREE_MEMORY_MB ?? "").trim() !== "";
+
+function effectiveMinFreeMemoryMb() {
+  if (minFreeMemoryMbOverride !== null && minFreeMemoryMbOverride !== undefined) return minFreeMemoryMbOverride;
+  if (!MIN_FREE_MEMORY_ENV_SET && process.argv.includes("--self-test")) return 0;
+  return CONFIG.minFreeMemoryMb;
+}
+
+// B-060: the idle limit of one run: the per-model entry of CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL
+// for the model that actually runs (override included), else CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS.
+function agentIdleTimeoutForModel(metadata = null) {
+  const key = `${String(metadata?.provider || "").toLowerCase()}/${String(metadata?.model || "").toLowerCase()}`;
+  return CONFIG.agentIdleTimeoutByModel.has(key) ? CONFIG.agentIdleTimeoutByModel.get(key) : CONFIG.agentIdleTimeoutMs;
+}
+
+function agentIdleTimeoutStatusLine() {
+  const perModel = [...CONFIG.agentIdleTimeoutByModel.entries()].map(([model, ms]) => `${model}=${ms} ms`);
+  return `Agent idle timeout (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS): ${CONFIG.agentIdleTimeoutMs > 0 ? `${CONFIG.agentIdleTimeoutMs} ms` : "disabled (0)"}; per model (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL): ${perModel.length ? perModel.join(", ") : "none"}`;
+}
+
 function queueMemoryGate() {
-  const floorMb = minFreeMemoryMbOverride ?? CONFIG.minFreeMemoryMb;
+  const floorMb = effectiveMinFreeMemoryMb();
   const freeMb = Math.floor(currentFreeMemoryBytes() / (1024 * 1024));
   const totalMb = Math.floor(totalmem() / (1024 * 1024));
   return { floorMb, freeMb, totalMb, blocked: floorMb > 0 && freeMb < floorMb };
@@ -808,6 +838,25 @@ function assertSupportedCallerModel() {
   throw new Error(
     "CODEX_OPENCODE_CALLER_MODEL only supports trusted_stdio. Shared or multiplexed callers require an external per-project capability/authentication boundary and are rejected by this bridge."
   );
+}
+
+// B-060: "provider/model=ms,provider/model=ms". A model that writes its whole output in one long
+// silent step (Space Bunny, Nemotron) needs a longer idle limit than the default; one global value
+// either killed those or let a stalled Muse run hold its slot. Invalid entries stop the bridge at
+// startup, like every other malformed setting.
+function readModelDurationMapEnv(name) {
+  const raw = process.env[name];
+  const map = new Map();
+  if (raw === undefined || raw === null || !String(raw).trim()) return map;
+  for (const entry of String(raw).split(",").map((item) => item.trim()).filter(Boolean)) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9._:-]*)\/([A-Za-z0-9][A-Za-z0-9._:/-]*)=(\d+)$/.exec(entry);
+    const value = match ? Number(match[3]) : NaN;
+    if (!match || !Number.isSafeInteger(value) || value > MAX_TIMER_MS) {
+      throw new Error(`${name} must be a comma-separated list of provider/model=milliseconds (each at most ${MAX_TIMER_MS}); got ${JSON.stringify(entry)}.`);
+    }
+    map.set(`${match[1].toLowerCase()}/${match[2].toLowerCase()}`, value);
+  }
+  return map;
 }
 
 function readCsvEnv(name, fallback = []) {
@@ -7729,6 +7778,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   let isolatedRuntimeCleanup = { ok: true, error: "" };
   let containmentUnconfirmed = false;
   let providerQuarantine = null;
+  const runIdleTimeoutMs = agentIdleTimeoutForModel(configuredMetadata);
   const finalAttestationMs = Math.round(nowMs() - runStarted);
   const spawnCalledWallMs = Date.now();
   try {
@@ -7745,7 +7795,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
         beforeHeartbeat: renewSupervisorAuthority,
         // B-046: queue jobs show their last output; the idle watchdog is off unless configured.
         onActivity: slotWaitJobId ? (atMs) => noteAgentActivity(slotWaitJobId, atMs) : null,
-        idleTimeoutMs: CONFIG.agentIdleTimeoutMs,
+        idleTimeoutMs: runIdleTimeoutMs,
       }
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
@@ -7800,7 +7850,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
     timeoutMs,
     timedOut: isTimeoutResult(result),
     idleTimedOut: Boolean(result.idleTimedOut),
-    idleTimeoutMs: result.idleTimedOut ? CONFIG.agentIdleTimeoutMs : 0,
+    idleTimeoutMs: result.idleTimedOut ? runIdleTimeoutMs : 0,
     cancelled: Boolean(result.cancelled),
     cancellationErrorType: result.cancellationErrorType || "",
     providerTerminated: Boolean(result.providerTerminated),
@@ -16391,6 +16441,7 @@ server.tool(
             `Parallel call job limit (CODEX_OPENCODE_PARALLEL_LIMIT): ${queueCapacity.parallelCallLimit} job(s) per run_opencode_parallel call (does not bound the queue)`,
             ...(queueCapacity.warning ? [queueCapacity.warning] : []),
             ...queueMemoryStatusLines(),
+            agentIdleTimeoutStatusLine(),
             `Provider active leases: ${providerCapacity.leases.length}`,
             // Slots are counted per provider key; one total against one limit read as over capacity.
             ...(providerCapacity.keys || []).map((item) => `- ${item.providerKey}: ${item.leases} of ${item.capacity} slot(s) held${item.quarantined ? ` (${item.quarantined} quarantined for an unconfirmed process tree)` : ""}`),
@@ -27775,6 +27826,12 @@ export const __selfTest = {
     requeueQueueJob,
     runtimeConcurrencyLimitError,
     setRuntimeConcurrency,
+    // tests/review-flex-*.js (flexible scheduling, B-060..)
+    DEFAULT_MIN_FREE_MEMORY_MB,
+    agentIdleTimeoutForModel,
+    agentIdleTimeoutStatusLine,
+    effectiveMinFreeMemoryMb,
+    readModelDurationMapEnv,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
