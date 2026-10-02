@@ -14,6 +14,9 @@ process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 delete process.env.CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-resume");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { makeFlexFixture, runFlexTests } = await import("./flex-fixture.js");
@@ -103,4 +106,4 @@ test("Q-008: the resume counts against maxAttempts, so a job that keeps being in
   assert.equal((await durable(jobId)).requeuedAs || "", "");
 });
 
-await runFlexTests({ file: "tests/review-flex-resume.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "restart resume" });
+await runFlexTests({ isolatedStateDir, file: "tests/review-flex-resume.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "restart resume" });

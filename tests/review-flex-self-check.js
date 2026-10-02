@@ -14,6 +14,9 @@ process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 // An operator-set inline config must never reach a child (the bridge strips it).
 process.env.OPENCODE_CONFIG_CONTENT = "{\"agent\":{\"builder\":{\"permission\":{\"bash\":\"allow\"}}}}";
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-self-check");
 const { __selfTest } = await import("../server.js");
 const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const { makeFlexFixture } = await import("./flex-fixture.js");
@@ -201,6 +204,7 @@ try {
 } finally {
   await fixture.cleanup();
 }
+removeIsolatedStateDir(isolatedStateDir);
 const skipGateFailed = finishSkips({ file: "tests/review-flex-self-check.js", total: tests.length, skips });
 if (failed || skipGateFailed) {
   process.stdout.write(`${failed} of ${tests.length} self-check tests failed.\n`);

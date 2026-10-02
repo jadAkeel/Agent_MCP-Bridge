@@ -44,6 +44,18 @@ account (another OpenCode session) can stop a silent bridge run; that is the sam
 but it is not proof for that run. A `startAfter` is kept when a pause is resumed by another bridge
 process (only this process's waiting retries are released).
 
+Found while testing (open, not fixed here): tests that set only `hooks.stateDirectoryOverride`
+and not `CODEX_OPENCODE_STATE_DIR` (`tests/review-queue-features.js`, `review-round5.js`,
+`review-provider-quota.js` and others) write into the operator's `~/.codex/codex-opencode-mcp`
+when a timer fires after their cleanup reset the override: during this session the live state
+directory got job rows of `review-queue-features-*` scratch repositories (one created 09:15 UTC,
+before any run from this branch; the live bridge marked them interrupted), project databases
+holding only a `bridge_instances` row, and the new empty `provider_pause_strikes` table in
+`provider-concurrency.sqlite`. All are inert (scratch paths, no rows; `npm run gc:apply` prunes
+the dead databases). The `review-flex-*` tests set `CODEX_OPENCODE_STATE_DIR` to a scratch folder
+before importing the bridge (`tests/flex-fixture.js`); the other tests need the same, or a
+self-test run without the variable should default to a temporary state directory.
+
 ### Operations log coverage (Claude, 2026-10-02)
 
 Branch `bridge/ops-log-coverage`, isolated worktree `<bridge-opslog2>` from `bridge/setup-cli`

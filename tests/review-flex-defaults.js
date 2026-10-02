@@ -11,6 +11,9 @@ process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 delete process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS;
 delete process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL;
 delete process.env.CODEX_OPENCODE_MIN_FREE_MEMORY_MB;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-defaults");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { hooks, internals } = __selfTest;
@@ -138,6 +141,7 @@ try {
 } finally {
   await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
+removeIsolatedStateDir(isolatedStateDir);
 const skipGateFailed = finishSkips({ file: "tests/review-flex-defaults.js", total: tests.length, skips: [] });
 if (failed || skipGateFailed) {
   process.stdout.write(`${failed} of ${tests.length} default tests failed.\n`);

@@ -14,6 +14,9 @@ process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 delete process.env.CODEX_OPENCODE_OPS_LOG;
 delete process.env.CODEX_OPENCODE_ISSUE_LOG;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-fallback");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { makeFlexFixture, runFlexTests } = await import("./flex-fixture.js");
@@ -219,4 +222,4 @@ test("Q-007: a job the scheduler holds keeps its waiting time across a restart o
   assert.equal((await terminalOf(job.record.jobId)).status, "completed");
 });
 
-await runFlexTests({ file: "tests/review-flex-fallback.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "model fallback" });
+await runFlexTests({ isolatedStateDir, file: "tests/review-flex-fallback.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "model fallback" });

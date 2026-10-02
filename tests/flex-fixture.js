@@ -4,6 +4,24 @@
 // git repository, the bridge state directory and the worktree root; nothing touches the operator's
 // state, clients or OpenCode files.
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import nodePath from "node:path";
+
+// Call before importing ../server.js: the bridge's own state directory (CODEX_OPENCODE_STATE_DIR)
+// becomes a scratch folder too. The tests also set hooks.stateDirectoryOverride, but a timer that
+// fires after cleanup reset it (a queue heartbeat, a retry) would otherwise open the operator's
+// ~/.codex/codex-opencode-mcp.
+export function isolateBridgeStateDir(name) {
+  const directory = mkdtempSync(nodePath.join(tmpdir(), `${name}-global-state-`));
+  process.env.CODEX_OPENCODE_STATE_DIR = directory;
+  return directory;
+}
+
+export function removeIsolatedStateDir(directory) {
+  try { rmSync(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 }); } catch { /* A file a late timer still holds open is left in the temp folder. */ }
+}
+
 export async function makeFlexFixture(selfTest, name) {
   const { hooks, internals } = selfTest;
   const { assert, mkdir, mkdtemp, path, resolveProjectStateRoot, rm, runCommand, server, tmpdir, writeFile } = internals;
@@ -72,7 +90,7 @@ export async function makeFlexFixture(selfTest, name) {
 }
 
 // Runs the collected tests, prints one line each and exits with the skip gate's verdict.
-export async function runFlexTests({ file, tests, cleanup, finishSkips, label }) {
+export async function runFlexTests({ file, tests, cleanup, finishSkips, label, isolatedStateDir = "" }) {
   let failed = 0;
   try {
     for (const { name, fn } of tests) {
@@ -86,6 +104,7 @@ export async function runFlexTests({ file, tests, cleanup, finishSkips, label })
     }
   } finally {
     await cleanup();
+    if (isolatedStateDir) removeIsolatedStateDir(isolatedStateDir);
   }
   const skipGateFailed = finishSkips({ file, total: tests.length, skips: [] });
   if (failed || skipGateFailed) {

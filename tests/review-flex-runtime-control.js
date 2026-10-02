@@ -13,6 +13,9 @@ process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT;
 delete process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-runtime-control");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { hooks, internals } = __selfTest;
@@ -221,6 +224,7 @@ try {
   hooks.stateDirectoryOverride = "";
   await rm(fixtureRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
+removeIsolatedStateDir(isolatedStateDir);
 const skipGateFailed = finishSkips({ file: "tests/review-flex-runtime-control.js", total: tests.length, skips: [] });
 if (failed || skipGateFailed) {
   process.stdout.write(`${failed} of ${tests.length} runtime control tests failed.\n`);

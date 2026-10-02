@@ -14,6 +14,9 @@ process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 delete process.env.CODEX_OPENCODE_AUTO_INTEGRATE;
 delete process.env.CODEX_OPENCODE_ISSUE_LOG;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-auto-integrate");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { makeFlexFixture, runFlexTests } = await import("./flex-fixture.js");
@@ -212,5 +215,5 @@ test("Q-010: without autoIntegrate a finished writer is not touched", async () =
   assert.equal((await durable(enqueued.record.jobId)).autoIntegration || null, null);
 });
 
-await runFlexTests({ file: "tests/review-flex-auto-integrate.js", tests, cleanup: fixture.cleanup, finishSkips, label: "auto-integration" });
+await runFlexTests({ isolatedStateDir, file: "tests/review-flex-auto-integrate.js", tests, cleanup: fixture.cleanup, finishSkips, label: "auto-integration" });
 void identity;

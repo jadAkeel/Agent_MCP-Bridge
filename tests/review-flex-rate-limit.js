@@ -20,6 +20,9 @@ delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_RATE_LIMIT_HITS;
 delete process.env.CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS;
 delete process.env.CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS;
+// Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
+const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
+const isolatedStateDir = isolateBridgeStateDir("review-flex-rate-limit");
 const { __selfTest } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { builderFallbackEligible } = await import("../bin/builder-model-fallback.js");
@@ -273,6 +276,7 @@ try {
   hooks.stateDirectoryOverride = "";
   await rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
+removeIsolatedStateDir(isolatedStateDir);
 const skipGateFailed = finishSkips({ file: "tests/review-flex-rate-limit.js", total: tests.length, skips: [] });
 if (failed || skipGateFailed) {
   process.stdout.write(`${failed} of ${tests.length} rate-limit tests failed.\n`);
