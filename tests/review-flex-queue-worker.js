@@ -116,6 +116,9 @@ async function runParent() {
     if (!existsSync(dbPath)) return [];
     const db = new DatabaseSync(dbPath);
     try {
+      // The worker child writes this database while the test polls it; without a busy timeout a
+      // read that meets its write lock fails at once with "database is locked".
+      db.exec("PRAGMA busy_timeout = 5000");
       // A database another process is creating may not have its tables (or columns) yet.
       if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get()) return [];
       return db.prepare("SELECT job_id, status, owner_instance_id, idempotency_key, record_json FROM opencode_jobs ORDER BY created_at").all()
