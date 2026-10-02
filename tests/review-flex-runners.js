@@ -58,6 +58,16 @@ const writeWork = () => { if (control.writeFile) fs.writeFileSync(path.join(proc
       await sleep(30000);
       process.exit(1);
     }
+    // B-144: one transient 429 that codex retries by itself, or two in a row.
+    if (mode === "transient-429" || mode === "repeated-429") {
+      out({ type: "error", message: "Reconnecting... 1/5 (Rate limit reached for gpt-test. Please try again in 1.2s.)" });
+      if (mode === "repeated-429") {
+        out({ type: "error", message: "Reconnecting... 2/5 (Rate limit reached for gpt-test. Please try again in 1.2s.)" });
+        await sleep(30000);
+        process.exit(1);
+      }
+      out({ type: "item.completed", item: { id: "item_r", type: "reasoning", text: "retrying" } });
+    }
     writeWork();
     if (mode === "commit") {
       execFileSync("git", ["add", "-A"], { cwd: process.cwd() });
@@ -225,6 +235,37 @@ test("Q-012: rate-limit evidence: codex error events at once, agy patterns and a
   assert.equal(runners.agyRateLimitEvidence({ inspection: failed, exitCode: 3, runMs: 10 * 60_000 }), null, "a late exit 3 is not a quota strike");
 });
 
+test("B-144/B-145: a transient codex 429 needs the configured hits in a row; reset times in compact and clock forms", () => {
+  const line = (message, type = "error") => JSON.stringify(type === "turn.failed" ? { type, error: { message } } : { type, message });
+  const transient = line("Reconnecting... 1/5 (Rate limit reached for gpt-test. Please try again in 1.2s.)");
+  const watch = runners.createCodexRateLimitWatch(2);
+  assert.equal(watch.watch(transient), false, "the first transient 429 does not stop the run");
+  assert.equal(watch.watch(JSON.stringify({ type: "item.completed", item: { type: "reasoning" } })), false);
+  assert.equal(watch.hits(), 0, "any other event starts the count again");
+  assert.equal(watch.watch(transient), false);
+  assert.equal(watch.watch(line("stream disconnected")), false, "an unrelated error neither counts nor resets");
+  assert.equal(watch.watch("not json"), false);
+  assert.equal(watch.watch(transient), true, "two in a row stop it");
+  assert.equal(watch.evidence().kind, "rate_limit");
+  assert.equal(watch.hits(), 2);
+  assert.equal(watch.watch(transient), false, "it trips once");
+  const quota = runners.createCodexRateLimitWatch(2);
+  assert.equal(quota.watch(line("You've hit your usage limit. Try again in 2 hours 5 minutes.")), true, "a usage limit stops it at once");
+  const failedTurn = runners.createCodexRateLimitWatch(3);
+  assert.equal(failedTurn.watch(line("exceeded retry limit, last status: 429 Too Many Requests", "turn.failed")), true, "so does a failed turn");
+  assert.equal(runners.createCodexRateLimitWatch(1).watch(transient), true, "CODEX_OPENCODE_RATE_LIMIT_HITS=1 keeps the old behaviour");
+  assert.equal(runners.resetMsFromText("Quota resets in 1h55m"), 115 * 60_000);
+  assert.equal(runners.resetMsFromText("Quota resets in 3h 55m"), (3 * 60 + 55) * 60_000);
+  assert.equal(runners.resetMsFromText("try again in 1.2s."), 1200);
+  assert.equal(runners.resetMsFromText("try again in 2 days 3 hours 12 minutes"), ((2 * 24 + 3) * 60 + 12) * 60_000);
+  assert.equal(runners.resetMsFromText("try again in 5 more minutes"), 0, "the \"m\" of \"more\" is no unit");
+  assert.equal(runners.resetMsFromText("retry in 45secs"), 45_000);
+  const now = new Date(2026, 9, 3, 14, 0, 0, 0).getTime();
+  assert.equal(runners.resetMsFromText("You've hit your usage limit, try again at 3:05 PM.", now), 65 * 60_000);
+  assert.equal(runners.resetMsFromText("try again at 1:30 PM", now), (23 * 60 + 30) * 60_000, "a time already past is tomorrow's");
+  assert.equal(runners.resetMsFromText("resets at 14:30", now), 30 * 60_000);
+});
+
 test("Q-012: settings are refused at startup when malformed", () => {
   assert.throws(() => runners.readExternalRunnersEnv({ CODEX_OPENCODE_EXTERNAL_RUNNERS: "codex,claude" }), /may list only codex, agy/);
   assert.deepEqual(runners.readExternalRunnersEnv({}), []);
@@ -242,6 +283,13 @@ test("Q-012: allowlist refusals: a runner that is not enabled, and a reserved na
   const conflict = runners.externalRunnerConfigProblems({ enabled: ["codex", "agy"], allowlist: [], parseEntry: parseModelAllowlistEntry, managedConfigTexts: [{ file: "opencode.jsonc", text: "{\n  // the managed config\n  \"provider\": { \"codex\": { \"url\": \"https://example.invalid//x\" }, },\n}" }] });
   assert.deepEqual(conflict.map((item) => item.errorType), ["external_runner_name_conflict"]);
   assert.equal(runners.externalRunnerConfigProblems({ enabled: [], allowlist: ["openai/gpt-x"], parseEntry: parseModelAllowlistEntry }).length, 0, "nothing reserved, nothing refused");
+  // B-143: an explicit shared concurrency key would put every runner slot and pause on one key.
+  const shared = runners.externalRunnerConfigProblems({ enabled: ["agy"], allowlist: [], parseEntry: parseModelAllowlistEntry, explicitConcurrencyKey: "acct", providerLimitsSet: true });
+  assert.deepEqual(shared.map((item) => item.errorType), ["external_runner_shared_concurrency_key"]);
+  assert.match(shared[0].error, /CODEX_OPENCODE_EXTERNAL_RUNNERS, CODEX_OPENCODE_PROVIDER_LIMITS cannot be combined with CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY \(acct\)/);
+  assert.equal(runners.externalRunnerConfigProblems({ enabled: [], allowlist: [], parseEntry: parseModelAllowlistEntry, explicitConcurrencyKey: "acct", quotaGroupsSet: true })[0]?.errorType, "external_runner_shared_concurrency_key", "quota groups alone are refused too");
+  assert.equal(runners.externalRunnerConfigProblems({ enabled: [], allowlist: [], parseEntry: parseModelAllowlistEntry, explicitConcurrencyKey: "acct" }).length, 0, "an explicit key alone is fine");
+  assert.equal(runners.externalRunnerConfigProblems({ enabled: ["codex"], allowlist: [], parseEntry: parseModelAllowlistEntry, providerLimitsSet: true, quotaGroupsSet: true }).length, 0, "per-provider keys are fine");
   // This process: both runners enabled, the scratch managed config defines neither, then codex.
   assert.deepEqual(await externalRunnerStartupProblems(), []);
   const configFile = nodePath.join(xdgConfig, "opencode", "opencode.json");
@@ -277,7 +325,10 @@ test("Q-012: argv: fixed flags, the variant and the read-only sandbox; env keeps
   const agy = runners.buildAgyArgs({ model: "claude-test", variant: "high", timeoutMs: 600_000, logPath: "G", prompt: "P" });
   assert.deepEqual(agy, ["-p", "P", "--dangerously-skip-permissions", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json", "--print-timeout", "540s", "--log-file", "G", "--model", "claude-test", "--effort", "high"]);
   assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" }).includes("--model"), false, "agy/default passes no --model");
-  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" })[8], "60s");
+  // B-148: a short budget keeps agy's own timeout inside it (a tenth of it as margin, at least 1 s).
+  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" })[8], "9s");
+  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 120_000, logPath: "G", prompt: "P" })[8], "108s");
+  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 900, logPath: "G", prompt: "P" })[8], "1s");
   assert.equal(runners.runnerFlagsError("codex", codex), "");
   assert.match(runners.runnerFlagsError("codex", codex.filter((item) => item !== "--ignore-user-config")), /--ignore-user-config/);
   assert.equal(runners.runnerFlagsError("agy", agy), "");
@@ -351,6 +402,39 @@ test("Q-012: a codex reader runs in the checkout with the read-only sandbox", as
   assert.equal(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase());
 });
 
+test("B-147: a codex reader's own edit of the checkout fails the reader instead of passing as another client's", async () => {
+  assert.equal(internals.readOnlyEditsDeniedByAttestation({ lockType: "read", scopeContract: { modelRequirement: { provider: "codex", model: "gpt-read" } } }, { ok: true, metadata: { canEdit: false } }), false);
+  assert.equal(internals.readOnlyEditsDeniedByAttestation({ lockType: "read", scopeContract: { modelRequirement: { provider: "openai", model: "m" } } }, { ok: true, metadata: { canEdit: false } }), true, "an OpenCode reader keeps the excuse");
+  writeControl({ writeFile: "src/a.txt", content: "edited by a codex reader\n" });
+  try {
+    const text = await run(runnerReadJob(requirement("codex", "gpt-read")));
+    assert.match(text, /^errorType: changed_file_validation_error$/m, text);
+    assert.match(text, /^disallowedFiles: src\/a\.txt$/m);
+    assert.doesNotMatch(text, /changed by another client/);
+  } finally {
+    writeControl({});
+    await git(["checkout", "--", "src/a.txt"]);
+  }
+});
+
+test("B-144: one transient codex 429 does not stop the run; two in a row do", async () => {
+  writeControl({ codex: "transient-429", writeFile: "src/a.txt", content: "a by codex\n" });
+  try {
+    const text = await run(runnerWriteJob(requirement("codex", "gpt-test")));
+    assert.equal(errorTypeOf(text), "none", text);
+    assert.equal((await cooldownKeys()).has(`${KEY}:codex/gpt-test`), false, "nothing is paused");
+    writeControl({ codex: "repeated-429" });
+    const started = Date.now();
+    const stopped = await run(runnerReadJob(requirement("codex", "gpt-read")));
+    assert.equal(errorTypeOf(stopped), "provider_rate_limited", stopped);
+    assert.ok(Date.now() - started < 20_000, "stopped long before the fake's 30 s sleep");
+    assert.match(stopped, /^Rate limit detected: rate limit: 2 line\(s\) for codex\/gpt-read/m);
+  } finally {
+    writeControl({});
+    await resumeAll();
+  }
+});
+
 test("Q-012: a codex usage limit stops the run at once as provider_rate_limited and pauses the quota group", async () => {
   writeControl({ codex: "usage-limit" });
   const started = Date.now();
@@ -376,6 +460,7 @@ test("Q-012: a codex usage limit stops the run at once as provider_rate_limited 
 });
 
 test("Q-012: a silent agy writer is stopped only by the job timeout, not the idle watchdog", async () => {
+  clearRecords();
   writeControl({ agy: "silent" });
   const started = Date.now();
   const text = await run(runnerWriteJob(requirement("agy", "default"), "src/a.txt", { timeoutMs: 4000 }));
@@ -383,6 +468,12 @@ test("Q-012: a silent agy writer is stopped only by the job timeout, not the idl
   assert.match(text, /^Timed out: yes$/m);
   assert.doesNotMatch(text, /Agent idle timeout:/);
   assert.ok(Date.now() - started >= 3500, "it ran for the whole job timeout although the idle limit is 1.5 s");
+  // B-148: agy's own timeout is inside the budget left at spawn time, not 60 s past it.
+  const [record] = records("agy");
+  const printTimeout = Number(/^(\d+)s$/.exec(record.args[record.args.indexOf("--print-timeout") + 1])?.[1]);
+  assert.ok(printTimeout >= 1 && printTimeout < 4, `--print-timeout ${printTimeout}s`);
+  // B-146: a failed run's sidecar is named in the result.
+  assert.match(text, /^Runner sidecar: .+runs[\\/]/m);
 });
 
 test("Q-012: agy exit 3 with quota text is provider_rate_limited and pauses that agy model", async () => {
@@ -408,8 +499,67 @@ test("Q-012: agy writing into the target checkout fails the job, pauses agy and 
     assert.match(text, /^Target checkout guard: changed \(src\/b\.txt\)$/m);
     assert.equal(readFileSync(target, "utf8"), "agy wrote here\n", "the bridge never reverts the target");
     assert.ok((await cooldownKeys()).has(`${KEY}:agy`), "the runner is paused");
+    // B-142: the next agy job is refused as provider_paused (retryable on its next model), not
+    // with the guard's error type, and the cause stays in the reason.
+    writeControl({});
+    await git(["checkout", "--", "src/b.txt"]);
+    const refused = await run(runnerWriteJob(requirement("agy", "default")));
+    assert.equal(errorTypeOf(refused), "provider_paused", refused);
+    assert.match(refused, /provider_paused: external_runner_wrote_outside_worktree: agy changed the target checkout/);
   } finally {
     await git(["checkout", "--", "src/b.txt"]);
+    await resumeAll();
+  }
+});
+
+test("B-140: agy changing a profile file (CODEX_HOME config.toml) fails the job and pauses agy", async () => {
+  const profileFile = nodePath.join(codexHome, "config.toml");
+  writeControl({ agy: "write-target", targetFile: profileFile, writeFile: "src/a.txt", content: "a by agy\n" });
+  try {
+    const text = await run(runnerWriteJob(requirement("agy", "default")));
+    assert.equal(errorTypeOf(text), "external_runner_wrote_outside_worktree", text);
+    assert.ok(text.includes(`Target checkout guard: profile files changed (${profileFile})`), text);
+    assert.ok((await cooldownKeys()).has(`${KEY}:agy`), "the runner is paused");
+    assert.equal(readFileSync(profileFile, "utf8"), "agy wrote here\n", "nothing is reverted");
+  } finally {
+    writeControl({});
+    rmSync(profileFile, { force: true });
+    await resumeAll();
+  }
+});
+
+test("B-141: a path a bridge integration wrote during the run is not held against agy", async () => {
+  const target = nodePath.join(repo, "src", "b.txt");
+  const operationId = `integration-test-${Date.now()}`;
+  const later = new Date(Date.now() + 10 * 60_000).toISOString();
+  const db = await internals.openLockDb(repo);
+  try {
+    // A finished operation of this checkout whose last update falls inside the run window.
+    db.prepare(`INSERT INTO integration_operations (operation_id, cwd, owner_instance_id, owner_generation, status, target_head, target_state_sha256,
+      pre_index_sha256, patch_sha256, source_base_commit, source_state_sha256, contract_sha256, affected_paths_json, created_at, updated_at, finished_at)
+      VALUES (?, ?, 'test', 'test', 'committed', '', '', '', '', '', '', '', ?, ?, ?, ?)`).run(operationId, nodePath.resolve(repo), JSON.stringify(["src/b.txt"]), later, later, later);
+  } finally {
+    internals.closeDb(db);
+  }
+  try {
+    writeControl({ agy: "write-target", targetFile: target, writeFile: "src/a.txt", content: "a by agy\n" });
+    const text = await run(runnerWriteJob(requirement("agy", "default")));
+    assert.equal(errorTypeOf(text), "none", text);
+    assert.match(text, /^Target checkout guard: unchanged$/m);
+    await git(["checkout", "--", "src/b.txt"]);
+    // Another file during that window still fails the job, but does not pause agy.
+    const other = nodePath.join(repo, "src", "other-output.txt");
+    writeControl({ agy: "write-target", targetFile: other, writeFile: "src/a.txt", content: "a by agy\n" });
+    const failed = await run(runnerWriteJob(requirement("agy", "default")));
+    rmSync(other, { force: true });
+    assert.equal(errorTypeOf(failed), "external_runner_wrote_outside_worktree", failed);
+    assert.match(failed, /agy is not paused: 1 bridge integration\(s\) ran in that checkout/);
+    assert.equal((await cooldownKeys()).has(`${KEY}:agy`), false);
+  } finally {
+    writeControl({});
+    await git(["checkout", "--", "src/b.txt"]);
+    const cleanup = await internals.openLockDb(repo);
+    try { cleanup.prepare("DELETE FROM integration_operations WHERE operation_id = ?").run(operationId); } finally { internals.closeDb(cleanup); }
     await resumeAll();
   }
 });
