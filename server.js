@@ -357,6 +357,8 @@ const {
   CONFIG,
   effectiveBridgeStateDirectory,
   getStateDirectoryOverride: () => stateDirectoryOverride,
+  // Q-013: the build a fault happened on; the lib pin is the digest the clients run.
+  buildStamp: () => `server ${BRIDGE_SOURCE_SHA256.slice(0, 12)} lib ${String(process.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256 || "").trim().toLowerCase().slice(0, 12) || "unpinned"}`,
 });
 
 let queueModeOverride = "";
@@ -601,20 +603,37 @@ function startupRecoveryPendingResult() {
   };
 }
 
+// Q-013: a handler that throws is a defect of the bridge (every refusal it makes on purpose is
+// a returned result). The SDK turns the throw into an isError answer with the message only, so
+// the fault log gets the stack here; the throw itself is unchanged.
+function wrapToolHandler(toolName, handler) {
+  return async (...handlerArgs) => {
+    const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
+    try {
+      const recovery = await awaitBridgeStartupRecovery();
+      if (!recovery.ok) return recovery.failed ? startupRecoveryFailedResult(recovery.error) : startupRecoveryPendingResult();
+      return await handler(...handlerArgs);
+    } catch (error) {
+      try {
+        logEvent("error", "tool.handler_failed", {
+          tool: String(toolName || ""),
+          errorType: String(error?.errorType || error?.code || error?.name || ""),
+          summary: failureSummary(error?.message || String(error)),
+          stack: typeof error?.stack === "string" ? error.stack.split(/\r?\n/).slice(0, 10).join("\n") : "",
+        });
+      } catch { /* Logging must never change the answer. */ }
+      throw error;
+    } finally {
+      stop();
+    }
+  };
+}
+
 const registerToolWithoutProgress = server.tool.bind(server);
 server.tool = (...registration) => {
   const handler = registration[registration.length - 1];
   if (typeof handler === "function") {
-    registration[registration.length - 1] = async (...handlerArgs) => {
-      const stop = startToolProgressHeartbeat(handlerArgs[handlerArgs.length - 1]);
-      try {
-        const recovery = await awaitBridgeStartupRecovery();
-        if (!recovery.ok) return recovery.failed ? startupRecoveryFailedResult(recovery.error) : startupRecoveryPendingResult();
-        return await handler(...handlerArgs);
-      } finally {
-        stop();
-      }
-    };
+    registration[registration.length - 1] = wrapToolHandler(registration[0], handler);
   }
   return registerToolWithoutProgress(...registration);
 };
@@ -1502,7 +1521,12 @@ function describeFailedMcpMessage(message, pending = new Map(), now = Date.now()
   const tool = request?.tool || "";
   if (message.error && typeof message.error === "object") {
     const code = Number.isSafeInteger(message.error.code) ? message.error.code : null;
-    return { level: "error", event: "mcp.request_failed", data: { method, tool, code, summary: failureSummary(message.error.message || "JSON-RPC error without a message"), durationMs } };
+    // Q-013: a client probing a method the bridge does not serve (resources/templates/list,
+    // prompts/list) gets -32601 by design; 35 such lines a day said nothing. A -32601 for a
+    // tools/call (unknown tool) stays an error.
+    if (code === -32601 && method && method !== "tools/call") return null;
+    // errorType groups the incident summary by JSON-RPC code (one bucket per code, not one for all).
+    return { level: "error", event: "mcp.request_failed", data: { method, tool, code, errorType: code === null ? "" : `jsonrpc_${code}`, summary: failureSummary(message.error.message || "JSON-RPC error without a message"), durationMs } };
   }
   const result = message.result;
   if (!result || typeof result !== "object") return null;
@@ -1512,7 +1536,7 @@ function describeFailedMcpMessage(message, pending = new Map(), now = Date.now()
     // whose text starts "MCP error <code>:"; those are request failures, not bridge refusals.
     const sdkError = /^MCP error (-?\d+):/.exec(text);
     if (sdkError) {
-      return { level: "error", event: "mcp.request_failed", data: { method, tool, code: Number(sdkError[1]), summary: failureSummary(text), durationMs } };
+      return { level: "error", event: "mcp.request_failed", data: { method, tool, code: Number(sdkError[1]), errorType: `jsonrpc_${Number(sdkError[1])}`, summary: failureSummary(text), durationMs } };
     }
     const errorType = /^errorType:\s*([A-Za-z0-9_.:-]+)/m.exec(text)?.[1] || "";
     return { level: "warn", event: "tool.refused", data: { tool, errorType, summary: failureSummary(text || "isError answer without text"), durationMs } };
@@ -5260,6 +5284,7 @@ export const __selfTest = {
     LIKELY_SECRET_PATTERNS,
     logEvent,
     describeFailedMcpMessage,
+    wrapToolHandler,
     installMcpFailureLogging,
     recordProcessFailure,
     rememberMcpRequest,

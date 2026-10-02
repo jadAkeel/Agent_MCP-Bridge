@@ -16,6 +16,25 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-03
 
+### Fault log: the bridge's own errors for a fix session (Claude, 2026-10-03)
+
+Branch `bridge/fault-log`, worktree `<bridge-faults>`, from the deployed tree (`0a3a2ee`). The owner
+asked for a record of the errors the system itself causes, kept as a log the owner's coding
+assistant can take and fix later. The operations log (B-047) and the issue log (Q-006) already
+held every failure, but they mixed the bridge's defects with agent, provider and rate-limit
+failures, and a fix session had nothing to read: the live log of 2026-10-02 showed the gaps
+(35 `mcp.request_failed` "Method not found" errors that were a client probing `server/discover`
+and `resources/*`, and `error`-level records whose `error` text was hashed away by
+`sanitizeLogValue`). Tests: `tests/review-fault-log.js` (8 cases, in `npm test` after
+`tests/review-ops-log-coverage.js`); `bin/ops-log.js --self-test` covers the writer.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| Q-013 | No record separated the bridge's own faults (a crash, a tool handler or queue runner that threw, state it could not write or recover, a JavaScript error inside a job failure) from agent and provider failures, and nothing produced a task a coding assistant could act on. | The operations log is flat; the issue log lists job failures only. | `bin/ops-log.js`: `isBridgeFault` (every `error` record except `process.exited` and the agy guard; warn records about lost ownership, persistence, recovery, quarantine, reconcile and cleanup failures; any record whose text carries a JavaScript or SQLite error; `mcp.request_failed` only for -32603; `cli.*.failed` only for Node error codes), `faultFingerprint` (event, errorType, normalized summary, first bridge stack frame), `faults.md` (one entry per fault per process with status, where, context, build, summary and stack; repeats are one line; header explains use), `--faults [--json \| --prompt]` (`npm run faults`; the prompt is a self-contained fix task), doctor warning. `CODEX_OPENCODE_FAULT_LOG` (default `<state-dir>/logs/faults.md`, `off`). | | open |
+| B-099 | An `error`-level record such as `provider.cooldown_record_failed` logged `errorSha256` and `errorChars` only: the text of the failure was not in the operations log. | `sanitizeLogValue` hashes the keys `error`, `message`, `reason` and `detail` at every depth. | `lib/logging.js`: a warn or error record without `summary` gets a redacted `failureSummary` of the first such string (the hash fields stay); every warn/error record carries `build` (`server <12 hex> lib <12 hex\|unpinned>`, from `BRIDGE_SOURCE_SHA256` and the lib pin). | | open |
+| B-100 | A tool handler that threw (a bridge defect) reached the client as a bare isError text and the log as a `tool.refused` with an empty errorType; a queue runner that threw was stored as `queue_job_failed` with the message only. | The SDK catches handler throws; `lib/queue/start.js` kept only `error.message`. | `server.js` `wrapToolHandler` logs `tool.handler_failed` (tool, errorType, summary, first 10 stack lines) and rethrows unchanged; `lib/queue/start.js` logs `queue.job_internal_failure` with the stack when the throw carries no `errorType`. | | open |
+| B-101 | 35 `mcp.request_failed` errors a day with `Method not found`: a client probing `server/discover`, `resources/list` and `resources/templates/list` on every new bridge process; `npm run incidents` drafted a log row for it and the doctor warned forever. All `mcp.request_failed` records shared one incident bucket (empty errorType). | `describeFailedMcpMessage` logged every JSON-RPC error. | A -32601 for a method other than `tools/call` is not logged; the remaining records carry `errorType: jsonrpc_<code>`. | | open |
+
 ### External runners: codex and agy (Claude, 2026-10-03)
 
 Branch `bridge/external-runners`, worktree `<bridge-runners>`, from the deployed tree (`1bce9c1`).

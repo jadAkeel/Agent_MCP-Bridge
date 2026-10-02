@@ -61,6 +61,7 @@ Run these from `<bridge-dir>`.
 | `npm run tui` | Terminal dashboard for pipelines and jobs |
 | `npm run incidents` | Summarize recurring warnings and errors from the operations log |
 | `npm run issues` | Print the issue log: one line per job failure, rebuilt from the operations log |
+| `npm run faults -- --prompt` | List the bridge's own faults (crashes, handlers that threw) as a task for your coding assistant |
 | `npm run worker -- --repo <project> --status` | Show the unattended queue worker of a repository and its queue counts |
 | `npm run release:activate -- --sync-clients` | Re-pin the `server.js` and plugin-manifest hashes and copy the Codex entry to Claude Code |
 | `npm run release:activate` | Run the release gate, build, activate, and verify a new release in one step |

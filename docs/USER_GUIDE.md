@@ -417,17 +417,21 @@ Run all of these from `<bridge-dir>`, your clone of the bridge repository (place
 | `npm run tui` | Terminal dashboard of jobs, pipelines, locks and worktrees. | Watching work live |
 | `npm run issues` (`-- --days 30`) | Prints the issue log lines (one per failure, below) rebuilt from the operations log. | After a batch |
 | `npm run incidents` (`-- --days 30`) | Groups the operations log (below) by event and error type, newest problems first, with the latest `summary` of each group, and prints a draft `log.md` row for each recurring one. Also warns when OpenCode's own database has grown too large. | **Weekly**, and after a bad day |
+| `npm run faults` (`-- --prompt`, `--json`, `--days 30`) | Lists the faults of the bridge itself (below), grouped, with the file and function of each. `--prompt` prints a ready task for your coding assistant. | When `doctor` reports faults, or after a crash |
 | `npm run release:activate -- --prune` | Runs a normal release, then deletes old releases and config backups. It keeps the active release, the previous one, and the two newest backups. | When releases pile up |
 
 **Operations log.** Every error you can hit is written, with credentials already redacted, to `<state-dir>\logs\bridge-YYYY-MM-DD.jsonl` (default state dir `%USERPROFILE%\.codex\codex-opencode-mcp`), one JSON line each with a readable `summary` (at most 400 characters):
 
 - every warning and error the bridge raises itself (queue, locks, integration, recovery);
 - every refused tool call (`tool.refused`, with the refusal's `errorType`, for example `unsafe_path`), every agent run that failed (`agent.run_failed`) and every queued job that failed (`queue.job_failed`);
-- every MCP request the SDK rejected, such as an unknown tool or invalid arguments (`mcp.request_failed`, with the JSON-RPC `code`), and MCP protocol errors (`mcp.protocol_error`);
+- every MCP request the SDK rejected, such as an unknown tool or invalid arguments (`mcp.request_failed`, with the JSON-RPC `code` and `errorType: jsonrpc_<code>`), and MCP protocol errors (`mcp.protocol_error`); a client probing a method the bridge does not serve (`resources/list`, `server/discover`) is not logged;
+- a tool handler that threw (`tool.handler_failed`) and a queue runner that threw (`queue.job_internal_failure`), both with the first stack lines;
 - a bridge crash (`process.uncaught_exception` / `process.unhandled_rejection` with the first stack lines, then `process.exited`), including a failed integrity check at startup;
 - failures of the `bin/` commands (`cli.<script>.failed` with `exitCode`): `npm run setup` (also a failed preflight and a refused write), `npm run doctor` (also "attention required"), `smoke:live`, `release:activate`, `test:release`, `gc`, `audit:state` and the runtime sync.
 
 **Issue log.** Every job failure (rate limit, idle stop, timeout, failed validation, no output, a retry, a job that gave up, a failed auto-integration) is also one markdown line in `<state-dir>\logs\issues.md`, derived from the same record: `- 2026-10-02 08:12 UTC | queue.job_failed | agent_idle_timeout | job builder-... builder on opencode/muse-spark-1.3-contributor-free | ...`. `CODEX_OPENCODE_ISSUE_LOG` names another file (absolute path, existing folder) or `off`. A file inside your repository makes the checkout dirty; keep it outside, or use `CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok`.
+
+**Fault log.** The issue log says what went wrong with a job. `<state-dir>\logs\faults.md` says what went wrong with the **bridge itself**: a crash, a tool handler or queue runner that threw, state it could not write or recover, a JavaScript error inside a job's failure text. Each fault is one entry (time, event, `errorType`, the first bridge file and function from the stack, the job or tool, the build it ran on, the summary and the stack), written the first time a bridge process sees it; a repeat is one line. The entries are meant for your coding assistant, not for you: run `npm run faults -- --prompt` and paste the output into Claude Code or Codex; it names the files to read and the rules a fix follows. When a fault is fixed, change its `status: open` line to `status: fixed <commit>`. `npm run doctor` warns when faults were logged in the last 7 days. `CODEX_OPENCODE_FAULT_LOG` names another file (absolute path, existing folder) or `off`. Every warn and error record of the operations log also carries `build` (the `server.js` hash and the pinned `lib/` digest, 12 characters each) and a readable `summary` of its error text, with credentials redacted.
 
 Files older than 30 days are deleted, and a day's file stops at 20 MB per process. The writer never follows a link: if `logs` or a day's file is a junction or symlink, nothing is written or deleted through it. The client only shows the bridge's stderr, so this file is where a failure from the middle of a migration can be found afterwards. `npm run doctor` counts its recurring problems too. `CODEX_OPENCODE_OPS_LOG=off` turns it off (bridge and commands). To turn a recurring problem into a fix, check the draft row against the code, give it a real B-xxx id in `log.md`, and hand it to a fix session.
 
@@ -447,7 +451,7 @@ git log main..agent/<role>/<job>
 
 ## 11. Troubleshooting
 
-When something fails, the bridge returns an error type. Copy it and look it up here.
+When something fails, the bridge returns an error type. Copy it and look it up here. If the bridge itself crashed or answered with a JavaScript error, run `npm run faults -- --prompt` (section 10) and hand the output to your coding assistant.
 
 | Error / symptom | Meaning | What to do |
 | --- | --- | --- |
