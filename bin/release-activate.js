@@ -73,7 +73,7 @@ const SERVER_NAME = "opencode";
 const KEEP_CONFIG_BACKUPS = 2;
 const RELEASE_MANIFEST = "release-manifest.json";
 // Files a release copies from the source tree (build-release.js LEGACY_PUBLISH_ENTRIES).
-const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "opencode", "tests", "package.json", "package-lock.json"];
+const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "lib", "opencode", "tests", "package.json", "package-lock.json"];
 const RENAME_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000];
 const SKIP_TESTS_NEEDS_RECEIPT = "--skip-tests needs --gate-receipt <file>: the receipt of a green `npm run test:release` of this source tree (written to .release-gate/receipt.json), at most 24 h old. Nothing was built or activated.";
 
@@ -1222,6 +1222,8 @@ async function selfTestCheckedBuild(fixture) {
   await write("package.json", "{}\n");
   await write("package-lock.json", "{}\n");
   await write("bin/tool.js", "committed\n");
+  await write("lib/redaction.js", "module\n");
+  await write("lib/git-patch.js", "module\n");
   await write("opencode/agents/a.md", "agent\n");
   await write("opencode/skills/s/SKILL.md", "skill\n");
   await write("opencode/.gitignore", "log/\n");
@@ -1242,7 +1244,7 @@ async function selfTestCheckedBuild(fixture) {
   git("init", "--quiet");
   git("add", ".");
   git("commit", "--quiet", "-m", "init");
-  const publishEntries = ["server.js", "package.json", "package-lock.json", "bin", "opencode/agents", "opencode/skills", "opencode/.gitignore", "opencode/plugin-integrity-manifest.json", "node_modules"];
+  const publishEntries = ["server.js", "package.json", "package-lock.json", "bin", "lib", "opencode/agents", "opencode/skills", "opencode/.gitignore", "opencode/plugin-integrity-manifest.json", "node_modules"];
   const installFromLockfile = async (staging) => {
     assert.equal(existsSync(path.join(staging, "node_modules")), false, "the working tree's node_modules is not copied into the release");
     await mkdir(path.join(staging, "node_modules", "dep"), { recursive: true });

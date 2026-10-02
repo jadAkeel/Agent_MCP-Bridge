@@ -5,376 +5,213 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execFile, spawn } from "node:child_process";
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
-import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createDirectRunAudit, directRunMetrics, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
+import { createDirectRunAudit, directRunMetrics } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
-import { detachWorktreeLinks } from "./bin/worktree-links.js";
-import { appendOpsLogLine } from "./bin/ops-log.js";
 import { resolvePluginManifestEntryPath } from "./bin/plugin-manifest-paths.js";
+import { LIKELY_SECRET_PATTERNS, redactLikelySecrets, redactSensitiveText, patchLikelySecretLines, sanitizePersistedValue, sanitizeLogValue, failureSummary } from "./lib/redaction.js";
+import { binaryTextFilesInPatch, patchFileEntries, diffStatFromPatch } from "./lib/git-patch.js";
+import { createBridgeConfig } from "./lib/config.js";
+import { createLoggingRuntime } from "./lib/logging.js";
+import { createStateSchema } from "./lib/state/schema.js";
+import { createStateDatabase } from "./lib/state/database.js";
+import { createStateCrypto } from "./lib/state/crypto.js";
+import { createQueueStoreRuntime } from "./lib/queue/store.js";
+import { createQueueRetryRuntime } from "./lib/queue/retry.js";
+import { createQueueWorkerFilesRuntime } from "./lib/queue/worker-files.js";
+import { createAgentPolicyRuntime } from "./lib/agent-policy.js";
+import { createOpenCodeEventRuntime } from "./lib/opencode-events.js";
+import { createLockPlanRuntime } from "./lib/lock-plan.js";
+import { createWorktreeRuntime } from "./lib/worktrees.js";
+import { createLockRuntime } from "./lib/locks.js";
+import { createValidationRuntime } from "./lib/validation-command.js";
+import { createProcessTableRuntime } from "./lib/process-table.js";
+import { createCommandRuntime } from "./lib/run-command.js";
+import {
+  queueRequestFingerprint,
+  queueStartAfterPending,
+  queueAgentTiming,
+  queueResultFields,
+  commandFingerprintFields,
+  scopeContractDurableSummary,
+  REQUEUE_ELIGIBLE_STATUSES,
+  REQUEUE_UNFINISHED_STATUSES,
+  requeueIdempotencyKey,
+  requeueRefusal,
+  RETRY_POLICY_DEFAULT_ATTEMPTS,
+  RETRY_POLICY_MAX_ATTEMPTS,
+  RETRY_POLICY_MAX_SLOT_WAITS,
+  RETRY_POLICY_MAX_PAUSE_WAITS,
+  RETRY_POLICY_HISTORY_MAX,
+  RETRY_POLICY_ERROR_TYPES,
+  retryPolicyRequirement,
+  retryPolicyModelSpec,
+  retryPolicyModelLabel,
+  autoIntegrationRetryDelayMs,
+  QUEUE_BLOCKED_BACKOFF_MAX_MS,
+  queueHardLockRequestRefusal,
+  QUEUE_WORKER_PRESENCE_FRESH_MS,
+  queueWorkerPresenceFresh,
+  queueWorkerPidAlive,
+  queueWorkerPresenceLive,
+} from "./lib/queue.js";
+import {
+  pipelineRecordSnapshot,
+  pipelineReplayRequest,
+  pipelinePersistenceKey,
+  pipelineConcurrentUpdateError,
+  pipelineRecordJson,
+  pipelineTerminalError,
+  pipelineIntegrationItemMatches,
+  PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES,
+  nextPipelineIntegrationItemStatus,
+  pipelineHasPendingIntegrations,
+} from "./lib/pipelines.js";
+import {
+  integrationFingerprintMode,
+  integrationJournalAad,
+  integrationJournalTargetPath,
+  integrationJournalFingerprintSha256,
+  integrationRecoveryErrorIsTransient,
+  integrationPathspecs,
+  integrationOperationResult,
+  integrationOperationDiagnosisView,
+  integrationScopePlan,
+  integrationBatchItemLabel,
+  integrationBatchOverlaps,
+  integrationBatchItemAtLine,
+  integrationPathsTouching,
+  patchedPathsStateSha256Of,
+  integrationContractValue,
+  integrationContractSha256,
+  integrationContractDifference,
+  integrationQuarantineStatusLine,
+  integrationPreviewReceiptSchema,
+  integrationBatchItemSchema,
+} from "./lib/integration.js";
+import {
+  MAX_AGENT_TIMEOUT_MS,
+  DEFAULT_FORBIDDEN_EDIT_PATHS,
+  scopePathSetSchema,
+  scopeValidationSchema,
+  MODEL_IDENTIFIER_PATTERN,
+  MODEL_NAME_PATTERN,
+  modelRequirementSchema,
+  scopeContractSchema,
+  normalizeScopeContract,
+  normalizeProjectAgentPolicy,
+  applyProjectPolicyToJobs,
+  scopeContractPathInputs,
+  formatScopeContractForPrompt,
+  findSerialOnlyMatches,
+  firstNonEmptyList,
+} from "./lib/scope-contract.js";
+import { parseCommandLine, formatValidationGateResult } from "./lib/validation-command.js";
+import {
+  retryAfterMsFromText,
+  syntheticProviderQuotaNotice,
+  parseOpenCodeLogLine,
+  openCodeRateLimitHit,
+  createRateLimitWatcher,
+  providerErrorTypeFromText,
+  providerErrorTypeFromDiagnosticLine,
+  providerErrorTypeFromStructuredEvent,
+} from "./lib/rate-limit.js";
+import {
+  readPositiveIntEnv,
+  readNonNegativeIntEnv,
+  readModelDurationMapEnv,
+  readChoiceEnv,
+} from "./lib/env.js";
+import {
+  REPOSITORY_SCOPE_LOCK_PATH,
+  normalizeList,
+  normalizeLockPath,
+  filesystemCaseModeForRoot,
+  realPathBoundaryReason,
+  windowsStreamSyntax,
+  unsafePathReason,
+  normalizeLockPathList,
+  normalizeLockPathForCwd,
+  normalizeLockPathListForCwd,
+  mergePathLists,
+  globToRegex,
+  isAbsolutePathLike,
+  normalizeFilesystemCase,
+  isWithinAnyPath,
+  unsafeChangedFiles,
+  isPathInside,
+  normalizePathForCompare,
+  hasAmbiguousPathPattern,
+  overlaps,
+} from "./lib/paths.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_SERVER_PATH = fileURLToPath(import.meta.url);
 const BRIDGE_SOURCE_SHA256 = createHash("sha256").update(await readFile(fileURLToPath(import.meta.url))).digest("hex");
 const PROCESS_SUPERVISOR_PATH = path.join(BRIDGE_RUNTIME_DIR, "bin", "process-supervisor.js");
-const SUPERVISOR_KILL_GRACE_MS = 5_000;
-const SUPERVISOR_TERMINATION_CONFIRM_MS = 5_000;
-// Must outlast the supervisor's own worst case (Windows: two bounded taskkill runs, two
-// child polls, a retry pause, the stdio-close wait = 21.25 s at 5 s confirm; POSIX: grace +
-// confirm + close wait = 11 s). A shorter deadline kills the supervisor mid-containment and
-// reports a job as unconfirmed even when termination was about to succeed.
-const SUPERVISOR_TERMINATION_FALLBACK_MS = 2 * Math.max(1_000, SUPERVISOR_TERMINATION_CONFIRM_MS)
-  + 2 * SUPERVISOR_TERMINATION_CONFIRM_MS + 250 + 1_000 + SUPERVISOR_KILL_GRACE_MS + 5_000;
-const USER_HOME_DIR = homedir();
-const DEFAULT_OPENCODE_CONFIG_DIR = process.env.XDG_CONFIG_HOME
-  ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
-  : path.join(USER_HOME_DIR, ".config", "opencode");
-const DEFAULT_OPENCODE_DATA_DIR = process.env.XDG_DATA_HOME
-  ? path.join(process.env.XDG_DATA_HOME, "opencode")
-  : path.join(USER_HOME_DIR, ".local", "share", "opencode");
-const DEFAULT_OPENCODE_CACHE_HOME = process.env.XDG_CACHE_HOME || path.join(USER_HOME_DIR, ".cache");
-const DEFAULT_OPENCODE_STATE_HOME = process.env.XDG_STATE_HOME || path.join(USER_HOME_DIR, ".local", "state");
-const CODEX_STATE_HOME = String(process.env.CODEX_HOME || path.join(USER_HOME_DIR, ".codex")).trim();
-const OPENCODE_EXE = String(
-  process.env.CODEX_OPENCODE_EXECUTABLE || process.env.OPENCODE_EXE || "opencode"
-).trim() || "opencode";
-const OPENCODE_AGENT_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_AGENT_DIR || path.join(DEFAULT_OPENCODE_CONFIG_DIR, "agents")).trim()
-);
-const OPENCODE_SKILL_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_SKILL_DIR || path.join(DEFAULT_OPENCODE_CONFIG_DIR, "skills")).trim()
-);
-const MCP_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-planner"
-).trim() || "opencode-orchestrator-mcp-planner";
-const MCP_CONTRACTOR_ORCHESTRATOR_AGENT = String(
-  process.env.CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT || "opencode-orchestrator-mcp-contractor"
-).trim() || "opencode-orchestrator-mcp-contractor";
-const STANDALONE_ORCHESTRATOR_AGENT = "opencode-orchestrator-standalone";
-const MCP_SANITIZED_READER_AGENT = "mcp-sanitized-reader";
-const MCP_SANITIZED_READER_PROFILE = Object.freeze({
-  mode: "all",
-  provider: "openai",
-  model: "gpt-5.6-terra",
-  variant: "high",
-});
-const MCP_SANITIZED_READER_PROMPT = [
-  "You are the bridge-managed reader for manifest-pinned sanitized workspaces.",
-  "",
-  "Use only built-in in-workspace read, glob, grep, and reasoning capabilities. Do not edit files, delegate tasks, invoke a shell, use network tools, or access paths outside the exact workspace root except OpenCode's unique bridge-isolated tool-output and temporary scratch directories. Never access the original repository or shared user data. If the task cannot be completed within those boundaries, stop and report the missing capability.",
-  "",
-  "Report the files inspected, conclusions, assumptions, and any evidence that could not be obtained within the sanitized boundary.",
-].join("\n");
-const MCP_SANITIZED_READER_PROMPT_SHA256 = createHash("sha256").update(MCP_SANITIZED_READER_PROMPT).digest("hex");
-const ORCHESTRATOR_AGENT_ALIASES = new Set(["orchestrator", "principal-engineer-orchestrator", STANDALONE_ORCHESTRATOR_AGENT]);
-const DEFAULT_SUBAGENT_PROXY_AGENT = "planner";
-const CONTRACTOR_ALLOWED_SUBAGENTS = new Set(["planner", "architect", "builder", "debugger", "reviewer", "tester", "explore"]);
-const WRITE_CAPABLE_AGENTS = new Set(["build", "builder", "debugger", "general"]);
-const READ_ONLY_PARALLEL_AGENTS = new Set(["planner", "reviewer", "architect", "explore", "explorer", "tester", MCP_SANITIZED_READER_AGENT]);
-const SAFE_AGENT_BASH_ALLOW_PATTERNS = new Set([
-  "Get-Command git",
-  "where.exe git",
-  "git diff",
-  "git diff --check",
-  "git diff --name-only",
-  "git diff --stat",
-  "git status",
-  "git status --short",
-  "git status --porcelain",
-  "git status --porcelain=v1",
-  "git show",
-  "git show --stat",
-  "git log",
-  "git log --oneline",
-  "git log --oneline --decorate",
-  "git rev-parse --show-toplevel",
-  "git rev-parse --is-inside-work-tree",
-  "git ls-files",
-  "git ls-files --others --exclude-standard",
-]);
-const REQUIRED_MANAGED_AGENTS = Object.freeze([
-  STANDALONE_ORCHESTRATOR_AGENT,
+const {
+  USER_HOME_DIR,
+  DEFAULT_OPENCODE_CONFIG_DIR,
+  DEFAULT_OPENCODE_DATA_DIR,
+  DEFAULT_OPENCODE_CACHE_HOME,
+  DEFAULT_OPENCODE_STATE_HOME,
+  CODEX_STATE_HOME,
+  OPENCODE_EXE,
+  OPENCODE_AGENT_DIR,
+  OPENCODE_SKILL_DIR,
   MCP_ORCHESTRATOR_AGENT,
   MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
-  "planner",
-  "architect",
-  "builder",
-  "debugger",
-  "reviewer",
-  "tester",
+  STANDALONE_ORCHESTRATOR_AGENT,
   MCP_SANITIZED_READER_AGENT,
-]);
-const GLOBALLY_REQUIRED_MANAGED_AGENTS = Object.freeze(
-  REQUIRED_MANAGED_AGENTS.filter((agent) => agent !== MCP_SANITIZED_READER_AGENT)
-);
-const RELEASE_REQUIRED_MANAGED_AGENTS = Object.freeze(
-  [...new Set([...REQUIRED_MANAGED_AGENTS, ...CONTRACTOR_ALLOWED_SUBAGENTS])].sort()
-);
-const REQUIRED_MANAGED_SKILLS = Object.freeze([
-  "agent-suitability-check",
-  "architecture-review",
-  "builder-safety",
-  "code-review-checklist",
-  "debugger-safety",
-  "debugging-investigation",
-  "error-trace-analysis",
-  "handoff-resume",
-  "minimal-fix-planning",
-  "project-testing",
-  "regression-analysis",
-  "task-packet",
-  "test-failure-diagnosis",
-]);
-const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
-// B-073: a self-test run without CODEX_OPENCODE_STATE_DIR gets a per-process temporary state
-// directory, never the operator's ~/.codex/codex-opencode-mcp. Suites that set only
-// hooks.stateDirectoryOverride fell back to the operator's directory whenever a timer fired after
-// their cleanup reset the override (job rows, empty databases and schema changes landed there).
-// The variable is set too, so a child process started with this environment shares the folder.
-const SELF_TEST_TEMP_STATE_DIR = process.argv.some((argument) => String(argument).startsWith("--self-test"))
-  && !String(process.env.CODEX_OPENCODE_STATE_DIR || "").trim()
-  ? mkdtempSync(path.join(tmpdir(), `codex-opencode-selftest-state-${process.pid}-`))
-  : "";
-if (SELF_TEST_TEMP_STATE_DIR) {
-  process.env.CODEX_OPENCODE_STATE_DIR = SELF_TEST_TEMP_STATE_DIR;
-  process.once("exit", () => {
-    try { rmSync(SELF_TEST_TEMP_STATE_DIR, { recursive: true, force: true }); } catch { /* Best effort; it is in the temp folder. */ }
-  });
-}
-const GLOBAL_BRIDGE_STATE_DIR = path.resolve(
-  String(SELF_TEST_TEMP_STATE_DIR || process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
-);
-const DISABLED_GIT_HOOKS_PATH = path.join(
+  MCP_SANITIZED_READER_PROFILE,
+  MCP_SANITIZED_READER_PROMPT,
+  MCP_SANITIZED_READER_PROMPT_SHA256,
+  ORCHESTRATOR_AGENT_ALIASES,
+  DEFAULT_SUBAGENT_PROXY_AGENT,
+  CONTRACTOR_ALLOWED_SUBAGENTS,
+  WRITE_CAPABLE_AGENTS,
+  READ_ONLY_PARALLEL_AGENTS,
+  SAFE_AGENT_BASH_ALLOW_PATTERNS,
+  REQUIRED_MANAGED_AGENTS,
+  GLOBALLY_REQUIRED_MANAGED_AGENTS,
+  RELEASE_REQUIRED_MANAGED_AGENTS,
+  REQUIRED_MANAGED_SKILLS,
+  PARALLEL_LOCK_TYPES,
+  SELF_TEST_TEMP_STATE_DIR,
   GLOBAL_BRIDGE_STATE_DIR,
-  `git-hooks-disabled-${process.pid}-${randomBytes(8).toString("hex")}`
-);
-const BRIDGE_OPENCODE_HOME_DIR = path.join(GLOBAL_BRIDGE_STATE_DIR, "opencode-home");
-const DEFAULT_LOCK_TTL_MS = 1000 * 60 * 30;
-// Agent timeouts are handed to the supervisor's setTimeout, which cannot represent more
-// than 2^31-1 ms; larger values failed as a supervisor protocol error. 24 h is the ceiling.
-const MAX_AGENT_TIMEOUT_MS = 1000 * 60 * 60 * 24;
-const MAX_LOCK_TTL_MS = 1000 * 60 * 60 * 24;
-// setTimeout and setInterval cannot represent more than 2^31-1 ms: a longer delay fires after
-// 1 ms, so a progress heartbeat interval of 2147483648 became a notification flood. Every
-// CODEX_OPENCODE_*_MS setting is a timer, lease or timeout, so readIntegerEnv caps them here.
-const MAX_TIMER_MS = 2 ** 31 - 1;
-// Q-002: the two concurrency limits can be changed in the running process (set_opencode_concurrency),
-// persisted in provider-concurrency.sqlite so a restart keeps them until cleared. CONFIG reads
-// them through accessors, so every use of CONFIG.providerConcurrencyLimit / queueParallelLimit
-// (slot leases, diagnose, the parallel-batch check, the scheduler) sees the effective value.
-const ENV_PROVIDER_CONCURRENCY_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT", 2);
-const ENV_QUEUE_PARALLEL_LIMIT = readPositiveIntEnv("CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT", 6);
-const MAX_RUNTIME_CONCURRENCY_LIMIT = 32;
-// Q-005: one cap on running agents across every provider and every bridge process (the round-6
-// orchestrator's max.txt). 0 = no cap; the per-provider limit still applies under it.
-const ENV_GLOBAL_WORKER_LIMIT = readNonNegativeIntEnv("CODEX_OPENCODE_GLOBAL_WORKER_LIMIT", 0);
-const MAX_GLOBAL_WORKER_LIMIT = 64;
-const RUNTIME_CONCURRENCY = { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, updatedAt: "" };
-// B-060: the default free-memory floor. A fixed 1024 MB would hold the queue forever on a machine
-// with 1 GB or less, so it is capped at an eighth of total memory.
-const DEFAULT_MIN_FREE_MEMORY_MB = Math.max(0, Math.min(1024, Math.floor(totalmem() / (1024 * 1024) / 8)));
-const CONFIG = Object.freeze({
-  readOnlyAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_TIMEOUT_MS", 1000 * 60 * 3),
-  writeAgentTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_WRITE_AGENT_TIMEOUT_MS", 1000 * 60 * 10),
-  builderTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_BUILDER_TIMEOUT_MS", 1000 * 60 * 15),
-  orchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_ORCHESTRATOR_TIMEOUT_MS", 1000 * 60 * 6),
-  contractorOrchestratorTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_CONTRACTOR_TIMEOUT_MS", 1000 * 60 * 20),
-  validationCommandTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_VALIDATION_TIMEOUT_MS", 1000 * 60 * 5),
-  maxReadOnlyAgentRetries: readNonNegativeIntEnv("CODEX_OPENCODE_READ_ONLY_AGENT_MAX_RETRIES", 2),
-  readOnlyRetryBaseDelayMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS", 1000),
-  readOnlyRetryMaxElapsedMs: readPositiveIntEnv("CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS", 1000 * 60 * 8),
-  maxProcessOutputChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_PROCESS_OUTPUT_CHARS", 1024 * 1024 * 2),
-  maxAssistantResponseChars: readPositiveIntEnv("CODEX_OPENCODE_MAX_ASSISTANT_RESPONSE_CHARS", 1024 * 128),
-  requireRuntimeModelEvidence: readChoiceEnv("CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE", ["false", "true"], "false") === "true",
-  maxIgnoredSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_IGNORED_SNAPSHOT_FILES", 20000),
-  maxSnapshotFiles: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILES", 25000),
-  maxSnapshotFileBytes: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_FILE_BYTES", 1024 * 1024),
-  maxSnapshotTotalBytes: readPositiveIntEnv("CODEX_OPENCODE_MAX_SNAPSHOT_TOTAL_BYTES", 1024 * 1024 * 128),
-  defaultReadLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_READ_LOCK_MODE", ["off"], "off"),
-  defaultWriteLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_WRITE_LOCK_MODE", ["simple", "strict"], "simple"),
-  defaultParallelWriteLockMode: readChoiceEnv("CODEX_OPENCODE_DEFAULT_PARALLEL_WRITE_LOCK_MODE", ["strict"], "strict"),
-  parallelLimit: readPositiveIntEnv("CODEX_OPENCODE_PARALLEL_LIMIT", 6),
-  logLevel: readChoiceEnv("CODEX_OPENCODE_LOG_LEVEL", ["off", "error", "warn", "info", "debug"], "warn"),
-  worktreeMode: readChoiceEnv("CODEX_OPENCODE_WORKTREE_MODE", ["off", "write", "all"], "off"),
-  // Worktree add/remove and temp-index rebuilds rehash the whole checkout; 60 s was short
-  // for a large repository on Windows.
-  gitHeavyTimeoutMs: readPositiveIntEnv("CODEX_OPENCODE_GIT_HEAVY_TIMEOUT_MS", 1000 * 60 * 5),
-  worktreeRoot: String(process.env.CODEX_OPENCODE_WORKTREE_ROOT || "global").trim() || "global",
-  worktreeCleanup: readChoiceEnv("CODEX_OPENCODE_WORKTREE_CLEANUP", ["always", "on_success", "never"], "never"),
-  sourceDirtPolicy: readChoiceEnv("CODEX_OPENCODE_SOURCE_DIRT_POLICY", ["strict", "unrelated_ok"], "strict"),
-  modelOverrideAllowlist: readCsvEnv("CODEX_OPENCODE_MODEL_ALLOWLIST", []),
-  worktreeBranchPrefix: String(process.env.CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX || "agent").trim() || "agent",
-  queueMode: readChoiceEnv("CODEX_OPENCODE_QUEUE_MODE", ["off", "memory", "sqlite"], "sqlite"),
-  get queueParallelLimit() { return RUNTIME_CONCURRENCY.queueParallelLimit ?? ENV_QUEUE_PARALLEL_LIMIT; },
-  // B-045: 0 disables. While the machine has less free memory than this, the queue starts no new job
-  // (twenty agent processes, their worktrees and test runs exhausted a laptop). B-060: on by
-  // default (1024 MB, at most an eighth of the machine's memory), because 10 builders took the
-  // owner's machine to 0.4 GB free while the floor was off.
-  minFreeMemoryMb: readNonNegativeIntEnv("CODEX_OPENCODE_MIN_FREE_MEMORY_MB", DEFAULT_MIN_FREE_MEMORY_MB),
-  // B-046: 0 disables. An agent that writes nothing to stdout or stderr for this long is stopped
-  // through the process-tree supervisor and fails as agent_idle_timeout (a stalled provider stream
-  // held a slot for 20+ minutes). Output arrives per finished step, so keep this well above the
-  // longest tool call or reasoning pause a healthy agent has. B-060: 10 minutes by default (the
-  // round-6 orchestrator's watchdog); CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL sets other
-  // limits for models that write a whole file in one long silent step.
-  agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 1000 * 60 * 10),
-  agentIdleTimeoutByModel: readModelDurationMapEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL"),
-  // B-061: OpenCode retries "Rate limit exceeded" by itself, silently on stdout, for as long as the
-  // run timeout allows. This many rate-limit lines for the job's model with no stdout output in
-  // between end the run as provider_rate_limited (0 turns the detection off).
-  rateLimitHits: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_HITS", 2),
-  // The pause a detected rate limit puts on that provider/model; it doubles on the next one up to
-  // the maximum (30, then 60 minutes, as the round-6 orchestrator did). 0 records no pause.
-  rateLimitPauseMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS", 1000 * 60 * 30),
-  rateLimitPauseMaxMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS", 1000 * 60 * 60),
-  // The OpenCode log file scanned for those lines in addition to the job's own stderr ("off" stops
-  // the scan). Tests point it at a scratch fixture.
-  openCodeLogPath: readOpenCodeLogPathEnv(),
-  openCodeLogScanMs: readPositiveIntEnv("CODEX_OPENCODE_OPENCODE_LOG_SCAN_MS", 1000 * 15),
-  // Q-008: a job with a retry policy (models / maxAttempts) that a bridge restart interrupted is
-  // requeued by the bridge that finds it, as one of its attempts. false leaves it interrupted.
-  autoResumeInterrupted: readChoiceEnv("CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED", ["true", "false"], "true") === "true",
-  // Q-010: false refuses every autoIntegrate job, for an operator who wants every patch reviewed.
-  autoIntegrateAllowed: readChoiceEnv("CODEX_OPENCODE_AUTO_INTEGRATE", ["true", "false"], "true") === "true",
-  queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
-  queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
-  queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
-  queueReadOnlyRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_READONLY_RETRIES", 0),
-  queueWriteRetries: readNonNegativeIntEnv("CODEX_OPENCODE_QUEUE_WRITE_RETRIES", 0),
-  queueHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_HEARTBEAT_MS", 1000 * 15),
-  // Idle bridges re-scan the state databases for orphaned work; back off to this interval when nothing is pending.
-  deferredRecoveryIdleMaxMs: readPositiveIntEnv("CODEX_OPENCODE_DEFERRED_RECOVERY_IDLE_MAX_MS", 1000 * 15),
-  // 0 disables progress notifications for long tool calls.
-  toolProgressIntervalMs: readNonNegativeIntEnv("CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS", 1000 * 30),
-  containmentReleaseGraceMs: readNonNegativeIntEnv("CODEX_OPENCODE_CONTAINMENT_RELEASE_GRACE_MS", 1000 * 60 * 10),
-  queueLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_LEASE_MS", 1000 * 60),
-  queueRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_QUEUE_RETENTION_DAYS", 30),
-  auditRetentionDays: readStrictPositiveIntEnv("CODEX_OPENCODE_AUDIT_RETENTION_DAYS", 90),
-  stateDbMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_STATE_DB_MAX_BYTES", 1024 * 1024 * 1024 * 2),
-  terminalJobMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_JOB_MAX_ROWS", 50000),
-  terminalPipelineMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_PIPELINE_MAX_ROWS", 10000),
-  terminalIntegrationMaxRows: readPositiveIntEnv("CODEX_OPENCODE_TERMINAL_INTEGRATION_MAX_ROWS", 10000),
-  retainedWorktreeMaxCount: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_COUNT", 64),
-  retainedWorktreeMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_RETAINED_WORKTREE_MAX_BYTES", 1024 * 1024 * 1024 * 20),
-  queueResultMaxChars: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS", 24000),
-  integrationPreviewMaxChars: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS", 12000),
-  integrationPreviewGlobalMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_GLOBAL_MAX", 256),
-  integrationPreviewProjectMax: readPositiveIntEnv("CODEX_OPENCODE_INTEGRATION_PREVIEW_PROJECT_MAX", 64),
-  allowExternalPlugins: readChoiceEnv("CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS", ["false", "true"], "false") === "true",
-  externalPluginAllowlist: readCsvEnv("CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST"),
-  externalPluginManifestPath: String(process.env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || "").trim(),
-  expectedExternalPluginManifestSha256: String(process.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 || "").trim().toLowerCase(),
-  validationExecutableAllowlist: readCsvEnv("CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST", ["git"]),
-  validationExecutableSha256Allowlist: readCsvEnv("CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST").map((item) => item.toLowerCase()),
-  trustedPolicySha256: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_SHA256 || "").trim().toLowerCase(),
-  trustedPolicyRoot: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_ROOT || "").trim(),
-  trustedPolicyPath: String(process.env.CODEX_OPENCODE_TRUSTED_POLICY_PATH || "").trim(),
-  get providerConcurrencyLimit() { return RUNTIME_CONCURRENCY.providerLimit ?? ENV_PROVIDER_CONCURRENCY_LIMIT; },
-  get globalWorkerLimit() { return RUNTIME_CONCURRENCY.globalWorkerLimit ?? ENV_GLOBAL_WORKER_LIMIT; },
-  attestationCacheTtlMs: readNonNegativeIntEnv("CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS", 1000 * 60 * 30),
-  providerLeasePollMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS", 250),
-  // How long a job may wait for a provider slot. The wait is not part of the agent's run
-  // timeout: the run clock starts when the slot is granted.
-  providerWaitMaxMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS", 1000 * 60 * 20),
-  providerLeaseMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_LEASE_MS", 1000 * 60 * 4),
-  providerHeartbeatMs: readPositiveIntEnv("CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS", 1000 * 20),
-  providerConcurrencyKey: String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "opencode-default-account").trim() || "opencode-default-account",
-  providerConcurrencyKeyExplicit: Boolean(String(process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY || "").trim()),
-  sanitizedMaxFiles: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_FILES", 25000),
-  sanitizedMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_SANITIZED_MAX_BYTES", 1024 * 1024 * 1024),
-  policyMaxBytes: readPositiveIntEnv("CODEX_OPENCODE_POLICY_MAX_BYTES", 1024 * 128),
-  contractorAuthorizationSha256: String(process.env.CODEX_OPENCODE_CONTRACTOR_AUTHORIZATION_SHA256 || "").trim().toLowerCase(),
-  callerModel: readChoiceEnv("CODEX_OPENCODE_CALLER_MODEL", ["trusted_stdio"], "trusted_stdio"),
-});
-assertSupportedQueueRetryConfig(CONFIG);
-assertSupportedCallerModel();
-const SERIAL_ONLY_PATHS = Object.freeze([
-  "package.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "bun.lockb",
-  "tsconfig.json",
-  "tsconfig.*.json",
-  "vite.config.*",
-  "next.config.*",
-  "nuxt.config.*",
-  "webpack.config.*",
-  "rollup.config.*",
-  "eslint.config.*",
-  ".eslintrc*",
-  ".prettierrc*",
-  ".env",
-  ".env.*",
-  "README.md",
-  "CHANGELOG.md",
-  "src/index.*",
-  "src/main.*",
-  "src/app.*",
-  "src/routes/**",
-  "app/routes/**",
-  "db/migrations/**",
-  "prisma/schema.prisma",
-]);
-const DEFAULT_FORBIDDEN_EDIT_PATHS = Object.freeze([
-  ".env",
-  ".env.*",
-  "**/.env",
-  "**/.env.*",
-  "*.pem",
-  "**/*.pem",
-  "*.key",
-  "**/*.key",
-  "secrets/**",
-  "**/secrets/**",
-  // Git's control surface: config, hooks, refs and a worktree's .git pointer file. Git never
-  // lists these as changes, so a deny rule is the only guard. The managed writer profiles
-  // (opencode/agents/builder.md, debugger.md) must list exactly this set.
-  ".git",
-  ".git/**",
-  "**/.git",
-  "**/.git/**",
-]);
-const DEFAULT_SHARED_FILE_PATHS = Object.freeze([
-  "package.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "tsconfig.json",
-  "packages/shared/**",
-  "schema/**",
-  "migrations/**",
-  // Python and CMake manifests are shared the same way (found porting a C++ repo to Python).
-  // overlaps() compares path prefixes, not globs, so these are literal root paths.
-  "pyproject.toml",
-  "setup.py",
-  "setup.cfg",
-  "requirements.txt",
-  "requirements-dev.txt",
-  "Pipfile",
-  "Pipfile.lock",
-  "poetry.lock",
-  "uv.lock",
-  "conftest.py",
-  "tests/conftest.py",
-  "CMakeLists.txt",
-]);
-const defaultReadOnlyAgentTimeoutMs = CONFIG.readOnlyAgentTimeoutMs;
-const defaultWriteAgentTimeoutMs = CONFIG.writeAgentTimeoutMs;
-const defaultBuilderTimeoutMs = CONFIG.builderTimeoutMs;
-const defaultOrchestratorTimeoutMs = CONFIG.orchestratorTimeoutMs;
-const defaultContractorOrchestratorTimeoutMs = CONFIG.contractorOrchestratorTimeoutMs;
-const maxReadOnlyAgentRetries = CONFIG.maxReadOnlyAgentRetries;
-const LOG_LEVELS = Object.freeze({ off: 0, error: 1, warn: 2, info: 3, debug: 4 });
+  DISABLED_GIT_HOOKS_PATH,
+  BRIDGE_OPENCODE_HOME_DIR,
+  DEFAULT_LOCK_TTL_MS,
+  MAX_LOCK_TTL_MS,
+  ENV_PROVIDER_CONCURRENCY_LIMIT,
+  ENV_QUEUE_PARALLEL_LIMIT,
+  MAX_RUNTIME_CONCURRENCY_LIMIT,
+  ENV_GLOBAL_WORKER_LIMIT,
+  MAX_GLOBAL_WORKER_LIMIT,
+  RUNTIME_CONCURRENCY,
+  DEFAULT_MIN_FREE_MEMORY_MB,
+  CONFIG,
+  defaultReadOnlyAgentTimeoutMs,
+  defaultWriteAgentTimeoutMs,
+  defaultBuilderTimeoutMs,
+  defaultOrchestratorTimeoutMs,
+  defaultContractorOrchestratorTimeoutMs,
+  maxReadOnlyAgentRetries,
+  assertSupportedQueueRetryConfig,
+  assertSupportedCallerModel,
+  readOpenCodeLogPathEnv,
+} = createBridgeConfig();
+
 const DEFAULT_RETURN_FORMAT = [
   "1. Summary",
   "2. Lock used",
@@ -419,8 +256,7 @@ const INTEGRATION_RESOLVED_SQL = INTEGRATION_RESOLVED_STATUSES.map((status) => `
 const OPERATOR_CLI_ENV = "CODEX_OPENCODE_OPERATOR_CLI";
 const PRIVATE_STATE_VACUUMED_DB_PATHS = new Set();
 const INTEGRATION_PREVIEW_TTL_MS = 1000 * 60 * 60;
-const REPOSITORY_SCOPE_LOCK_PATH = ".";
-const FILESYSTEM_CASE_MODE_CACHE = new Map();
+
 let queueSchedulerActive = false;
 let queueWakeTimer = null;
 let queueHeartbeatTimer = null;
@@ -432,8 +268,70 @@ let deferredRecoveryRunning = false;
 let deferredRecoveryIdlePasses = 0;
 // dbPath -> { fingerprint, pending }: an unchanged database with no non-terminal work is not reopened.
 const DEFERRED_RECOVERY_DB_MEMO = new Map();
-const QUEUE_REQUEST_KEY_PROMISES = new Map();
 let stateDirectoryOverride = "";
+
+// Construct shared services before startup probes can call them.
+const {
+  ensureTableColumn,
+  ensureQueueLeaseSchema,
+  ensurePipelineRevisionSchema,
+  ensureIntegrationJournalSchema,
+  ensureIntegrationPreviewReceiptSchema,
+  ensureWorktreeArtifactSchema,
+} = createStateSchema();
+
+const {
+  projectStateKey,
+  recordMatchesProject,
+  effectiveBridgeStateDirectory,
+  stateDbPath,
+  resolveProjectStateRoot,
+  scrubLegacyLockSecrets,
+  openLockDb,
+  closeDb,
+} = createStateDatabase({
+  CONFIG,
+  GLOBAL_BRIDGE_STATE_DIR,
+  getStateDirectoryOverride: () => stateDirectoryOverride,
+  runCommand: (...args) => runCommand(...args),
+  assertNoLinkedPath,
+  ensureLockTableSchema: (...args) => ensureLockTableSchema(...args),
+  ensureTableColumn,
+  ensureQueueLeaseSchema,
+  ensurePipelineRevisionSchema,
+  ensureIntegrationJournalSchema,
+  ensureIntegrationPreviewReceiptSchema,
+  ensureWorktreeArtifactSchema,
+  migrateLegacyEncryptedState,
+  BRIDGE_INSTANCE_ID,
+  KNOWN_STATE_DB_PATHS,
+  ensureQueueHeartbeatTimer,
+  ensureStateMaintenanceTimer,
+  prunePersistedState,
+});
+
+const {
+  queueRequestKeyPath,
+  queueRequestKey,
+  encryptQueueRequest,
+  decryptQueueRequest,
+  encryptIntegrationJournalBytes,
+  decryptIntegrationJournalBytes,
+} = createStateCrypto({
+  effectiveBridgeStateDirectory,
+  assertNoLinkedPath,
+  CONFIG,
+});
+
+const {
+  logEvent,
+  opsLogEnabled,
+} = createLoggingRuntime({
+  CONFIG,
+  effectiveBridgeStateDirectory,
+  getStateDirectoryOverride: () => stateDirectoryOverride,
+});
+
 let queueModeOverride = "";
 let queueWriteConflictPolicyOverride = "";
 
@@ -577,7 +475,6 @@ let selfTestContractorAuthorizationSha256 = "";
 let selfTestModelOverrideAllowlist = null;
 let pipelinePersistenceTestHook = null;
 let queueCancellationTestHook = null;
-let worktreeCleanupTestHook = null;
 let integrationScratchCleanupTestHook = null;
 let pipelineGateExecutorTestHook = null;
 // Self-test only: stands in for agent discovery, attestation and the OpenCode run so the job
@@ -699,64 +596,6 @@ server.tool = (...registration) => {
   return registerToolWithoutProgress(...registration);
 };
 
-const scopePathSetSchema = z
-  .object({
-    read: z.array(z.string()).optional(),
-    write: z.array(z.string()).optional(),
-    forbidden: z.array(z.string()).optional(),
-  })
-  .strict();
-
-const scopeValidationSchema = z
-  .object({
-    changedFilesMustBeWithinWriteScope: z.boolean().optional(),
-    forbiddenFilesMustNotChange: z.boolean().optional(),
-    readOnlyMustNotChangeFiles: z.boolean().optional(),
-  })
-  .strict();
-
-const scopeTimeoutPolicySchema = z
-  .object({
-    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
-    readOnlyTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
-    writeTimeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
-  })
-  .strict();
-
-// These values become `opencode run` arguments. A value starting with "-" (variant
-// "--attach=http://host:4096") was parsed by the CLI as an extra option.
-// Model IDs may contain "/" (openrouter/anthropic/...); they still may not start with "-".
-const MODEL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
-const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
-const modelRequirementSchema = z.object({
-  provider: z.string().trim().min(1).max(256).regex(MODEL_IDENTIFIER_PATTERN),
-  model: z.string().trim().min(1).max(256).regex(MODEL_NAME_PATTERN),
-  variant: z.string().trim().min(1).max(128).regex(MODEL_IDENTIFIER_PATTERN).optional(),
-  requireRuntimeEvidence: z.boolean().optional(),
-}).strict();
-
-const scopeContractSchema = z
-  .object({
-    agent: z.string().optional(),
-    role: z.string().optional(),
-    mode: z.enum(["read", "write", "read-only", "readonly"]).optional(),
-    read: z.array(z.string()).optional(),
-    write: z.array(z.string()).optional(),
-    allowedEdits: z.array(z.string()).optional(),
-    forbidden: z.array(z.string()).optional(),
-    shared: z.array(z.string()).optional(),
-    serialOnly: z.array(z.string()).optional(),
-    validationCommand: z.string().optional(),
-    scope: scopePathSetSchema.optional(),
-    actions: z.array(z.string()).optional(),
-    validation: scopeValidationSchema.optional(),
-    timeoutMs: z.number().int().positive().max(MAX_AGENT_TIMEOUT_MS).optional(),
-    timeoutPolicy: scopeTimeoutPolicySchema.optional(),
-    modelRequirement: modelRequirementSchema.optional().describe("Pin provider/model[@variant] for this job. It must be in CODEX_OPENCODE_MODEL_ALLOWLIST or match the managed profile."),
-    selfCheckCommands: z.array(z.string().min(1).max(500)).max(8).optional().describe("Write jobs (builder/debugger) only: exact commands the BRIDGE runs in the worktree after the agent finished, before validationCommand, e.g. \"node tools/validate.cjs out/x.json\". A failing one gives the agent another run with its output (selfCheckPasses). The agent itself gets no shell. Each must pass the validationCommand rules (CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST, no shell, npx or inline eval) and be written without wildcards, quotes or shell operators; a script it runs must not be in allowedEdits."),
-  })
-  .strict();
-
 const sanitizedWorkspaceSchema = z
   .object({
     root: z.string().min(1),
@@ -806,133 +645,13 @@ const jobInputShape = {
   }).optional().describe("Optional prompt hints: permissions summary and expected return format."),
 };
 
-const integrationPreviewReceiptSchema = z
-  .object({
-    previewId: z.string().regex(/^[a-fA-F0-9]{64}$/),
-    createdAt: z.string(),
-    expiresAt: z.string(),
-    nonce: z.string().regex(/^[a-fA-F0-9]{32}$/).optional(),
-    patchSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
-    sourceBaseCommit: z.string().min(1),
-    sourceStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
-    targetHead: z.string().min(1),
-    targetStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
-    contractSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
-    // I-001: identity of the patched paths alone (HEAD entry, index entry and working bytes of
-    // each), bound into previewId. It lets the apply accept a target HEAD that moved on commits
-    // that left those paths alone. Receipts issued without it stay strict.
-    patchedPathsStateSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
-  })
-  .strict();
 
-const projectAgentPolicySchema = z
-  .object({
-    version: z.literal(1),
-    owners: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional(),
-    sharedFiles: z.array(z.string()).optional(),
-    contracts: z.array(z.string()).optional(),
-    serialOnly: z.array(z.string()).optional(),
-    forbiddenEdits: z.array(z.string()).optional(),
-    finalValidationCommand: z.string().max(4096).optional(),
-    requiresWorktrees: z.boolean().optional(),
-  })
-  .strict();
 
-// Unset or blank keeps the default (Number("") is 0, so CODEX_OPENCODE_TOOL_PROGRESS_INTERVAL_MS=""
-// used to disable progress heartbeats). Anything else must be an integer in range: a typo
-// (PROVIDER_CONCURRENCY_LIMIT=foo) used to fall back to the default silently, like the unknown
-// choice values readChoiceEnv already rejects at startup.
-function readIntegerEnv(name, fallback, minimum) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
-  const maximum = name.endsWith("_MS") ? MAX_TIMER_MS : Number.MAX_SAFE_INTEGER;
-  const value = Number(raw);
-  if (Number.isInteger(value) && value >= minimum && value <= maximum) return value;
-  throw new Error(`${name} must be an integer from ${minimum} to ${maximum} (or unset for ${fallback}); got ${JSON.stringify(String(raw).trim())}.`);
-}
-
-function readPositiveIntEnv(name, fallback) {
-  return readIntegerEnv(name, fallback, 1);
-}
-
-function readNonNegativeIntEnv(name, fallback) {
-  return readIntegerEnv(name, fallback, 0);
-}
-
-function readStrictPositiveIntEnv(name, fallback) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) return fallback;
-  const value = Number(raw);
-  if (Number.isInteger(value) && value > 0) return value;
-  throw new Error(`${name} must be a positive integer; zero disables required state-retention bounds.`);
-}
-
-function assertSupportedQueueRetryConfig(config) {
-  if (Number(config?.queueReadOnlyRetries || 0) === 0 && Number(config?.queueWriteRetries || 0) === 0) return;
-  throw new Error(
-    "CODEX_OPENCODE_QUEUE_READONLY_RETRIES and CODEX_OPENCODE_QUEUE_WRITE_RETRIES are unsupported and must remain 0; bounded provider retries are managed inside read-only execution."
-  );
-}
-
-function assertSupportedCallerModel() {
-  const configured = String(process.env.CODEX_OPENCODE_CALLER_MODEL || "trusted_stdio").trim().toLowerCase();
-  if (configured === "trusted_stdio") return;
-  throw new Error(
-    "CODEX_OPENCODE_CALLER_MODEL only supports trusted_stdio. Shared or multiplexed callers require an external per-project capability/authentication boundary and are rejected by this bridge."
-  );
-}
-
-// B-060: "provider/model=ms,provider/model=ms". A model that writes its whole output in one long
-// silent step (Space Bunny, Nemotron) needs a longer idle limit than the default; one global value
-// either killed those or let a stalled Muse run hold its slot. Invalid entries stop the bridge at
-// startup, like every other malformed setting.
-function readModelDurationMapEnv(name) {
-  const raw = process.env[name];
-  const map = new Map();
-  if (raw === undefined || raw === null || !String(raw).trim()) return map;
-  for (const entry of String(raw).split(",").map((item) => item.trim()).filter(Boolean)) {
-    const match = /^([A-Za-z0-9][A-Za-z0-9._:-]*)\/([A-Za-z0-9][A-Za-z0-9._:/-]*)=(\d+)$/.exec(entry);
-    const value = match ? Number(match[3]) : NaN;
-    if (!match || !Number.isSafeInteger(value) || value > MAX_TIMER_MS) {
-      throw new Error(`${name} must be a comma-separated list of provider/model=milliseconds (each at most ${MAX_TIMER_MS}); got ${JSON.stringify(entry)}.`);
-    }
-    map.set(`${match[1].toLowerCase()}/${match[2].toLowerCase()}`, value);
-  }
-  return map;
-}
-
-// B-061: CODEX_OPENCODE_OPENCODE_LOG_PATH, default <OpenCode data dir>/log/opencode.log (bridge
-// children write there too: they run with --print-logs, which writes the file and stderr). "off"
-// disables the file scan; anything else must be an absolute path.
-function readOpenCodeLogPathEnv() {
-  const raw = String(process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH || "").trim();
-  if (!raw) return path.join(DEFAULT_OPENCODE_DATA_DIR, "log", "opencode.log");
-  if (raw.toLowerCase() === "off") return "";
-  if (!path.isAbsolute(raw)) throw new Error(`CODEX_OPENCODE_OPENCODE_LOG_PATH must be an absolute path or off; got ${JSON.stringify(raw)}.`);
-  return path.resolve(raw);
-}
-
-function readCsvEnv(name, fallback = []) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || !String(raw).trim()) {
-    return [...fallback];
-  }
-  return [...new Set(String(raw).split(",").map((item) => item.trim()).filter(Boolean))];
-}
 
 // Windows editors (Notepad, PowerShell 5 Out-File) write UTF-8 with a byte-order mark, which
 // JSON.parse rejects. Callers hash the raw bytes first; only the parse ignores the BOM.
 function parseJsonText(text) {
   return JSON.parse(String(text).replace(/^\uFEFF/, ""));
-}
-
-function readChoiceEnv(name, allowedValues, fallback) {
-  // An unknown value used to fall back silently (WORKTREE_MODE=writes ran writers in the
-  // checkout with worktrees off). Unset or blank keeps the default; anything else must be listed.
-  const value = String(process.env[name] || "").trim().toLowerCase();
-  if (!value) return fallback;
-  if (allowedValues.includes(value)) return value;
-  throw new Error(`${name} must be one of ${allowedValues.join(", ")} (or unset for ${fallback}); got ${JSON.stringify(String(process.env[name]).trim())}.`);
 }
 
 async function runSingleFlight(flights, key, operation) {
@@ -1630,123 +1349,6 @@ async function inspectRepositoryGitControlSurface(cwd) {
     : { ok: true, errorType: null, error: "", unsafeKeys: [] };
 }
 
-// Body of a key block whose END line is missing (a truncated answer): base64 runs of 16+
-// characters, at any wrap width, separated by blank space or by real or escaped line breaks
-// (a key inside a JSON string carries the two characters \n, or \\n one level deeper, instead
-// of a newline). Every scan is sticky and bounded, so it stays linear.
-const PEM_BODY_GAP = /(?:[ \t\r\n]|\\{1,8}[rn])*/y;
-const PEM_BODY_RUN = /[A-Za-z0-9+\/=]{16,}/y;
-function pemBodyEnd(text, from) {
-  let end = from;
-  for (;;) {
-    PEM_BODY_GAP.lastIndex = end;
-    PEM_BODY_GAP.exec(text);
-    PEM_BODY_RUN.lastIndex = PEM_BODY_GAP.lastIndex;
-    if (!PEM_BODY_RUN.exec(text)) return end;
-    end = PEM_BODY_RUN.lastIndex;
-  }
-}
-
-// Private key blocks are cut in one forward pass: a lazy BEGIN...END regex rescanned the
-// rest of the text from every unterminated BEGIN line, which is quadratic on agent output.
-// An unterminated block (a truncated answer) loses its header and base64 body lines.
-function redactPrivateKeyBlocks(text) {
-  const begin = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/gi;
-  const endMarker = /-----END [A-Z ]{0,40}PRIVATE KEY-----/gi;
-  let output = "";
-  let cursor = 0;
-  let endSearchExhausted = false;
-  for (let match = begin.exec(text); match; match = begin.exec(text)) {
-    let blockEnd = -1;
-    if (!endSearchExhausted) {
-      endMarker.lastIndex = begin.lastIndex;
-      const end = endMarker.exec(text);
-      if (end) blockEnd = endMarker.lastIndex;
-      else endSearchExhausted = true;
-    }
-    if (blockEnd < 0) blockEnd = pemBodyEnd(text, begin.lastIndex);
-    output += `${text.slice(cursor, match.index)}[private key redacted]`;
-    cursor = blockEnd;
-    begin.lastIndex = cursor;
-  }
-  return output + text.slice(cursor);
-}
-
-// Gate for integration previews. redactSensitiveText() is deliberately greedy because it
-// scrubs logs, where over-redaction is harmless; used as a patch gate it rejected ordinary
-// code ("// Basic usage", "password = getpass()"), and a rejected preview gets no receipt,
-// so the patch could never be integrated. This only matches values shaped like real
-// credentials: key material, well-known token formats, and literal secrets assigned to
-// credential-named keys.
-const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/;
-// Every repeat is bounded and every token pattern refuses to start inside a longer run:
-// unbounded runs rescanned the rest of an agent answer from each position (seconds per
-// answer, which freezes the bridge event loop). Key names need a digit+letter value and a
-// real credential word, so lexer code such as token_type = TokenType.INT64 still passes.
-const LIKELY_SECRET_PATTERNS = [
-  PRIVATE_KEY_HEADER,
-  /\bBearer\s+[A-Za-z0-9._~+\/-]{20,4096}=*/,
-  // Base64 credentials almost always contain a digit; "Basic auth/authorization" does not.
-  /\bBasic\s+(?=[A-Za-z0-9+\/]{0,512}[0-9])[A-Za-z0-9+\/]{12,4096}={0,2}(?![A-Za-z0-9+\/=])/,
-  /(?<![A-Za-z0-9._-])(?:ya29\.[A-Za-z0-9._-]{20,4096}|1\/\/0[A-Za-z0-9._-]{20,4096})/,
-  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}(?![A-Za-z0-9_-])/,
-  // sk-proj-..., sk-ant-...: dash form with a digit (CSS names like sk-spinner-plane pass).
-  /(?<![A-Za-z0-9_-])(?:sk|rk|pk)-(?=[A-Za-z0-9_-]{0,256}[0-9])[A-Za-z0-9_-]{20,256}(?![A-Za-z0-9_-])/,
-  // Stripe sk_live_/pk_test_...; plain identifiers like pk_index_for_table_1 pass.
-  /(?<![A-Za-z0-9_])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,256}(?![A-Za-z0-9])/,
-  /(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,512}(?![A-Za-z0-9-])/,
-  /(?<![A-Za-z0-9_])(?:gh[pousr]_|github_pat_)[_A-Za-z0-9]{20,512}(?![A-Za-z0-9_])/,
-  /(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])/,
-  /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,512}(?![A-Za-z0-9_-])/,
-  /(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/,
-  /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{1,64}\/B[A-Z0-9]{1,64}\/[A-Za-z0-9]{16,256}/,
-  // scheme://user:password@host with a password that has a digit (not user:user@localhost).
-  /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s:\/@]{1,256}:(?=[^\s\/@]{0,256}[0-9])[^\s\/@]{6,256}@/i,
-  // Quoted literal assigned to a credential-named key (not a suffix of a longer word such as
-  // invalid_token); the value needs a letter and a digit, so "test-password" passes.
-  /(?<![A-Za-z0-9])(?:authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|password|passwd|secret|client[-_]?secret|credential)["']?\s*[:=]\s*(["'])(?=[^"'\s]{0,256}[0-9])(?=[^"'\s]{0,256}[A-Za-z])[^"'\s]{8,256}\1/i,
-  // Unquoted .env / YAML value that is the whole rest of the line (DB_PASSWORD=..., password:
-  // ...). No dots in the value, so attribute access such as settings.API_KEY passes. The tail
-  // is [ \t]* rather than \s*;?\s*: two adjacent \s* backtrack quadratically on a long run of
-  // blanks, and every redactor applies this pattern to whole patches and logs (G-05 review).
-  /(?:^\+?|\s)(?:export\s+)?[A-Za-z0-9_]{0,40}(?:password|passwd|secret|api_?key|access_?key|private_?key|auth_?token|access_?token|refresh_?token|credential)[A-Za-z0-9_]{0,40}\s*[:=]\s*(?=[^\s"'#]{0,256}[0-9])(?=[^\s"'#]{0,256}[A-Za-z])[^\s"'#(){}\[\].$,;]{8,256}[ \t]*(?:;[ \t]*)?(?:#.{0,256})?$/im,
-];
-
-// Agent answers quote code back to the coordinator. The greedy log redaction turned
-// "password = getpass.getpass()" into "password = [redacted]", which misreports what the
-// agent wrote. Only values shaped like real credentials are masked here; persisted
-// records and logs keep the greedy redactSensitiveText().
-const LIKELY_SECRET_GLOBAL_PATTERNS = LIKELY_SECRET_PATTERNS.map((pattern) => new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`));
-function redactLikelySecrets(value) {
-  // Whole key blocks first: the header pattern alone left the base64 body in the answer.
-  let text = redactPrivateKeyBlocks(String(value || ""));
-  for (const pattern of LIKELY_SECRET_GLOBAL_PATTERNS) text = text.replace(pattern, "[credential redacted]");
-  return text;
-}
-
-// Logs, diagnostics, stored results and stored patch previews. The broad rules below catch
-// credential-named keys and short token forms the gate ignores; every shape the gate flags is
-// then masked from the same LIKELY_SECRET_PATTERNS list, so a line the preview flags (or an
-// operator accepts with acceptFlaggedSecretLines) cannot reach a log or a stored record.
-const BROAD_LOG_REDACTIONS = [
-  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
-  [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
-  [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}/g, "[jwt redacted]"],
-  [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
-  [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
-  [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
-  [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
-  [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
-];
-function redactSensitiveText(value) {
-  let text = redactPrivateKeyBlocks(String(value || ""));
-  for (const [pattern, replacement] of BROAD_LOG_REDACTIONS) {
-    text = text.replace(pattern, replacement);
-  }
-  for (const pattern of LIKELY_SECRET_GLOBAL_PATTERNS) text = text.replace(pattern, "[credential redacted]");
-  return text;
-}
-
 // Git never reports edits under .git/ as changes, so a writer that rewrote .git/config
 // (core.hooksPath, an alias, a filter driver) or dropped a hook would pass every
 // changed-file check. This fingerprint covers the control files a job could use to run
@@ -1834,242 +1436,8 @@ function applyGitControlSurfaceCheck(result, before, after, phase = "agent execu
   ].filter(Boolean).join("\n");
 }
 
-// A NUL byte or a .gitattributes "binary" entry turns a file into a base85 "GIT binary
-// patch" hunk the reviewer cannot read, and the secret scan only sees "+" text lines, so the
-// preview would approve content nobody saw. Every binary hunk is rejected unless its path
-// has a known binary media/font/archive extension or the caller acknowledges binary hunks.
-// (An allowlist of text extensions left every other extension, and extensionless files,
-// free to arrive as unreviewed binary.) Executables and libraries are deliberately absent.
-const KNOWN_BINARY_EXTENSION = /\.(?:png|jpe?g|gif|bmp|ico|icns|webp|avif|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|7z|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|ogg|flac|webm|mov|wasm)$/i;
-// R-154: git C-quotes a path that has a quote, backslash, control character (or, without the
-// bridge's core.quotePath=false, a non-ASCII byte) in "diff --git" headers: "a/x\"y" "b/x\"y".
-// The unquoted-only header pattern did not match such a header, so its binary hunk was
-// attributed to the previous file (or to no file) and passed the gate.
-const GIT_C_QUOTE_ESCAPES = Object.freeze({ a: 0x07, b: 0x08, t: 0x09, n: 0x0a, v: 0x0b, f: 0x0c, r: 0x0d, '"': 0x22, "\\": 0x5c });
-function gitUnquotePath(body) {
-  const input = Buffer.from(body, "utf8");
-  const bytes = [];
-  for (let index = 0; index < input.length; index += 1) {
-    const byte = input[index];
-    if (byte !== 0x5c) { bytes.push(byte); continue; }
-    const octal = input.subarray(index + 1, index + 4).toString("latin1");
-    if (/^[0-7]{3}$/.test(octal)) {
-      bytes.push(Number.parseInt(octal, 8) & 0xff);
-      index += 3;
-      continue;
-    }
-    const escaped = GIT_C_QUOTE_ESCAPES[String.fromCharCode(input[index + 1])];
-    if (escaped === undefined) { bytes.push(byte); continue; }
-    bytes.push(escaped);
-    index += 1;
-  }
-  return Buffer.from(bytes).toString("utf8");
-}
 
-// The post-image path of a "diff --git" header, unquoted; null when the header is not understood.
-function gitDiffHeaderNewPath(line) {
-  const rest = /^diff --git (.*)$/.exec(line)?.[1];
-  if (rest === undefined) return null;
-  const quotedAt = (text) => {
-    if (!text.startsWith('"')) return null;
-    for (let index = 1; index < text.length; index += 1) {
-      if (text[index] === "\\") index += 1;
-      else if (text[index] === '"') return { value: gitUnquotePath(text.slice(1, index)), after: text.slice(index + 1) };
-    }
-    return null;
-  };
-  let newSide;
-  const oldQuoted = quotedAt(rest);
-  if (oldQuoted) {
-    if (!oldQuoted.after.startsWith(" ")) return null;
-    newSide = oldQuoted.after.slice(1);
-  } else {
-    // An unquoted old path cannot contain a quote, so a quoted new side starts at ` "b/`.
-    newSide = /^a\/.+? ("b\/.*")$/.exec(rest)?.[1] ?? (/^a\/.+? (b\/.+)$/.exec(rest)?.[1]);
-    if (newSide === undefined) return null;
-  }
-  const newQuoted = quotedAt(newSide);
-  const value = newQuoted ? (newQuoted.after === "" ? newQuoted.value : "") : newSide;
-  return value.startsWith("b/") && value.length > 2 ? value.slice(2) : null;
-}
 
-function binaryTextFilesInPatch(patchText) {
-  const files = [];
-  let current = "";
-  for (const line of String(patchText || "").split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      // A header that cannot be parsed must not lend its binary hunk the previous file's name;
-      // the unresolved name is reported (and never matches a binary extension).
-      current = gitDiffHeaderNewPath(line) ?? `${line} (unparsed diff header)`;
-      continue;
-    }
-    if (current && (line === "GIT binary patch" || /^Binary files .* differ$/.test(line))
-      && !KNOWN_BINARY_EXTENSION.test(current)) {
-      files.push(current);
-      current = "";
-    }
-  }
-  return files;
-}
-
-// A key marker in an added line is a key when 40+ base64 characters of body follow it,
-// however the file wraps them (OpenSSL wraps at 64, other tools at 32, 76 or not at all;
-// the first version of this gate needed one 40-character line, so a 32-column PKCS#8 key
-// passed). The body is read from the rest of the marker line (a JSON string holds the whole
-// key with escaped \n) and from the added lines below it, which may be indented, quoted or
-// followed by a comma; blank lines and RFC 1421 header fields (Proc-Type, DEK-Info) between
-// the marker and the body are skipped. Each line is scanned by at most one marker.
-const KEY_BODY_MIN_CHARS = 40;
-const KEY_BODY_LOOKAHEAD_LINES = 64;
-const KEY_BODY_LINE = /^\+[ \t]*["'`]?([A-Za-z0-9+\/=]+)(?:\\{1,8}[rn])*["'`]?[ \t]*[,;+]?[ \t]*$/;
-const KEY_BODY_SKIPPED_LINE = /^\+[ \t]*(?:(?:Proc-Type|DEK-Info):.*)?$/;
-const KEY_BODY_RUN = /[A-Za-z0-9+\/=]+/y;
-const KEY_BODY_ESCAPED_BREAKS = /(?:\\{1,8}[rn])+/y;
-function inlineKeyBodyChars(line, from) {
-  let position = from;
-  let chars = 0;
-  for (;;) {
-    KEY_BODY_ESCAPED_BREAKS.lastIndex = position;
-    if (KEY_BODY_ESCAPED_BREAKS.exec(line)) position = KEY_BODY_ESCAPED_BREAKS.lastIndex;
-    KEY_BODY_RUN.lastIndex = position;
-    const run = KEY_BODY_RUN.exec(line);
-    if (!run) return chars;
-    chars += run[0].length;
-    position = KEY_BODY_RUN.lastIndex;
-  }
-}
-function patchKeyBodyChars(lines, index) {
-  const header = PRIVATE_KEY_HEADER.exec(lines[index]);
-  let chars = inlineKeyBodyChars(lines[index], header.index + header[0].length);
-  const last = Math.min(lines.length - 1, index + KEY_BODY_LOOKAHEAD_LINES);
-  for (let next = index + 1; chars < KEY_BODY_MIN_CHARS && next <= last; next += 1) {
-    if (KEY_BODY_SKIPPED_LINE.test(lines[next])) continue;
-    const body = KEY_BODY_LINE.exec(lines[next]);
-    if (!body) break;
-    chars += body[1].length;
-  }
-  return chars;
-}
-
-function patchLikelySecretLines(patchText) {
-  const hits = [];
-  const lines = String(patchText || "").split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    // Only added lines introduce new content; context and removed lines already exist.
-    // "+++ b/..." is a file header; an added line that itself starts with "++" is content.
-    if (!line.startsWith("+") || /^\+\+\+ (?:b\/|\/dev\/null)/.test(line)) continue;
-    const keyHeader = PRIVATE_KEY_HEADER.test(line);
-    if (keyHeader) {
-      // A test comment naming the header is not a key; a key body after it is.
-      if (patchKeyBodyChars(lines, index) >= KEY_BODY_MIN_CHARS) hits.push(index + 1);
-      continue;
-    }
-    if (LIKELY_SECRET_PATTERNS.some((pattern) => pattern.test(line))) hits.push(index + 1);
-  }
-  return hits;
-}
-
-function sanitizePersistedValue(value, depth = 0) {
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "string") {
-    return redactSensitiveText(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizePersistedValue(item, depth + 1));
-  }
-  if (typeof value === "object") {
-    const safe = {};
-    for (const [key, child] of Object.entries(value)) {
-      if (/token|secret|password|credential|api[-_]?key|authorization|cookie/i.test(key)) {
-        continue;
-      }
-      if (/^(task|prompt|messages|input)$/i.test(key)) {
-        const raw = String(child || "");
-        safe[`${key}Sha256`] = createHash("sha256").update(raw).digest("hex");
-        safe[`${key}Chars`] = raw.length;
-        continue;
-      }
-      safe[key] = sanitizePersistedValue(child, depth + 1);
-    }
-    return safe;
-  }
-  return redactSensitiveText(String(value));
-}
-
-function sanitizeLogValue(value, depth = 0) {
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    const redacted = redactSensitiveText(value);
-    return redacted.length > 1000 ? `${redacted.slice(0, 1000)}...` : redacted;
-  }
-
-  if (Array.isArray(value)) {
-    if (depth > 2) {
-      return `[${value.length} items]`;
-    }
-    return value.map((item) => sanitizeLogValue(item, depth + 1));
-  }
-
-  if (typeof value === "object") {
-    if (depth > 2) {
-      return "[object]";
-    }
-
-    const safe = {};
-    for (const [key, childValue] of Object.entries(value)) {
-      if (/prompt|stdout|stderr|env|token|secret|password|api[-_]?key/i.test(key)) {
-        continue;
-      }
-      if (/^(?:error|detail|reason|message)$/i.test(key) && typeof childValue === "string") {
-        safe[`${key}Sha256`] = createHash("sha256").update(childValue).digest("hex");
-        safe[`${key}Chars`] = childValue.length;
-        continue;
-      }
-      safe[key] = sanitizeLogValue(childValue, depth + 1);
-    }
-    return safe;
-  }
-
-  return String(value);
-}
-
-// B-075: info events that still belong in the operations log. An unattended worker has no client
-// that shows its stderr, so its start, its 10-minute summaries and its stop are only visible there;
-// a client bridge's "worker present, adoption skipped" line explains jobs it leaves alone.
-const OPS_LOG_INFO_EVENTS = new Set(["queue_worker.started", "queue_worker.summary", "queue_worker.stopped", "queue.worker_present"]);
-
-function logEvent(level, event, data = {}) {
-  const configuredLevel = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.warn;
-  const eventLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
-  const toStderr = configuredLevel >= eventLevel;
-  const toOpsLog = (eventLevel <= LOG_LEVELS.warn || OPS_LOG_INFO_EVENTS.has(event)) && opsLogEnabled();
-  if (!toStderr && !toOpsLog) {
-    return;
-  }
-  const record = {
-    ts: new Date().toISOString(),
-    level,
-    event,
-    ...sanitizeLogValue(data),
-  };
-  if (toStderr) console.error(JSON.stringify(record));
-  // Warn and error events also go to <state-dir>/logs/bridge-<day>.jsonl (bin/ops-log.js):
-  // stderr reaches only the MCP client, so a failure during a migration was otherwise lost.
-  if (toOpsLog) appendOpsLogLine(effectiveBridgeStateDirectory(), record);
-}
-
-// CODEX_OPENCODE_OPS_LOG=off turns the file off. A self-test writes it only under its own state
-// directory override, never into the operator's.
-function opsLogEnabled() {
-  if (String(process.env.CODEX_OPENCODE_OPS_LOG || "").trim().toLowerCase() === "off") return false;
-  return !process.argv.includes("--self-test") || Boolean(stateDirectoryOverride);
-}
 
 // B-056: SDK errors (unknown tool, input validation: "MCP error -32602 ...") and handler
 // exceptions become `isError` answers inside @modelcontextprotocol/sdk, and the bridge's own
@@ -2079,12 +1447,7 @@ function opsLogEnabled() {
 // The text goes under `summary`, not `error`/`message`/`reason`: sanitizeLogValue hashes those
 // keys, and this line exists to be read. It is redacted before it is cut, so a cut can never
 // leave half a credential that the redactor no longer recognizes.
-const FAILED_ANSWER_SUMMARY_CHARS = 400;
 const MCP_PENDING_REQUEST_CAP = 1000;
-
-function failureSummary(text) {
-  return redactSensitiveText(String(text ?? "").slice(0, 16_000)).slice(0, FAILED_ANSWER_SUMMARY_CHARS);
-}
 
 function mcpAnswerText(result) {
   const content = Array.isArray(result?.content) ? result.content : [];
@@ -2226,1105 +1589,43 @@ function crashAndExit(kind, error, origin) {
   process.exit(processCrashExitCode);
 }
 
-// encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
-// The default utf8 decoding turned every non-UTF-8 byte of a patch into U+FFFD.
-async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null, encoding = "utf8" } = {}) {
-  const binary = encoding === "buffer";
-  const output = (value) => binary
-    ? (Buffer.isBuffer(value) ? value : Buffer.from(String(value || ""), "utf8"))
-    : (Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""));
-  const text = (value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || "");
-  try {
-    const gitCommand = isGitExecutable(command);
-    const result = await execFileAsync(command, gitCommand ? trustedGitArgs(args) : args, {
-      cwd: cwd || process.cwd(),
-      shell: false,
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024 * 30,
-      env: gitCommand ? buildTrustedGitEnv(env) : (env === null ? process.env : env),
-      ...(binary ? { encoding: "buffer" } : {}),
-      ...(signal ? { signal } : {}),
-    });
+const { runCommand, runSpawnCommand } = createCommandRuntime({
+  execFileAsync,
+  isGitExecutable,
+  trustedGitArgs,
+  buildTrustedGitEnv,
+  CONFIG,
+  BRIDGE_RUNTIME_DIR,
+  PROCESS_SUPERVISOR_PATH,
+  nowMs,
+  abortSignalErrorType,
+  logEvent,
+});
 
-    return {
-      stdout: output(result.stdout),
-      stderr: text(result.stderr),
-      exitCode: 0,
-    };
-  } catch (error) {
-    if (/maxBuffer|ENOBUFS/i.test(String(error?.message || error))) {
-      return {
-        stdout: output(error?.stdout),
-        stderr: "Process output exceeded the bridge capture budget; the command was terminated by the bridge instead of returning truncated evidence.",
-        exitCode: "process_output_limit_exceeded",
-      };
-    }
-    return {
-      stdout: output(error.stdout),
-      stderr: text(error.stderr) || String(error),
-      exitCode: error.code || (error.killed ? "timeout" : 1),
-    };
-  }
-}
 
-// After the control channel reports "exit", stdout/stderr may still hold the payload's last
-// bytes; the result waits for the supervisor's "close" (all pipes drained) this long at most.
-const SUPERVISOR_EXIT_CLOSE_GRACE_MS = 5_000;
 
-async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, {
-  signal = null,
-  terminateOnProviderError = false,
-  onSpawn = null,
-  beforeHeartbeat = null,
-  // B-046: onActivity(epochMs) runs for the launch and for every chunk the payload writes to
-  // stdout or stderr; idleTimeoutMs > 0 ends the payload (the supervisor's terminate path) once
-  // it has written nothing for that long.
-  onActivity = null,
-  idleTimeoutMs = 0,
-  // B-061: { hits, provider, model, agent, logPath, scanMs }: stop the payload as rate_limited once
-  // that many rate-limit lines of its model arrive with no stdout output in between.
-  rateLimitWatch = null,
-  supervisorScriptForTest = "",
-} = {}) {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let stdoutTail = "";
-    let stderrTail = "";
-    let stdoutChars = 0;
-    let stderrChars = 0;
-    let stdoutLineBuffer = "";
-    let stderrLineBuffer = "";
-    let controlLineBuffer = "";
-    // One decoder per stream: a multi-byte UTF-8 character split across two pipe reads
-    // decoded chunk by chunk became two U+FFFD (Arabic text, emoji). Hashes stay on raw bytes.
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    let exitCloseFallbackTimer = null;
-    const stdoutHash = createHash("sha256");
-    const stderrHash = createHash("sha256");
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
-    let settled = false;
-    let supervisorReady = false;
-    let identityPersisted = typeof onSpawn !== "function";
-    let launchSent = false;
-    let terminationRequested = false;
-    let terminationReason = "";
-    let timedOut = false;
-    let cancelled = false;
-    let cancellationErrorType = "";
-    let providerTerminated = false;
-    let idleTimedOut = false;
-    let rateLimited = false;
-    const rateWatcher = rateLimitWatch && Number(rateLimitWatch.hits) > 0
-      ? createRateLimitWatcher({ ...rateLimitWatch, startedAtMs: Date.now(), onTrip: () => requestTermination("rate_limited") })
-      : null;
-    let lastActivityMs = 0;
-    let idleTimer = null;
-    let startupTimer = null;
-    let heartbeatTimer = null;
-    let terminationFallbackTimer = null;
-    let controlExitEvent = null;
-    let observedPayloadPid = 0;
-    let controlTerminationUnconfirmed = false;
-    let controlProtocolCompromised = false;
-    let gateFailureType = "";
-    let launchAuthorityDeadlineAt = 0;
-    let heartbeatInFlight = false;
-    const supervisorIdentity = randomBytes(32).toString("hex");
-    const supervisorStartedAt = new Date().toISOString();
-    const supervisorStartedAtMs = Date.now();
-    const supervisorWatchdogMs = Math.max(
-      100,
-      Math.min(45_000, Math.floor(CONFIG.queueLeaseMs * 0.75), Math.floor(CONFIG.providerLeaseMs * 0.75))
-    );
-    const supervisorHeartbeatMs = Math.max(50, Math.min(5_000, Math.floor(supervisorWatchdogMs / 3)));
+const { validationCommandTrustError, validationPathValue, resolveValidationExecutable, prepareValidationCommand, VALIDATION_PREFLIGHT_FIX, validationCommandPreflightError, runValidationProcess, runValidationGate } = createValidationRuntime({
+  CONFIG,
+  buildValidationEnv,
+  sha256File,
+  runCommand,
+  runSpawnCommand,
+  integrationTimed,
+  nowMs,
+  truncateText,
+});
 
-    const supervisorScript = supervisorScriptForTest && process.argv.includes("--self-test")
-      ? supervisorScriptForTest
-      : PROCESS_SUPERVISOR_PATH;
-    const supervisor = spawn(process.execPath, [supervisorScript, "--identity", supervisorIdentity], {
-      cwd: BRIDGE_RUNTIME_DIR,
-      shell: false,
-      windowsHide: true,
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
-      detached: false,
-    });
 
-    const clearTimers = () => {
-      rateWatcher?.stop();
-      if (startupTimer) clearTimeout(startupTimer);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      if (idleTimer) clearTimeout(idleTimer);
-      if (terminationFallbackTimer) clearTimeout(terminationFallbackTimer);
-      if (exitCloseFallbackTimer) clearTimeout(exitCloseFallbackTimer);
-      startupTimer = null;
-      heartbeatTimer = null;
-      idleTimer = null;
-      terminationFallbackTimer = null;
-      exitCloseFallbackTimer = null;
-    };
 
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimers();
-      signal?.removeEventListener("abort", abortHandler);
-      try { supervisor.stdin.end(); } catch { /* The result is already authoritative. */ }
-      if (stdoutTruncated) {
-        result.stdout = `${result.stdout.slice(0, Math.floor(CONFIG.maxProcessOutputChars / 2))}\n... [stdout truncated by bridge; terminal tail preserved] ...\n${stdoutTail}`;
-      }
-      if (stderrTruncated) {
-        result.stderr = `${result.stderr.slice(0, Math.floor(CONFIG.maxProcessOutputChars / 2))}\n... [stderr truncated by bridge; terminal tail preserved] ...\n${stderrTail}`;
-      }
-      result.rateLimited = rateLimited;
-      result.rateLimitHits = rateWatcher?.state.hits || 0;
-      result.rateLimitEvidence = rateWatcher?.state.evidence || null;
-      result.stdoutChars = stdoutChars;
-      result.stderrChars = stderrChars;
-      result.stdoutSha256 = stdoutHash.digest("hex");
-      result.stderrSha256 = stderrHash.digest("hex");
-      result.supervisorProcessId = Number(supervisor.pid || 0);
-      result.payloadProcessId = observedPayloadPid;
-      result.supervisorIdentity = supervisorIdentity;
-      // Both ends use wall-clock epoch milliseconds: the supervisor reports its start as
-      // an ISO timestamp, and mixing that with the monotonic nowMs() clock made every
-      // interval end before it started, so parallel overlap was always reported as "no".
-      result.childStartedAtMs = Date.parse(controlExitEvent?.payloadStartedAt || "") || supervisorStartedAtMs;
-      result.childFinishedAtMs = Date.now();
-      resolve(result);
-    };
 
-    const sendControl = (message) => {
-      if (settled || supervisor.stdin.destroyed || !supervisor.stdin.writable) return false;
-      try {
-        supervisor.stdin.write(`${JSON.stringify(message)}\n`);
-        return true;
-      } catch {
-        return false;
-      }
-    };
 
-    const finishInfrastructureFailure = (errorType, detail = "The process supervisor failed before returning a verified payload result.") => {
-      finish({
-        stdout,
-        stderr: [stderr, detail].filter(Boolean).join("\n"),
-        exitCode: errorType,
-        timedOut,
-        cancelled,
-        cancellationErrorType,
-        providerTerminated,
-        idleTimedOut,
-        treeTerminationConfirmed: false,
-        terminationErrorType: errorType,
-        containmentGuarantee: "supervisor_unavailable",
-        stdoutTruncated,
-        stderrTruncated,
-      });
-    };
 
-    const requestTermination = (reason) => {
-      if (settled || terminationRequested) return;
-      terminationRequested = true;
-      terminationReason = reason;
-      if (reason === "timeout") timedOut = true;
-      if (reason === "provider_error") providerTerminated = true;
-      if (reason === "rate_limited") rateLimited = true;
-      // An idle stop is a timeout for everything downstream (exit 124, retry rules); idleTimedOut tells which.
-      if (reason === "idle_timeout") { idleTimedOut = true; timedOut = true; }
-      if (!launchSent) {
-        try { supervisor.stdin.end(); } catch { /* Close is the pre-launch cancellation signal. */ }
-      } else if (!sendControl({ type: "terminate", reason })) {
-        try { supervisor.stdin.end(); } catch { /* Pipe closure asks the supervisor to contain the payload. */ }
-      }
-      terminationFallbackTimer = setTimeout(() => {
-        try { supervisor.kill("SIGKILL"); } catch { /* The explicit unconfirmed result below remains authoritative. */ }
-        finishInfrastructureFailure(
-          "process_tree_termination_unconfirmed",
-          "The process supervisor did not confirm containment termination before the bounded deadline."
-        );
-      }, SUPERVISOR_TERMINATION_FALLBACK_MS);
-      terminationFallbackTimer.unref?.();
-    };
 
-    const abortHandler = () => {
-      if (settled || cancelled) return;
-      cancelled = true;
-      cancellationErrorType = abortSignalErrorType(signal);
-      requestTermination("cancelled");
-    };
 
-    const noteActivity = () => {
-      lastActivityMs = Date.now();
-      if (typeof onActivity !== "function") return;
-      try { onActivity(lastActivityMs); } catch { /* A display hook must never end the run. */ }
-    };
 
-    // One timer re-armed for the remaining time, not one per output chunk.
-    const armIdleTimer = () => {
-      if (!(idleTimeoutMs > 0) || settled || terminationRequested || idleTimer) return;
-      idleTimer = setTimeout(() => {
-        idleTimer = null;
-        if (settled || terminationRequested) return;
-        if (Date.now() - lastActivityMs >= idleTimeoutMs) requestTermination("idle_timeout");
-        else armIdleTimer();
-      }, Math.max(20, lastActivityMs + idleTimeoutMs - Date.now()));
-      idleTimer.unref?.();
-    };
-
-    const maybeLaunch = () => {
-      if (settled || launchSent || terminationRequested || gateFailureType || !supervisorReady || !identityPersisted) return;
-      const watchdogDeadlineAt = Math.min(
-        Date.now() + supervisorWatchdogMs,
-        launchAuthorityDeadlineAt > 0 ? launchAuthorityDeadlineAt : Number.POSITIVE_INFINITY
-      );
-      if (!Number.isFinite(watchdogDeadlineAt) || watchdogDeadlineAt <= Date.now()) {
-        gateFailureType = "durable_launch_authority_expired";
-        requestTermination("launch_gate_expired");
-        return;
-      }
-      launchSent = sendControl({
-        type: "launch",
-        command,
-        args,
-        cwd: cwd || process.cwd(),
-        env: env === null ? process.env : env,
-        timeoutMs,
-        watchdogMs: supervisorWatchdogMs,
-        watchdogDeadlineAt,
-        killGraceMs: SUPERVISOR_KILL_GRACE_MS,
-        terminationConfirmMs: SUPERVISOR_TERMINATION_CONFIRM_MS,
-      });
-      if (!launchSent) {
-        finishInfrastructureFailure("process_supervisor_control_failed");
-        return;
-      }
-      if (startupTimer) {
-        clearTimeout(startupTimer);
-        startupTimer = null;
-      }
-      noteActivity();
-      armIdleTimer();
-      rateWatcher?.start();
-      heartbeatTimer = setInterval(() => {
-        if (heartbeatInFlight || settled || terminationRequested) return;
-        heartbeatInFlight = true;
-        Promise.resolve().then(async () => {
-          const proof = typeof beforeHeartbeat === "function"
-            ? await beforeHeartbeat()
-            : { ok: true, deadlineAt: Date.now() + supervisorWatchdogMs };
-          const provenDeadlineAt = Number(proof?.deadlineAt || Date.now() + supervisorWatchdogMs);
-          const deadlineAt = Math.min(
-            Date.now() + supervisorWatchdogMs,
-            provenDeadlineAt
-          );
-          if (proof === false || proof?.ok === false || !Number.isFinite(deadlineAt) || deadlineAt <= Date.now()) {
-            requestTermination("durable_lease_renewal_failed");
-            return;
-          }
-          if (!sendControl({ type: "heartbeat", deadlineAt })) requestTermination("control_channel_failed");
-        }).catch(() => {
-          requestTermination("durable_lease_renewal_failed");
-        }).finally(() => {
-          heartbeatInFlight = false;
-        });
-      }, supervisorHeartbeatMs);
-      heartbeatTimer.unref?.();
-    };
-
-    const finishFromControlExit = (event) => {
-      controlExitEvent = event;
-      if (gateFailureType) {
-        finishInfrastructureFailure(
-          gateFailureType,
-          "The payload was not launched because its supervisor identity could not be persisted durably."
-        );
-        return;
-      }
-      const reason = String(event.reason || terminationReason || "payload_closed");
-      timedOut ||= reason === "timeout";
-      const watchdogExpired = reason === "watchdog_expired";
-      const terminationUnconfirmed = controlTerminationUnconfirmed || event.errorType === "termination_unconfirmed";
-      // The supervisor could not start the payload (ENOENT, E2BIG, a Windows command line
-      // over 32,767 characters). That used to surface as a bare nonzero exit.
-      const spawnFailed = event.errorType === "spawn_failed" || reason === "spawn_failed";
-      const terminationErrorType = terminationUnconfirmed
-        ? "process_tree_termination_unconfirmed"
-        : watchdogExpired
-          ? "process_supervisor_watchdog_expired"
-          : spawnFailed
-            ? "spawn_failed"
-            : "";
-      const verifiedTermination = Boolean(event.treeTerminationConfirmed);
-      const exitCode = cancelled
-        ? 130
-        : timedOut
-          ? 124
-          : providerTerminated || rateLimited
-            ? 1
-            : Number.isInteger(event.payloadExitCode)
-              ? event.payloadExitCode
-              : Number.isInteger(event.supervisorExitCode)
-                ? event.supervisorExitCode
-                : 1;
-      finish({
-        stdout,
-        stderr,
-        exitCode,
-        timedOut,
-        cancelled,
-        cancellationErrorType,
-        providerTerminated,
-        idleTimedOut,
-        directChildClosed: Boolean(event.payloadExitCode !== null || event.payloadSignal),
-        treeTerminationConfirmed: verifiedTermination,
-        terminationErrorType,
-        containmentGuarantee: event.containmentGuarantee || "process_supervisor",
-        terminationBestEffortSucceeded: Boolean(event.terminationBestEffortSucceeded),
-        spawnErrorCode: spawnFailed ? String(event.spawnErrorCode || event.errorCode || "spawn_failed") : "",
-        stdoutTruncated,
-        stderrTruncated,
-      });
-    };
-
-    const handleControlEvent = (event) => {
-      if (settled || !event || typeof event !== "object") return;
-      if (String(event.supervisorIdentity || "").toLowerCase() !== supervisorIdentity) {
-        gateFailureType = "process_supervisor_identity_mismatch";
-        requestTermination("protocol_error");
-        return;
-      }
-      const reportedPayloadPid = Number(event.payloadPid);
-      if (Number.isSafeInteger(reportedPayloadPid) && reportedPayloadPid > 0) observedPayloadPid = reportedPayloadPid;
-      if (event.type === "launched") return;
-      if (event.type === "ready") {
-        if (Number(event.protocolVersion) !== 1 || Number(event.supervisorPid) !== Number(supervisor.pid || 0)) {
-          gateFailureType = "process_supervisor_identity_mismatch";
-          requestTermination("protocol_error");
-          return;
-        }
-        supervisorReady = true;
-        maybeLaunch();
-        return;
-      }
-      if (event.type === "termination_unconfirmed") {
-        controlTerminationUnconfirmed = true;
-        return;
-      }
-      if (event.type === "protocol_error") {
-        if (!gateFailureType) gateFailureType = "process_supervisor_protocol_error";
-        return;
-      }
-      if (event.type === "exit") {
-        // Output the payload wrote before exiting may still be in the stdout/stderr pipes;
-        // finishing here dropped it (every later chunk hit `if (settled) return`). The
-        // supervisor's "close" fires once every pipe has drained; the timer bounds the wait.
-        controlExitEvent = event;
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = null;
-        if (!exitCloseFallbackTimer) {
-          exitCloseFallbackTimer = setTimeout(() => {
-            if (!settled) finishFromControlExit(controlExitEvent);
-          }, SUPERVISOR_EXIT_CLOSE_GRACE_MS);
-          exitCloseFallbackTimer.unref?.();
-        }
-      }
-    };
-
-    supervisor.stdio[3].setEncoding("utf8");
-    supervisor.stdio[3].on("data", (chunk) => {
-      if (settled || controlProtocolCompromised) return;
-      controlLineBuffer += chunk;
-      if (controlLineBuffer.length > 1024 * 1024) {
-        controlLineBuffer = "";
-        controlProtocolCompromised = true;
-        gateFailureType = "process_supervisor_protocol_error";
-        requestTermination("protocol_error");
-        return;
-      }
-      const lines = controlLineBuffer.split(/\r?\n/);
-      controlLineBuffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          handleControlEvent(JSON.parse(line));
-        } catch {
-          gateFailureType = "process_supervisor_protocol_error";
-          requestTermination("protocol_error");
-        }
-      }
-    });
-
-    const consumeStdout = (text) => {
-      if (!text) return;
-      stdoutChars += text.length;
-      stdoutTail = `${stdoutTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
-      const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stdout.length);
-      if (remaining) stdout += text.slice(0, remaining);
-      stdoutTruncated ||= text.length > remaining;
-      stdoutLineBuffer += text;
-      if (stdoutLineBuffer.length > CONFIG.maxProcessOutputChars) {
-        stdoutLineBuffer = stdoutLineBuffer.slice(-CONFIG.maxProcessOutputChars);
-        stdoutTruncated = true;
-      }
-      const lines = stdoutLineBuffer.split(/\r?\n/);
-      stdoutLineBuffer = lines.pop() || "";
-      rateWatcher?.stdoutText(text);
-      if (terminateOnProviderError && !providerTerminated) {
-        for (const line of lines) {
-          try {
-            const event = JSON.parse(line);
-            if (event?.type !== "error" && event?.type !== "session.error" && !event?.error && !event?.data?.error && !event?.properties?.error) continue;
-            const type = providerErrorTypeFromStructuredEvent(event);
-            if (["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(type)) {
-              requestTermination("provider_error");
-              break;
-            }
-          } catch {
-            // Only structured stdout error events are eligible for fail-fast termination.
-          }
-        }
-      }
-    };
-
-    const consumeStderr = (text) => {
-      if (!text) return;
-      stderrChars += text.length;
-      stderrTail = `${stderrTail}${text}`.slice(-Math.floor(CONFIG.maxProcessOutputChars / 2));
-      const remaining = Math.max(0, CONFIG.maxProcessOutputChars - stderr.length);
-      if (remaining) stderr += text.slice(0, remaining);
-      stderrTruncated ||= text.length > remaining;
-      // Classify whole lines only: a diagnostic split across two reads was judged as two
-      // fragments, each of which could miss or mis-match the classifier.
-      stderrLineBuffer += text;
-      const lines = stderrLineBuffer.split(/\r?\n/);
-      stderrLineBuffer = (lines.pop() || "").slice(-64 * 1024);
-      if (rateWatcher) for (const line of lines) rateWatcher.stderrLine(line);
-      const recentErrorLines = lines
-        .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
-        .filter((line) => /level\s*=\s*ERROR|\berror\b\s*[:=.]|APIError|CreditsError|HTTP\s+[45]\d\d/i.test(line))
-        .slice(-20)
-        .join("\n");
-      if (terminateOnProviderError && !providerTerminated && recentErrorLines && ["opencode_quota_exhausted", "opencode_auth_error", "opencode_billing_error", "opencode_model_error"].includes(providerErrorTypeFromText(providerDiagnosticTextFromStderr(recentErrorLines)))) {
-        requestTermination("provider_error");
-      }
-    };
-
-    supervisor.stdout.on("data", (chunk) => {
-      if (settled) return;
-      noteActivity();
-      stdoutHash.update(chunk);
-      consumeStdout(stdoutDecoder.write(chunk));
-    });
-    supervisor.stdout.on("end", () => {
-      if (!settled) consumeStdout(stdoutDecoder.end());
-    });
-
-    supervisor.stderr.on("data", (chunk) => {
-      if (settled) return;
-      noteActivity();
-      stderrHash.update(chunk);
-      consumeStderr(stderrDecoder.write(chunk));
-    });
-    supervisor.stderr.on("end", () => {
-      if (settled) return;
-      consumeStderr(stderrDecoder.end());
-    });
-
-    supervisor.once("error", () => {
-      finishInfrastructureFailure("process_supervisor_spawn_failed", "The bridge could not start its process supervisor.");
-    });
-    supervisor.stdin.on("error", () => {
-      if (!settled) requestTermination("control_channel_failed");
-    });
-    supervisor.once("close", () => {
-      if (settled) return;
-      if (controlExitEvent) finishFromControlExit(controlExitEvent);
-      else finishInfrastructureFailure(
-        gateFailureType || "process_supervisor_exited_without_result",
-        launchSent
-          ? "The process supervisor exited without a verified payload result."
-          : "The process supervisor exited before the payload launch gate opened."
-      );
-    });
-
-    startupTimer = setTimeout(() => {
-      if (settled || launchSent) return;
-      gateFailureType = "child_identity_persistence_failed";
-      requestTermination("launch_gate_timeout");
-    }, 15_000);
-    startupTimer.unref?.();
-
-    if (typeof onSpawn === "function") {
-      Promise.resolve().then(() => onSpawn({
-        pid: Number(supervisor.pid || 0),
-        startedAt: supervisorStartedAt,
-        processRole: "supervisor",
-        containmentIdentity: supervisorIdentity,
-      })).then((authority) => {
-        // An explicit refusal from the launch gate is a failure like a thrown error; it used
-        // to be ignored and the payload launched anyway.
-        if (authority?.ok === false) {
-          gateFailureType = "child_identity_persistence_failed";
-          logEvent("warn", "opencode.supervisor_launch_gate_rejected", { errorType: String(authority?.errorType || "") });
-          requestTermination("launch_gate_rejected");
-          return;
-        }
-        launchAuthorityDeadlineAt = Number(authority?.deadlineAt || Date.now() + supervisorWatchdogMs);
-        identityPersisted = true;
-        maybeLaunch();
-      }).catch((error) => {
-        gateFailureType = "child_identity_persistence_failed";
-        logEvent("warn", "opencode.supervisor_identity_persist_failed", {
-          errorSha256: createHash("sha256").update(error?.message || String(error)).digest("hex"),
-        });
-        requestTermination("launch_gate_rejected");
-      });
-    }
-
-    signal?.addEventListener("abort", abortHandler, { once: true });
-    if (signal?.aborted) abortHandler();
-    maybeLaunch();
-  });
-}
-
-function parseCommandLine(commandLine) {
-  const input = String(commandLine || "").trim();
-  const parts = [];
-  let current = "";
-  let quote = "";
-
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index];
-    const next = input[index + 1] || "";
-
-    if (char === "\\") {
-      const canEscape = quote
-        ? next === quote || next === "\\"
-        : Boolean(next) && (/\s/.test(next) || next === "'" || next === '"' || next === "\\");
-      if (canEscape) {
-        current += next;
-        index += 1;
-      } else {
-        current += char;
-      }
-      continue;
-    }
-
-    if (quote) {
-      if (char === quote) {
-        quote = "";
-      } else {
-        current += char;
-      }
-      continue;
-    }
-
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-
-    if (/\s/.test(char)) {
-      if (current) {
-        parts.push(current);
-        current = "";
-      }
-      continue;
-    }
-
-    current += char;
-  }
-
-  if (quote) {
-    throw new Error("Validation command has an unterminated quoted string.");
-  }
-
-  if (current) {
-    parts.push(current);
-  }
-
-  return parts;
-}
-
-function windowsCommand(command) {
-  if (process.platform !== "win32") {
-    return command;
-  }
-
-  const normalized = String(command || "").toLowerCase();
-  if (["npm", "npx", "pnpm", "yarn"].includes(normalized)) {
-    return `${command}.cmd`;
-  }
-
-  return command;
-}
-
-function safeValidationPathspec(value) {
-  const raw = String(value || "");
-  return Boolean(raw)
-    && !path.isAbsolute(raw)
-    && !/^[A-Za-z]:/.test(raw)
-    && !raw.replace(/\\/g, "/").split("/").includes("..")
-    && !/[\x00-\x1F\x7F]/.test(raw);
-}
-
-function strictProjectGitArgsError(args) {
-  const subcommand = String(args[0] || "").toLowerCase();
-  const rest = args.slice(1).map(String);
-  if (subcommand === "--version") return rest.length ? "git --version accepts no additional project-policy arguments." : "";
-  if (subcommand === "status") {
-    const allowed = new Set(["--short", "--porcelain", "--porcelain=v1", "--porcelain=v2", "--branch", "--untracked-files=no", "--untracked-files=normal", "--untracked-files=all"]);
-    return rest.every((item) => allowed.has(item)) ? "" : "Project-policy git status accepts only bounded porcelain/status flags and no path arguments.";
-  }
-  if (subcommand === "diff") {
-    const allowedOptions = new Set(["--check", "--cached", "--staged", "--no-ext-diff", "--no-textconv", "--ignore-submodules"]);
-    let afterSeparator = false;
-    let separatorCount = 0;
-    let sawCheck = false;
-    for (const item of rest) {
-      if (item === "--") { afterSeparator = true; separatorCount += 1; continue; }
-      if (!afterSeparator && item.startsWith("-")) {
-        if (!allowedOptions.has(item)) return `Project-policy git diff option is forbidden: ${item}`;
-        if (item === "--check") sawCheck = true;
-        continue;
-      }
-      if (!afterSeparator) return `Project-policy git diff revisions/operands are forbidden before --: ${item}`;
-      if (!safeValidationPathspec(item)) return `Project-policy git diff pathspec is unsafe: ${item}`;
-    }
-    if (separatorCount > 1) return "Project-policy git diff accepts at most one -- pathspec separator.";
-    return sawCheck ? "" : "Project-policy git diff must use --check.";
-  }
-  if (subcommand === "rev-parse") {
-    const allowedVectors = [
-      ["--show-toplevel"],
-      ["--is-inside-work-tree"],
-      ["--verify", "HEAD"],
-      ["HEAD"],
-    ];
-    return allowedVectors.some((vector) => JSON.stringify(vector) === JSON.stringify(rest))
-      ? ""
-      : "Project-policy git rev-parse arguments are not an approved fixed vector.";
-  }
-  if (subcommand === "ls-files") {
-    const separator = rest.indexOf("--");
-    const options = separator === -1 ? rest : rest.slice(0, separator);
-    const pathspecs = separator === -1 ? [] : rest.slice(separator + 1);
-    const allowed = new Set(["--cached", "--others", "--exclude-standard", "--error-unmatch"]);
-    return options.every((item) => allowed.has(item)) && pathspecs.every(safeValidationPathspec)
-      ? ""
-      : "Project-policy git ls-files arguments are not bounded to safe flags and repo-relative pathspecs.";
-  }
-  return `Git validation subcommand is not allowed: ${subcommand || "missing"}`;
-}
-
-function validationCommandTrustError(parsed, { strictProjectPolicy = false } = {}) {
-  if (!parsed.length) {
-    return "";
-  }
-  const executable = path.basename(parsed[0]).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-  const allowed = new Set(CONFIG.validationExecutableAllowlist.map((item) => path.basename(item).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "")));
-  if (!allowed.has(executable)) {
-    return `Validation executable is not operator-allowlisted: ${parsed[0]}`;
-  }
-  if (["cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx", "pnpx", "bunx"].includes(executable)) {
-    return `Shell, interpreter, and package-executor validation commands are forbidden: ${parsed[0]}`;
-  }
-  // Interpreter options that run inline code or preload modules: -e/-p/-c and bundles such as
-  // -pe or -Ic, -r (node --require), and the long forms. Python stops reading interpreter
-  // options at "-m <module>", so the module's own arguments (pytest -p ...) are not checked.
-  const interpreterCodeOption = /^-(?:[a-z]*[ecpr][a-z]*|-(?:eval|print|import|require|loader|experimental-loader|experimental-default-type|env-file|inspect[a-z-]*))(?:=|$)/i;
-  if (["node", "python", "python3", "py", "bun", "deno"].includes(executable)) {
-    const pythonLike = ["python", "python3", "py"].includes(executable);
-    for (const argument of parsed.slice(1).map(String)) {
-      if (pythonLike && argument === "-m") break;
-      if (interpreterCodeOption.test(argument)) {
-        return `Inline evaluation and module preloading are forbidden in validation commands: ${parsed[0]} ${argument}`;
-      }
-    }
-    if (executable === "deno" && ["eval", "repl"].includes(String(parsed.find((argument, index) => index > 0 && !String(argument).startsWith("-")) || "").toLowerCase())) {
-      return `Inline evaluation is forbidden in validation commands: ${parsed.join(" ")}`;
-    }
-  }
-  // Package managers: only the subcommand position selects an executor. Any other argument
-  // equal to "x" or "exec" ("pnpm test --filter x") used to be rejected. When options come
-  // before the subcommand their values cannot be told apart from it, so every bare word up
-  // to "--" is checked then.
-  if (["npm", "pnpm", "yarn", "bun"].includes(executable)) {
-    const executorSubcommands = new Set(["exec", "x", "dlx", "create", "init", "explore", "node"]);
-    const rest = parsed.slice(1).map(String);
-    const separator = rest.indexOf("--");
-    const beforeSeparator = separator === -1 ? rest : rest.slice(0, separator);
-    const subcommandIndex = beforeSeparator.findIndex((argument) => !argument.startsWith("-"));
-    const candidates = subcommandIndex <= 0
-      ? beforeSeparator.slice(subcommandIndex === -1 ? 0 : subcommandIndex, subcommandIndex === -1 ? 0 : subcommandIndex + 1)
-      : beforeSeparator.filter((argument) => !argument.startsWith("-"));
-    const executor = candidates.find((argument) => executorSubcommands.has(argument.toLowerCase()));
-    if (executor) {
-      return `Package-executor validation subcommands are forbidden: ${parsed.join(" ")}`;
-    }
-  }
-  if (strictProjectPolicy && executable !== "git") {
-    return "Untrusted project policy may execute only a hash-pinned Git read/check vector. Package scripts and repository interpreters require an external sandbox.";
-  }
-  if (executable === "git") {
-    const subcommand = String(parsed[1] || "").toLowerCase();
-    if (!["--version", "diff", "status", "rev-parse", "ls-files"].includes(subcommand)) {
-      return `Git validation subcommand is not allowed: ${subcommand || "missing"}`;
-    }
-    if (parsed.slice(1).some((argument) => /^-c(?:$|=)/i.test(String(argument))
-      || /^--(?:config-env|exec-path|upload-pack|receive-pack|ext-diff|textconv)(?:$|=)/i.test(String(argument)))) {
-      return "Git validation arguments may not select aliases, helpers, alternate executables, or external diff programs.";
-    }
-    return strictProjectGitArgsError(parsed.slice(1));
-  }
-  return "";
-}
-
-function validationPathValue(env = buildValidationEnv()) {
-  return String(env.PATH || env.Path || env.path || "");
-}
-
-// Node refuses to spawn .cmd/.bat files without a shell on Windows (EINVAL), and the
-// validation gate never uses a shell. Package managers ship as batch shims that only
-// forward to a JavaScript entry, so resolve that entry and run it with node directly.
-// Only plain top-level SET assignments are honoured; conditional overrides (such as
-// npm's global-prefix lookup) are ignored, so the bundled entry next to the shim runs.
-async function resolveWindowsNodeShim(shimPath) {
-  const shimDirectory = path.dirname(shimPath);
-  const text = await readFile(shimPath, "utf8");
-  const lines = text.split(/\r?\n/);
-  const variables = new Map();
-  for (const line of lines) {
-    const match = /^SET "([A-Za-z_][A-Za-z0-9_]*)=([^"]*)"\s*$/i.exec(line);
-    if (match && !variables.has(match[1].toUpperCase())) variables.set(match[1].toUpperCase(), match[2]);
-  }
-  const expand = (value) => value
-    .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (whole, name) => (variables.has(name.toUpperCase()) ? variables.get(name.toUpperCase()) : whole))
-    .replace(/%~dp0|%dp0%/gi, () => `${shimDirectory}${path.sep}`);
-  const forwardingLine = lines.find((line) => /%\*\s*$/.test(line));
-  if (!forwardingLine) throw new Error(`Windows shim has no argument-forwarding line: ${shimPath}`);
-  const tokens = [...expand(forwardingLine).matchAll(/"([^"]+)"|(\S+)/g)].map((match) => match[1] || match[2]);
-  const script = tokens.find((token) => /\.(?:c|m)?js$/i.test(token));
-  if (!script) throw new Error(`Windows shim does not forward to a JavaScript entry: ${shimPath}`);
-  const scriptPath = path.resolve(script);
-  const details = await lstat(scriptPath);
-  if (details.isSymbolicLink() || !details.isFile()) throw new Error(`Windows shim entry is not a regular file: ${scriptPath}`);
-  const canonicalScript = realpathSync(scriptPath);
-  const canonicalDirectory = realpathSync(shimDirectory);
-  const relative = path.relative(canonicalDirectory.toLowerCase(), canonicalScript.toLowerCase());
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Windows shim entry escapes the shim directory: ${canonicalScript}`);
-  }
-  const bundledNode = path.join(shimDirectory, "node.exe");
-  const nodePath = existsSync(bundledNode) ? realpathSync(bundledNode) : process.execPath;
-  return {
-    nodePath,
-    nodeSha256: await sha256File(nodePath),
-    scriptPath: canonicalScript,
-    scriptSha256: await sha256File(canonicalScript),
-  };
-}
-
-async function resolveValidationExecutable(command) {
-  const raw = String(command || "").trim();
-  if (!raw || (!path.isAbsolute(raw) && /[\\/]/.test(raw))) {
-    throw new Error("Validation executable must be an operator-allowlisted name or an absolute path; relative paths are forbidden.");
-  }
-  const candidates = [];
-  if (path.isAbsolute(raw)) {
-    candidates.push(path.resolve(raw));
-  } else {
-    const extensions = process.platform === "win32"
-      ? (path.extname(raw) ? [""] : String(buildValidationEnv().PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean))
-      : [""];
-    for (const entry of validationPathValue().split(path.delimiter).filter(Boolean)) {
-      if (!path.isAbsolute(entry)) continue;
-      for (const extension of extensions) candidates.push(path.join(entry, `${raw}${extension}`));
-    }
-  }
-  for (const candidate of candidates) {
-    try {
-      // Package managers install binaries as symlinks (/usr/bin/python3, Homebrew, nvm):
-      // resolve the link and require the target to be a regular file. The allowlist and hash
-      // checks compare this canonical target.
-      const details = await lstat(candidate);
-      const canonicalPath = details.isSymbolicLink() ? await realpath(candidate) : candidate;
-      const targetDetails = details.isSymbolicLink() ? await stat(canonicalPath) : details;
-      if (!targetDetails.isFile()) continue;
-      const resolvedPath = realpathSync(canonicalPath);
-      return {
-        path: resolvedPath,
-        sha256: await sha256File(resolvedPath),
-      };
-    } catch (error) {
-      // A PATH entry that is a file (ENOTDIR), unreadable (EACCES/EPERM) or a dangling link
-      // is skipped like a missing one instead of failing every validation command.
-      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP"].includes(error?.code)) throw error;
-    }
-  }
-  throw new Error(`Validation executable could not be resolved through the trusted process PATH: ${raw}`);
-}
-
-async function prepareValidationCommand(command, { requirePinnedExecutable = false, operatorExecutableHashes = CONFIG.validationExecutableSha256Allowlist } = {}) {
-  let parsed;
-  try {
-    parsed = Array.isArray(command) ? command.map(String) : parseCommandLine(command);
-  } catch (error) {
-    return { ok: false, errorType: "validation_command_parse_error", error: error.message || String(error) };
-  }
-  if (!parsed.length) return { ok: false, errorType: "validation_command_parse_error", error: "Validation command is empty." };
-  const lexicalError = validationCommandTrustError(parsed, { strictProjectPolicy: requirePinnedExecutable });
-  if (lexicalError) return { ok: false, errorType: "validation_command_untrusted", error: lexicalError };
-  try {
-    const executable = await resolveValidationExecutable(parsed[0]);
-    const allowedPaths = [];
-    for (const allowlisted of CONFIG.validationExecutableAllowlist) {
-      try {
-        allowedPaths.push((await resolveValidationExecutable(allowlisted)).path);
-      } catch {
-        // A stale allowlist entry grants nothing.
-      }
-    }
-    const comparePath = (value) => process.platform === "win32" ? value.toLowerCase() : value;
-    if (!allowedPaths.some((value) => comparePath(value) === comparePath(executable.path))) {
-      return { ok: false, errorType: "validation_command_untrusted", error: `Validation executable is not operator-allowlisted: ${parsed[0]}` };
-    }
-    const pinnedHashes = [...new Set((operatorExecutableHashes || []).map((item) => String(item).trim().toLowerCase()).filter((item) => /^[a-f0-9]{64}$/.test(item)))];
-    if (requirePinnedExecutable && !pinnedHashes.includes(executable.sha256)) {
-      return { ok: false, errorType: "validation_command_untrusted", error: "Project-policy validation requires the exact executable SHA-256 in CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST." };
-    }
-    let args = parsed.slice(1);
-    const executableName = path.basename(executable.path).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-    if (executableName === "git" && args[0] === "diff") {
-      args = ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1).filter((item) => !["--no-ext-diff", "--no-textconv"].includes(item))];
-    }
-    let launchPath = executable.path;
-    let launchSha256 = executable.sha256;
-    let shimEvidence = null;
-    if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(executable.path)) {
-      const shim = await resolveWindowsNodeShim(executable.path);
-      launchPath = shim.nodePath;
-      launchSha256 = shim.nodeSha256;
-      args = [shim.scriptPath, ...args];
-      shimEvidence = { shimPath: executable.path, shimSha256: executable.sha256, scriptSha256: shim.scriptSha256 };
-    }
-    const commandSha256 = createHash("sha256").update(JSON.stringify([launchPath, ...args, shimEvidence])).digest("hex");
-    return {
-      ok: true,
-      displayCommand: Array.isArray(command) ? parsed.join(" ") : String(command).trim(),
-      executablePath: launchPath,
-      executableSha256: launchSha256,
-      args,
-      commandSha256,
-      ...(shimEvidence ? { windowsShim: shimEvidence } : {}),
-    };
-  } catch (error) {
-    return { ok: false, errorType: "validation_command_untrusted", error: error.message || String(error) };
-  }
-}
-
-// A validation command that can never run must fail before an agent spends model
-// time on the job. The post-run gate still re-verifies the command at execution time.
-const VALIDATION_PREFLIGHT_FIX = "Use a validation command whose executable is listed in CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST, with plain arguments (no shell, npx, package executors, or inline evaluation).";
-
-async function validationCommandPreflightError(validationCommand, { dryRun = false, sanitized = false } = {}) {
-  const command = String(validationCommand || "").trim();
-  if (!command || dryRun || sanitized) return null;
-  const prepared = await prepareValidationCommand(command);
-  return prepared.ok ? null : { errorType: prepared.errorType, error: prepared.error, command };
-}
-
-// A validation command other than bridge Git (npm test, pytest, node scripts) runs under the
-// process-tree supervisor: a timeout, a cancellation or the bridge's death ends the whole tree,
-// not only the direct child, so no leftover test process keeps writing the checkout after the
-// bridge rolled it back and released its lock. Bridge Git (git diff --check) spawns nothing that
-// outlives it and stays on the plain runner, which is much cheaper per call.
-async function runValidationProcess(executablePath, args, cwd, timeoutMs, env, { signal = null } = {}) {
-  const executable = path.basename(executablePath).toLowerCase().replace(/.(exe|cmd|bat|ps1)$/i, "");
-  if (executable === "git") return runCommand(executablePath, args, cwd, timeoutMs, env, { signal });
-  const supervised = await runSpawnCommand(executablePath, args, cwd, timeoutMs, env, { signal });
-  return {
-    stdout: supervised.stdout || "",
-    stderr: supervised.stderr || "",
-    exitCode: supervised.timedOut ? "timeout" : supervised.exitCode,
-    // The supervisor could not confirm the tree is gone: something may still write the checkout.
-    processTreeUnconfirmed: supervised.terminationErrorType === "process_tree_termination_unconfirmed"
-      || supervised.terminationErrorType === "process_supervisor_watchdog_expired",
-    terminationErrorType: supervised.terminationErrorType || "",
-  };
-}
-
-function runValidationGate(...args) {
-  return integrationTimed("validation", () => runValidationGateUntimed(...args));
-}
-
-async function runValidationGateUntimed({ command, cwd, dryRun = false, timeoutMs = CONFIG.validationCommandTimeoutMs, trustedSpec = null, signal = null }) {
-  const validationCommand = String(command || "").trim();
-  if (!validationCommand) {
-    return {
-      status: "skipped",
-      command: "",
-      exitCode: "not_run",
-      durationMs: 0,
-      stdout: "",
-      stderr: "",
-      errorType: null,
-    };
-  }
-
-  if (dryRun) {
-    return {
-      status: "skipped_dry_run",
-      command: validationCommand,
-      exitCode: "not_run",
-      durationMs: 0,
-      stdout: "",
-      stderr: "",
-      errorType: null,
-    };
-  }
-
-  const prepared = await prepareValidationCommand(validationCommand, {
-    requirePinnedExecutable: Boolean(trustedSpec),
-    operatorExecutableHashes: CONFIG.validationExecutableSha256Allowlist,
-  });
-  if (!prepared.ok) {
-    return {
-      status: "failed",
-      command: validationCommand,
-      exitCode: prepared.errorType === "validation_command_parse_error" ? "parse_error" : "not_authorized",
-      durationMs: 0,
-      stdout: "",
-      stderr: prepared.error,
-      errorType: prepared.errorType,
-    };
-  }
-  if (trustedSpec) {
-    const same = trustedSpec.displayCommand === prepared.displayCommand
-      && trustedSpec.executablePath === prepared.executablePath
-      && trustedSpec.executableSha256 === prepared.executableSha256
-      && trustedSpec.commandSha256 === prepared.commandSha256
-      && JSON.stringify(trustedSpec.args) === JSON.stringify(prepared.args);
-    if (!same) {
-      return {
-        status: "failed",
-        command: validationCommand,
-        exitCode: "not_authorized",
-        durationMs: 0,
-        stdout: "",
-        stderr: "The operator-pinned validation executable or exact argument vector changed after policy approval.",
-        errorType: "validation_command_untrusted",
-      };
-    }
-  }
-
-  if (!prepared.executablePath) {
-    return {
-      status: "failed",
-      command: validationCommand,
-      exitCode: "not_authorized",
-      durationMs: 0,
-      stdout: "",
-      stderr: "Validation executable resolution failed closed.",
-      errorType: "validation_command_untrusted",
-    };
-  }
-
-  const started = nowMs();
-  const executable = path.basename(prepared.executablePath).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-  // Bridge Git now carries the operator's core.autocrlf (see USER_LINE_ENDING_GIT_CONFIG), so
-  // with autocrlf=true/input the diff never shows a CR. A repository that sets
-  // core.autocrlf=false locally (this one does) still gets CRLF files from agents on Windows,
-  // and `git diff --check` would report every such line as trailing whitespace, failing an
-  // otherwise clean job. Treat CR at end of line as allowed unless the repository's own
-  // core.whitespace says otherwise; real trailing blanks, space-before-tab and conflict
-  // markers are still caught.
-  let whitespaceConfig = [];
-  if (executable === "git" && prepared.args[0] === "diff" && prepared.args.includes("--check")) {
-    const configured = await runCommand(prepared.executablePath, ["config", "--get", "core.whitespace"], cwd || process.cwd(), 1000 * 15, buildValidationEnv(), { signal });
-    const existing = configured.exitCode === 0 ? String(configured.stdout || "").trim() : "";
-    if (!/(^|,)\s*-?cr-at-eol\s*(,|$)/i.test(existing)) {
-      whitespaceConfig = ["-c", `core.whitespace=${existing ? `${existing},` : ""}cr-at-eol`];
-    }
-  }
-  let result = await runValidationProcess(prepared.executablePath, [...whitespaceConfig, ...prepared.args], cwd || process.cwd(), timeoutMs, buildValidationEnv(), { signal });
-  const isUnstagedDiffCheck = executable === "git"
-    && prepared.args[0] === "diff"
-    && prepared.args.slice(1).includes("--check")
-    && !prepared.args.slice(1).some((argument) => argument === "--cached" || argument === "--staged");
-  if (result.exitCode === 0 && isUnstagedDiffCheck) {
-    const remainingTimeoutMs = Math.max(1, timeoutMs - (nowMs() - started));
-    const stagedResult = await runValidationProcess(prepared.executablePath, [
-      ...whitespaceConfig,
-      "diff",
-      "--cached",
-      ...prepared.args.slice(1),
-    ], cwd || process.cwd(), remainingTimeoutMs, buildValidationEnv(), { signal });
-    result = {
-      exitCode: stagedResult.exitCode,
-      processTreeUnconfirmed: Boolean(result.processTreeUnconfirmed || stagedResult.processTreeUnconfirmed),
-      stdout: [result.stdout, stagedResult.stdout].filter(Boolean).join("\n"),
-      stderr: [result.stderr, stagedResult.stderr].filter(Boolean).join("\n"),
-    };
-  }
-  return {
-    status: result.exitCode === 0 ? "passed" : "failed",
-    command: validationCommand,
-    exitCode: result.exitCode,
-    durationMs: nowMs() - started,
-    stdout: truncateText(redactSensitiveText(result.stdout || ""), 6000),
-    stderr: truncateText(redactSensitiveText(result.stderr || ""), 6000),
-    errorType: result.processTreeUnconfirmed
-      ? "validation_process_tree_unconfirmed"
-      : result.exitCode === 0 ? null : "validation_command_failed",
-    ...(result.processTreeUnconfirmed ? { processTreeUnconfirmed: true } : {}),
-  };
-}
-
-function formatValidationGateResult(validationGate) {
-  if (!validationGate || validationGate.status === "skipped") {
-    return "Validation gate: skipped";
-  }
-
-  return [
-    `Validation gate: ${validationGate.status}`,
-    `Validation command: ${validationGate.command || "not specified"}`,
-    `Validation exit code: ${validationGate.exitCode}`,
-    `Validation duration ms: ${validationGate.durationMs || 0}`,
-    validationGate.stdout ? `Validation stdout:\n${validationGate.stdout}` : null,
-    validationGate.stderr ? `Validation stderr:\n${validationGate.stderr}` : null,
-  ].filter(Boolean).join("\n");
-}
 
 function nowMs() {
   return Number(process.hrtime.bigint() / 1000000n);
-}
-
-function retryAfterMsFromText(value, currentTimeMs = Date.now()) {
-  const text = String(value || "");
-  const milliseconds = text.match(/(?:retry[-_ ]?after[-_ ]?ms|retryAfterMs)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)(?:\s*ms)?["']?/i);
-  if (milliseconds) {
-    return Math.max(0, Math.ceil(Number(milliseconds[1])));
-  }
-  const googleDelay = text.match(/(?:retry[-_ ]?delay|retryDelay)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)["']?/i);
-  if (googleDelay) {
-    return Math.max(0, Math.ceil(Number(googleDelay[1]) * 1000));
-  }
-  const seconds = text.match(/(?:retry[-_ ]?after|retryAfter)["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?["']?/i);
-  if (seconds) {
-    return Math.max(0, Math.ceil(Number(seconds[1]) * 1000));
-  }
-  const httpDate = text.match(/retry-after\s*:\s*([^\r\n]+)/i);
-  if (httpDate) {
-    const parsed = Date.parse(httpDate[1].trim());
-    if (Number.isFinite(parsed)) return Math.max(0, parsed - currentTimeMs);
-  }
-  return 0;
 }
 
 function delayWithSignal(delayMs, signal = null) {
@@ -4057,146 +2358,19 @@ async function sweepStaleIndexScratchDirs(maxAgeMs = 1000 * 60 * 60 * 24) {
   return removed;
 }
 
-// One process-table read: pid, parent pid and creation time. The creation time tells a
-// recorded process from a later one that reused its PID (Windows reuses PIDs quickly), which
-// otherwise held a containment quarantine indefinitely or attributed a stranger's process.
-async function processTable() {
-  const listed = process.platform === "win32"
-    ? await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process | ForEach-Object { $c = if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { '' }; \"$($_.ProcessId),$($_.ParentProcessId),$c\" }"], BRIDGE_RUNTIME_DIR, 1000 * 20)
-    : await runCommand("ps", ["-A", "-o", "pid=,ppid=,lstart="], BRIDGE_RUNTIME_DIR, 1000 * 20, { ...process.env, LC_ALL: "C" })
-      .then((result) => (result.exitCode === 0
-        ? result
-        // A ps without lstart (BusyBox) still yields PID-only evidence.
-        : runCommand("ps", ["-A", "-o", "pid=,ppid="], BRIDGE_RUNTIME_DIR, 1000 * 20)));
-  if (listed.exitCode !== 0) return { ok: false, at: Date.now(), rows: [] };
-  const rows = [];
-  for (const line of String(listed.stdout || "").split(/\r?\n/)) {
-    const match = process.platform === "win32"
-      ? /^\s*(\d+),(\d+),(\d*)\s*$/.exec(line)
-      : /^\s*(\d+)\s+(\d+)(?:\s+(.+?))?\s*$/.exec(line);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    const ppid = Number(match[2]);
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || pid <= 0) continue;
-    rows.push({ pid, ppid, createdAt: String(match[3] || "").trim() });
-  }
-  return { ok: true, at: Date.now(), rows };
-}
+const { processTable, processDescendants, containmentRecord, recordedProcessStillRuns, containmentProcessExists, openCodeProcessRunning, containmentStillPossible } = createProcessTableRuntime({
+  runCommand,
+  BRIDGE_RUNTIME_DIR,
+  OPENCODE_EXE,
+  CONFIG,
+});
 
-async function processDescendants(rootPids) {
-  const table = await processTable();
-  if (!table.ok) return { ok: false, pids: [], processes: [] };
-  const children = new Map();
-  const createdAt = new Map();
-  for (const { pid, ppid, createdAt: created } of table.rows) {
-    createdAt.set(pid, created);
-    if (pid === ppid) continue;
-    if (!children.has(ppid)) children.set(ppid, []);
-    children.get(ppid).push(pid);
-  }
-  const found = new Set();
-  const queue = [...rootPids];
-  while (queue.length && found.size < 4096) {
-    for (const child of children.get(queue.shift()) || []) {
-      if (found.has(child) || rootPids.includes(child)) continue;
-      found.add(child);
-      queue.push(child);
-    }
-  }
-  const pids = [...found];
-  return {
-    ok: true,
-    pids,
-    processes: [...rootPids, ...pids].map((pid) => ({ pid, createdAt: createdAt.get(pid) || "" })),
-  };
-}
 
-async function containmentRecord(result = {}) {
-  const payloadPid = Number(result?.payloadProcessId || 0);
-  const supervisorPid = Number(result?.supervisorProcessId || 0);
-  const roots = [supervisorPid, payloadPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0);
-  const descendants = roots.length ? await processDescendants(roots).catch(() => ({ ok: false, pids: [], processes: [] })) : { ok: false, pids: [], processes: [] };
-  const processes = (descendants.processes || []).filter((item) => item.createdAt);
-  const pids = [...roots, ...descendants.pids];
-  return JSON.stringify({
-    pids,
-    // Creation time per PID where the process table reported one. PIDs without one are
-    // evidence by PID only, so reclaim stays as conservative as before for them.
-    processes,
-    pidOnly: processes.length < pids.length,
-    complete: payloadPid > 0 && descendants.ok,
-    recordedAt: Date.now(),
-  });
-}
 
-// Process-table reads are cached briefly so a reclaim pass over several quarantines spawns
-// the listing once. A cached table older than a record cannot prove anything about it.
-let processTableProbe = null;
-async function processTableNewerThan(recordedAt) {
-  if (!processTableProbe || processTableProbe.at < recordedAt || Date.now() - processTableProbe.at > 1000 * 30) {
-    processTableProbe = await processTable().catch(() => ({ ok: false, at: Date.now(), rows: [] }));
-  }
-  return processTableProbe;
-}
 
-async function recordedProcessStillRuns(pid, createdAt, recordedAt) {
-  if (!containmentProcessExists(pid)) return false;
-  if (!createdAt) return true;
-  const table = await processTableNewerThan(recordedAt);
-  if (!table.ok || table.at < recordedAt) return true;
-  const row = table.rows.find((item) => item.pid === pid);
-  // Absent from a listing taken after the record: that process is gone and the live PID
-  // belongs to a process started later. A different creation time: the PID was reused.
-  return Boolean(row) && row.createdAt === createdAt;
-}
 
-function containmentProcessExists(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to someone else.
-    return error?.code === "EPERM";
-  }
-}
 
-let openCodeProcessProbe = { at: 0, running: true };
-async function openCodeProcessRunning() {
-  if (Date.now() - openCodeProcessProbe.at < 1000 * 30) return openCodeProcessProbe.running;
-  const base = path.basename(OPENCODE_EXE).replace(/\.(exe|cmd|bat|ps1)$/i, "") || "opencode";
-  let running = true;
-  if (process.platform === "win32") {
-    const listed = await runCommand("tasklist", ["/FO", "CSV", "/NH"], BRIDGE_RUNTIME_DIR, 1000 * 15);
-    if (listed.exitCode === 0) {
-      const names = new Set(String(listed.stdout || "").split(/\r?\n/).map((line) => (line.match(/^"([^"]+)"/) || [])[1]?.toLowerCase()).filter(Boolean));
-      running = names.has(`${base.toLowerCase()}.exe`) || names.has("opencode.exe");
-    }
-  } else {
-    const probe = await runCommand("pgrep", ["-x", base], BRIDGE_RUNTIME_DIR, 1000 * 15);
-    running = probe.exitCode !== 1;
-  }
-  openCodeProcessProbe = { at: Date.now(), running };
-  return running;
-}
 
-async function containmentStillPossible(containmentJson, ownerPid = 0) {
-  let info = {};
-  try { info = JSON.parse(containmentJson || "{}") || {}; } catch { info = {}; }
-  const pids = Array.isArray(info.pids) ? info.pids.map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
-  const recordedAt = Number(info.recordedAt || 0);
-  const createdAtByPid = new Map((Array.isArray(info.processes) ? info.processes : [])
-    .map((item) => [Number(item?.pid), String(item?.createdAt || "")])
-    .filter(([pid, created]) => Number.isSafeInteger(pid) && pid > 0 && created));
-  for (const pid of pids) {
-    if (await recordedProcessStillRuns(pid, createdAtByPid.get(pid) || "", recordedAt)) return true;
-  }
-  if (recordedAt > 0 && Date.now() - recordedAt < CONFIG.containmentReleaseGraceMs) return true;
-  if (info.complete === true && pids.length) return false;
-  if (containmentProcessExists(Number(ownerPid))) return true;
-  return await openCodeProcessRunning();
-}
 
 let providerQuarantineReclaimAt = 0;
 async function reclaimProvenGoneProviderQuarantines({ force = false } = {}) {
@@ -4467,130 +2641,37 @@ async function debugAgentExistsUncached(agent, cwd, { forcePure = false } = {}) 
   }
 }
 
-function normalizedPermissionRules(permissions, permission) {
-  return permissions
-    .filter((rule) => rule?.permission === permission)
-    .map((rule) => ({
-      permission,
-      pattern: String(rule?.pattern || ""),
-      action: String(rule?.action || "").toLowerCase(),
-    }));
-}
+const {
+  normalizedPermissionRules,
+  permissionDefaultAndOverrides,
+  effectivePermissionProfileRules,
+  approvedOpenCodeToolOutputPattern,
+  normalizeAgentDebugMetadata,
+  parseModelAllowlistEntry,
+  allowlistedModelOverride,
+  applyModelOverrideToMetadata,
+  effectiveReadOnlyMetadataError,
+  contractorNestedAgentMetadataError,
+  sanitizedExternalPatternInsideRoot,
+  sanitizedAgentMetadataError,
+  agentMetadataPolicyOptions,
+  sanitizedRoutingPolicyError,
+  availableAgentLabels,
+} = createAgentPolicyRuntime({
+  USER_HOME_DIR,
+  SAFE_AGENT_BASH_ALLOW_PATTERNS,
+  CONTRACTOR_ALLOWED_SUBAGENTS,
+  WRITE_CAPABLE_AGENTS,
+  MCP_SANITIZED_READER_AGENT,
+  MCP_SANITIZED_READER_PROFILE,
+  MCP_SANITIZED_READER_PROMPT_SHA256,
+  MCP_CONTRACTOR_ORCHESTRATOR_AGENT,
+  activeModelOverrideAllowlist,
+});
 
-function permissionDefaultAndOverrides(permissions, permission) {
-  const rules = normalizedPermissionRules(permissions, permission);
-  let wildcardIndex = -1;
-  for (let index = 0; index < rules.length; index += 1) {
-    if (rules[index].pattern === "*") wildcardIndex = index;
-  }
-  return {
-    rules,
-    defaultAction: wildcardIndex >= 0 ? rules[wildcardIndex].action : "",
-    overrides: wildcardIndex >= 0 ? rules.slice(wildcardIndex + 1) : rules,
-  };
-}
 
-function effectivePermissionProfileRules(permissions, isolatedRuntimeRoot = "") {
-  const permissionNames = [...new Set(
-    permissions.map((rule) => String(rule?.permission || "")).filter(Boolean)
-  )].sort();
-  return permissionNames.map((permission) => {
-    const summary = permissionDefaultAndOverrides(permissions, permission);
-    return {
-      permission,
-      defaultAction: summary.defaultAction,
-      overrides: summary.overrides.map((rule) => ({
-        pattern: approvedOpenCodeToolOutputPattern(rule.pattern, isolatedRuntimeRoot)
-          ? "<opencode-tool-output>"
-          : rule.pattern,
-        action: rule.action,
-      })),
-    };
-  });
-}
 
-function approvedOpenCodeToolOutputPattern(patternValue, additionalDataRoot = "") {
-  const raw = String(patternValue || "").trim().replace(/[\\/]+\*$/, "");
-  if (!raw || /[*?{}[\]!]/.test(raw)) return false;
-  const approvedRoots = [
-    path.join(USER_HOME_DIR, ".local", "share", "opencode", "tool-output"),
-    process.env.XDG_DATA_HOME ? path.join(process.env.XDG_DATA_HOME, "opencode", "tool-output") : "",
-    additionalDataRoot ? path.join(additionalDataRoot, "opencode", "tool-output") : "",
-  ].filter(Boolean).map((item) => path.resolve(item));
-  return approvedRoots.some((root) => path.resolve(raw) === root);
-}
 
-function normalizeAgentDebugMetadata(parsed, expectedName = "", { isolatedRuntimeRoot = "" } = {}) {
-  if (!parsed || typeof parsed !== "object" || (expectedName && parsed.name !== expectedName)) {
-    return null;
-  }
-  const permissions = Array.isArray(parsed.permission) ? parsed.permission : [];
-  const tools = parsed.tools && typeof parsed.tools === "object" ? parsed.tools : {};
-  const editToolKeys = ["apply_patch", "edit", "write"].filter((key) => Object.hasOwn(tools, key));
-  const permissionDeniedAll = (permission) => {
-    const summary = permissionDefaultAndOverrides(permissions, permission);
-    return summary.defaultAction === "deny" && summary.overrides.every((rule) => rule.action === "deny");
-  };
-  const logicalToolDenied = (toolNames, permissionName) => toolNames.some((key) => Object.hasOwn(tools, key) && tools[key] === false)
-    || permissionDeniedAll(permissionName);
-  const external = permissionDefaultAndOverrides(permissions, "external_directory");
-  const externalUnsafeOverrides = external.overrides.filter((rule) => rule.action !== "deny" && !approvedOpenCodeToolOutputPattern(rule.pattern, isolatedRuntimeRoot));
-  const edit = permissionDefaultAndOverrides(permissions, "edit");
-  const editProtectedDenyPatterns = edit.overrides
-    .filter((rule) => rule.action === "deny")
-    .map((rule) => rule.pattern);
-  const bash = permissionDefaultAndOverrides(permissions, "bash");
-  const bashAutomaticAllowUnsafe = bash.overrides.filter((rule) => rule.action === "allow" && !SAFE_AGENT_BASH_ALLOW_PATTERNS.has(rule.pattern));
-  const task = permissionDefaultAndOverrides(permissions, "task");
-  const taskAllowedPatterns = task.overrides.filter((rule) => rule.action === "allow").map((rule) => rule.pattern.toLowerCase());
-  const taskDelegationAllowlistSafe = task.defaultAction === "deny"
-    && task.overrides.every((rule) => rule.action === "deny" || (rule.action === "allow" && CONTRACTOR_ALLOWED_SUBAGENTS.has(rule.pattern.toLowerCase())))
-    && taskAllowedPatterns.length === CONTRACTOR_ALLOWED_SUBAGENTS.size
-    && [...CONTRACTOR_ALLOWED_SUBAGENTS].every((agent) => taskAllowedPatterns.includes(agent));
-  const canEdit = editToolKeys.length === 0 || editToolKeys.some((key) => tools[key] !== false);
-  const protectedEditsDenied = !canEdit || (
-    edit.defaultAction === "allow"
-    && edit.overrides.length === DEFAULT_FORBIDDEN_EDIT_PATHS.length
-    && edit.overrides.every((rule) => rule.action === "deny" && DEFAULT_FORBIDDEN_EDIT_PATHS.includes(rule.pattern))
-    && DEFAULT_FORBIDDEN_EDIT_PATHS.every((pattern) => editProtectedDenyPatterns.includes(pattern))
-  );
-  const normalized = {
-    name: String(parsed.name || expectedName || ""),
-    mode: String(parsed.mode || "unknown"),
-    provider: String(parsed.model?.providerID || ""),
-    model: String(parsed.model?.modelID || ""),
-    variant: String(parsed.variant || ""),
-    temperature: Number(parsed.temperature),
-    promptSha256: createHash("sha256").update(String(parsed.prompt || "").trim()).digest("hex"),
-    canEdit,
-    protectedEditsDenied,
-    canDelegate: !logicalToolDenied(["task"], "task"),
-    taskDelegationAllowlistSafe,
-    taskAllowedPatterns,
-    externalDirectoryDenied: external.defaultAction === "deny" && externalUnsafeOverrides.length === 0,
-    externalDirectoryDefaultAction: external.defaultAction,
-    externalAllowedPatterns: external.overrides.filter((rule) => rule.action === "allow").map((rule) => rule.pattern),
-    bashDenied: logicalToolDenied(["bash"], "bash"),
-    bashAutomaticAllowSafe: logicalToolDenied(["bash"], "bash")
-      || (["ask", "deny"].includes(bash.defaultAction) && bashAutomaticAllowUnsafe.length === 0),
-    bashDefaultAction: bash.defaultAction,
-    bashAllowedPatterns: bash.overrides.filter((rule) => rule.action === "allow").map((rule) => rule.pattern),
-    webDenied: logicalToolDenied(["webfetch", "web_fetch"], "webfetch")
-      && logicalToolDenied(["websearch", "web_search"], "websearch"),
-    skillDenied: logicalToolDenied(["skill"], "skill"),
-  };
-  const normalizedPermissionProfileRules = effectivePermissionProfileRules(permissions, isolatedRuntimeRoot);
-  const normalizedPermissionProfileTools = Object.fromEntries(Object.entries(tools).sort(([left], [right]) => left.localeCompare(right)));
-  normalized.permissionRulesSha256 = createHash("sha256").update(JSON.stringify(normalizedPermissionProfileRules)).digest("hex");
-  normalized.toolsSha256 = createHash("sha256").update(JSON.stringify(normalizedPermissionProfileTools)).digest("hex");
-  normalized.permissionProfileSha256 = createHash("sha256").update(JSON.stringify({
-    permissions: normalizedPermissionProfileRules,
-    tools: normalizedPermissionProfileTools,
-    prompt: String(parsed.prompt || "").trim(),
-    temperature: Number(parsed.temperature),
-  })).digest("hex");
-  return normalized;
-}
 
 function managedAgentSourceProfile(source, agent) {
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(String(source || ""));
@@ -4841,21 +2922,6 @@ async function readAgentDebugMetadataUncached(agent, cwd, { forcePure = false, r
   }
 }
 
-function parseModelAllowlistEntry(entry) {
-  const raw = String(entry || "").trim();
-  if (!raw) return null;
-  const at = raw.lastIndexOf("@");
-  const modelPart = at > 0 ? raw.slice(0, at).trim() : raw;
-  const variant = at > 0 ? raw.slice(at + 1).trim() : "";
-  const slash = modelPart.indexOf("/");
-  if (slash <= 0 || slash === modelPart.length - 1) return null;
-  if (at > 0 && !variant) return null;
-  const provider = modelPart.slice(0, slash).trim();
-  const model = modelPart.slice(slash + 1).trim();
-  // The same identifier rules as modelRequirementSchema: these become CLI arguments.
-  if (!MODEL_IDENTIFIER_PATTERN.test(provider) || !MODEL_NAME_PATTERN.test(model) || (variant && !MODEL_IDENTIFIER_PATTERN.test(variant))) return null;
-  return { provider, model, variant };
-}
 
 function activeModelOverrideAllowlist() {
   return process.argv.some((argument) => String(argument).startsWith("--self-test")) && Array.isArray(selfTestModelOverrideAllowlist)
@@ -4863,159 +2929,9 @@ function activeModelOverrideAllowlist() {
     : CONFIG.modelOverrideAllowlist;
 }
 
-// A job may select a model through scopeContract.modelRequirement only when the
-// operator listed that provider/model (optionally pinned to one variant) in
-// CODEX_OPENCODE_MODEL_ALLOWLIST. The selection becomes an explicit --model/--variant
-// pin that is attested against runtime evidence exactly like the managed profile.
-// The sanitized reader keeps its exact profile and is never overridable.
-function allowlistedModelOverride(modelRequirement, agent = "", allowlist = activeModelOverrideAllowlist()) {
-  if (!modelRequirement?.provider || !modelRequirement?.model) return null;
-  if (String(agent || "").trim().toLowerCase() === MCP_SANITIZED_READER_AGENT.toLowerCase()) return null;
-  for (const entry of Array.isArray(allowlist) ? allowlist : []) {
-    const parsed = parseModelAllowlistEntry(entry);
-    if (!parsed || parsed.provider !== modelRequirement.provider || parsed.model !== modelRequirement.model) continue;
-    if (parsed.variant && modelRequirement.variant !== undefined && parsed.variant !== modelRequirement.variant) continue;
-    return {
-      provider: parsed.provider,
-      model: parsed.model,
-      variant: modelRequirement.variant !== undefined ? String(modelRequirement.variant) : parsed.variant,
-      source: "operator_allowlist",
-    };
-  }
-  return null;
-}
 
-function applyModelOverrideToMetadata(metadata, override) {
-  if (!metadata || !override) return metadata;
-  return {
-    ...metadata,
-    provider: override.provider,
-    model: override.model,
-    // The managed profile's variant belongs to the managed model; a different overridden
-    // model runs with the override's variant only (none when the allowlist pins none).
-    variant: override.variant || "",
-    modelSelection: "operator_allowlist_override",
-    profileProvider: metadata.provider,
-    profileModel: metadata.model,
-    profileVariant: metadata.variant,
-  };
-}
 
-function effectiveReadOnlyMetadataError(metadataResult, lockPlan, {
-  expectedAgent = "",
-  expectedMode = "",
-  expectedMetadata = null,
-  allowDelegation = false,
-  requireBashDenied = false,
-  requireSkillDenied = false,
-  modelRequirement = lockPlan?.scopeContract?.modelRequirement || null,
-} = {}) {
-  if (!metadataResult?.ok || !metadataResult.metadata) {
-    return {
-      errorType: metadataResult?.errorType || "agent_metadata_unavailable",
-      error: metadataResult?.error || "Effective OpenCode agent permissions could not be attested.",
-    };
-  }
-  const metadata = metadataResult.metadata;
-  if (!metadata.provider || !metadata.model) {
-    return {
-      errorType: "agent_model_unattested",
-      error: "Effective OpenCode agent metadata did not provide an exact provider and model, so the bridge cannot pin or attest execution.",
-    };
-  }
-  if (modelRequirement && !allowlistedModelOverride(modelRequirement, metadata.name) && (
-    metadata.provider !== modelRequirement.provider
-    || metadata.model !== modelRequirement.model
-    || (modelRequirement.variant !== undefined && metadata.variant !== modelRequirement.variant)
-  )) {
-    return {
-      errorType: "configured_model_requirement_mismatch",
-      error: `The attested managed profile uses ${metadata.provider}/${metadata.model} (variant ${metadata.variant || "unspecified"}), but the scope requires ${modelRequirement.provider}/${modelRequirement.model}${modelRequirement.variant !== undefined ? ` (variant ${modelRequirement.variant})` : ""}. No agent was spawned with a substitute model.`,
-      suggestedFix: "Select an attested managed profile matching the requested model requirement, or explicitly revise the requirement. The bridge will not override the managed profile.",
-    };
-  }
-  if (expectedAgent && metadata.name !== expectedAgent) {
-    return {
-      errorType: "agent_metadata_changed",
-      error: `Effective agent name changed before execution (expected ${expectedAgent}, received ${metadata.name || "missing"}).`,
-    };
-  }
-  if (!['primary', 'all'].includes(metadata.mode) || (expectedMode && metadata.mode !== expectedMode)) {
-    return {
-      errorType: "agent_mode_unattested",
-      error: `Effective mode for ${metadata.name} is ${metadata.mode || "missing"}; the bridge requires the resolved primary/all mode${expectedMode ? ` ${expectedMode}` : ""}.`,
-    };
-  }
-  if (expectedMetadata && (
-    metadata.provider !== expectedMetadata.provider
-    || metadata.model !== expectedMetadata.model
-    || metadata.variant !== expectedMetadata.variant
-    || metadata.permissionProfileSha256 !== expectedMetadata.permissionProfileSha256
-  )) {
-    const changedFields = [
-      "provider",
-      "model",
-      "variant",
-      "permissionRulesSha256",
-      "toolsSha256",
-      "promptSha256",
-      "temperature",
-      "permissionProfileSha256",
-    ].filter((field) => metadata[field] !== expectedMetadata[field]);
-    return {
-      errorType: "agent_metadata_changed",
-      error: `Effective model or permission metadata for ${metadata.name} changed between discovery and the final pre-spawn attestation (changed fields: ${changedFields.join(", ") || "unknown"}).`,
-    };
-  }
-  if (
-    (!allowDelegation && metadata.canDelegate)
-    || (allowDelegation && (!metadata.canDelegate || !metadata.taskDelegationAllowlistSafe))
-    || !metadata.externalDirectoryDenied
-    || !metadata.webDenied
-    || !metadata.bashAutomaticAllowSafe
-    || (requireBashDenied && !metadata.bashDenied)
-    || (requireSkillDenied && !metadata.skillDenied)
-    || (metadata.canEdit && !metadata.protectedEditsDenied)
-  ) {
-    return {
-      errorType: "agent_permissions_unsafe",
-      error: `Effective permissions for ${metadata.name} cross the bridge boundary (canDelegate=${metadata.canDelegate}, taskDelegationAllowlistSafe=${metadata.taskDelegationAllowlistSafe}, externalDirectoryDenied=${metadata.externalDirectoryDenied}, webDenied=${metadata.webDenied}, bashDenied=${metadata.bashDenied}, bashAutomaticAllowSafe=${metadata.bashAutomaticAllowSafe}, skillDenied=${metadata.skillDenied}, protectedEditsDenied=${metadata.protectedEditsDenied}).`,
-    };
-  }
-  if (lockPlan?.lockType === "read" && metadata.canEdit) {
-    return {
-      errorType: "read_only_agent_permissions_unsafe",
-      error: `Effective permissions for ${metadata.name} are not read-only (canEdit=${metadata.canEdit}).`,
-    };
-  }
-  return null;
-}
 
-function contractorNestedAgentMetadataError(agent, metadataResult) {
-  if (!metadataResult?.ok || !metadataResult.metadata) {
-    return {
-      errorType: metadataResult?.errorType || "contractor_nested_agent_unattested",
-      error: metadataResult?.error || `Contractor nested agent ${agent} could not be attested.`,
-    };
-  }
-  const metadata = metadataResult.metadata;
-  const writeCapable = WRITE_CAPABLE_AGENTS.has(String(agent || "").toLowerCase());
-  if (
-    !["primary", "all", "subagent"].includes(metadata.mode)
-    || metadata.canDelegate
-    || !metadata.externalDirectoryDenied
-    || !metadata.webDenied
-    || metadata.bashDefaultAction !== "deny"
-    || !metadata.bashAutomaticAllowSafe
-    || (writeCapable ? (!metadata.canEdit || !metadata.protectedEditsDenied) : metadata.canEdit)
-  ) {
-    return {
-      errorType: "contractor_nested_agent_permissions_unsafe",
-      error: `Contractor nested agent ${agent} crosses the bridge boundary (mode=${metadata.mode}, canEdit=${metadata.canEdit}, canDelegate=${metadata.canDelegate}, externalDirectoryDenied=${metadata.externalDirectoryDenied}, webDenied=${metadata.webDenied}, bashDefaultAction=${metadata.bashDefaultAction}, bashAutomaticAllowSafe=${metadata.bashAutomaticAllowSafe}, protectedEditsDenied=${metadata.protectedEditsDenied}).`,
-    };
-  }
-  return null;
-}
 
 async function attestContractorNestedAgents(cwd, { forcePure = false } = {}) {
   const agents = [...CONTRACTOR_ALLOWED_SUBAGENTS].sort();
@@ -5032,90 +2948,10 @@ async function attestContractorNestedAgents(cwd, { forcePure = false } = {}) {
   return { ok: true, profiles };
 }
 
-function sanitizedExternalPatternInsideRoot(patternValue, root, isolatedRuntimeRoot = "") {
-  const raw = String(patternValue || "").trim().replace(/[\\/]+\*$/, "");
-  if (!raw || /[*?{}[\]!]/.test(raw)) return false;
-  const resolved = path.resolve(raw);
-  const normalized = normalizePathForCompare(resolved);
-  const toolOutputSuffix = normalizePathForCompare(path.join("opencode", "tool-output"));
-  const isolatedTempSuffix = normalizePathForCompare(path.join("tmp", "opencode"));
-  const insideWorkspaceToolOutput = root
-    && isPathInside(path.resolve(root), resolved)
-    && normalized.endsWith(toolOutputSuffix);
-  const insideIsolatedRuntime = isolatedRuntimeRoot
-    && isPathInside(path.resolve(isolatedRuntimeRoot), resolved)
-    && (normalized.endsWith(toolOutputSuffix) || normalized.endsWith(isolatedTempSuffix));
-  return Boolean(insideWorkspaceToolOutput || insideIsolatedRuntime);
-}
 
-function sanitizedAgentMetadataError(metadataResult, root = "") {
-  if (!metadataResult?.ok || !metadataResult.metadata) {
-    return {
-      errorType: metadataResult?.errorType || "agent_metadata_unavailable",
-      error: metadataResult?.error || "Sanitized-workspace effective agent permissions could not be attested.",
-    };
-  }
-  const metadata = metadataResult.metadata;
-  if (
-    metadata.name !== MCP_SANITIZED_READER_AGENT
-    || metadata.mode !== "all"
-    || metadata.provider !== MCP_SANITIZED_READER_PROFILE.provider
-    || metadata.model !== MCP_SANITIZED_READER_PROFILE.model
-    || metadata.variant !== MCP_SANITIZED_READER_PROFILE.variant
-    || metadata.temperature !== 0
-    || metadata.promptSha256 !== MCP_SANITIZED_READER_PROMPT_SHA256
-    || metadata.canEdit
-    || metadata.canDelegate
-    || metadata.externalDirectoryDefaultAction !== "deny"
-    || metadata.externalAllowedPatterns.some((pattern) => !sanitizedExternalPatternInsideRoot(pattern, root, metadataResult.isolatedRuntimeRoot || ""))
-    || !metadata.bashDenied
-    || !metadata.webDenied
-    || !metadata.skillDenied
-  ) {
-    return {
-      errorType: "sanitized_workspace_agent_unsafe",
-      error: `Sanitized execution requires exact role ${MCP_SANITIZED_READER_AGENT} (${MCP_SANITIZED_READER_PROFILE.provider}/${MCP_SANITIZED_READER_PROFILE.model}, ${MCP_SANITIZED_READER_PROFILE.variant}) with edit/task/external/shell/web/skill denial.`,
-    };
-  }
-  return null;
-}
 
-function agentMetadataPolicyOptions(resolution, lockPlan, expectedMetadata = null) {
-  const contractorDelegation = lockPlan?.orchestratorMode === "contractor"
-    && lockPlan?.contractorAuthorizationVerified
-    && String(resolution?.actualAgent || "").toLowerCase() === MCP_CONTRACTOR_ORCHESTRATOR_AGENT.toLowerCase();
-  return {
-    expectedAgent: resolution?.actualAgent || "",
-    expectedMode: resolution?.actualAgentMode || resolution?.requestedAgentMode || "",
-    expectedMetadata,
-    modelRequirement: lockPlan?.scopeContract?.modelRequirement || null,
-    allowDelegation: contractorDelegation,
-    requireBashDenied: contractorDelegation,
-    requireSkillDenied: contractorDelegation,
-  };
-}
 
-function sanitizedRoutingPolicyError(job, resolution, executionCwd = "") {
-  if (!job?.sanitizedWorkspace) return null;
-  const expectedRoot = path.resolve(job.sanitizedWorkspace.root);
-  if (
-    resolution?.actualAgent !== MCP_SANITIZED_READER_AGENT
-    || resolution?.actualAgentMode !== "all"
-    || resolution?.proxyUsed
-    || resolution?.fallbackUsed
-    || (executionCwd && path.resolve(executionCwd) !== expectedRoot)
-  ) {
-    return {
-      errorType: "sanitized_workspace_agent_unsafe",
-      error: `Sanitized execution must use ${MCP_SANITIZED_READER_AGENT} directly in exact manifest root ${expectedRoot}, without fallback, proxying, or bridge worktrees.`,
-    };
-  }
-  return null;
-}
 
-function availableAgentLabels(agents) {
-  return [...agents.entries()].map(([name, mode]) => `${name} (${mode})`).sort();
-}
 
 function exactPluginSpecifier(value) {
   const specifier = String(value || "").trim();
@@ -5787,622 +3623,37 @@ async function verifySanitizedWorkspace(contract, phase = "manual") {
   }
 }
 
-function detectsOpenCodeFallback(stderr) {
-  return /agent\s+"[^"]+"\s+is a subagent,\s+not a primary agent\.\s+Falling back to default agent/i.test(stderr || "");
-}
+const {
+  detectsOpenCodeFallback,
+  modelEvidenceFromEvent,
+  emptyOpenCodeUsage,
+  addStepFinishUsage,
+  formatOpenCodeUsage,
+  emptyToolWeights,
+  toolWeightSession,
+  noteToolUse,
+  noteStepFinish,
+  heaviestToolCalls,
+  mergeHeavyToolCalls,
+  formatHeavyToolCalls,
+  inspectOpenCodeEventStream,
+  detectsOpenCodeApiError,
+} = createOpenCodeEventRuntime({
+  CONFIG,
+});
 
-// The Antigravity auth plugin answers an exhausted account pool with a synthetic assistant text,
-// not an error event ("All 2 account(s) rate-limited for gemini. Quota resets in 3h 55m. Add more
-// accounts with `opencode auth login` or wait and retry."). The run then looked like a normal
-// final answer, a writer that changed nothing "completed", and five batch jobs were lost
-// silently. Only a final message that starts with the plugin's exact wording counts, so an agent
-// that merely talks about rate limits is never failed.
-const SYNTHETIC_QUOTA_NOTICE_PATTERN = /^(?:Quota protection: )?All \d+ account\(s\) (?:rate-limited for|are over \d+% usage for) [\w.-]+\. Quota resets in (unknown|\d+ms|\d+[hms](?: \d+[ms])?)\./;
 
-function syntheticProviderQuotaNotice(finalText) {
-  const match = String(finalText || "").trim().match(SYNTHETIC_QUOTA_NOTICE_PATTERN);
-  if (!match) return null;
-  let resetMs = 0;
-  if (match[1] !== "unknown") {
-    for (const [, amount, unit] of match[1].matchAll(/(\d+)(ms|h|m|s)/g)) {
-      resetMs += Number(amount) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[unit];
-    }
-  }
-  return { errorType: "opencode_quota_exhausted", resetMs, resetText: match[1] };
-}
 
-// B-043: "Streaming response failed: [504] Upstream idle timeout exceeded" came back as an error
-// event whose only evidence was its message text. It matched no classifier, so the run ended as
-// opencode_api_error with "Provider error type: none" and none of the retry rules applied.
-// GATEWAY_TIMEOUT_TEXT_PATTERN is the wording providerErrorTypeFromText maps to
-// opencode_transient_provider_error (a bare 504 is fine there: callers only pass diagnostic
-// text). GATEWAY_FAILURE_MESSAGE_PATTERN is the narrower set that may classify free message
-// text of an event that already is an error with no other provider evidence: bracketed 5xx codes
-// and the timeout phrases, never a bare number, so a fixture or an agent quoting "504" in a
-// message is not mistaken for one. GATEWAY_DIAGNOSTIC_LINE_PATTERN is narrower still, for
-// stderr and non-JSON stdout lines (see providerErrorTypeFromDiagnosticLine).
-const GATEWAY_TIMEOUT_TEXT_PATTERN = /\b504\b|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
-const GATEWAY_DIAGNOSTIC_LINE_PATTERN = /\[50[0234]\]|\bupstream[\s-]+idle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
-const GATEWAY_FAILURE_MESSAGE_PATTERN =/\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 
-// B-061: OpenCode's log lines are logfmt: `timestamp=2026-10-01T08:25:56.490Z level=ERROR run=...
-// message="stream error" providerID=opencode modelID=muse-spark-1.3-contributor-free
-// session.id=ses_... small=false agent=builder mode=all error.error="AI_APICallError: Rate limit
-// exceeded. Please retry after a brief wait."`. The same line reaches the job's stderr (the bridge
-// runs OpenCode with --print-logs) and ~/.local/share/opencode/log/opencode.log.
-function parseOpenCodeLogLine(line) {
-  const text = String(line || "");
-  if (!/\btimestamp=\S/.test(text) && !/\bmodelID=\S/.test(text)) return null;
-  const fields = {};
-  for (const match of text.matchAll(/([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|[^\s"]*)/g)) {
-    const raw = match[2];
-    let value = raw;
-    if (raw.startsWith("\"")) {
-      try { value = JSON.parse(raw); } catch { value = raw.slice(1, -1); }
-    }
-    if (!(match[1] in fields)) fields[match[1]] = String(value);
-  }
-  const timestamp = fields.timestamp || "";
-  const detail = Object.entries(fields)
-    .filter(([key]) => key === "message" || key === "error" || key.startsWith("error."))
-    .map(([, value]) => value)
-    .join(" ")
-    .slice(0, 2000);
-  return {
-    timestamp,
-    timestampMs: Date.parse(timestamp) || 0,
-    level: fields.level || "",
-    providerID: fields.providerID || "",
-    modelID: fields.modelID || "",
-    sessionID: fields["session.id"] || fields.sessionID || "",
-    agent: fields.agent || "",
-    small: fields.small === "true",
-    detail,
-  };
-}
 
-const RATE_LIMIT_LOG_PATTERN = /rate.?limit|too many requests|\b429\b|quota|insufficient account funds|RESOURCE_EXHAUSTED/i;
 
-// A rate-limit, quota or no-funds line of the main model. The title agent's small model fails on
-// its own account ("small=true agent=title ... Insufficient account funds") and says nothing about
-// the job's model, so those lines are ignored.
-function openCodeRateLimitHit(line) {
-  if (!RATE_LIMIT_LOG_PATTERN.test(String(line || ""))) return null;
-  const entry = parseOpenCodeLogLine(line);
-  if (!entry || entry.small || entry.agent.toLowerCase() === "title") return null;
-  if (!RATE_LIMIT_LOG_PATTERN.test(entry.detail)) return null;
-  const kind = /insufficient account funds/i.test(entry.detail) ? "funds" : /quota|RESOURCE_EXHAUSTED/i.test(entry.detail) ? "quota" : "rate_limit";
-  return { ...entry, kind, detail: redactSensitiveText(entry.detail).slice(0, 300) };
-}
 
-// Watches one agent run for silent rate limiting: rate-limit lines of the run's model on its own
-// stderr, and (when a log path is set) in OpenCode's log file. A file line names its session; once
-// the run's own session id is known (the first stdout event carries it) only that session counts,
-// before that the provider, model and agent must match and the line must be newer than the run.
-// Any stdout output means the agent is making progress and resets the count, so a run that
-// recovers between retries is never stopped.
-// B-070: two rules against a false pause. A log-file line counts only once the run's own session
-// id is known and the line names that session (before that, the job's stderr is the only source:
-// a line of another session on the same model, two of them in one scan, used to stop the run and
-// pause the model for everyone). And the hits of a streak must span reads at least minSpreadMs
-// apart (default 5 s): a burst delivered by one read, or several reads in the same moment, is one
-// observation, while OpenCode's real retries are seconds to minutes apart.
-const RATE_LIMIT_MIN_SPREAD_MS = 5000;
 
-function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "", logPath = "", scanMs = 15000, startedAtMs = Date.now(), minSpreadMs = RATE_LIMIT_MIN_SPREAD_MS, onTrip = () => {} } = {}) {
-  const state = { hits: 0, consecutive: 0, streakStartedAt: 0, sessionId: "", evidence: null, tripped: false, offset: -1, remainder: "", timer: null, scanning: false };
-  const seen = new Set();
-  const wantedProvider = String(provider || "").toLowerCase();
-  const wantedModel = String(model || "").toLowerCase();
-  const wantedAgent = String(agent || "").toLowerCase();
-  const modelMatches = (entry) => (!entry.modelID || entry.modelID.toLowerCase() === wantedModel)
-    && (!entry.providerID || !wantedProvider || entry.providerID.toLowerCase() === wantedProvider);
-  const consider = (entry, source, readAt = Date.now()) => {
-    if (!entry || state.tripped || !(hits > 0)) return;
-    if (source === "file") {
-      if (entry.timestampMs && entry.timestampMs < startedAtMs - 1000) return;
-      if (!state.sessionId || entry.sessionID !== state.sessionId) return;
-      if (!modelMatches(entry)) return;
-      if (wantedAgent && entry.agent && entry.agent.toLowerCase() !== wantedAgent) return;
-    } else if (!modelMatches(entry)) {
-      return;
-    }
-    // The same line arrives on stderr and in the file; count it once.
-    const key = `${entry.timestamp}|${entry.sessionID}|${entry.detail}`;
-    if (seen.has(key)) return;
-    if (seen.size > 500) seen.clear();
-    seen.add(key);
-    state.hits += 1;
-    state.consecutive += 1;
-    if (state.consecutive === 1) state.streakStartedAt = readAt;
-    state.evidence = { source, kind: entry.kind, at: entry.timestamp, sessionId: entry.sessionID, providerID: entry.providerID, modelID: entry.modelID, detail: entry.detail };
-    // B-074: one hit has no spread; with hits 1 the operator asked to stop at the first line.
-    if (state.consecutive >= hits && (hits === 1 || readAt - state.streakStartedAt >= minSpreadMs)) {
-      state.tripped = true;
-      try { onTrip(state.evidence); } catch { /* The trip only asks for termination. */ }
-    }
-  };
-  const scanFile = async () => {
-    if (!logPath || state.scanning || state.tripped) return;
-    state.scanning = true;
-    let handle = null;
-    try {
-      const details = await stat(logPath);
-      if (state.offset < 0 || details.size < state.offset) {
-        // First look (only lines written from now on count), or the file was rotated/truncated.
-        state.offset = state.offset < 0 ? details.size : 0;
-        state.remainder = "";
-        if (state.offset === details.size) return;
-      }
-      const length = Math.min(details.size - state.offset, 1024 * 1024);
-      if (length <= 0) return;
-      handle = await open(logPath, "r");
-      const buffer = Buffer.alloc(length);
-      const { bytesRead } = await handle.read(buffer, 0, length, state.offset);
-      state.offset += bytesRead;
-      const lines = `${state.remainder}${buffer.subarray(0, bytesRead).toString("utf8")}`.split(/\r?\n/);
-      state.remainder = (lines.pop() || "").slice(-64 * 1024);
-      const readAt = Date.now();
-      for (const text of lines) consider(openCodeRateLimitHit(text), "file", readAt);
-    } catch {
-      // A missing or unreadable log file only means there is nothing to scan.
-    } finally {
-      state.scanning = false;
-      if (handle) await handle.close().catch(() => {});
-    }
-  };
-  return {
-    state,
-    start() {
-      if (!logPath || !(hits > 0) || state.timer) return;
-      void scanFile();
-      state.timer = setInterval(() => { void scanFile(); }, Math.max(50, scanMs));
-      state.timer.unref?.();
-    },
-    stop() {
-      if (state.timer) clearInterval(state.timer);
-      state.timer = null;
-    },
-    scanNow: scanFile,
-    stderrLine(line) {
-      consider(openCodeRateLimitHit(line), "stderr");
-    },
-    stdoutText(text) {
-      if (!state.sessionId) {
-        const match = /"sessionID"\s*:\s*"([^"]{1,200})"/.exec(String(text || ""));
-        if (match) state.sessionId = match[1];
-      }
-      if (String(text || "").trim()) state.consecutive = 0;
-    },
-  };
-}
 
-function providerErrorTypeFromText(value) {
-  const text = String(value || "");
-  if (!text.trim()) {
-    return "";
-  }
-  // Ordinary 429s carry billing words: Gemini says "You exceeded your current quota, please
-  // check your plan and billing details" and OpenAI links ".../account/billing" to add a
-  // payment method. Checked first, those made every rate limit a non-retryable billing error
-  // that also killed the run. A rate-limit marker wins unless an explicit billing marker is
-  // present (OpenAI's insufficient_quota, CreditsError, 402 Payment Required) or the limit
-  // is a daily/hard quota that retrying cannot clear.
-  const explicitBilling = /insufficient_quota|CreditsError|payment.required|\b402\b/i.test(text);
-  if (/\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|rate.?limit|too many requests/i.test(text) && !explicitBilling) {
-    return /daily.{0,80}(quota|limit)|per.?day\b|hard.{0,40}quota/i.test(text) ? "opencode_quota_exhausted" : "opencode_rate_limited";
-  }
-  if (explicitBilling || /No payment method|insufficient.{0,20}(credit|balance)|(?:provider|account|payment|quota).{0,40}billing|billing.{0,40}(?:disabled|failed|required|problem|error|account|quota)/i.test(text)) {
-    return "opencode_billing_error";
-  }
-  if (/daily.{0,80}(quota|limit)|quota.{0,80}(exhausted|exceeded).{0,80}(daily|billing)|hard.{0,40}quota/i.test(text)) {
-    return "opencode_quota_exhausted";
-  }
-  if (/RESOURCE_EXHAUSTED|rateLimitExceeded|\b429\b|too many requests|rate.?limit|quota.{0,80}(?:per.?minute|per.?hour|requests?|temporar|exceeded|limit)/i.test(text)) {
-    return "opencode_rate_limited";
-  }
-  if (/invalid_grant|invalid_client|interaction_required|access_denied|login_required|consent_required|revoked.{0,30}(refresh|token)|expired.{0,30}refresh|unauthori[sz]ed|access.{0,20}forbidden|invalid.{0,30}(api.?key|refresh.?token|access.?token|credential)|authentication.{0,30}(failed|required)|\b401\b.{0,80}(?:auth|credential|api.?key|token)|\b403\b.{0,80}(?:auth|credential|api.?key|token)/i.test(text)) {
-    return "opencode_auth_error";
-  }
-  if (/model.{0,40}(not found|unavailable|unsupported|does not exist)|unknown model|invalid model/i.test(text)) {
-    return "opencode_model_error";
-  }
-  // B-043: a 504 / gateway or upstream idle timeout is a transient provider error (the same
-  // retry rules as ProviderHeaderTimeoutError below), not an unclassified API error.
-  if (GATEWAY_TIMEOUT_TEXT_PATTERN.test(text)) {
-    return "opencode_transient_provider_error";
-  }
-  if (/\b(?:500|502|503)\b|service unavailable|bad gateway/i.test(text)) {
-    return "opencode_provider_unavailable";
-  }
-  if (/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET)|socket hang up|network error|fetch failed/i.test(text)) {
-    return "opencode_transport_error";
-  }
-  if (/Provider(?:HeaderTimeout|Connection|RequestTimeout)Error|DEADLINE_EXCEEDED|response headers timed out|stream error.{0,200}(timed out|timeout)/i.test(text)) {
-    return "opencode_transient_provider_error";
-  }
-  if (/\bAPIError\b|provider.{0,30}error|model.{0,30}(not found|unavailable)/i.test(text)) {
-    return "opencode_api_error";
-  }
-  return "";
-}
 
-function providerErrorTypeFromDiagnosticLine(value) {
-  const line = String(value || "").trim();
-  if (!line || /"(?:messages|system|prompt|input)"\s*:/i.test(line) || /^\s*(?:task|prompt|messages|input)\s*[:=]/i.test(line)) {
-    return "";
-  }
-  const authoritativeMarker = /(?:\bAPIError\b|\bCreditsError\b|\bProvider[A-Za-z]*(?:Error|Timeout)\b|\bOAuth\b|\bHTTP\s+[45]\d\d\b|\b(?:status|statusCode|code)\s*[:=]\s*["']?(?:[45]\d\d|RESOURCE_EXHAUSTED|rateLimitExceeded|invalid_grant)\b|\bRESOURCE_EXHAUSTED\b|\brateLimitExceeded\b|\binvalid_(?:grant|client)\b|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_[A-Z_]+|DEADLINE_EXCEEDED)\b|\b401\s+Unauthorized\b|\b429\s+Too Many Requests\b)/i;
-  // Diagnostic lines come from stderr and from stdout lines that are not JSON, and a match there can
-  // fail a run that produced its answer: the free-text (no authoritative marker) gateway match is
-  // only the bracketed status or the exact upstream-idle-timeout phrase, never "gateway timeout" alone.
-  if (authoritativeMarker.test(line) || GATEWAY_DIAGNOSTIC_LINE_PATTERN.test(line)) return providerErrorTypeFromText(line);
-  // B-023: OpenCode logs retried provider failures as the AI SDK's AI_APICallError (and
-  // AI_RetryError). Such a line alone only ever counts as a transient failure: a billing/auth
-  // reading of its free text must not stop a live run or fail one that produced its answer,
-  // which is what the line meant before it was recognized at all.
-  if (/\bAI_[A-Za-z]*Error\b/.test(line)) {
-    const type = providerErrorTypeFromText(line);
-    return SDK_ONLY_PROVIDER_ERROR_TYPES.has(type) ? type : "";
-  }
-  return "";
-}
 
-const SDK_ONLY_PROVIDER_ERROR_TYPES = new Set(["opencode_rate_limited", "opencode_transient_provider_error", "opencode_provider_unavailable", "opencode_transport_error"]);
 
-function providerErrorTypeFromStructuredEvent(event) {
-  if (!event || typeof event !== "object" || (event.type !== "error" && event.type !== "session.error" && !event.error && !event.data?.error && !event.properties?.error)) {
-    return "";
-  }
-  const errorValue = event.error ?? event.data?.error ?? event.properties?.error;
-  if (typeof errorValue === "string") {
-    // The event already is an error, so the wider gateway phrases may name its type here.
-    return providerErrorTypeFromDiagnosticLine(errorValue)
-      || (GATEWAY_FAILURE_MESSAGE_PATTERN.test(errorValue) ? providerErrorTypeFromText(errorValue) : "");
-  }
-  if (!errorValue || typeof errorValue !== "object") {
-    return "";
-  }
-  const authoritativeFields = [
-    errorValue.name,
-    errorValue.type,
-    errorValue.code,
-    errorValue.status,
-    errorValue.statusCode,
-    errorValue.data?.code,
-    errorValue.data?.status,
-    errorValue.data?.statusCode,
-    errorValue.data?.providerID,
-    errorValue.data?.providerId,
-    errorValue.providerID,
-    errorValue.providerId,
-    event.providerID,
-    event.providerId,
-  ].filter((item) => item !== undefined && item !== null && String(item).trim()).join(" ");
-  const fieldType = providerErrorTypeFromText(authoritativeFields);
-  // A status code is authoritative over message wording: 429 is a rate limit even when the
-  // message mentions billing, 402 is billing. Message text only refines a status-less error.
-  const statusValues = [
-    errorValue.status,
-    errorValue.statusCode,
-    errorValue.code,
-    errorValue.data?.status,
-    errorValue.data?.statusCode,
-    errorValue.data?.code,
-  ].map((item) => String(item ?? "").trim()).filter(Boolean);
-  const messageText = [errorValue.message, errorValue.detail, errorValue.data?.message, errorValue.data?.detail].filter(Boolean).join(" ");
-  const statusType = statusValues.includes("402")
-    ? "opencode_billing_error"
-    : statusValues.length ? providerErrorTypeFromText(statusValues.join(" ")) : "";
-  const hasProviderContext = /(?:^|\s)(?:APIError|CreditsError|Provider[A-Za-z]*(?:Error|Timeout)|OAuth[A-Za-z]*Error|Auth[A-Za-z]*Error|Quota[A-Za-z]*Error|RateLimit[A-Za-z]*Error|Billing[A-Za-z]*Error|Transport[A-Za-z]*Error|Network[A-Za-z]*Error|Fetch[A-Za-z]*Error|Timeout[A-Za-z]*Error)(?:\s|$)/i.test(authoritativeFields)
-    || Boolean(errorValue.providerID || errorValue.providerId || errorValue.data?.providerID || errorValue.data?.providerId);
-  const contextualType = hasProviderContext
-    ? providerErrorTypeFromText([authoritativeFields, messageText].filter(Boolean).join(" "))
-    : "";
-  let type = "";
-  if (statusType === "opencode_rate_limited") {
-    // Still a rate limit unless the text adds an explicit billing marker or a daily quota.
-    type = providerErrorTypeFromText([statusValues.join(" "), authoritativeFields, messageText].filter(Boolean).join(" "));
-  } else if (statusType && statusType !== "opencode_api_error") {
-    type = statusType;
-  } else {
-    type = (fieldType && fieldType !== "opencode_api_error" ? fieldType : "") || contextualType || fieldType;
-  }
-  // B-043: an error event carrying only a message (name "UnknownError", no status field) that
-  // says "[504] Upstream idle timeout exceeded" is a gateway failure all the same.
-  if ((!type || type === "opencode_api_error") && GATEWAY_FAILURE_MESSAGE_PATTERN.test(messageText)) {
-    type = providerErrorTypeFromText(messageText) || "opencode_transient_provider_error";
-  }
-  // OpenCode marks provider errors it would retry itself (429, 5xx, overloaded) isRetryable.
-  if (errorValue.data?.isRetryable === true || errorValue.isRetryable === true) {
-    if (type === "opencode_billing_error" && !/insufficient_quota|CreditsError|payment.required|\b402\b/i.test(`${authoritativeFields} ${messageText}`)) {
-      type = "opencode_rate_limited";
-    } else if (!type || type === "opencode_api_error") {
-      type = "opencode_transient_provider_error";
-    }
-  }
-  return type;
-}
 
-function modelEvidenceFromEvent(event) {
-  if (!event || typeof event !== "object") return null;
-  const authoritative = event.type === "message.updated"
-    ? (event.properties?.info || event.info || event.data?.info)
-    : event.type === "assistant_message"
-      ? (event.message || event.data)
-      : null;
-  if (!authoritative || authoritative.role !== "assistant") return null;
-  const provider = authoritative.providerID || authoritative.providerId || authoritative.provider_id;
-  const model = authoritative.modelID || authoritative.modelId || authoritative.model_id;
-  if (typeof provider === "string" && typeof model === "string" && provider && model) {
-    return { provider: provider.slice(0, 120), model: model.slice(0, 240) };
-  }
-  return null;
-}
-
-function providerDiagnosticLinesFromStderr(stderr) {
-  return String(stderr || "")
-    .split(/\r?\n/)
-    .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
-    .filter((line) => !/^\s*(?:task|prompt|messages|input)\s*[:=]/i.test(line))
-    .filter((line) => Boolean(providerErrorTypeFromDiagnosticLine(line)));
-}
-
-function providerDiagnosticTextFromStderr(stderr) {
-  return providerDiagnosticLinesFromStderr(stderr).slice(-100).join("\n");
-}
-
-// Token usage from OpenCode's step_finish events (one per model step, subagent sessions included).
-function emptyOpenCodeUsage() {
-  // Field names avoid "token" and "input": sanitizePersistedValue drops or hashes those keys.
-  return { steps: 0, inputCount: 0, outputCount: 0, reasoningCount: 0, cacheReadCount: 0, cacheWriteCount: 0, cost: 0, rootSteps: 0 };
-}
-
-function addStepFinishUsage(usage, event, rootSessionId) {
-  const tokens = event?.part?.tokens;
-  if (!tokens || typeof tokens !== "object") return false;
-  const count = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
-  usage.steps += 1;
-  if (!rootSessionId || String(event.sessionID || event.part?.sessionID || "") === rootSessionId) usage.rootSteps += 1;
-  usage.inputCount += count(tokens.input);
-  usage.outputCount += count(tokens.output);
-  usage.reasoningCount += count(tokens.reasoning);
-  usage.cacheReadCount += count(tokens.cache?.read);
-  usage.cacheWriteCount += count(tokens.cache?.write);
-  usage.cost += count(event.part.cost);
-  return true;
-}
-
-function formatOpenCodeUsage(usage) {
-  if (!usage || !usage.steps) return "not emitted by OpenCode";
-  const cost = Math.round(Number(usage.cost || 0) * 1e6) / 1e6;
-  return `steps=${usage.steps} input=${usage.inputCount} output=${usage.outputCount} reasoning=${usage.reasoningCount} cache_read=${usage.cacheReadCount} cache_write=${usage.cacheWriteCount} cost=${cost}${cost === 0 ? " (provider reported no price)" : ""}`;
-}
-
-// Q-003: OpenCode reports token counts per model step (step_finish), not per tool call. A tool
-// call's cost is therefore estimated from what the stream does carry: the call's result enters
-// the prompt of the step after it, so the growth of the prompt size (input + cache read + cache
-// write) from one step to the next, less the assistant output of that step, is the size of that
-// step's tool results; it is split over the step's calls by result length. Every later step
-// sends the result again, so growth x later steps is the input the result cost. These are
-// estimates for ranking ("which call read the most"), not billing figures. Field names avoid
-// "token" and "input" for sanitizePersistedValue.
-function emptyToolWeights() {
-  return new Map();
-}
-
-function toolWeightSession(weights, sessionId) {
-  if (!weights.has(sessionId)) weights.set(sessionId, { pending: [], steps: [] });
-  return weights.get(sessionId);
-}
-
-function noteToolUse(weights, sessionId, part) {
-  const session = toolWeightSession(weights, sessionId);
-  if (session.pending.length >= 25) return;
-  const input = part?.state?.input && typeof part.state.input === "object" ? part.state.input : {};
-  const targetKey = ["pattern", "command", "filePath", "path", "url", "query", "description"].find((key) => typeof input[key] === "string" && input[key]);
-  const label = targetKey ? `${targetKey === "filePath" || targetKey === "path" ? "" : `${targetKey}: `}${input[targetKey]}${targetKey === "pattern" && typeof input.path === "string" && input.path ? ` in ${input.path}` : ""}` : "";
-  session.pending.push({
-    tool: String(part?.tool || "unknown").slice(0, 40),
-    target: redactSensitiveText(label).replace(/\s+/g, " ").slice(0, 120),
-    outputChars: String(part?.state?.output ?? part?.state?.error ?? "").length,
-  });
-}
-
-function noteStepFinish(weights, sessionId, tokens) {
-  const count = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
-  const session = toolWeightSession(weights, sessionId);
-  session.steps.push({
-    context: count(tokens?.input) + count(tokens?.cache?.read) + count(tokens?.cache?.write),
-    output: count(tokens?.output),
-    tools: session.pending,
-  });
-  session.pending = [];
-}
-
-function heaviestToolCalls(weights, limit = 3) {
-  const calls = [];
-  for (const session of weights.values()) {
-    const { steps } = session;
-    for (let index = 0; index < steps.length - 1; index += 1) {
-      const step = steps[index];
-      if (!step.tools.length) continue;
-      const growth = Math.max(0, steps[index + 1].context - step.context - step.output);
-      if (!growth) continue;
-      const totalChars = step.tools.reduce((sum, tool) => sum + tool.outputChars, 0);
-      const laterSteps = steps.length - 1 - index;
-      for (const tool of step.tools) {
-        const share = totalChars ? tool.outputChars / totalChars : 1 / step.tools.length;
-        const added = Math.round(growth * share);
-        if (added) calls.push({ tool: tool.tool, target: tool.target, addedContextCount: added, laterSteps, rereadInputCount: added * laterSteps });
-      }
-    }
-  }
-  return calls.sort((left, right) => right.rereadInputCount - left.rereadInputCount).slice(0, limit);
-}
-
-// Top calls over several runs of one job (read-only retries, a validation fix pass).
-function mergeHeavyToolCalls(...lists) {
-  return lists.flat().filter((call) => call && typeof call === "object")
-    .sort((left, right) => Number(right.rereadInputCount || 0) - Number(left.rereadInputCount || 0)).slice(0, 3);
-}
-
-function formatHeavyToolCalls(calls) {
-  if (!Array.isArray(calls) || !calls.length) return "";
-  return `Heaviest tool calls (estimated input re-read by later steps): ${calls
-    .map((call) => `${call.tool}${call.target ? ` ${call.target}` : ""} +${call.addedContextCount} context x ${call.laterSteps} steps = ~${call.rereadInputCount}`)
-    .join("; ")}`;
-}
-
-function inspectOpenCodeEventStream(stdout, stderr = "") {
-  const stderrDiagnosticLines = providerDiagnosticLinesFromStderr(stderr);
-  const stderrProviderErrorType = providerErrorTypeFromText(stderrDiagnosticLines.slice(-100).join("\n"));
-  const usage = emptyOpenCodeUsage();
-  const toolWeights = emptyToolWeights();
-  let providerErrorType = stderrProviderErrorType;
-  let stdoutErrorDetected = false;
-  const toolOutcomes = [];
-  let parsedEvents = 0;
-  let invalidLines = 0;
-  let malformedEventLines = 0;
-  let rootSessionId = "";
-  let permissionDeniedCount = 0;
-  const runtimeModels = [];
-  const sessions = new Map();
-  const sessionState = (id) => {
-    if (!sessions.has(id)) sessions.set(id, { lastEvent: "", messageId: "", parts: new Map() });
-    return sessions.get(id);
-  };
-
-  for (const line of (stdout || "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    try {
-      const event = JSON.parse(trimmed);
-      parsedEvents += 1;
-      if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string") {
-        malformedEventLines += 1;
-        continue;
-      }
-      const info = event.type === "message.updated"
-        ? (event.properties?.info || event.info || event.data?.info)
-        : event.type === "assistant_message" ? (event.message || event.data) : null;
-      const sessionId = String(info?.sessionID || event.sessionID || event.part?.sessionID || "");
-      if (!rootSessionId && ["step_start", "text", "tool_use"].includes(event.type) && event.sessionID) {
-        rootSessionId = String(event.sessionID);
-      }
-      const state = sessionState(sessionId);
-      const modelEvidence = modelEvidenceFromEvent(event);
-      if (modelEvidence) runtimeModels.push({ ...modelEvidence, sessionId });
-      if (event?.type === "error" || event?.type === "session.error" || event?.error || event?.data?.error || event?.properties?.error) {
-        stdoutErrorDetected = true;
-        providerErrorType = providerErrorTypeFromStructuredEvent(event) || providerErrorType;
-        state.lastEvent = "error";
-        continue;
-      }
-      // Not a turn boundary: step_finish follows the final text part, so it leaves lastEvent alone.
-      if (event.type === "step_finish" && addStepFinishUsage(usage, event, rootSessionId)) {
-        noteStepFinish(toolWeights, sessionId, event.part.tokens);
-        continue;
-      }
-      if (event?.type === "text" && event?.part?.type === "text") {
-        state.lastEvent = "incomplete_text";
-        if (!event.part.time?.end) continue;
-        const text = String(event.part.text || "").trim();
-        if (text) {
-          // Identified parts are full snapshots, not deltas. Replace repeats;
-          // retain distinct parts only within the final assistant message.
-          const messageId = String(event.part.messageID || event.messageID || `legacy-${parsedEvents}`);
-          if (messageId !== state.messageId) state.parts.clear();
-          state.messageId = messageId;
-          state.parts.set(String(event.part.id || `part-${parsedEvents}`), text);
-          state.lastEvent = "text";
-        }
-        continue;
-      }
-      if (event?.type === "tool_use") {
-        state.lastEvent = "tool_use";
-        const toolError = String(event.part?.state?.error || "");
-        if (/permission.{0,40}(denied|reject)|(?:denied|reject).{0,40}permission|auto-rejecting/i.test(toolError)) {
-          permissionDeniedCount += 1;
-        }
-        if (toolOutcomes.length < 50) {
-          toolOutcomes.push({
-            tool: String(event?.part?.tool || "unknown"),
-            status: String(event?.part?.state?.status || "unknown"),
-          });
-        }
-        noteToolUse(toolWeights, sessionId, event.part);
-      }
-    } catch {
-      invalidLines += 1;
-      malformedEventLines += 1;
-      const detected = providerErrorTypeFromDiagnosticLine(trimmed);
-      if (detected) {
-        stdoutErrorDetected = true;
-        providerErrorType = detected || providerErrorType;
-      }
-    }
-  }
-
-  const observedSessionIds = [...new Set(runtimeModels.map((item) => item.sessionId).filter(Boolean))];
-  if (!rootSessionId && observedSessionIds.length === 1) rootSessionId = observedSessionIds[0];
-  const modelEvidenceAmbiguous = !rootSessionId && observedSessionIds.length > 1;
-  const rootModels = runtimeModels.filter((item) => !rootSessionId || item.sessionId === rootSessionId || !item.sessionId);
-  const identities = [...new Map(rootModels.map(({ provider, model }) => [`${provider}\0${model}`, { provider, model }])).values()];
-  const runtimeModelEvidence = identities.at(-1);
-  const finalState = sessions.get(rootSessionId)?.lastEvent ? sessions.get(rootSessionId) : sessions.get("");
-  const finalText = finalState ? [...finalState.parts.values()].join("\n\n") : "";
-  const finalResponseDetected = finalState?.lastEvent === "text" && Boolean(finalText);
-  const deniedDiagnostics = String(stderr).split(/\r?\n/)
-    .filter((line) => /permission requested:.*auto-rejecting|permission.{0,30}denied/i.test(line))
-    .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line));
-  permissionDeniedCount = Math.max(permissionDeniedCount, deniedDiagnostics.length);
-  // OpenCode logs every failed provider attempt to stderr, including ones it retried and
-  // then completed; a generic APIError there must not fail a run that produced its answer.
-  const recoveredTransientProviderError = !stdoutErrorDetected
-    && ["opencode_transient_provider_error", "opencode_rate_limited", "opencode_provider_unavailable", "opencode_transport_error", "opencode_api_error"].includes(stderrProviderErrorType)
-    && finalResponseDetected;
-  if (recoveredTransientProviderError) {
-    providerErrorType = "";
-  }
-  const quotaNotice = syntheticProviderQuotaNotice(finalText);
-  if (quotaNotice) providerErrorType = quotaNotice.errorType;
-  const apiErrorDetected = stdoutErrorDetected || Boolean(providerErrorType);
-  const finalTextTruncated = finalText.length > CONFIG.maxAssistantResponseChars;
-  return {
-    apiErrorDetected,
-    providerErrorType: providerErrorType || "",
-    recoveredTransientProviderError: recoveredTransientProviderError && !quotaNotice,
-    providerWarningType: recoveredTransientProviderError && !quotaNotice ? stderrProviderErrorType : "",
-    providerQuotaNotice: quotaNotice,
-    // Each classified stderr line is one provider attempt that failed (OpenCode retries some itself).
-    providerRetryWarningCount: stderrDiagnosticLines.length,
-    usage,
-    heavyToolCalls: heaviestToolCalls(toolWeights),
-    retryAfterMs: quotaNotice?.resetMs || retryAfterMsFromText(`${stderr}\n${stdout}`),
-    runtimeObservedProvider: runtimeModelEvidence?.provider || "",
-    runtimeObservedModel: runtimeModelEvidence?.model || "",
-    runtimeModelIdentities: identities,
-    runtimeModelConflict: identities.length > 1,
-    modelEvidenceAmbiguous,
-    rootSessionId,
-    permissionDeniedCount,
-    streamIntegrity: malformedEventLines ? "malformed" : "valid",
-    malformedEventLines,
-    finalResponseDetected,
-    finalText: redactLikelySecrets(finalTextTruncated ?`${finalText.slice(0, CONFIG.maxAssistantResponseChars)}\n... [assistant response truncated by bridge]` : finalText),
-    finalTextTruncated,
-    toolOutcomes,
-    parsedEvents,
-    invalidLines,
-  };
-}
-
-function detectsOpenCodeApiError(stdout, stderr = "") {
-  return inspectOpenCodeEventStream(stdout, stderr).apiErrorDetected;
-}
 
 async function readAgentDefinition(agent) {
   try {
@@ -6613,146 +3864,6 @@ async function resolveAgent(requestedAgent, cwd, allowFallbackToBuild = false, s
     availableAgents: availableAgentLabels(agents),
     discoveryExitCode: result.exitCode,
   };
-}
-
-function normalizeList(value) {
-  if (!value) {
-    return [];
-  }
-  return Array.isArray(value) ? value.filter(Boolean) : [String(value)];
-}
-
-function uniqueList(values) {
-  return [...new Set(normalizeList(values).map((value) => String(value).trim()).filter(Boolean))];
-}
-
-function normalizeLockPath(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return "";
-  }
-
-  const slashNormalized = raw
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/^(?:\.\/)+/, "")
-    .replace(/\/\.(?=\/|$)/g, "")
-    .replace(/\/+/g, "/");
-  // Only "dir/**" means the whole directory. "dir/*" is one level and stays a glob:
-  // stripping it turned allowedEdits ["src/cli/*"] into "src/cli", which allowed src/cli/deep/x.ts.
-  // A plain directory name already covers its subtree, so its "/**" is dropped. With wildcards
-  // before the suffix ("**/secrets/**", "**/.git/**") the path is matched as a glob, where
-  // "**/secrets" is only a directory named secrets: dropping the suffix there let
-  // pkg/secrets/credentials.txt pass the forbidden rule. globToRegex reads the kept suffix.
-  let normalized = slashNormalized.replace(/\/+$/, "");
-  if (normalized.endsWith("/**") && !/[*?[\]{}!]/.test(normalized.slice(0, -3))) {
-    normalized = normalized.slice(0, -3).replace(/\/+$/, "");
-  }
-  return normalized || (slashNormalized.startsWith("/") ? "/" : "");
-}
-
-function hasParentTraversalSegment(value) {
-  return String(value || "")
-    .replace(/\\/g, "/")
-    .split("/")
-    .some((segment) => segment === "..");
-}
-
-function toggledAsciiCase(value) {
-  const input = String(value || "");
-  const index = input.search(/[A-Za-z]/);
-  if (index < 0) return "";
-  const character = input[index];
-  const toggled = character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase();
-  return `${input.slice(0, index)}${toggled}${input.slice(index + 1)}`;
-}
-
-function sameFilesystemObject(leftPath, rightPath) {
-  const left = lstatSync(leftPath, { bigint: true });
-  const right = lstatSync(rightPath, { bigint: true });
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
-function filesystemCaseModeForRoot(cwd = "") {
-  if (!cwd) return process.platform === "win32" ? "insensitive" : "sensitive";
-  const root = path.resolve(cwd);
-  const cached = FILESYSTEM_CASE_MODE_CACHE.get(root);
-  if (cached) return cached;
-
-  let mode = "conservative_insensitive";
-  try {
-    const realRoot = realpathSync(root);
-    const entries = readdirSync(realRoot);
-    const exactNames = new Set(entries);
-    for (const entry of entries) {
-      const toggled = toggledAsciiCase(entry);
-      if (!toggled || exactNames.has(toggled)) continue;
-      try {
-        mode = sameFilesystemObject(path.join(realRoot, entry), path.join(realRoot, toggled))
-          ? "insensitive"
-          : "sensitive";
-        break;
-      } catch (error) {
-        if (error?.code === "ENOENT") {
-          mode = "sensitive";
-          break;
-        }
-      }
-    }
-  } catch {
-    // Unknown filesystem semantics fail safely by folding case for lock identity.
-  }
-  FILESYSTEM_CASE_MODE_CACHE.set(root, mode);
-  return mode;
-}
-
-function realPathBoundaryReason(rawPath, cwd) {
-  if (!cwd) {
-    return "";
-  }
-  const root = path.resolve(cwd);
-  if (!existsSync(root)) {
-    return `Allowed root does not exist: ${root}.`;
-  }
-
-  const normalized = normalizeLockPath(rawPath);
-  const wildcardIndex = normalized.search(/[*?[\]{}!]/);
-  const staticValue = wildcardIndex === -1 ? normalized : normalized.slice(0, wildcardIndex).replace(/[\\/]+$/, "");
-  const candidate = path.resolve(root, staticValue || ".");
-  let nearest = candidate;
-  while (!existsSync(nearest) && nearest !== path.parse(nearest).root) {
-    nearest = path.dirname(nearest);
-  }
-
-  try {
-    const realRoot = realpathSync(root);
-    const realNearest = realpathSync(nearest);
-    const relativeReal = path.relative(realRoot, realNearest);
-    if (pathRelativeEscapes(relativeReal) || path.isAbsolute(relativeReal)) {
-      return `Path ${JSON.stringify(rawPath)} resolves through a symlink or junction outside the allowed root ${realRoot}.`;
-    }
-
-    const relativeLexical = path.relative(root, nearest);
-    let current = root;
-    for (const segment of relativeLexical.split(path.sep).filter(Boolean)) {
-      current = path.join(current, segment);
-      if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
-        return `Path ${JSON.stringify(rawPath)} traverses a symbolic link or junction at ${current}.`;
-      }
-    }
-  } catch (error) {
-    return `Path ${JSON.stringify(rawPath)} could not be safely resolved: ${error.message || String(error)}.`;
-  }
-
-  return "";
-}
-
-// G-08: a ':' anywhere but a leading drive ("C:/...") names a stream or a drive-relative path on
-// win32. Elsewhere ':' is an ordinary file-name character.
-function windowsStreamSyntax(normalized, platform = process.platform) {
-  if (platform !== "win32") return false;
-  const withoutDrive = String(normalized || "").replace(/^[A-Za-z]:(?:\/|$)/, "");
-  return withoutDrive.includes(":");
 }
 
 // G-08: Git reports neither the bytes of an NTFS alternate data stream nor what a write through a
@@ -6966,219 +4077,6 @@ function writableScopeFilesystemViolation(before, after) {
   return null;
 }
 
-function unsafePathReason(paths, cwd = "") {
-  const root = cwd ? path.resolve(cwd) : "";
-  for (const rawPath of normalizeList(paths)) {
-    const raw = String(rawPath || "");
-    const normalized = normalizeLockPath(raw);
-    const label = JSON.stringify(raw);
-
-    if (!normalized) {
-      return `Unsafe path ${label} is empty.`;
-    }
-
-    if (/[\0\r\n]/.test(raw)) {
-      return `Unsafe path ${label} contains control characters.`;
-    }
-
-    if (windowsStreamSyntax(normalized)) {
-      return `Unsafe path ${label} contains ':' inside a path segment. On Windows that names an NTFS alternate data stream (file.txt:stream, file::$DATA), whose bytes Git never reports, or a drive-relative path (C:file). Use a plain file or directory path.`;
-    }
-
-    if (normalized === "~" || normalized.startsWith("~/")) {
-      return `Unsafe path ${label} uses a home-directory shortcut. Use an explicit path.`;
-    }
-
-    if (normalized === "." || normalized === "/" || /^[A-Za-z]:\/?$/.test(normalized)) {
-      return `Unsafe path ${label} targets a filesystem root. Use a bounded file or directory.`;
-    }
-
-    if (hasParentTraversalSegment(raw) || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
-      return `Unsafe path ${label} includes parent traversal.`;
-    }
-
-    if (isAbsolutePathLike(normalized) && root) {
-      const resolved = path.resolve(normalized);
-      const relative = path.relative(root, resolved);
-      if (!relative || pathRelativeEscapes(relative) || path.isAbsolute(relative)) {
-        return `Unsafe path ${label} resolves outside the allowed root ${root}.`;
-      }
-    }
-
-    const realBoundaryError = realPathBoundaryReason(normalized, root);
-    if (realBoundaryError) {
-      return realBoundaryError;
-    }
-  }
-
-  return "";
-}
-
-function normalizeLockPathList(values) {
-  return [...new Set(uniqueList(values).map(normalizeLockPath).filter(Boolean))];
-}
-
-function normalizeLockPathForCwd(value, cwd = "") {
-  const raw = String(value || "").trim();
-  const normalized = normalizeLockPath(value);
-  if (!normalized || !cwd) {
-    return normalized;
-  }
-  if (hasParentTraversalSegment(raw)) return normalized;
-
-  const root = path.resolve(cwd);
-  const resolved = isAbsolutePathLike(raw)
-    ? path.resolve(raw)
-    : path.resolve(root, normalized);
-  const relative = normalizeLockPath(path.relative(root, resolved) || REPOSITORY_SCOPE_LOCK_PATH);
-  return normalizeFilesystemCase(relative, root);
-}
-
-function normalizeLockPathListForCwd(values, cwd = "") {
-  return [
-    ...new Set(
-      uniqueList(values)
-        .map((value) => normalizeLockPathForCwd(value, cwd))
-        .filter(Boolean)
-    ),
-  ];
-}
-
-function mergePathLists(...values) {
-  return normalizeLockPathList(values.flatMap((value) => normalizeList(value)));
-}
-
-function normalizeScopeMode(mode) {
-  const raw = String(mode || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  if (!raw) {
-    return "";
-  }
-  if (raw === "readonly" || raw === "read_only") {
-    return "read";
-  }
-  if (raw === "write" || raw === "read") {
-    return raw;
-  }
-  return raw;
-}
-
-function rawScopeContractInput(job) {
-  if (job?.scopeContract) {
-    return job.scopeContract;
-  }
-
-  if (job?.delegation?.scopeContract) {
-    return job.delegation.scopeContract;
-  }
-
-  if (job?.scope && !Array.isArray(job.scope) && typeof job.scope === "object") {
-    return {
-      agent: job.agent,
-      role: job.role,
-      mode: job.mode,
-      scope: job.scope,
-      actions: job.actions,
-      validation: job.validation,
-      timeoutMs: job.timeoutMs,
-      timeoutPolicy: job.timeoutPolicy,
-    };
-  }
-
-  if (job?.delegation?.scope && !Array.isArray(job.delegation.scope) && typeof job.delegation.scope === "object") {
-    return {
-      agent: job.agent,
-      role: job.delegation.role,
-      mode: job.delegation.mode,
-      scope: job.delegation.scope,
-      actions: job.delegation.actions,
-      validation: job.delegation.validation,
-      timeoutMs: job.delegation.timeoutMs,
-      timeoutPolicy: job.delegation.timeoutPolicy,
-    };
-  }
-
-  return null;
-}
-
-function normalizeScopeContract(job) {
-  const raw = rawScopeContractInput(job);
-  if (!raw) {
-    return null;
-  }
-
-  const normalized = {
-    ...(raw.modelRequirement !== undefined ? { modelRequirement: modelRequirementSchema.parse(raw.modelRequirement) } : {}),
-    // Q-009: kept as written (validated by selfCheckCommandsError, matched exactly by OpenCode).
-    ...(raw.selfCheckCommands !== undefined ? { selfCheckCommands: Array.isArray(raw.selfCheckCommands) ? raw.selfCheckCommands.map((item) => String(item).trim()) : raw.selfCheckCommands } : {}),
-    agent: String(raw.agent || job.agent || "").trim(),
-    role: String(raw.role || "").trim(),
-    mode: normalizeScopeMode(raw.mode),
-    scope: {
-      read: mergePathLists(raw.scope?.read, raw.read),
-      write: mergePathLists(raw.scope?.write, raw.write),
-      forbidden: mergePathLists(raw.scope?.forbidden, raw.forbidden),
-    },
-    allowedEdits: normalizeLockPathList(raw.allowedEdits),
-    shared: normalizeLockPathList(raw.shared),
-    serialOnly: normalizeLockPathList(raw.serialOnly),
-    validationCommand: String(raw.validationCommand || "").trim(),
-    actions: uniqueList(raw.actions).map((action) => String(action).trim()).filter(Boolean),
-    validation: {
-      changedFilesMustBeWithinWriteScope: raw.validation?.changedFilesMustBeWithinWriteScope !== false,
-      forbiddenFilesMustNotChange: raw.validation?.forbiddenFilesMustNotChange !== false,
-      readOnlyMustNotChangeFiles: raw.validation?.readOnlyMustNotChangeFiles !== false,
-    },
-    timeoutMs: raw.timeoutMs || raw.timeoutPolicy?.timeoutMs || null,
-    timeoutPolicy: {
-      readOnlyTimeoutMs: raw.timeoutPolicy?.readOnlyTimeoutMs || null,
-      writeTimeoutMs: raw.timeoutPolicy?.writeTimeoutMs || null,
-    },
-  };
-
-  if (!normalized.mode) {
-    normalized.mode = normalized.scope.write.length ? "write" : "read";
-  }
-
-  const scopeRoot = job.cwd || "";
-  normalized.scope.read = normalizeLockPathListForCwd(normalized.scope.read, scopeRoot);
-  normalized.scope.write = normalizeLockPathListForCwd(normalized.scope.write, scopeRoot);
-  normalized.scope.forbidden = normalizeLockPathListForCwd(normalized.scope.forbidden, scopeRoot);
-  normalized.allowedEdits = normalizeLockPathListForCwd(normalized.allowedEdits, scopeRoot);
-  normalized.shared = normalizeLockPathListForCwd(normalized.shared, scopeRoot);
-  normalized.serialOnly = normalizeLockPathListForCwd(normalized.serialOnly, scopeRoot);
-
-  return normalized;
-}
-
-function ownerMatchesPolicyValue(owner, value) {
-  if (!owner) {
-    return false;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).includes(owner);
-  }
-
-  return String(value || "").trim() === owner;
-}
-
-function normalizeProjectAgentPolicy(raw = {}) {
-  const parsed = projectAgentPolicySchema.parse(raw);
-  const owners = parsed.owners && typeof parsed.owners === "object" && !Array.isArray(parsed.owners) ? parsed.owners : {};
-  return {
-    owners: Object.fromEntries(
-      Object.entries(owners)
-        .map(([pathKey, owner]) => [normalizeLockPath(pathKey), owner])
-        .filter(([pathKey]) => Boolean(pathKey))
-    ),
-    sharedFiles: mergePathLists(DEFAULT_SHARED_FILE_PATHS, parsed.sharedFiles, parsed.contracts),
-    serialOnly: mergePathLists(SERIAL_ONLY_PATHS, parsed.serialOnly),
-    forbiddenEdits: mergePathLists(DEFAULT_FORBIDDEN_EDIT_PATHS, parsed.forbiddenEdits),
-    finalValidationCommand: String(parsed.finalValidationCommand || "").trim(),
-    requiresWorktrees: parsed.requiresWorktrees === true ? true : null,
-  };
-}
-
 async function loadProjectAgentPolicy(
   cwd = "",
   policyPath = ".mcp/agent-policy.json",
@@ -7285,260 +4183,11 @@ async function loadProjectAgentPolicy(
   }
 }
 
-function applyProjectPolicyToJobs(jobs = [], policy = null, { allowOwnershipInference = false } = {}) {
-  if (!policy) {
-    return jobs.map((job) => ({ ...job }));
-  }
 
-  return jobs.map((job) => {
-    const owner = String(job.owner || job.role || job.agent || "").trim();
-    const ownedPaths = Object.entries(policy.owners)
-      .filter(([, value]) => ownerMatchesPolicyValue(owner, value))
-      .map(([ownedPath]) => ownedPath);
-    const otherOwnerPaths = Object.entries(policy.owners)
-      .filter(([, value]) => !ownerMatchesPolicyValue(owner, value))
-      .map(([ownedPath]) => ownedPath);
-    const writeScope = normalizeLockPathList(job.scope?.write || job.scopeContract?.scope?.write || job.delegation?.scopeContract?.scope?.write);
-    const shouldInferWriteScope = allowOwnershipInference && (job.write === true || writeScope.length) && ownedPaths.length;
-    const inferredWritePaths = shouldInferWriteScope ? ownedPaths : [];
-    const lockedPaths = firstNonEmptyList(job.lockedPaths, job.ownedPaths, job.delegation?.lockedPaths, inferredWritePaths);
-    const allowedEdits = firstNonEmptyList(job.allowedEdits, job.delegation?.allowedEdits, writeScope, inferredWritePaths);
-    const forbiddenEdits = mergePathLists(
-      job.forbiddenEdits,
-      job.delegation?.forbiddenEdits,
-      policy.forbiddenEdits,
-      policy.sharedFiles,
-      policy.serialOnly,
-      otherOwnerPaths
-    );
-    const sharedFiles = mergePathLists(job.sharedFiles, job.delegation?.sharedFiles, policy.sharedFiles);
-    const serialOnly = mergePathLists(job.serialOnly, job.delegation?.serialOnly, policy.serialOnly);
-    const scopeContract = rawScopeContractInput(job)
-      ? job.scopeContract
-      : shouldInferWriteScope
-        ? {
-            agent: job.agent,
-            role: owner,
-            mode: "write",
-            read: mergePathLists(ownedPaths, sharedFiles),
-            write: allowedEdits,
-            allowedEdits,
-            forbidden: forbiddenEdits,
-            shared: sharedFiles,
-            serialOnly,
-            validationCommand: job.validationCommand || job.delegation?.validationCommand || "",
-          }
-        : job.scopeContract;
 
-    return {
-      ...job,
-      lockedPaths,
-      allowedEdits,
-      forbiddenEdits,
-      sharedFiles,
-      serialOnly,
-      scopeContract,
-      policyOwner: owner,
-      policyOwnedPaths: ownedPaths,
-    };
-  });
-}
 
-function scopeContractPathInputs(scopeContract) {
-  return scopeContract
-    ? scopeContract.scope.read.concat(
-      scopeContract.scope.write,
-      scopeContract.scope.forbidden,
-      scopeContract.allowedEdits,
-      scopeContract.shared,
-      scopeContract.serialOnly
-    )
-    : [];
-}
 
-function scopeContractTimeout(scopeContract, lockType) {
-  if (!scopeContract) {
-    return null;
-  }
-  if (scopeContract.timeoutMs) {
-    return scopeContract.timeoutMs;
-  }
-  return lockType === "read"
-    ? scopeContract.timeoutPolicy.readOnlyTimeoutMs
-    : scopeContract.timeoutPolicy.writeTimeoutMs;
-}
 
-function formatScopeContractForPrompt(scopeContract, spell = (values) => normalizeList(values)) {
-  if (!scopeContract) {
-    return "";
-  }
-  const list = (values) => spell(values).join(", ");
-
-  return [
-    `Agent: ${scopeContract.agent || "not specified"}`,
-    `Role: ${scopeContract.role || "not specified"}`,
-    `Mode: ${scopeContract.mode}`,
-    ...(scopeContract.modelRequirement ? [
-      `Required managed provider/model: ${scopeContract.modelRequirement.provider}/${scopeContract.modelRequirement.model}`,
-      `Required variant: ${scopeContract.modelRequirement.variant || "not specified"}`,
-      `Runtime model evidence required: ${scopeContract.modelRequirement.requireRuntimeEvidence ? "yes" : "no"}`,
-    ] : []),
-    `Read paths: ${scopeContract.scope.read.length ? list(scopeContract.scope.read) : "not specified"}`,
-    `Write paths: ${scopeContract.scope.write.length ? list(scopeContract.scope.write) : "none"}`,
-    `Allowed edits: ${scopeContract.allowedEdits.length ? list(scopeContract.allowedEdits) : "not specified"}`,
-    `Forbidden paths: ${scopeContract.scope.forbidden.length ? list(scopeContract.scope.forbidden) : "none"}`,
-    `Shared/frozen paths: ${scopeContract.shared.length ? list(scopeContract.shared) : "none"}`,
-    `Serial-only paths: ${scopeContract.serialOnly.length ? list(scopeContract.serialOnly) : "none"}`,
-    `Validation command: ${scopeContract.validationCommand || "not specified"}`,
-    ...(Array.isArray(scopeContract.selfCheckCommands) && scopeContract.selfCheckCommands.length ? [
-      "Self-checks: when you finish, the bridge runs these commands in your working directory (you cannot run them). If one fails, you get another run with its output; fix what it reports then:",
-      ...scopeContract.selfCheckCommands.map((command) => `- ${command}`),
-    ] : []),
-    `Allowed actions: ${scopeContract.actions.length ? scopeContract.actions.join(", ") : "not specified"}`,
-    `Validation changedFilesMustBeWithinWriteScope: ${scopeContract.validation.changedFilesMustBeWithinWriteScope ? "yes" : "no"}`,
-    `Validation forbiddenFilesMustNotChange: ${scopeContract.validation.forbiddenFilesMustNotChange ? "yes" : "no"}`,
-    `Validation readOnlyMustNotChangeFiles: ${scopeContract.validation.readOnlyMustNotChangeFiles ? "yes" : "no"}`,
-  ].join("\n");
-}
-
-function escapeRegex(value) {
-  return String(value).replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-}
-
-// Callers route any pattern containing * ? [ ] { } ! here, so every one of them must mean
-// what it says: `?` one character, `[..]`/`[!..]` a class, `{a,b}` alternatives, `**/` zero
-// or more directories. `?`, `[` and `{` used to be escaped and matched only literally, and
-// `**/x` required a slash, so forbidden globs like "config/{prod,staging}.json" or
-// "**/settings.py" matched nothing and failed open. No wildcard ever matches "/".
-function globSourceToRegex(glob) {
-  let regex = "";
-  for (let index = 0; index < glob.length; index += 1) {
-    const char = glob[index];
-    if (char === "*") {
-      if (glob[index + 1] === "*") {
-        const atSegmentStart = index === 0 || glob[index - 1] === "/";
-        if (atSegmentStart && glob[index + 2] === "/") {
-          regex += "(?:.*/)?";
-          index += 2;
-        } else {
-          regex += ".*";
-          index += 1;
-        }
-      } else {
-        regex += "[^/]*";
-      }
-    } else if (char === "?") {
-      regex += "[^/]";
-    } else if (char === "[") {
-      const close = glob.indexOf("]", index + 2);
-      if (close === -1) {
-        regex += "\\[";
-        continue;
-      }
-      let body = glob.slice(index + 1, close);
-      const negated = body.startsWith("!") || body.startsWith("^");
-      if (negated) body = body.slice(1);
-      body = body.replace(/[\\\]^/]/g, (item) => (item === "/" ? "" : `\\${item}`));
-      regex += negated ? `[^/${body}]` : body ? `[${body}]` : "(?!)";
-      index = close;
-    } else if (char === "{") {
-      let depth = 0;
-      let close = -1;
-      const alternatives = [];
-      let start = index + 1;
-      for (let cursor = index; cursor < glob.length; cursor += 1) {
-        if (glob[cursor] === "{") depth += 1;
-        else if (glob[cursor] === "}") {
-          depth -= 1;
-          if (depth === 0) { close = cursor; break; }
-        } else if (glob[cursor] === "," && depth === 1) {
-          alternatives.push(glob.slice(start, cursor));
-          start = cursor + 1;
-        }
-      }
-      if (close === -1 || !alternatives.length) {
-        regex += "\\{";
-        continue;
-      }
-      alternatives.push(glob.slice(start, close));
-      regex += `(?:${alternatives.map(globSourceToRegex).join("|")})`;
-      index = close;
-    } else {
-      regex += escapeRegex(char);
-    }
-  }
-  return regex;
-}
-
-function globToRegex(pattern, matchDescendants = false) {
-  let normalized = normalizeLockPath(pattern);
-  // A glob directory pattern ("**/secrets/**") keeps its suffix through normalizeLockPath and
-  // means the directory and everything below it, whatever the caller passes for the flag.
-  if (normalized.endsWith("/**")) {
-    normalized = normalized.slice(0, -3);
-    matchDescendants = true;
-  }
-  const regex = globSourceToRegex(normalized);
-  return new RegExp(`^${regex}${matchDescendants ? "(?:/.*)?" : ""}$`, process.platform === "win32" ? "i" : "");
-}
-
-function serialPatternStaticPrefix(pattern) {
-  const normalized = normalizeLockPath(pattern);
-  const wildcardIndex = normalized.search(/[*?[\]{}!]/);
-  const prefix = wildcardIndex === -1 ? normalized : normalized.slice(0, wildcardIndex);
-  return normalizeLockPath(prefix.replace(/\/[^/]*$/, ""));
-}
-
-function pathOverlapsSerialPattern(candidate, pattern) {
-  const normalizedCandidate = normalizeLockPath(candidate);
-  const normalizedPattern = normalizeLockPath(pattern);
-  if (!normalizedCandidate || !normalizedPattern) {
-    return false;
-  }
-
-  if (globToRegex(normalizedPattern).test(normalizedCandidate)) {
-    return true;
-  }
-
-  const staticPrefix = serialPatternStaticPrefix(normalizedPattern);
-  if (normalizedPattern.includes("**") && staticPrefix && overlaps([normalizedCandidate], [staticPrefix])) {
-    return true;
-  }
-
-  if (!/[*?[\]{}!]/.test(normalizedPattern)) {
-    return Boolean(overlaps([normalizedCandidate], [normalizedPattern]));
-  }
-
-  return false;
-}
-
-function findSerialOnlyMatches(paths, serialOnlyPaths = []) {
-  const matches = [];
-  const seen = new Set();
-  const patterns = mergePathLists(SERIAL_ONLY_PATHS, serialOnlyPaths);
-  for (const candidate of normalizeLockPathList(paths)) {
-    for (const pattern of patterns) {
-      if (pathOverlapsSerialPattern(candidate, pattern)) {
-        const label = `${candidate} (${pattern})`;
-        if (!seen.has(label)) {
-          matches.push(label);
-          seen.add(label);
-        }
-      }
-    }
-  }
-  return matches;
-}
-
-function firstNonEmptyList(...values) {
-  for (const value of values) {
-    const list = normalizeLockPathList(value);
-    if (list.length) {
-      return list;
-    }
-  }
-  return [];
-}
 
 // Lock plans compare paths case-folded on case-insensitive filesystems, so their lists are
 // lower-case. Agents must see the caller's spelling: told "Allowed edits: src/parser.py"
@@ -9125,10 +5774,6 @@ async function integrationWorktreeRules(cwd) {
   return INTEGRATION_WORKTREE_RULES.get(key);
 }
 
-function integrationFingerprintMode(permissions, rules) {
-  return rules?.execBit && (Number(permissions) & 0o100) ? 0o111 : 0;
-}
-
 async function exactIntegrationFileSnapshot(cwd, files) {
   const snapshot = new Map();
   let totalBytes = 0;
@@ -9362,59 +6007,6 @@ function snapshotIdentitySha256(snapshot) {
     hash.update("\0");
   }
   return hash.digest("hex");
-}
-
-function isAbsolutePathLike(value) {
-  const raw = String(value || "");
-  return /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\") || raw.startsWith("/");
-}
-
-function normalizeFilesystemCase(value, cwd = "") {
-  const normalized = String(value || "");
-  if (cwd) {
-    return filesystemCaseModeForRoot(cwd) === "sensitive" ? normalized : normalized.toLowerCase();
-  }
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function comparePathCandidates(value, cwd = "") {
-  const raw = cwd ? normalizeLockPathForCwd(value, cwd) : normalizeLockPath(value);
-  if (!raw) {
-    return [];
-  }
-
-  const candidates = [raw];
-
-  return [
-    ...new Set(
-      candidates.map((candidate) =>
-        normalizeFilesystemCase(candidate.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, ""), cwd)
-      )
-    ),
-  ];
-}
-
-function isWithinAnyPath(file, allowedPaths = [], cwd = "") {
-  const fileCandidates = comparePathCandidates(file, cwd);
-  return allowedPaths.some((allowed) => {
-    const allowedCandidates = comparePathCandidates(allowed, cwd);
-    const rawAllowed = String(allowed || "").replace(/\\/g, "/").replace(/\/+$/, "");
-    const matchDescendants = rawAllowed.endsWith("/**");
-    return fileCandidates.some((normalizedFile) =>
-      allowedCandidates.some(
-        (normalizedAllowed) => /[*?[\]{}!]/.test(normalizedAllowed)
-          ? globToRegex(normalizedAllowed, matchDescendants).test(normalizedFile)
-          : normalizedFile === normalizedAllowed || normalizedFile.startsWith(`${normalizedAllowed}/`)
-      )
-    );
-  });
-}
-
-function unsafeChangedFiles(changedFiles, allowedPaths = [], cwd = "") {
-  if (!allowedPaths.length) {
-    return changedFiles;
-  }
-  return changedFiles.filter((file) => !isWithinAnyPath(file, allowedPaths, cwd));
 }
 
 async function readFileIfExists(filePath) {
@@ -9814,173 +6406,18 @@ function safeNamePart(value, fallback = "item") {
   return safe || fallback;
 }
 
-function projectStateKey(cwd) {
-  const resolved = path.resolve(cwd || process.cwd());
-  const canonical = existsSync(resolved) ? realpathSync(resolved) : resolved;
-  const normalized = normalizeFilesystemCase(canonical, canonical);
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
-}
 
-function recordMatchesProject(record, projectRoot = "") {
-  if (!projectRoot) {
-    return true;
-  }
 
-  const normalizedProjectRoot = path.resolve(projectRoot);
-  return normalizeFilesystemCase(path.resolve(record?.cwd || process.cwd()), normalizedProjectRoot)
-    === normalizeFilesystemCase(normalizedProjectRoot, normalizedProjectRoot);
-}
-
-function effectiveBridgeStateDirectory() {
-  return stateDirectoryOverride || GLOBAL_BRIDGE_STATE_DIR;
-}
 
 function makeQueueJobId(agent = "agent") {
   return `${safeNamePart(agent, "agent")}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
-function queueRequestFingerprint(request) {
-  const comparable = structuredClone(request);
-  // Both are minted per enqueue (the job id is random), so an idempotent retry of the same
-  // contractor request must not see them as different content.
-  delete comparable.internalQueueContractorProof;
-  delete comparable.internalQueueJobId;
-  return createHash("sha256").update(JSON.stringify(comparable)).digest("hex");
-}
 
-function queueRequestKeyPath() {
-  return path.join(effectiveBridgeStateDirectory(), "queue-request.key");
-}
 
-async function queueRequestKey() {
-  const keyPath = queueRequestKeyPath();
-  if (!QUEUE_REQUEST_KEY_PROMISES.has(keyPath)) {
-    const promise = (async () => {
-      await mkdir(path.dirname(keyPath), { recursive: true });
-      await assertNoLinkedPath(path.dirname(keyPath), "Queue state-key directory");
-      try {
-        const details = await lstat(keyPath);
-        if (details.isSymbolicLink() || !details.isFile()) {
-          throw new Error("Queue request key must be a regular file, not a link or special entry.");
-        }
-        const existing = await readFile(keyPath);
-        if (existing.length !== 32) throw new Error("Queue request key must be exactly 32 bytes.");
-        if (process.platform !== "win32" && (details.mode & 0o077) !== 0) {
-          await chmod(keyPath, 0o600);
-          const tightened = await lstat(keyPath);
-          if ((tightened.mode & 0o077) !== 0) throw new Error("Queue request key permissions must be 0600.");
-        }
-        return existing;
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
-      const key = randomBytes(32);
-      try {
-        await writeFile(keyPath, key, { flag: "wx", mode: 0o600 });
-        try { await chmod(keyPath, 0o600); } catch { /* Windows ACLs are enforced by the containing state directory. */ }
-        return key;
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-        await assertNoLinkedPath(keyPath, "Queue request key");
-        const details = await lstat(keyPath);
-        if (details.isSymbolicLink() || !details.isFile()) {
-          throw new Error("Queue request key must be a regular file, not a link or special entry.");
-        }
-        const existing = await readFile(keyPath);
-        if (existing.length !== 32) throw new Error("Queue request key must be exactly 32 bytes.");
-        return existing;
-      }
-    })().catch((error) => {
-      QUEUE_REQUEST_KEY_PROMISES.delete(keyPath);
-      throw error;
-    });
-    QUEUE_REQUEST_KEY_PROMISES.set(keyPath, promise);
-  }
-  return QUEUE_REQUEST_KEY_PROMISES.get(keyPath);
-}
 
-async function encryptQueueRequest(request, jobId) {
-  const key = await queueRequestKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  cipher.setAAD(Buffer.from(String(jobId), "utf8"));
-  const plaintext = Buffer.from(JSON.stringify(request), "utf8");
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  return JSON.stringify({
-    v: 1,
-    alg: "aes-256-gcm",
-    iv: iv.toString("base64"),
-    tag: cipher.getAuthTag().toString("base64"),
-    ciphertext: ciphertext.toString("base64"),
-  });
-}
 
-async function decryptQueueRequest(envelope, jobId) {
-  if (!envelope) return null;
-  const parsed = JSON.parse(envelope);
-  if (parsed?.v !== 1 || parsed?.alg !== "aes-256-gcm") throw new Error("Unsupported queue request envelope.");
-  const key = await queueRequestKey();
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(parsed.iv, "base64"));
-  decipher.setAAD(Buffer.from(String(jobId), "utf8"));
-  decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
-  return JSON.parse(Buffer.concat([
-    decipher.update(Buffer.from(parsed.ciphertext, "base64")),
-    decipher.final(),
-  ]).toString("utf8"));
-}
 
-function integrationJournalAad(operationId, file, kind) {
-  return `integration-journal\0${operationId}\0${kind}\0${file}`;
-}
-
-async function encryptIntegrationJournalBytes(value, aad) {
-  const key = await queueRequestKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  cipher.setAAD(Buffer.from(String(aad), "utf8"));
-  const plaintext = Buffer.isBuffer(value) ? value : Buffer.from(value);
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  return JSON.stringify({
-    v: 1,
-    alg: "aes-256-gcm",
-    iv: iv.toString("base64"),
-    tag: cipher.getAuthTag().toString("base64"),
-    ciphertext: ciphertext.toString("base64"),
-  });
-}
-
-async function decryptIntegrationJournalBytes(envelope, aad) {
-  const parsed = JSON.parse(String(envelope || ""));
-  if (parsed?.v !== 1 || parsed?.alg !== "aes-256-gcm") {
-    throw new Error("Unsupported integration journal envelope.");
-  }
-  const iv = Buffer.from(String(parsed.iv || ""), "base64");
-  const tag = Buffer.from(String(parsed.tag || ""), "base64");
-  const ciphertext = Buffer.from(String(parsed.ciphertext || ""), "base64");
-  if (iv.length !== 12 || tag.length !== 16 || ciphertext.length > CONFIG.maxSnapshotFileBytes + 1024) {
-    throw new Error("Invalid integration journal envelope bounds.");
-  }
-  const key = await queueRequestKey();
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAAD(Buffer.from(String(aad), "utf8"));
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-}
-
-function integrationJournalTargetPath(cwd, file) {
-  const base = path.resolve(cwd || process.cwd());
-  const target = path.resolve(base, file);
-  if (target === base || !isPathInside(base, target)) {
-    const error = new Error("Integration journal path escaped the repository root.");
-    error.errorType = "integration_journal_path_invalid";
-    throw error;
-  }
-  return target;
-}
-
-function integrationJournalFingerprintSha256(value) {
-  return createHash("sha256").update(String(value || "")).digest("hex");
-}
 
 async function captureIntegrationJournalEvidence({ cwd, files, expectedPostSnapshot, operationId }) {
   if (!(expectedPostSnapshot instanceof Map)) {
@@ -10324,28 +6761,10 @@ async function quarantineIntegrationOperation(cwd, operationId, expectedStatuses
   }
 }
 
-// Errors that say the evidence could not be read right now (a file held open by an editor or a
-// virus scanner, a busy state database, a git timeout), not that the repository drifted. Recovery
-// leaves the operation nonterminal for these and the next recovery pass retries it; quarantining
-// them turned a momentary EBUSY into a permanent block on every writer.
-const TRANSIENT_INTEGRATION_RECOVERY_CODES = new Set(["EBUSY", "EACCES", "EPERM", "EAGAIN", "EMFILE", "ENFILE", "ETIMEDOUT"]);
-
-function integrationRecoveryErrorIsTransient(error) {
-  if (TRANSIENT_INTEGRATION_RECOVERY_CODES.has(error?.code)) return true;
-  if (["integration_journal_cas_rejected", "integration_lock_ownership_lost", "integration_index_snapshot_failed", "integration_target_state_failed"].includes(error?.errorType)) return true;
-  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|timed out|timeout/i.test(String(error?.message || error || ""));
-}
-
 function integrationRecoveryErrorText(error) {
   return truncateText(redactSensitiveText(String(error?.message || error || "unknown error")), 500);
 }
 
-// Bridge git already runs with GIT_LITERAL_PATHSPECS=1, so plain paths are literal. A
-// ":(literal)" prefix is pathspec magic, which that setting disables: the prefixed path then
-// matched nothing and "no commit touched the affected paths" was always true (fail open).
-function integrationPathspecs(paths) {
-  return normalizeLockPathList(paths);
-}
 
 // Decides whether HEAD and the real Git index still hold the state the operation was prepared
 // on. With per-path index evidence in the journal only the affected paths count: their index
@@ -10752,39 +7171,7 @@ async function readIntegrationOperationSummary(cwd, operationId) {
   }
 }
 
-function integrationOperationResult(row) {
-  try {
-    const parsed = JSON.parse(row?.result_json || "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
 
-function integrationOperationDiagnosisView(row) {
-  const result = integrationOperationResult(row);
-  let affectedPaths = [];
-  try { affectedPaths = normalizeLockPathList(JSON.parse(row.affected_paths_json || "[]")); } catch { /* Shown as empty. */ }
-  return {
-    operationId: row.operation_id,
-    status: row.status,
-    reason: result.reason || result.quarantineReason || "",
-    outcome: result.outcome || "",
-    error: result.error || "",
-    affectedPaths: affectedPaths.slice(0, 20),
-    affectedPathCount: affectedPaths.length,
-    cwd: row.cwd,
-    pipelineId: row.pipeline_id || "",
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    // A quarantine is written with the transition, so updated_at is when it began.
-    ...(row.status === "quarantined" ? {
-      quarantinedMinutes: Math.max(0, Math.floor((Date.now() - Date.parse(row.updated_at || "")) / 60_000)) || 0,
-      resolveWith: "resolve_integration_quarantine (verify_restored | accept_current)",
-    } : {}),
-    ...(["recovered_verified", "resolved_by_operator"].includes(row.status) ? { resolvedBy: result.resolvedBy || "", operatorReason: result.operatorReason || "" } : {}),
-  };
-}
 
 // The integration journal as diagnose_opencode_bridge shows it: every unresolved operation
 // (these block writers; quarantined ones until resolved) up to the limit, the most recent
@@ -10819,15 +7206,6 @@ async function integrationJournalDiagnosis(cwd, { limit = 20 } = {}) {
   } finally {
     closeDb(db);
   }
-}
-
-function pathRelativeEscapes(relative) {
-  return relative === ".." || relative.startsWith(`..${path.sep}`) || relative.startsWith("../");
-}
-
-function isPathInside(parent, candidate) {
-  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
-  return Boolean(relative) && !pathRelativeEscapes(relative) && !path.isAbsolute(relative);
 }
 
 const BRIDGE_PROCESS_STARTED_AT = new Date().toISOString();
@@ -10894,757 +7272,42 @@ function truncateResultText(value, limit = CONFIG.queueResultMaxChars) {
   return `${text.slice(0, head)}${marker}${tail ? text.slice(text.length - tail) : ""}`;
 }
 
-// Default integration cleanup removes only worktrees the bridge created; a worktree path
-// the caller made by hand keeps its branch and history unless cleanup is asked for.
-function isBridgeGeneratedWorktree(cwd, worktreePath) {
-  if (!worktreePath) return false;
-  const configured = String(CONFIG.worktreeRoot || "").trim();
-  const root = configured.toLowerCase() === "global"
-    ? path.join(effectiveBridgeStateDirectory(), "worktrees")
-    : generatedWorktreeRootForCwd(cwd);
-  return Boolean(root) && isPathInside(path.resolve(root), path.resolve(worktreePath));
-}
+const { isBridgeGeneratedWorktree, generatedWorktreeRootForCwd, filterGeneratedWorktreeFiles, resolveWorktreeRoot, shouldUseWorktree, makeWorktreeBranchName, inspectSourceCheckpointState, dirtyCheckpointDetails, reconcileWorktreeArtifactRegistry, reserveWorktreeArtifact, markWorktreeArtifactState, releaseFailedWorktreeReservation, measureRetainedWorktreeBytes, updateRetainedWorktreeMeasurement, createWorktreeForJob, collectWorktreeDiff, cleanupWorktree, cleanupWorktreeUntimed, formatWorktreeSummary, RETAINED_WORKTREE_STATUSES, worktreeTestHooks } = createWorktreeRuntime({
+  CONFIG,
+  effectiveBridgeStateDirectory,
+  projectStateKey,
+  safeNamePart,
+  runCommand,
+  buildValidationEnv,
+  openLockDb,
+  closeDb,
+  logEvent,
+  stateCapacityError,
+  inspectRepositoryGitControlSurface,
+  inspectRepositoryOperationState,
+  createPatchFromWorkingTree,
+  truncateText,
+  integrationTimed,
+});
 
-function generatedWorktreeRootForCwd(cwd) {
-  const base = cwd || process.cwd();
-  const configured = String(CONFIG.worktreeRoot || "").trim();
-  if (!configured) {
-    return "";
-  }
 
-  if (configured.toLowerCase() === "global") {
-    return path.join(effectiveBridgeStateDirectory(), "worktrees", projectStateKey(base));
-  }
 
-  return path.resolve(path.isAbsolute(configured) ? configured : path.join(base, configured));
-}
 
-function filterGeneratedWorktreeFiles(files, cwd) {
-  const root = generatedWorktreeRootForCwd(cwd);
-  const filtered = normalizeLockPathList(files);
-  if (!root || !isPathInside(cwd || process.cwd(), root)) {
-    return filtered;
-  }
 
-  const relativeRoot = normalizeLockPath(path.relative(path.resolve(cwd || process.cwd()), root));
-  return filtered.filter((file) => !isWithinAnyPath(file, [relativeRoot], cwd));
-}
 
-function resolveWorktreeRoot(repoRoot) {
-  const configured = String(CONFIG.worktreeRoot || "global").trim();
-  if (!configured || /[\x00-\x1F\x7F]/.test(configured) || configured.startsWith("~")) {
-    return {
-      ok: false,
-      errorType: "worktree_path_unsafe",
-      error: `Unsafe worktree root: ${JSON.stringify(configured)}`,
-    };
-  }
 
-  const normalized = configured.replace(/\\/g, "/");
-  if (normalized.split("/").includes("..")) {
-    return {
-      ok: false,
-      errorType: "worktree_path_unsafe",
-      error: `Worktree root must not contain parent traversal: ${JSON.stringify(configured)}`,
-    };
-  }
 
-  const resolved = configured.toLowerCase() === "global"
-    ? path.join(effectiveBridgeStateDirectory(), "worktrees", projectStateKey(repoRoot))
-    : path.resolve(path.isAbsolute(configured) ? configured : path.join(repoRoot, configured));
-  if (resolved === path.parse(resolved).root) {
-    return {
-      ok: false,
-      errorType: "worktree_path_unsafe",
-      error: "Worktree root resolved to a filesystem root.",
-    };
-  }
 
-  return { ok: true, root: resolved };
-}
 
-function shouldUseWorktree(job, lockPlan, worktreeMode = CONFIG.worktreeMode) {
-  if (job.dryRun || !lockPlan) {
-    return false;
-  }
 
-  if (job.sanitizedWorkspace || lockPlan.sanitizedWorkspace) {
-    return false;
-  }
 
-  // Internal only (pipeline gates; tool schemas strip unknown keys): a reader of the checkout.
-  if (job.noWorktree === true && lockPlan.lockType === "read") return false;
 
-  if (lockPlan.orchestratorMode === "contractor") {
-    return true;
-  }
 
-  if (worktreeMode === "all") {
-    return true;
-  }
 
-  return worktreeMode === "write" && lockPlan.lockType === "write";
-}
 
-function makeWorktreeBranchName(agent, jobId) {
-  return [
-    safeNamePart(CONFIG.worktreeBranchPrefix, "agent"),
-    safeNamePart(agent, "agent"),
-    safeNamePart(jobId, "job"),
-  ].join("/");
-}
 
-async function inspectSourceCheckpointState(cwd, { lockedPaths = [], allowedEdits = [], scopeContract = null, policy = CONFIG.sourceDirtPolicy } = {}) {
-  const result = await runCommand("git", ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], cwd, 1000 * 30, buildValidationEnv());
-  if (result.exitCode !== 0) {
-    return {
-      ok: false,
-      errorType: "dirty_worktree_preflight_failed",
-      error: result.stderr || result.stdout || "Could not inspect the source checkout before worktree creation.",
-      dirtyEntries: [],
-      dirtyFiles: [],
-      overlappingFiles: [],
-      disjointFiles: [],
-      conflictingPaths: [],
-    };
-  }
-  const tokens = String(result.stdout || "").split("\0").filter(Boolean);
-  const dirtyEntries = [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    const status = token.slice(0, 2);
-    const file = normalizeLockPath(token.slice(3));
-    if (!file) continue;
-    dirtyEntries.push({ status, file });
-    if (/[RC]/.test(status) && tokens[index + 1]) {
-      const original = normalizeLockPath(tokens[index + 1]);
-      if (original) dirtyEntries.push({ status: `${status}:source`, file: original });
-      index += 1;
-    }
-  }
-  const dirtyFiles = normalizeLockPathList(dirtyEntries.map((entry) => entry.file));
-  const scopePaths = mergePathLists(lockedPaths, allowedEdits, scopeContractPathInputs(scopeContract));
-  const overlappingFiles = dirtyFiles.filter((file) => Boolean(overlaps([file], scopePaths)));
-  const disjointFiles = dirtyFiles.filter((file) => !overlappingFiles.includes(file));
-  const conflictingPaths = overlappingFiles.length ? overlappingFiles : dirtyFiles;
-  const toleratesUnrelated = policy === "unrelated_ok" && scopePaths.length > 0;
-  const blockingFiles = toleratesUnrelated ? overlappingFiles : dirtyFiles;
-  return {
-    ok: blockingFiles.length === 0,
-    errorType: blockingFiles.length ? "dirty_worktree_requires_checkpoint" : null,
-    error: blockingFiles.length
-      ? (toleratesUnrelated
-        ? `The source checkout has uncommitted changes inside this job's locked/allowed scope (${overlappingFiles.join(", ")}). A HEAD-based worktree would omit that state. The bridge will not stash, reset, commit, or overlay it; checkpoint or revert those files and retry. Unrelated changes are tolerated under CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok.`
-        : "The source checkout contains staged, unstaged, untracked, conflicted, or submodule changes. A HEAD-based worktree would omit that state. The bridge will not stash, reset, commit, or overlay it; create or select an external checkpoint and retry. Unrelated dirt is also rejected because the base must be fully reproducible (set CODEX_OPENCODE_SOURCE_DIRT_POLICY=unrelated_ok to tolerate changes outside the job scope).")
-      : "",
-    sourceDirtPolicy: toleratesUnrelated ? "unrelated_ok" : "strict",
-    toleratedDisjointFiles: toleratesUnrelated ? disjointFiles : [],
-    dirtyEntries,
-    dirtyFiles,
-    overlappingFiles,
-    disjointFiles,
-    conflictingPaths,
-  };
-}
 
-function dirtyCheckpointDetails(checkpoint = {}) {
-  const dirtyFiles = normalizeLockPathList(checkpoint.dirtyFiles || []);
-  const overlappingFiles = normalizeLockPathList(checkpoint.overlappingFiles || []);
-  const disjointFiles = normalizeLockPathList(checkpoint.disjointFiles || []);
-  const conflictingPaths = overlappingFiles.length ? overlappingFiles : dirtyFiles;
-  return { dirtyFiles, overlappingFiles, disjointFiles, conflictingPaths };
-}
 
-const RETAINED_WORKTREE_STATUSES = Object.freeze(["creating", "retained", "cleanup_failed"]);
-
-async function reconcileWorktreeArtifactRegistry(cwd) {
-  const canonicalCwd = path.resolve(cwd || process.cwd());
-  const knownDb = await openLockDb(canonicalCwd);
-  let knownPaths;
-  try {
-    // Any active row counts as known, whichever cwd registered it: a directory another
-    // checkout owns was re-walked on every reservation because the insert below never
-    // replaces an active row.
-    knownPaths = new Set(
-      knownDb.prepare(`
-        SELECT worktree_path FROM worktree_artifacts
-        WHERE status IN ('creating', 'retained', 'cleanup_failed')
-      `)
-        .all()
-        .map((row) => path.resolve(row.worktree_path))
-    );
-  } finally {
-    closeDb(knownDb);
-  }
-  const root = generatedWorktreeRootForCwd(canonicalCwd);
-  const discovered = [];
-  if (root) {
-    try {
-      for (const entry of await readdir(root, { withFileTypes: true })) {
-        const absolute = path.resolve(root, entry.name);
-        if (!isPathInside(root, absolute)) continue;
-        if (knownPaths.has(absolute)) continue;
-        try {
-          const details = await lstat(absolute);
-          if (details.isDirectory() && !details.isSymbolicLink()) {
-            discovered.push({
-              path: absolute,
-              status: "retained",
-              measuredBytes: await measureRetainedWorktreeBytes(absolute),
-            });
-          } else if (details.isSymbolicLink()) {
-            discovered.push({
-              path: absolute,
-              status: "cleanup_failed",
-              measuredBytes: CONFIG.retainedWorktreeMaxBytes + 1,
-            });
-          }
-        } catch (error) {
-          if (error?.code === "ENOENT") continue;
-          // An entry that cannot be measured (EPERM/EBUSY on Windows) is recorded as a
-          // capacity-full cleanup failure instead of failing this job's reservation.
-          logEvent("warn", "worktree.registry_measure_failed", { path: absolute, error: error?.message || String(error) });
-          discovered.push({
-            path: absolute,
-            status: "cleanup_failed",
-            measuredBytes: CONFIG.retainedWorktreeMaxBytes + 1,
-          });
-        }
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }
-
-  const db = await openLockDb(canonicalCwd);
-  let transactionOpen = false;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    transactionOpen = true;
-    const now = new Date().toISOString();
-    const insert = db.prepare(`
-      INSERT INTO worktree_artifacts
-        (worktree_path, cwd, branch, job_id, status, measured_bytes, created_at, updated_at, cleaned_at)
-      VALUES (?, ?, '', ?, ?, ?, ?, ?, NULL)
-      ON CONFLICT(worktree_path) DO UPDATE SET
-        cwd = excluded.cwd,
-        job_id = excluded.job_id,
-        status = excluded.status,
-        measured_bytes = excluded.measured_bytes,
-        updated_at = excluded.updated_at,
-        cleaned_at = NULL
-      WHERE worktree_artifacts.status IN ('cleaned', 'cleaned_branch_retained')
-    `);
-    for (const item of discovered) {
-      insert.run(item.path, canonicalCwd, path.basename(item.path), item.status, item.measuredBytes, now, now);
-    }
-    const activeRows = db.prepare(`
-      SELECT worktree_path FROM worktree_artifacts
-      WHERE cwd = ? AND status IN ('creating', 'retained', 'cleanup_failed')
-    `).all(canonicalCwd);
-    const markMissing = db.prepare(`
-      UPDATE worktree_artifacts
-      SET status = 'cleaned', cleaned_at = ?, updated_at = ?
-      WHERE worktree_path = ? AND cwd = ?
-    `);
-    for (const row of activeRows) {
-      if (!existsSync(row.worktree_path)) markMissing.run(now, now, row.worktree_path, canonicalCwd);
-    }
-    db.exec("COMMIT");
-    transactionOpen = false;
-  } catch (error) {
-    if (transactionOpen) {
-      try { db.exec("ROLLBACK"); } catch { /* Preserve the registry error. */ }
-    }
-    throw error;
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function reserveWorktreeArtifact({ cwd, worktreePath, branch, jobId }) {
-  await reconcileWorktreeArtifactRegistry(cwd);
-  const db = await openLockDb(cwd);
-  let transactionOpen = false;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    transactionOpen = true;
-    const stateCapacity = stateCapacityError(db);
-    if (stateCapacity) {
-      db.exec("ROLLBACK");
-      transactionOpen = false;
-      return { ok: false, ...stateCapacity };
-    }
-    const placeholders = RETAINED_WORKTREE_STATUSES.map(() => "?").join(", ");
-    const capacity = db.prepare(`
-      SELECT COUNT(*) AS count, COALESCE(SUM(measured_bytes), 0) AS bytes
-      FROM worktree_artifacts
-      WHERE cwd = ? AND status IN (${placeholders})
-    `).get(path.resolve(cwd), ...RETAINED_WORKTREE_STATUSES);
-    if (Number(capacity?.count || 0) >= CONFIG.retainedWorktreeMaxCount
-      || Number(capacity?.bytes || 0) >= CONFIG.retainedWorktreeMaxBytes) {
-      db.exec("ROLLBACK");
-      transactionOpen = false;
-      return {
-        ok: false,
-        errorType: "worktree_capacity_exceeded",
-        error: "Retained worktree recovery evidence reached its configured count or measured-byte capacity.",
-      };
-    }
-    const now = new Date().toISOString();
-    const inserted = db.prepare(`
-      INSERT INTO worktree_artifacts
-        (worktree_path, cwd, branch, job_id, status, measured_bytes, created_at, updated_at, cleaned_at)
-      VALUES (?, ?, ?, ?, 'creating', 0, ?, ?, NULL)
-      ON CONFLICT(worktree_path) DO NOTHING
-    `).run(path.resolve(worktreePath), path.resolve(cwd), branch, jobId, now, now);
-    if (Number(inserted.changes || 0) !== 1) {
-      db.exec("ROLLBACK");
-      transactionOpen = false;
-      return {
-        ok: false,
-        errorType: "worktree_identity_conflict",
-        error: "The generated worktree path already has durable artifact ownership.",
-      };
-    }
-    db.exec("COMMIT");
-    transactionOpen = false;
-    return { ok: true };
-  } catch (error) {
-    if (transactionOpen) {
-      try { db.exec("ROLLBACK"); } catch { /* Preserve the reservation error. */ }
-    }
-    throw error;
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function markWorktreeArtifactState(worktree, status, measuredBytes = null) {
-  if (!worktree?.path || !worktree?.repoRoot) return;
-  const db = await openLockDb(worktree.repoRoot);
-  try {
-    const now = new Date().toISOString();
-    db.prepare(`
-      UPDATE worktree_artifacts
-      SET status = ?, measured_bytes = COALESCE(?, measured_bytes), updated_at = ?,
-          cleaned_at = CASE WHEN ? IN ('cleaned', 'cleaned_branch_retained') THEN ? ELSE cleaned_at END
-      WHERE worktree_path = ? AND cwd = ?
-    `).run(
-      status,
-      measuredBytes === null ? null : Math.max(0, Math.trunc(measuredBytes)),
-      now,
-      status,
-      now,
-      path.resolve(worktree.path),
-      path.resolve(worktree.repoRoot)
-    );
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function releaseFailedWorktreeReservation(worktree) {
-  if (!worktree?.path || !worktree?.repoRoot) return;
-  if (existsSync(worktree.path)) {
-    await updateRetainedWorktreeMeasurement(worktree);
-    return;
-  }
-  const db = await openLockDb(worktree.repoRoot);
-  try {
-    db.prepare(`
-      DELETE FROM worktree_artifacts
-      WHERE worktree_path = ? AND cwd = ? AND status = 'creating'
-    `).run(path.resolve(worktree.path), path.resolve(worktree.repoRoot));
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function measureRetainedWorktreeBytes(worktreePath) {
-  const root = path.resolve(worktreePath);
-  const rootDetails = await lstat(root);
-  if (rootDetails.isSymbolicLink() || !rootDetails.isDirectory()) throw new Error("Retained worktree root is not a real directory.");
-  const stack = [root];
-  let bytes = 0;
-  let entriesSeen = 0;
-  const maxEntries = Math.max(CONFIG.maxSnapshotFiles * 4, 100000);
-  while (stack.length) {
-    const directory = stack.pop();
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      entriesSeen += 1;
-      if (entriesSeen > maxEntries) return CONFIG.retainedWorktreeMaxBytes + 1;
-      const absolute = path.resolve(directory, entry.name);
-      if (!isPathInside(root, absolute)) return CONFIG.retainedWorktreeMaxBytes + 1;
-      const details = await lstat(absolute);
-      if (details.isDirectory() && !details.isSymbolicLink()) stack.push(absolute);
-      else bytes += Number(details.size || 0);
-      if (bytes > CONFIG.retainedWorktreeMaxBytes) return bytes;
-    }
-  }
-  return bytes;
-}
-
-async function updateRetainedWorktreeMeasurement(worktree) {
-  if (!worktree?.path || !worktree?.repoRoot || !existsSync(worktree.path)) return;
-  try {
-    const bytes = await measureRetainedWorktreeBytes(worktree.path);
-    await markWorktreeArtifactState(worktree, "retained", bytes);
-  } catch {
-    await markWorktreeArtifactState(worktree, "cleanup_failed", CONFIG.retainedWorktreeMaxBytes + 1);
-  }
-}
-
-async function createWorktreeForJob({ cwd, agent, jobId, lockedPaths = [], allowedEdits = [], scopeContract = null }) {
-  const baseCwd = cwd || process.cwd();
-  const gitVersion = await runCommand("git", ["--version"], baseCwd, 1000 * 15);
-  if (gitVersion.exitCode !== 0) {
-    return {
-      ok: false,
-      errorType: "worktree_git_not_available",
-      error: gitVersion.stderr || "git is not available.",
-    };
-  }
-
-  const repoRootResult = await runCommand("git", ["rev-parse", "--show-toplevel"], baseCwd, 1000 * 15);
-  if (repoRootResult.exitCode !== 0) {
-    return {
-      ok: false,
-      errorType: "worktree_git_not_available",
-      error: repoRootResult.stderr || "Current working directory is not inside a Git repository.",
-    };
-  }
-
-  const repoRoot = path.resolve(repoRootResult.stdout.trim());
-  const gitControlSurface = await inspectRepositoryGitControlSurface(repoRoot);
-  if (!gitControlSurface.ok) return gitControlSurface;
-  const operationState = await inspectRepositoryOperationState(repoRoot);
-  if (!operationState.ok) return operationState;
-  const checkpointState = await inspectSourceCheckpointState(repoRoot, { lockedPaths, allowedEdits, scopeContract });
-  if (!checkpointState.ok) {
-    return checkpointState;
-  }
-  const baseCommitResult = await runCommand("git", ["rev-parse", "HEAD"], repoRoot, 1000 * 15);
-  if (baseCommitResult.exitCode !== 0 || !baseCommitResult.stdout.trim()) {
-    return {
-      ok: false,
-      errorType: "worktree_base_invalid",
-      error: baseCommitResult.stderr || "Could not capture the repository HEAD before creating the worktree.",
-    };
-  }
-  const baseCommit = baseCommitResult.stdout.trim();
-  const baseTreeResult = await runCommand("git", ["rev-parse", `${baseCommit}^{tree}`], repoRoot, 1000 * 15);
-  if (baseTreeResult.exitCode !== 0 || !baseTreeResult.stdout.trim()) {
-    return {
-      ok: false,
-      errorType: "worktree_base_invalid",
-      error: baseTreeResult.stderr || "Could not capture the repository base tree.",
-    };
-  }
-  const rootResult = resolveWorktreeRoot(repoRoot);
-  if (!rootResult.ok) {
-    return rootResult;
-  }
-
-  const branch = makeWorktreeBranchName(agent, jobId);
-  const worktreePath = path.resolve(rootResult.root, `${safeNamePart(agent, "agent")}-${safeNamePart(jobId, "job")}`);
-  if (!isPathInside(rootResult.root, worktreePath) || path.resolve(worktreePath) === repoRoot) {
-    return {
-      ok: false,
-      errorType: "worktree_path_unsafe",
-      error: "Generated worktree path is outside the configured worktree root or matches the main repository.",
-    };
-  }
-
-  const reservation = await reserveWorktreeArtifact({
-    cwd: repoRoot,
-    worktreePath,
-    branch,
-    jobId,
-  });
-  if (!reservation.ok) return reservation;
-
-  await mkdir(rootResult.root, { recursive: true });
-  const branchExists = await runCommand("git", ["show-ref", "--verify", `refs/heads/${branch}`], repoRoot, 1000 * 15);
-  if (branchExists.exitCode === 0) {
-    await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
-    return {
-      ok: false,
-      errorType: "worktree_checkout_failed",
-      error: `Worktree branch already exists: ${branch}`,
-    };
-  }
-
-  const created = await runCommand("git", ["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, CONFIG.gitHeavyTimeoutMs);
-  if (created.exitCode !== 0) {
-    await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
-    // B-028: git creates the branch before it creates the worktree, so a failed add ("'$GIT_DIR'
-    // too big" or "Filename too long" on Windows, an unwritable .git/worktrees) left an
-    // agent/... branch behind on every attempt. The branch did not exist before this call
-    // (checked above); it is deleted only while it still points at the base commit, and
-    // git branch -D refuses a branch that some worktree has checked out.
-    let branchCleanup = "not_created";
-    const leftover = await runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot, 1000 * 15);
-    if (leftover.exitCode === 0) {
-      const removed = leftover.stdout.trim() === baseCommit
-        ? await runCommand("git", ["branch", "-D", "--", branch], repoRoot, 1000 * 15)
-        : { exitCode: 1 };
-      branchCleanup = removed.exitCode === 0 ? "deleted" : "retained";
-    }
-    return {
-      ok: false,
-      errorType: "worktree_create_failed",
-      error: `${created.stderr || created.stdout || "git worktree add failed."}${branchCleanup === "retained" ? ` The branch ${branch} that git created was retained; delete it with git branch -D once nothing uses it.` : ""}`,
-      repoRoot,
-      branch,
-      branchCleanup,
-      path: worktreePath,
-    };
-  }
-
-  const [postCheckpointState, postHead, createdWorktreeState] = await Promise.all([
-    inspectSourceCheckpointState(repoRoot, { lockedPaths, allowedEdits, scopeContract }),
-    runCommand("git", ["rev-parse", "HEAD"], repoRoot, 1000 * 15, buildValidationEnv()),
-    inspectSourceCheckpointState(worktreePath, { policy: "strict" }),
-  ]);
-  if (!postCheckpointState.ok || postHead.exitCode !== 0 || postHead.stdout.trim() !== baseCommit || !createdWorktreeState.ok) {
-    let preExecutionCleanup = { cleanup: "retained", reason: "new worktree was not proven clean" };
-    if (createdWorktreeState.ok) {
-      preExecutionCleanup = await cleanupWorktree({ repoRoot, path: worktreePath, branch }, "always", true);
-    }
-    if (preExecutionCleanup.cleanup !== "success") {
-      await releaseFailedWorktreeReservation({ repoRoot, path: worktreePath, branch });
-    }
-    return {
-      ok: false,
-      errorType: !postCheckpointState.ok
-        ? postCheckpointState.errorType
-        : !createdWorktreeState.ok
-          ? "worktree_created_dirty"
-          : "worktree_source_checkpoint_changed",
-      error: !postCheckpointState.ok
-        ? `${postCheckpointState.error} The source changed during worktree creation, so no agent was started.`
-        : !createdWorktreeState.ok
-          ? "The new worktree was not clean immediately after creation. It was retained as evidence and no agent was started."
-        : "Repository HEAD changed during worktree creation, so the new worktree no longer represents the current source checkpoint.",
-      dirtyEntries: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).dirtyEntries || [],
-      dirtyFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).dirtyFiles || [],
-      overlappingFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).overlappingFiles || [],
-      disjointFiles: (!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).disjointFiles || [],
-      conflictingPaths: dirtyCheckpointDetails(!createdWorktreeState.ok ? createdWorktreeState : postCheckpointState).conflictingPaths,
-      repoRoot,
-      path: worktreePath,
-      branch,
-      baseCommit,
-      preExecutionCleanup,
-    };
-  }
-
-  await markWorktreeArtifactState({ repoRoot, path: worktreePath, branch }, "retained", 0);
-
-  return {
-    ok: true,
-    repoRoot,
-    path: worktreePath,
-    branch,
-    baseCommit,
-    baseTree: baseTreeResult.stdout.trim(),
-    cleanup: "not_attempted",
-    sourceDirtPolicy: checkpointState.sourceDirtPolicy || "strict",
-    toleratedDisjointFiles: checkpointState.toleratedDisjointFiles || [],
-  };
-}
-
-// `git diff --stat <base>` left out files the agent created (untracked in the worktree), so a
-// builder that wrote a new test file showed "1 file changed". The review patch already carries
-// every file, new ones included; count its lines instead.
-// Q-010: the patch's files with their kind (created, deleted, binary), for the stat below and for
-// auto-integration, which lands a patch by itself only when every file in it is new.
-function patchFileEntries(patchText) {
-  const files = [];
-  let current = null;
-  for (const line of String(patchText || "").split("\n")) {
-    const header = line.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/);
-    if (header) {
-      current = { path: header[2], added: 0, removed: 0, binary: false, created: false, deleted: false, inHunk: false };
-      files.push(current);
-      continue;
-    }
-    if (!current) continue;
-    // The ---/+++ file header lines exist only before a file's first hunk; inside a hunk a
-    // removed "-- x" or an added "++ y" line is content and was skipped as a header.
-    if (!current.inHunk) {
-      if (line.startsWith("new file mode")) current.created = true;
-      else if (line.startsWith("deleted file mode")) current.deleted = true;
-      else if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) current.binary = true;
-      else if (line.startsWith("@@")) current.inHunk = true;
-      continue;
-    }
-    if (line.startsWith("+")) current.added += 1;
-    else if (line.startsWith("-")) current.removed += 1;
-  }
-  return files;
-}
-
-function diffStatFromPatch(patchText) {
-  const files = patchFileEntries(patchText);
-  if (!files.length) return "";
-  const width = Math.max(...files.map((file) => file.path.length));
-  const rows = files.map((file) => {
-    const note = file.created ? " (new)" : file.deleted ? " (deleted)" : "";
-    const counts = file.binary ? "binary" : `+${file.added} -${file.removed}`;
-    return ` ${file.path.padEnd(width)} | ${counts}${note}`;
-  });
-  const added = files.reduce((sum, file) => sum + file.added, 0);
-  const removed = files.reduce((sum, file) => sum + file.removed, 0);
-  const created = files.filter((file) => file.created).length;
-  rows.push(` ${files.length} file${files.length === 1 ? "" : "s"} changed${created ? ` (${created} new)` : ""}, ${added} insertion${added === 1 ? "" : "s"}(+), ${removed} deletion${removed === 1 ? "" : "s"}(-)`);
-  return rows.join("\n");
-}
-
-async function collectWorktreeDiff(worktree) {
-  if (!worktree?.path) {
-    return null;
-  }
-  const patch = await createPatchFromWorkingTree(worktree.path, worktree.baseCommit || "HEAD", { rejectIgnoredSource: true });
-  if (!patch.ok) {
-    return {
-      changedFiles: [],
-      diffStat: "",
-      patchPreview: "",
-      patchSha256: "",
-      errorType: patch.errorType,
-      error: patch.error,
-    };
-  }
-  return {
-    changedFiles: patch.changedFiles,
-    diffStat: diffStatFromPatch(patch.patch),
-    patchPreview: truncateText(redactSensitiveText(patch.patch)),
-    patchSha256: patch.patchSha256,
-    sourceStateSha256: patch.sourceStateSha256,
-    sourceBaseCommit: patch.baseCommit,
-    sourceHead: patch.sourceHead,
-    errorType: null,
-    error: "",
-  };
-}
-
-function cleanupWorktree(...args) {
-  return integrationTimed("worktreeRemove", () => cleanupWorktreeUntimed(...args));
-}
-
-async function cleanupWorktreeUntimed(worktree, cleanupMode, success) {
-  if (!worktree?.path || cleanupMode === "never") {
-    return {
-      cleanup: "skipped",
-      reason: cleanupMode === "never" ? "configured never" : "no worktree",
-    };
-  }
-
-  if (cleanupMode === "on_success" && !success) {
-    return {
-      cleanup: "skipped",
-      reason: "job did not finish successfully",
-    };
-  }
-
-  const removeArgs = ["worktree", "remove"];
-  if (cleanupMode === "always" || cleanupMode === "on_success") {
-    removeArgs.push("--force");
-  }
-  removeArgs.push(worktree.path);
-
-  const branchRef = worktree.branch && worktree.branch !== "HEAD"
-    ? `refs/heads/${worktree.branch}`
-    : "";
-  const expectedBranch = branchRef
-    ? await runCommand("git", ["show-ref", "--hash", "--verify", branchRef], worktree.repoRoot, 1000 * 15)
-    : null;
-  const expectedBranchOid = expectedBranch?.exitCode === 0 ? expectedBranch.stdout.trim() : "";
-
-  // B-030: git would delete through a junction into its target (a source checkout's
-  // node_modules/); the links go first, and a link that cannot be detached keeps the worktree.
-  try {
-    await detachWorktreeLinks(worktree.path);
-  } catch (error) {
-    await updateRetainedWorktreeMeasurement(worktree);
-    await markWorktreeArtifactState(worktree, "cleanup_failed");
-    return {
-      cleanup: "failed",
-      errorType: "worktree_cleanup_failed",
-      error: `Could not detach links before removing the worktree: ${error?.message || error}`,
-    };
-  }
-  const removed = await runCommand("git", removeArgs, worktree.repoRoot, CONFIG.gitHeavyTimeoutMs);
-  if (removed.exitCode !== 0) {
-    await updateRetainedWorktreeMeasurement(worktree);
-    await markWorktreeArtifactState(worktree, "cleanup_failed");
-    return {
-      cleanup: "failed",
-      errorType: "worktree_cleanup_failed",
-      error: removed.stderr || removed.stdout || "git worktree remove failed.",
-    };
-  }
-
-  if (!worktree.branch || worktree.branch === "HEAD") {
-    await markWorktreeArtifactState(worktree, "cleaned");
-    return {
-      cleanup: "success",
-      branchCleanup: "skipped",
-      reason: "worktree had no removable local branch",
-    };
-  }
-
-  if (!expectedBranchOid) {
-    // show-ref failed: either the branch is already gone (nothing to clean) or its identity
-    // really could not be read (keep reporting that as retained).
-    const listed = await runCommand("git", ["for-each-ref", "--format=%(refname)", branchRef], worktree.repoRoot, 1000 * 15);
-    if (listed.exitCode === 0 && !listed.stdout.split(/\r?\n/).map((line) => line.trim()).includes(branchRef)) {
-      await markWorktreeArtifactState(worktree, "cleaned");
-      return {
-        cleanup: "success",
-        branchCleanup: "already_absent",
-        reason: "the worktree's local branch no longer existed",
-      };
-    }
-  }
-
-  if (typeof worktreeCleanupTestHook === "function") {
-    await worktreeCleanupTestHook({ worktree, branchRef, expectedBranchOid });
-  }
-
-  const deletedBranch = expectedBranchOid
-    ? await runCommand("git", ["update-ref", "-d", branchRef, expectedBranchOid], worktree.repoRoot, 1000 * 30)
-    : { exitCode: 1, stdout: "", stderr: "The source branch identity could not be captured before worktree removal." };
-  await markWorktreeArtifactState(
-    worktree,
-    deletedBranch.exitCode === 0 ? "cleaned" : "cleaned_branch_retained"
-  );
-  return {
-    cleanup: deletedBranch.exitCode === 0 ? "success" : "partial",
-    branchCleanup: deletedBranch.exitCode === 0 ? "success" : "failed",
-    error: deletedBranch.exitCode === 0 ? "" : deletedBranch.stderr || deletedBranch.stdout || "git branch cleanup failed.",
-  };
-}
-
-function formatWorktreeSummary(worktree, cleanupResult = null) {
-  if (!worktree) {
-    return "Worktree: not used";
-  }
-
-  return [
-    "Worktree: used",
-    `Worktree path: ${worktree.path}`,
-    `Worktree branch: ${worktree.branch}`,
-    worktree.toleratedDisjointFiles?.length
-      ? `Worktree tolerated unrelated source changes (${worktree.sourceDirtPolicy}): ${worktree.toleratedDisjointFiles.join(", ")}`
-      : null,
-    `Worktree cleanup: ${cleanupResult?.cleanup || "not attempted"}`,
-    cleanupResult?.reason ? `Worktree cleanup reason: ${cleanupResult.reason}` : null,
-    cleanupResult?.error ? `Worktree cleanup error: ${cleanupResult.error}` : null,
-  ].filter(Boolean).join("\n");
-}
 
 async function markUntrackedFilesForDiff(cwd) {
   const untracked = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], cwd, 1000 * 15);
@@ -12103,64 +7766,13 @@ async function collectIntegrationPatchUntimed({ cwd, worktreePath = "", branch =
   };
 }
 
-// The write plan a patch's changed files are validated against: the same shape for a single
-// integration and for each item of a batch.
-function integrationScopePlan({ cwd, allowedEdits, forbiddenEdits = [], sharedFiles = [], serialOnly = [] }) {
-  const allowed = normalizeLockPathList(allowedEdits);
-  return {
-    agent: "merge_manager",
-    cwd,
-    lockType: "write",
-    lockMode: "serial_integration",
-    lockedPaths: allowed,
-    allowedEdits: allowed,
-    forbiddenEdits: mergePathLists(DEFAULT_FORBIDDEN_EDIT_PATHS, forbiddenEdits),
-    sharedFiles: normalizeLockPathList(sharedFiles),
-    serialOnly: normalizeLockPathList(serialOnly),
-    scopeContract: null,
-  };
-}
 
 // I-002: one integration of several disjoint worktrees/branches. A batch is capped so one call
 // stays inside the client's tool timeout (every item rehashes its own source tree).
 const INTEGRATION_BATCH_MAX_ITEMS = 25;
 const INTEGRATION_BATCH_COLLECT_CONCURRENCY = 4;
 
-function integrationBatchItemLabel(item) {
-  return item.worktreePath ? path.resolve(item.worktreePath) : `branch ${item.branch}`;
-}
 
-// Paths two items both write, or one writes below a path the other writes as a file. Compared
-// case-folded, like the target-movement check.
-function integrationBatchOverlaps(itemFiles) {
-  const owner = new Map();
-  const conflicts = [];
-  const seen = new Set();
-  const record = (file, other, current) => {
-    const key = `${file}\0${other}\0${current}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    conflicts.push({ path: file, items: [other + 1, current + 1] });
-  };
-  itemFiles.forEach((files, index) => {
-    for (const file of normalizeLockPathList(files)) {
-      const key = file.toLowerCase();
-      const other = owner.get(key);
-      if (other !== undefined && other !== index) record(file, other, index);
-      else owner.set(key, index);
-    }
-  });
-  itemFiles.forEach((files, index) => {
-    for (const file of normalizeLockPathList(files)) {
-      const key = file.toLowerCase();
-      for (let slash = key.lastIndexOf("/"); slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
-        const other = owner.get(key.slice(0, slash));
-        if (other !== undefined && other !== index) record(file, other, index);
-      }
-    }
-  });
-  return conflicts;
-}
 
 // Collects every item with the single-item collector, refuses anything that is not a clean,
 // in-scope, pairwise disjoint set of patches, and returns ONE composite patch shaped like a
@@ -12313,13 +7925,6 @@ async function collectIntegrationBatchPatch({ cwd, items, sourceBaseCommit = "",
     sourceHead: "",
     items: summaries,
   };
-}
-
-// The item that holds line `line` (1-based) of a batch's combined patch, for messages about
-// flagged lines; null for a single-item patch.
-function integrationBatchItemAtLine(patch, line) {
-  const item = (patch?.items || []).find((candidate) => line >= candidate.patchLineStart && line < candidate.patchLineStart + candidate.patchLineCount);
-  return item ? { item: item.index, source: item.source, line: line - item.patchLineStart + 1 } : null;
 }
 
 async function writeTemporaryPatchFile(patch) {
@@ -12733,39 +8338,6 @@ async function captureIntegrationTargetStateUntimed(cwd) {
 // patched paths alone; everything else stays the strict comparison.
 const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
-// The changed paths (from `git diff --name-only`) that can affect how the patch lands on its
-// paths: a changed path equal to a patched path, a directory above one (a file/directory
-// switch), a path below one, or a .gitattributes file whose rules reach a patched path (it
-// changes line-ending conversion and filters). Compared case-folded so a case-insensitive
-// checkout never reads a rename of case as unrelated. Renames arrive as two paths
-// (--no-renames), so both sides count.
-function integrationPathsTouching(changedPaths, patchedFiles) {
-  const patched = new Set();
-  const patchedDirectories = new Set();
-  const patchedKeys = [];
-  for (const file of normalizeLockPathList(patchedFiles)) {
-    const key = file.toLowerCase();
-    patched.add(key);
-    patchedKeys.push(key);
-    for (let slash = key.lastIndexOf("/"); slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
-      patchedDirectories.add(key.slice(0, slash));
-    }
-  }
-  const touched = [];
-  for (const changed of normalizeLockPathList(changedPaths)) {
-    const key = changed.toLowerCase();
-    let hit = patched.has(key) || patchedDirectories.has(key);
-    for (let slash = key.lastIndexOf("/"); !hit && slash > 0; slash = key.lastIndexOf("/", slash - 1)) {
-      hit = patched.has(key.slice(0, slash));
-    }
-    if (!hit && (key === ".gitattributes" || key.endsWith("/.gitattributes"))) {
-      const directory = key.slice(0, Math.max(0, key.length - ".gitattributes".length));
-      hit = !directory || patchedKeys.some((candidate) => candidate.startsWith(directory));
-    }
-    if (hit) touched.push(changed);
-  }
-  return touched;
-}
 
 // `git ls-tree` entries ("<mode> <type> <object>") of the patched paths at one commit; a path
 // the commit does not hold has no entry.
@@ -12789,18 +8361,6 @@ async function integrationHeadEntries(cwd, head, files) {
     }
   }
   return entries;
-}
-
-// One hash over what decides how a patch lands on its own paths: each path's entry in HEAD, its
-// index entry and its working-tree fingerprint. The three maps are keyed by normalized path.
-function patchedPathsStateSha256Of({ files, headEntries, indexSnapshot, workingSnapshot }) {
-  const hash = createHash("sha256");
-  hash.update("patched-paths-state-v1\n");
-  for (const file of normalizeLockPathList(files).sort()) {
-    hash.update(JSON.stringify([file, headEntries.get(file) ?? "", indexSnapshot.get(file) ?? "", workingSnapshot.get(file) ?? ""]));
-    hash.update("\n");
-  }
-  return hash.digest("hex");
 }
 
 async function capturePatchedPathsState(cwd, head, files) {
@@ -12912,51 +8472,6 @@ async function captureGitHead(cwd) {
     throw error;
   }
   return result.stdout.trim();
-}
-
-function integrationContractValue({ cwd, worktreePath, branch, allowedEdits, forbiddenEdits, sharedFiles, serialOnly, validationCommand, allowDirtyTarget, cleanupAfterSuccess, items = null }) {
-  return {
-    cwd: path.resolve(cwd || process.cwd()),
-    worktreePath: worktreePath ? path.resolve(worktreePath) : "",
-    branch: String(branch || ""),
-    allowedEdits: normalizeLockPathList(allowedEdits).sort(),
-    forbiddenEdits: normalizeLockPathList(forbiddenEdits).sort(),
-    sharedFiles: normalizeLockPathList(sharedFiles).sort(),
-    serialOnly: normalizeLockPathList(serialOnly).sort(),
-    validationCommand: String(validationCommand || "").trim(),
-    allowDirtyTarget: Boolean(allowDirtyTarget),
-    cleanupAfterSuccess: Boolean(cleanupAfterSuccess),
-    // I-002: a batch integration binds every item, in the caller's order, with its own scope and
-    // cleanup choice. A single integration has no such key, so its contract hash is unchanged.
-    ...(Array.isArray(items) && items.length
-      ? {
-          items: items.map((item) => ({
-            worktreePath: item.worktreePath ? path.resolve(item.worktreePath) : "",
-            branch: String(item.branch || ""),
-            allowedEdits: normalizeLockPathList(item.allowedEdits).sort(),
-            cleanupAfterSuccess: Boolean(item.cleanup),
-          })),
-        }
-      : {}),
-  };
-}
-
-function integrationContractSha256(options) {
-  return createHash("sha256").update(JSON.stringify(integrationContractValue(options))).digest("hex");
-}
-
-// A reviewed apply whose arguments differ from its dry run used to fail with "contractSha256
-// changed after review", which reads like a moved target. Name the arguments that differ so the
-// caller can dry-run again with the same ones (the usual case: validationCommand only on apply).
-function integrationContractDifference(previewContract, applyContract) {
-  if (!previewContract || !applyContract) return "";
-  const show = (value) => (Array.isArray(value) && value.every((item) => typeof item !== "object") ? `[${value.join(", ")}]` : JSON.stringify(value));
-  const fields = Object.keys(applyContract)
-    .filter((key) => JSON.stringify(previewContract[key]) !== JSON.stringify(applyContract[key]))
-    .map((key) => `${key} (dry run ${show(previewContract[key])}, apply ${show(applyContract[key])})`);
-  return fields.length
-    ? `The apply's arguments differ from the dry run's: ${fields.join("; ")}. Dry-run again with exactly the arguments you will apply with.`
-    : "";
 }
 
 function sweepIntegrationPreviews(now = Date.now()) {
@@ -13603,14 +9118,6 @@ async function resolveIntegrationQuarantine({ cwd, operationId, mode, reason = "
       logEvent("warn", "integration.recovery_lock_release_failed", { lockId: lockResult.lock.id, error: error?.message || String(error) });
     }
   }
-}
-
-function integrationQuarantineStatusLine(journal) {
-  if (!journal || journal.error) return `Integration quarantines: unavailable (${journal?.error || "no journal"})`;
-  const quarantined = (journal.unresolved || []).filter((item) => item.status === "quarantined");
-  if (!quarantined.length) return "Integration quarantines: none";
-  const oldest = quarantined.reduce((left, right) => (right.quarantinedMinutes > left.quarantinedMinutes ? right : left));
-  return `Integration quarantines: ${quarantined.length} (oldest ${oldest.quarantinedMinutes} min: ${oldest.operationId}, reason ${oldest.reason || "unknown"}); writers are blocked; resolve with resolve_integration_quarantine`;
 }
 
 function formatIntegrationQuarantineResolution(result) {
@@ -14826,73 +10333,25 @@ async function recordChangedFiles(runId, cwd, changedFiles, disallowedFiles = []
   }
 }
 
-function lockPaths(lock) {
-  return normalizeLockPathList(lock.paths || lock.lockedPaths || lock.allowedEdits || []);
-}
+const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTableHasCompositePrimaryKey, ensureLockTableSchema, migrateLegacyLockTable, rowsToLocks, expireLocksFromDb, listLocksFromDb, cleanupExpiredLocks, listLocks, acquireHardLock, releaseHardLock, quarantineHardLock, formatLockExpiry, formatAgentLockList, reservedLockAgentError, hardLockPathsForPlan, hardLockTtlForPlan, lockOwnershipLossError, startHardLockHeartbeat, hardLockSummary } = createLockRuntime({
+  CONFIG,
+  DEFAULT_LOCK_TTL_MS,
+  MAX_LOCK_TTL_MS,
+  PARALLEL_LOCK_TYPES,
+  INTEGRATION_RECOVERY_BLOCKED_ROOTS,
+  INTEGRATION_RESOLVED_SQL,
+  ensureTableColumn,
+  openLockDb,
+  closeDb,
+  resolveProjectStateRoot,
+  reclaimLockQuarantinesForRoot,
+  logEvent,
+  timeoutForAgent,
+});
 
-function conflictsWithActiveLock(request, activeLock, worktreeMode = CONFIG.worktreeMode) {
-  const requestType = request.lockType;
-  const activeType = activeLock.lockType;
 
-  if (requestType === "read" && activeType === "read") {
-    return null;
-  }
 
-  const requestPaths = lockPaths(request);
-  const activePaths = lockPaths(activeLock);
-  // Integration changes the real checkout, so it waits for every reader of the checkout and
-  // for other integrations. With worktrees on, writers work in their own worktree and only
-  // conflict when paths overlap; blocking integration on every running builder meant a
-  // reviewed patch could not land while any other builder (from either client) still ran.
-  // Manual acquire_agent_lock writers, legacy rows, and CODEX_OPENCODE_WORKTREE_MODE=off
-  // writers edit the checkout itself, so they still serialize with integration.
-  // Whether a writer edits the checkout is recorded on its lock row by the process that took
-  // it (editsCheckout); deciding from this process's CONFIG.worktreeMode was wrong whenever the
-  // two bridges (Codex, Claude) ran with different worktree modes. Rows without the flag are
-  // legacy and count as editing the checkout; in-memory requests without it keep the mode rule.
-  const editsCheckout = (lock) => typeof lock.editsCheckout === "boolean"
-    ? lock.editsCheckout
-    : !(worktreeMode !== "off" && (lock.origin || "internal") === "internal");
-  const involvesIntegration = requestType === "serial_integration" || activeType === "serial_integration";
-  const worktreeJobWriter = (lock) => lock.lockType === "write" && !editsCheckout(lock);
-  const writerAndIntegration = involvesIntegration
-    && (worktreeJobWriter(request) || worktreeJobWriter(activeLock));
-  const requiresRepositorySerialization = involvesIntegration && !writerAndIntegration;
-  const overlap = requiresRepositorySerialization
-    ? overlaps(requestPaths, activePaths) || [requestPaths[0], activePaths[0]]
-    : overlaps(requestPaths, activePaths);
-  return overlap
-    ? {
-        lockId: activeLock.id,
-        owner: activeLock.owner,
-        agent: activeLock.agent,
-        origin: activeLock.origin || "legacy",
-        lockType: activeLock.lockType,
-        paths: activePaths,
-        overlap,
-        expiresAt: activeLock.expiresAt,
-      }
-    : null;
-}
 
-function makeLockId(owner, agent) {
-  const safeOwner = String(owner || "unknown").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
-  const safeAgent = String(agent || "agent").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
-  return `${safeOwner}-${safeAgent}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function makeLockToken() {
-  return randomBytes(32).toString("hex");
-}
-
-function stateDbPath(cwd = "") {
-  const root = cwd ? path.resolve(cwd) : "";
-  const stateRoot = effectiveBridgeStateDirectory();
-  if (root && root !== path.parse(root).root) {
-    return path.join(stateRoot, "projects", `${projectStateKey(root)}.sqlite`);
-  }
-  return path.join(stateRoot, "bridge-state.sqlite");
-}
 
 const statePruneTimes = new Map();
 
@@ -15540,14 +10999,6 @@ function ensureStateMaintenanceTimer() {
   stateMaintenanceTimer.unref?.();
 }
 
-async function resolveProjectStateRoot(cwd = "") {
-  const base = path.resolve(cwd || process.cwd());
-  const repoRoot = await runCommand("git", ["rev-parse", "--show-toplevel"], base, 1000 * 15);
-  const resolved = repoRoot.exitCode === 0 && repoRoot.stdout.trim()
-    ? path.resolve(repoRoot.stdout.trim())
-    : base;
-  return existsSync(resolved) ? realpathSync(resolved) : resolved;
-}
 
 async function normalizeJobCwd(job) {
   if (job?.sanitizedWorkspace?.root) {
@@ -15562,219 +11013,14 @@ async function normalizeJobCwd(job) {
   };
 }
 
-function lockTableHasCompositePrimaryKey(db) {
-  const primaryKeyColumns = db.prepare("PRAGMA table_info(locks)").all()
-    .filter((column) => Number(column.pk) > 0)
-    .sort((left, right) => Number(left.pk) - Number(right.pk))
-    .map((column) => column.name);
-  return primaryKeyColumns.length === 2
-    && primaryKeyColumns[0] === "normalized_path"
-    && primaryKeyColumns[1] === "run_id";
-}
 
-function ensureLockTableSchema(db) {
-  if (!lockTableHasCompositePrimaryKey(db)) migrateLegacyLockTable(db);
-  // 1 when the lock holder edits the checkout itself, 0 for a writer in its own worktree;
-  // NULL rows come from older bridges and are treated as editing the checkout.
-  ensureTableColumn(db, "locks", "edits_checkout", "INTEGER");
-}
 
-function migrateLegacyLockTable(db) {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (!lockTableHasCompositePrimaryKey(db)) {
-      db.exec(`
-        ALTER TABLE locks RENAME TO locks_legacy_single_path;
-        CREATE TABLE locks (
-          normalized_path TEXT NOT NULL,
-          owner_agent TEXT NOT NULL,
-          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
-          run_id TEXT NOT NULL,
-          token TEXT NOT NULL,
-          lock_mode TEXT NOT NULL,
-          expires_at INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          cwd TEXT,
-          task TEXT,
-          PRIMARY KEY (normalized_path, run_id)
-        );
-        INSERT OR IGNORE INTO locks
-          (normalized_path, owner_agent, run_id, token, lock_mode, expires_at, created_at, cwd, task)
-        SELECT normalized_path, owner_agent, run_id, token, lock_mode, expires_at, created_at, cwd, task
-        FROM locks_legacy_single_path;
-        DROP TABLE locks_legacy_single_path;
-      `);
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Preserve the original migration error.
-    }
-    throw error;
-  }
-}
 
-function ensureTableColumn(db, table, column, definition) {
-  const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((item) => item.name));
-  if (!columns.has(column)) {
-    try {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-    } catch (error) {
-      if (!/duplicate column name/i.test(error.message || String(error))) throw error;
-    }
-  }
-}
 
-function ensureQueueLeaseSchema(db) {
-  ensureTableColumn(db, "opencode_jobs", "owner_instance_id", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "owner_process_id", "INTEGER");
-  ensureTableColumn(db, "opencode_jobs", "owner_generation", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "updated_at", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "heartbeat_at", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "lease_expires_at", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "cancellation_requested_at", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "child_process_id", "INTEGER");
-  ensureTableColumn(db, "opencode_jobs", "child_process_started_at", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "revision", "INTEGER NOT NULL DEFAULT 0");
-  ensureTableColumn(db, "opencode_jobs", "idempotency_key", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "request_encrypted", "TEXT");
-  ensureTableColumn(db, "opencode_jobs", "result_encrypted", "TEXT");
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS opencode_jobs_idempotency_idx ON opencode_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';");
-}
 
-function ensurePipelineRevisionSchema(db) {
-  ensureTableColumn(db, "opencode_pipelines", "revision", "INTEGER NOT NULL DEFAULT 0");
-  ensureTableColumn(db, "opencode_pipelines", "request_encrypted", "TEXT");
-  ensureTableColumn(db, "opencode_pipelines", "details_encrypted", "TEXT");
-  ensureTableColumn(db, "opencode_pipelines", "owner_instance_id", "TEXT NOT NULL DEFAULT ''");
-  ensureTableColumn(db, "opencode_pipelines", "owner_generation", "TEXT NOT NULL DEFAULT ''");
-  ensureTableColumn(db, "opencode_pipelines", "owner_heartbeat_at", "TEXT NOT NULL DEFAULT ''");
-  ensureTableColumn(db, "opencode_pipelines", "owner_lease_expires_at", "TEXT NOT NULL DEFAULT ''");
-  ensureTableColumn(db, "opencode_pipelines", "expected_child_count", "INTEGER NOT NULL DEFAULT 0");
-  ensureTableColumn(db, "opencode_pipelines", "batch_state", "TEXT NOT NULL DEFAULT 'unstarted'");
-  ensureTableColumn(db, "opencode_pipelines", "cleanup_state", "TEXT NOT NULL DEFAULT 'none'");
-  ensureTableColumn(db, "opencode_pipelines", "queue_mode", "TEXT NOT NULL DEFAULT 'legacy'");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS opencode_pipeline_children (
-      pipeline_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      job_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (pipeline_id, ordinal),
-      UNIQUE (job_id),
-      FOREIGN KEY (pipeline_id) REFERENCES opencode_pipelines(pipeline_id) ON DELETE CASCADE,
-      FOREIGN KEY (job_id) REFERENCES opencode_jobs(job_id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS opencode_pipeline_children_job_idx
-      ON opencode_pipeline_children (job_id);
-    CREATE INDEX IF NOT EXISTS opencode_pipelines_owner_lease_idx
-      ON opencode_pipelines (status, owner_lease_expires_at);
-    UPDATE opencode_pipelines
-    SET owner_instance_id = COALESCE(NULLIF(owner_instance_id, ''), json_extract(record_json, '$.ownerInstanceId'), ''),
-        owner_generation = COALESCE(NULLIF(owner_generation, ''), json_extract(record_json, '$.ownerGeneration'), ''),
-        owner_heartbeat_at = COALESCE(NULLIF(owner_heartbeat_at, ''), json_extract(record_json, '$.ownerHeartbeatAt'), ''),
-        owner_lease_expires_at = COALESCE(NULLIF(owner_lease_expires_at, ''), json_extract(record_json, '$.ownerLeaseExpiresAt'), ''),
-        expected_child_count = CASE
-          WHEN expected_child_count > 0 THEN expected_child_count
-          ELSE COALESCE(json_array_length(record_json, '$.queueJobIds'), 0)
-        END,
-        batch_state = CASE
-          WHEN batch_state <> 'unstarted' THEN batch_state
-          WHEN COALESCE(json_array_length(record_json, '$.queueJobIds'), 0) > 0
-            OR status = 'running'
-            OR EXISTS (
-              SELECT 1 FROM opencode_jobs AS legacy_child
-              WHERE json_valid(legacy_child.record_json)
-                AND json_extract(legacy_child.record_json, '$.parentJobId') = opencode_pipelines.pipeline_id
-            )
-          THEN 'legacy'
-          ELSE batch_state
-        END
-    WHERE json_valid(record_json);
-  `);
-}
 
-function ensureIntegrationJournalSchema(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS integration_operations (
-      operation_id TEXT PRIMARY KEY,
-      cwd TEXT NOT NULL,
-      pipeline_id TEXT NOT NULL DEFAULT '',
-      pipeline_job_id TEXT NOT NULL DEFAULT '',
-      owner_instance_id TEXT NOT NULL,
-      owner_generation TEXT NOT NULL,
-      revision INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL,
-      target_head TEXT NOT NULL,
-      target_state_sha256 TEXT NOT NULL,
-      pre_index_sha256 TEXT NOT NULL,
-      patch_sha256 TEXT NOT NULL,
-      source_base_commit TEXT NOT NULL,
-      source_state_sha256 TEXT NOT NULL,
-      contract_sha256 TEXT NOT NULL,
-      affected_paths_json TEXT NOT NULL,
-      result_json TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      finished_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS integration_operation_files (
-      operation_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      path TEXT NOT NULL,
-      pre_kind TEXT NOT NULL,
-      pre_mode INTEGER NOT NULL DEFAULT 0,
-      pre_sha256 TEXT NOT NULL,
-      pre_encrypted TEXT,
-      post_sha256 TEXT NOT NULL,
-      post_encrypted TEXT NOT NULL,
-      PRIMARY KEY (operation_id, ordinal),
-      UNIQUE (operation_id, path),
-      FOREIGN KEY (operation_id) REFERENCES integration_operations(operation_id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS integration_operations_recovery_idx
-      ON integration_operations (cwd, status, updated_at);
-    CREATE INDEX IF NOT EXISTS integration_operations_pipeline_idx
-      ON integration_operations (pipeline_id, pipeline_job_id);
-    CREATE INDEX IF NOT EXISTS integration_operation_files_operation_idx
-      ON integration_operation_files (operation_id, ordinal);
-  `);
-  // SHA-256 of the path's `git ls-files --stage` entry at prepare time. Recovery compares the
-  // affected paths' entries only; NULL (rows from older bridges) keeps the whole-index rule.
-  ensureTableColumn(db, "integration_operation_files", "pre_index_entry_sha256", "TEXT");
-}
 
-function ensureIntegrationPreviewReceiptSchema(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS consumed_integration_previews (
-      preview_id TEXT PRIMARY KEY,
-      expires_at INTEGER NOT NULL,
-      consumed_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS consumed_integration_previews_expiry_idx
-      ON consumed_integration_previews (expires_at);
-  `);
-}
 
-function ensureWorktreeArtifactSchema(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS worktree_artifacts (
-      worktree_path TEXT PRIMARY KEY,
-      cwd TEXT NOT NULL,
-      branch TEXT NOT NULL,
-      job_id TEXT NOT NULL,
-      status TEXT NOT NULL,
-      measured_bytes INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      cleaned_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS worktree_artifacts_capacity_idx
-      ON worktree_artifacts (cwd, status, updated_at);
-  `);
-}
 
 async function migrateLegacyEncryptedState(db, dbPath) {
   const legacyJobs = db.prepare(`
@@ -15848,156 +11094,7 @@ async function migrateLegacyEncryptedState(db, dbPath) {
   return true;
 }
 
-function scrubLegacyLockSecrets(db) {
-  const rows = db.prepare("SELECT rowid, token, task FROM locks").all();
-  const update = db.prepare("UPDATE locks SET token = ?, task = ? WHERE rowid = ?");
-  for (const row of rows) {
-    const token = String(row.token || "");
-    const task = String(row.task || "");
-    const tokenDigest = /^sha256:[a-f0-9]{64}$/i.test(token)
-      ? token.toLowerCase()
-      : `sha256:${createHash("sha256").update(token).digest("hex")}`;
-    const taskDigest = /^sha256:[a-f0-9]{64}$/i.test(task)
-      ? task.toLowerCase()
-      : `sha256:${createHash("sha256").update(task).digest("hex")}`;
-    if (token !== tokenDigest || task !== taskDigest) update.run(tokenDigest, taskDigest, row.rowid);
-  }
-}
 
-async function openLockDb(cwd = "") {
-  const dbPath = stateDbPath(await resolveProjectStateRoot(cwd));
-  await mkdir(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-  await assertNoLinkedPath(path.dirname(dbPath), "Bridge state directory");
-  if (existsSync(dbPath)) {
-    const details = await lstat(dbPath);
-    if (details.isSymbolicLink() || !details.isFile()) {
-      throw new Error("Bridge state database must be a regular file, not a link or special entry.");
-    }
-  }
-  const maxAttempts = 8;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    let db = null;
-    try {
-      db = new DatabaseSync(dbPath);
-      const openedDetails = await lstat(dbPath);
-      if (openedDetails.isSymbolicLink() || !openedDetails.isFile()) {
-        throw new Error("Bridge state database identity changed during open.");
-      }
-      db.exec("PRAGMA busy_timeout = 5000;");
-      db.exec("PRAGMA foreign_keys = ON;");
-      db.exec("PRAGMA synchronous = FULL;");
-      db.exec("PRAGMA secure_delete = ON;");
-      const journalMode = String(db.prepare("PRAGMA journal_mode").get()?.journal_mode || "").toLowerCase();
-      if (journalMode !== "wal") {
-        db.exec("PRAGMA journal_mode = WAL;");
-      }
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS locks (
-          normalized_path TEXT NOT NULL,
-          owner_agent TEXT NOT NULL,
-          acquisition_origin TEXT NOT NULL DEFAULT 'legacy',
-          run_id TEXT NOT NULL,
-          token TEXT NOT NULL,
-          lock_mode TEXT NOT NULL,
-          expires_at INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          cwd TEXT,
-          task TEXT,
-          PRIMARY KEY (normalized_path, run_id)
-        );
-        CREATE TABLE IF NOT EXISTS runs (
-          run_id TEXT PRIMARY KEY,
-          agent TEXT NOT NULL,
-          status TEXT NOT NULL,
-          lock_mode TEXT,
-          started_at INTEGER NOT NULL,
-          finished_at INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS changed_files (
-          run_id TEXT NOT NULL,
-          path TEXT NOT NULL,
-          allowed INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS opencode_jobs (
-          job_id TEXT PRIMARY KEY,
-          cwd TEXT,
-          status TEXT NOT NULL,
-          agent TEXT NOT NULL,
-          mode TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          started_at TEXT,
-          finished_at TEXT,
-          record_json TEXT NOT NULL,
-          idempotency_key TEXT,
-          request_encrypted TEXT,
-          result_encrypted TEXT
-        );
-        CREATE TABLE IF NOT EXISTS opencode_pipelines (
-          pipeline_id TEXT PRIMARY KEY,
-          cwd TEXT,
-          status TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          record_json TEXT NOT NULL,
-          revision INTEGER NOT NULL DEFAULT 0,
-          request_encrypted TEXT,
-          details_encrypted TEXT
-        );
-        CREATE TABLE IF NOT EXISTS bridge_instances (
-          instance_id TEXT PRIMARY KEY,
-          process_id INTEGER NOT NULL,
-          started_at TEXT NOT NULL,
-          heartbeat_at TEXT NOT NULL,
-          lease_expires_at TEXT NOT NULL
-        );
-      `);
-      ensureDirectRunAuditSchema(db);
-      ensureLockTableSchema(db);
-      ensureTableColumn(db, "locks", "acquisition_origin", "TEXT NOT NULL DEFAULT 'legacy'");
-      ensureTableColumn(db, "runs", "containment", "TEXT NOT NULL DEFAULT ''");
-      ensureQueueLeaseSchema(db);
-      ensurePipelineRevisionSchema(db);
-      ensureIntegrationJournalSchema(db);
-      ensureIntegrationPreviewReceiptSchema(db);
-      ensureWorktreeArtifactSchema(db);
-      await migrateLegacyEncryptedState(db, dbPath);
-      scrubLegacyLockSecrets(db);
-      const heartbeatAt = new Date().toISOString();
-      const leaseExpiresAt = new Date(Date.now() + CONFIG.queueLeaseMs).toISOString();
-      db.prepare(`
-        INSERT INTO bridge_instances (instance_id, process_id, started_at, heartbeat_at, lease_expires_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(instance_id) DO UPDATE SET
-          process_id = excluded.process_id,
-          heartbeat_at = excluded.heartbeat_at,
-          lease_expires_at = excluded.lease_expires_at
-      `).run(BRIDGE_INSTANCE_ID, process.pid, heartbeatAt, heartbeatAt, leaseExpiresAt);
-      db.exec("CREATE INDEX IF NOT EXISTS locks_expires_at_idx ON locks (expires_at)");
-      db.exec("CREATE INDEX IF NOT EXISTS runs_retention_idx ON runs (status, finished_at)");
-      db.exec("CREATE INDEX IF NOT EXISTS changed_files_run_idx ON changed_files (run_id)");
-      db.exec("CREATE INDEX IF NOT EXISTS opencode_jobs_lease_idx ON opencode_jobs (status, lease_expires_at)");
-      db.exec("CREATE INDEX IF NOT EXISTS opencode_jobs_retention_idx ON opencode_jobs (status, finished_at)");
-      db.exec("CREATE INDEX IF NOT EXISTS opencode_pipelines_retention_idx ON opencode_pipelines (status, updated_at)");
-      KNOWN_STATE_DB_PATHS.add(dbPath);
-      ensureQueueHeartbeatTimer();
-      ensureStateMaintenanceTimer();
-      prunePersistedState(db, dbPath);
-      return db;
-    } catch (error) {
-      if (db) {
-        closeDb(db);
-      }
-      const retryable = /database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(error.message || String(error));
-      if (!retryable || attempt === maxAttempts - 1) {
-        throw error;
-      }
-      const delayMs = Math.min(1000, 25 * (2 ** attempt));
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-
-  throw new Error("SQLite lock database could not be opened.");
-}
 
 function directRunAuditStore() {
   return createDirectRunAudit({
@@ -16016,441 +11113,21 @@ function directRunAuditStore() {
   });
 }
 
-function closeDb(db) {
-  try {
-    db.close();
-  } catch {
-    // Nothing useful to do during cleanup.
-  }
-}
 
-function rowsToLocks(rows) {
-  const grouped = new Map();
-  for (const row of rows) {
-    const key = row.run_id;
-    const lock = grouped.get(key) || {
-      id: row.run_id,
-      runId: row.run_id,
-      owner: row.owner_agent,
-      agent: row.owner_agent,
-      origin: row.acquisition_origin || "legacy",
-      lockType: row.lock_mode,
-      lockMode: row.lock_mode,
-      paths: [],
-      cwd: row.cwd || "",
-      taskSha256: String(row.task || "").replace(/^sha256:/i, ""),
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-      editsCheckout: row.edits_checkout === null || row.edits_checkout === undefined ? true : Number(row.edits_checkout) !== 0,
-    };
-    lock.paths.push(row.normalized_path);
-    grouped.set(key, lock);
-  }
-  return [...grouped.values()].map((lock) => ({ ...lock, paths: normalizeLockPathList(lock.paths) }));
-}
 
-function expireLocksFromDb(db, now = Date.now()) {
-  const expiredRunIds = db.prepare("SELECT DISTINCT run_id FROM locks WHERE expires_at <= ?").all(now)
-    .map((row) => row.run_id)
-    .filter(Boolean);
-  db.prepare("DELETE FROM locks WHERE expires_at <= ?").run(now);
-  const markExpired = db.prepare(`
-    UPDATE runs
-    SET status = 'expired', finished_at = COALESCE(finished_at, ?)
-    WHERE run_id = ? AND status = 'running'
-      AND NOT EXISTS (SELECT 1 FROM locks WHERE locks.run_id = runs.run_id)
-  `);
-  for (const runId of expiredRunIds) markExpired.run(now, runId);
-  return expiredRunIds;
-}
 
-function listLocksFromDb(db, now = Date.now()) {
-  expireLocksFromDb(db, now);
-  return rowsToLocks(db.prepare("SELECT * FROM locks WHERE expires_at > ? ORDER BY created_at, run_id, normalized_path").all(now));
-}
 
-async function cleanupExpiredLocks(cwd = "") {
-  const db = await openLockDb(cwd);
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    expireLocksFromDb(db, Date.now());
-    db.exec("COMMIT");
-  } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* Preserve the cleanup error. */ }
-    throw error;
-  } finally {
-    closeDb(db);
-  }
-}
 
-async function listLocks(cwd = "") {
-  const db = await openLockDb(cwd);
-  try {
-    return listLocksFromDb(db);
-  } finally {
-    closeDb(db);
-  }
-}
 
-async function acquireHardLock({
-  owner = "codex",
-  agent = "opencode",
-  origin = "internal",
-  task = "",
-  cwd = "",
-  lockType = "write",
-  paths = [],
-  repositoryScope = false,
-  ttlMs = DEFAULT_LOCK_TTL_MS,
-  editsCheckout = undefined,
-  // Internal-only: set by recoverIntegrationRepositorySerially so journal recovery can take its
-  // lock while the journal blocks writers. The tool never passes it (the exemption used to key
-  // on the caller-controlled agent name).
-  integrationRecoveryAuthority = false,
-}) {
-  const normalizedLockType = String(lockType || "write").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  const normalizedOrigin = origin === "manual" ? "manual" : "internal";
-  const recoveryAuthority = integrationRecoveryAuthority === true && normalizedOrigin === "internal";
-  // A writer edits the checkout unless it is an internal job writer while this process runs
-  // writers in worktrees; the flag is persisted so other bridge processes decide from it.
-  const lockEditsCheckout = typeof editsCheckout === "boolean"
-    ? editsCheckout
-    : !(normalizedOrigin === "internal" && normalizedLockType === "write" && CONFIG.worktreeMode !== "off");
-  const projectRoot = await resolveProjectStateRoot(cwd || process.cwd());
-  const requestedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : paths;
-  const unsafeReason = repositoryScope ? "" : unsafePathReason(requestedPaths, projectRoot);
-  const lockPathsRequested = normalizeLockPathListForCwd(requestedPaths, projectRoot);
-  await reclaimLockQuarantinesForRoot(projectRoot);
 
-  if (INTEGRATION_RECOVERY_BLOCKED_ROOTS.has(path.resolve(projectRoot))
-    && normalizedLockType !== "read"
-    && !recoveryAuthority) {
-    return {
-      ok: false,
-      errorType: "integration_recovery_pending",
-      error: "Repository mutation is blocked until the durable integration journal is recovered or explicitly quarantined.",
-    };
-  }
 
-  if (!PARALLEL_LOCK_TYPES.has(normalizedLockType)) {
-    return {
-      ok: false,
-      error: `Invalid lockType "${lockType}". Use read, write, or serial_integration.`,
-    };
-  }
 
-  if (repositoryScope && (normalizedOrigin !== "internal" || normalizedLockType === "write")) {
-    return {
-      ok: false,
-      error: "Repository-wide scope is reserved for internal read or serial-integration consistency leases.",
-    };
-  }
 
-  if (!lockPathsRequested.length) {
-    return {
-      ok: false,
-      error: "Write lock rejected: paths are required.",
-    };
-  }
 
-  if (unsafeReason) {
-    return {
-      ok: false,
-      error: `Write lock rejected: ${unsafeReason}`,
-    };
-  }
 
-  // With the project root, a real file named like a pattern (app/[slug]/page.tsx) is accepted
-  // here exactly as the plan checks accept it; without it such a job passed its plan and then
-  // had every lock refused.
-  if (hasAmbiguousPathPattern(lockPathsRequested, projectRoot)) {
-    return {
-      ok: false,
-      error: "Write lock rejected: wildcard or ambiguous paths are not allowed.",
-    };
-  }
 
-  const db = await openLockDb(projectRoot);
-  const now = Date.now();
-  const runId = makeLockId(owner, agent);
-  const token = makeLockToken();
-  const tokenSha256 = `sha256:${createHash("sha256").update(token).digest("hex")}`;
-  const taskSha256 = createHash("sha256").update(String(task || "")).digest("hex");
-  const expiresAt = now + Math.min(MAX_LOCK_TTL_MS, Math.max(1000, Number(ttlMs) || DEFAULT_LOCK_TTL_MS));
-  const request = { lockType: normalizedLockType, paths: lockPathsRequested, origin: normalizedOrigin, editsCheckout: lockEditsCheckout };
 
-  let committed = false;
-  let commitAttempted = false;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    if (normalizedLockType !== "read" && !recoveryAuthority) {
-      const unresolvedIntegration = db.prepare(`
-        SELECT operation_id, status
-        FROM integration_operations
-        WHERE cwd = ? AND status NOT IN (${INTEGRATION_RESOLVED_SQL})
-        ORDER BY updated_at, operation_id
-        LIMIT 1
-      `).get(path.resolve(projectRoot));
-      if (unresolvedIntegration) {
-        db.exec("ROLLBACK");
-        return {
-          ok: false,
-          errorType: "integration_recovery_pending",
-          error: "Repository mutation is blocked by an unresolved durable integration operation.",
-          operationId: unresolvedIntegration.operation_id,
-          operationStatus: unresolvedIntegration.status,
-        };
-      }
-    }
-    const keptLocks = listLocksFromDb(db, now);
-    const conflict = keptLocks.map((lock) => conflictsWithActiveLock(request, lock)).find(Boolean);
-    if (conflict) {
-      db.exec("ROLLBACK");
-      const conflictPath = normalizeLockPath(conflict.overlap?.[0] || conflict.overlap?.[1] || conflict.paths?.[0] || "");
-      return {
-        ok: false,
-        error: `Write lock conflict on: ${conflictPath || "unknown"}`,
-        conflict,
-        activeLocks: keptLocks,
-      };
-    }
 
-    db.prepare(
-      "INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at) VALUES (?, ?, ?, ?, ?, NULL)"
-    ).run(runId, agent, "running", normalizedLockType, now);
-    const insert = db.prepare(
-      "INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    );
-    for (const requestedPath of lockPathsRequested) {
-      insert.run(requestedPath, agent || owner, normalizedOrigin, runId, tokenSha256, normalizedLockType, expiresAt, now, projectRoot, `sha256:${taskSha256}`, lockEditsCheckout ? 1 : 0);
-    }
-    // Read inside the transaction: after COMMIT a SQLITE_BUSY in this listing (it expires
-    // rows) reported the acquire as rejected while the lock rows stayed committed with a
-    // token nobody had, orphaning the lock for its whole TTL.
-    const activeLocks = listLocksFromDb(db, now);
-    commitAttempted = true;
-    db.exec("COMMIT");
-    committed = true;
-
-    const lock = {
-      id: runId,
-      runId,
-      token,
-      owner,
-      agent,
-      origin: normalizedOrigin,
-      taskSha256,
-      cwd: projectRoot,
-      lockType: normalizedLockType,
-      lockMode: normalizedLockType,
-      paths: lockPathsRequested,
-      createdAt: now,
-      expiresAt,
-      editsCheckout: lockEditsCheckout,
-      pid: process.pid,
-    };
-    return { ok: true, lock, activeLocks };
-  } catch (error) {
-    if (!committed) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback errors after failed begin/commit.
-      }
-    }
-    // COMMIT can report an error after its rows are durable, and anything that throws after it
-    // lands here too. This acquire is reported as failed and nobody holds the token, so a row
-    // that did commit would stay locked for the whole TTL (up to a day). Remove what this call
-    // inserted, identified by its own run id and fresh token, so a failed acquire never leaves
-    // a lock. The DELETE is a no-op when the transaction rolled back.
-    if (commitAttempted) {
-      try {
-        db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(runId, tokenSha256);
-        db.prepare("UPDATE runs SET status = 'released', finished_at = ? WHERE run_id = ? AND status = 'running'").run(Date.now(), runId);
-      } catch (cleanupError) {
-        logEvent("error", "lock.acquire_cleanup_failed", {
-          lockId: runId,
-          error: cleanupError?.message || String(cleanupError),
-        });
-      }
-    }
-    return { ok: false, error: `Write lock rejected: ${error.message || String(error)}` };
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function releaseHardLock(lockId, token = "", paths = [], cwd = "") {
-  if (!lockId) {
-    return { ok: false, released: false, error: "lockId is required." };
-  }
-
-  if (!token) {
-    return { ok: false, released: false, error: "Lock release token is required." };
-  }
-
-  let db;
-  try {
-    db = await openLockDb(cwd);
-  } catch (error) {
-    // Callers release in finally blocks; an unopenable state database must not replace their
-    // result with an exception. The lease expires on its own.
-    return { ok: false, released: false, error: error.message || String(error) };
-  }
-  let committed = false;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    const requestedPaths = normalizeLockPathList(paths);
-    const tokenSha256 = `sha256:${createHash("sha256").update(String(token)).digest("hex")}`;
-    const rows = requestedPaths.length
-      ? db.prepare(`SELECT * FROM locks WHERE run_id = ? AND token = ? AND normalized_path IN (${requestedPaths.map(() => "?").join(",")})`).all(lockId, tokenSha256, ...requestedPaths)
-      : db.prepare("SELECT * FROM locks WHERE run_id = ? AND token = ?").all(lockId, tokenSha256);
-    if (!rows.length) {
-      db.exec("ROLLBACK");
-      return { ok: false, released: false, error: "No active lock matched that run_id and token." };
-    }
-
-    if (requestedPaths.length) {
-      db.prepare(`DELETE FROM locks WHERE run_id = ? AND token = ? AND normalized_path IN (${requestedPaths.map(() => "?").join(",")})`).run(lockId, tokenSha256, ...requestedPaths);
-    } else {
-      db.prepare("DELETE FROM locks WHERE run_id = ? AND token = ?").run(lockId, tokenSha256);
-    }
-    const remaining = db.prepare("SELECT 1 FROM locks WHERE run_id = ? LIMIT 1").get(lockId);
-    if (!remaining) {
-      db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?").run("released", Date.now(), lockId);
-    }
-    const activeLocks = listLocksFromDb(db);
-    db.exec("COMMIT");
-    committed = true;
-    return { ok: true, released: true, activeLocks };
-  } catch (error) {
-    if (!committed) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback errors after failed begin/commit.
-      }
-    }
-    return { ok: false, released: false, error: error.message || String(error) };
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function quarantineHardLock(lock, containment = "") {
-  if (!lock?.id || !lock?.token) return { ok: false };
-  const db = await openLockDb(lock.cwd);
-  try {
-    const now = Date.now();
-    const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-    db.exec("BEGIN IMMEDIATE");
-    db.prepare(`
-      UPDATE locks SET expires_at = ?
-      WHERE run_id = ? AND token = ?
-    `).run(Number.MAX_SAFE_INTEGER, lock.id, tokenSha256);
-    // Expired rows may already have been pruned, including only some of the
-    // original paths. Restore the complete scope before another writer starts.
-    const heldPaths = new Set(db.prepare("SELECT normalized_path FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
-      .all(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER).map((row) => row.normalized_path));
-    if (!heldPaths.size && (!Array.isArray(lock.paths) || !lock.paths.length)) {
-      db.exec("ROLLBACK");
-      return { ok: false };
-    }
-    if (Array.isArray(lock.paths) && lock.paths.some((lockPath) => !heldPaths.has(lockPath))) {
-      const insert = db.prepare(`
-        INSERT INTO locks (normalized_path, owner_agent, acquisition_origin, run_id, token, lock_mode, expires_at, created_at, cwd, task, edits_checkout)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const lockPath of lock.paths) {
-        if (heldPaths.has(lockPath)) continue;
-        insert.run(lockPath, lock.agent || lock.owner || "opencode", lock.origin || "internal", lock.id,
-          tokenSha256, lock.lockType || lock.lockMode || "write", Number.MAX_SAFE_INTEGER,
-          Number(lock.createdAt) || now, lock.cwd, `sha256:${lock.taskSha256 || ""}`, lock.editsCheckout === false ? 0 : 1);
-      }
-    }
-    db.prepare(`
-      INSERT INTO runs (run_id, agent, status, lock_mode, started_at, finished_at, containment)
-      VALUES (?, ?, 'quarantined', ?, ?, NULL, ?)
-      ON CONFLICT(run_id) DO UPDATE SET status = 'quarantined', finished_at = NULL, containment = excluded.containment
-    `).run(lock.id, lock.agent || lock.owner || "opencode", lock.lockType || lock.lockMode || "write",
-      Number(lock.createdAt) || now, String(containment || ""));
-    db.exec("COMMIT");
-    lock.expiresAt = Number.MAX_SAFE_INTEGER;
-    return { ok: true };
-  } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* Preserve the containment error. */ }
-    logEvent("error", "lock.containment_quarantine_failed", {
-      lockId: lock.id,
-      error: error.message || String(error),
-    });
-    return { ok: false };
-  } finally {
-    closeDb(db);
-  }
-}
-
-// A containment quarantine sets expires_at to Number.MAX_SAFE_INTEGER, beyond the largest
-// Date, so new Date(...).toISOString() threw RangeError and list_agent_locks failed.
-function formatLockExpiry(expiresAt) {
-  const value = Number(expiresAt);
-  if (value >= Number.MAX_SAFE_INTEGER) return "quarantined (no expiry)";
-  const date = new Date(value);
-  return Number.isFinite(value) && !Number.isNaN(date.getTime()) ? date.toISOString() : "unknown";
-}
-
-function formatAgentLockList(locks = []) {
-  return locks.length
-    ? [
-        "Active temporary locks:",
-        "",
-        ...locks.map((lock) =>
-          [
-            `- ${lock.id}`,
-            `  owner: ${lock.owner}`,
-            `  agent: ${lock.agent}`,
-            `  type: ${lock.lockType}`,
-            `  paths: ${lock.paths.join(", ")}`,
-            `  expires: ${formatLockExpiry(lock.expiresAt)}`,
-          ].join("\n")
-        ),
-      ].join("\n")
-    : "No active temporary locks.";
-}
-
-// Agent names the bridge's own internal locks use. The recovery bypass used to key on the
-// agent name, which acquire_agent_lock takes from the caller.
-const RESERVED_LOCK_AGENT_NAMES = new Set(["integration_recovery", "merge_manager", "pipeline_finalizer"]);
-
-function reservedLockAgentError(name) {
-  const normalized = String(name || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  return RESERVED_LOCK_AGENT_NAMES.has(normalized)
-    ? `Lock rejected: "${name}" is reserved for the bridge's internal locks.`
-    : "";
-}
-
-function hardLockPathsForPlan(lockPlan) {
-  if (lockPlan?.lockType === "read") {
-    return firstNonEmptyList(lockPlan.lockedPaths, lockPlan.scopeContract?.scope?.read, [REPOSITORY_SCOPE_LOCK_PATH]);
-  }
-  return firstNonEmptyList(lockPlan.allowedEdits, lockPlan.lockedPaths);
-}
-
-function hardLockTtlForPlan(lockPlan) {
-  const executionTimeoutMs = timeoutForAgent(lockPlan?.agent, lockPlan, lockPlan?.timeoutMs);
-  const safetyMarginMs = CONFIG.validationCommandTimeoutMs + 1000 * 60 * 5;
-  return Math.max(DEFAULT_LOCK_TTL_MS, executionTimeoutMs + safetyMarginMs);
-}
-
-function lockOwnershipLossError(lock, detail = "Durable lock ownership could not be renewed before expiry.") {
-  const error = new Error(detail);
-  error.errorType = lock?.lockType === "read"
-    ? "read_lock_ownership_lost"
-    : lock?.lockType === "serial_integration"
-      ? "integration_lock_ownership_lost"
-      : "write_lock_ownership_lost";
-  error.lockId = lock?.id || "";
-  return error;
-}
 
 function abortSignalErrorType(signal, fallback = "agent_cancelled") {
   return signal?.aborted && typeof signal.reason?.errorType === "string"
@@ -16465,125 +11142,7 @@ function combineAbortSignals(signals = []) {
   return AbortSignal.any(active);
 }
 
-function startHardLockHeartbeat(lock, ttlMs, { intervalMs: requestedIntervalMs = 0, refreshLease = null } = {}) {
-  const controller = new AbortController();
-  const inertStop = Object.assign(() => {}, {
-    signal: controller.signal,
-    pulse: async () => false,
-    assertOwned: () => null,
-  });
-  if (!lock?.id || !lock?.token) return inertStop;
 
-  const effectiveTtlMs = Math.max(250, Number(ttlMs) || DEFAULT_LOCK_TTL_MS);
-  const intervalMs = requestedIntervalMs > 0
-    ? Math.max(20, Math.min(requestedIntervalMs, Math.floor(effectiveTtlMs / 2)))
-    : Math.max(100, Math.min(1000 * 30, Math.floor(effectiveTtlMs / 3)));
-  const expiryGuardMs = Math.max(20, Math.min(intervalMs, Math.floor(effectiveTtlMs / 4)));
-  let lastConfirmedExpiresAt = Number(lock.expiresAt) || Date.now() + effectiveTtlMs;
-  let fenceTimer = null;
-  let refreshPromise = null;
-  let stopped = false;
-
-  const loseOwnership = (detail) => {
-    if (controller.signal.aborted || stopped) return;
-    const error = lockOwnershipLossError(lock, detail);
-    logEvent("error", "lock.ownership_lost", { lockId: lock.id, errorType: error.errorType, detail });
-    controller.abort(error);
-  };
-  const scheduleFence = () => {
-    if (fenceTimer) clearTimeout(fenceTimer);
-    const delayMs = Math.max(0, lastConfirmedExpiresAt - Date.now() - expiryGuardMs);
-    fenceTimer = setTimeout(() => {
-      loseOwnership("Durable lock renewal did not complete before the fail-closed lease deadline.");
-    }, delayMs);
-    fenceTimer.unref?.();
-  };
-
-  const pulse = async () => {
-    if (stopped || controller.signal.aborted) return false;
-    if (refreshPromise) return await refreshPromise;
-    refreshPromise = (async () => {
-      let db = null;
-      try {
-        const now = Date.now();
-        if (lastConfirmedExpiresAt <= now) {
-          loseOwnership("The durable lock expired before its heartbeat could run.");
-          return false;
-        }
-        const expiresAt = now + effectiveTtlMs;
-        let renewed = false;
-        if (typeof refreshLease === "function") {
-          renewed = (await refreshLease({ lock, expiresAt })) !== false;
-        } else {
-          db = await openLockDb(lock.cwd);
-          if (stopped || controller.signal.aborted) return false;
-          const tokenSha256 = `sha256:${createHash("sha256").update(String(lock.token)).digest("hex")}`;
-          // expires_at = MAX_SAFE_INTEGER is a containment quarantine; a pulse that was already
-          // running when quarantineHardLock ran must not renew it back into an expiring lease.
-          const updated = db.prepare("UPDATE locks SET expires_at = ? WHERE run_id = ? AND token = ? AND expires_at > ? AND expires_at <> ?")
-            .run(expiresAt, lock.id, tokenSha256, now, Number.MAX_SAFE_INTEGER);
-          renewed = Number(updated.changes || 0) === Math.max(1, lock.paths?.length || 0);
-          if (!renewed && Number(updated.changes || 0) === 0) {
-            const quarantined = db.prepare("SELECT COUNT(*) AS count FROM locks WHERE run_id = ? AND token = ? AND expires_at = ?")
-              .get(lock.id, tokenSha256, Number.MAX_SAFE_INTEGER);
-            if (Number(quarantined?.count || 0) > 0) {
-              // Held without expiry until containment is resolved; nothing left to renew.
-              if (fenceTimer) clearTimeout(fenceTimer);
-              fenceTimer = null;
-              clearInterval(timer);
-              lastConfirmedExpiresAt = Number.MAX_SAFE_INTEGER;
-              return true;
-            }
-          }
-        }
-        if (!renewed) {
-          loseOwnership("The durable lock row or fencing token no longer belongs to this execution.");
-          return false;
-        }
-        lock.expiresAt = expiresAt;
-        lastConfirmedExpiresAt = expiresAt;
-        scheduleFence();
-        return true;
-      } catch (error) {
-        logEvent("warn", "lock.heartbeat_failed", { lockId: lock.id, error: error.message || String(error) });
-        return false;
-      } finally {
-        if (db) closeDb(db);
-      }
-    })();
-    try {
-      return await refreshPromise;
-    } finally {
-      refreshPromise = null;
-    }
-  };
-
-  scheduleFence();
-  const timer = setInterval(pulse, intervalMs);
-  timer.unref?.();
-  // stop() returns a promise that settles once an in-flight pulse finished, so a caller that
-  // awaits it (before releasing or quarantining the lock) never races a renewal; callers that
-  // do not await it keep working.
-  const stop = Object.assign(() => {
-    stopped = true;
-    clearInterval(timer);
-    if (fenceTimer) clearTimeout(fenceTimer);
-    return refreshPromise ? refreshPromise.then(() => undefined, () => undefined) : Promise.resolve();
-  }, {
-    signal: controller.signal,
-    pulse,
-    assertOwned: () => controller.signal.aborted ? controller.signal.reason : null,
-  });
-  return stop;
-}
-
-function hardLockSummary(acquiredLock) {
-  if (!acquiredLock) {
-    return "not acquired";
-  }
-
-  return `${acquiredLock.id} (${acquiredLock.lockType}: ${acquiredLock.paths.join(", ")})`;
-}
 
 function validateDelegationPlanInputs(jobs) {
   if (!Array.isArray(jobs) || jobs.length < 1) {
@@ -19121,22 +13680,6 @@ server.tool(
   }
 );
 
-// I-002: integrate_opencode_worktrees. Landing N disjoint worktrees took 2N calls (a dry run and
-// an apply each). This is a separate tool, not an `items` mode of integrate_opencode_worktree,
-// because that tool's schema requires a top-level allowedEdits and carries the pipeline
-// parameters (pipelineId) a batch cannot honour; overloading it would have loosened a published
-// schema and made every parameter's meaning depend on a mode. It reuses the same engine:
-// integratePatchSerially runs the batch as ONE patch (see collectIntegrationBatchPatch), so the
-// receipt, serial lock, journal operation, validation, rollback and recovery are the single-item
-// ones, and all-or-nothing is a property of that one operation.
-const integrationBatchItemSchema = z
-  .object({
-    worktreePath: z.string().min(1).optional().describe("OpenCode worktree path containing uncommitted changes to integrate. Give worktreePath or branch."),
-    branch: z.string().min(1).optional().describe("Branch containing committed changes to integrate. Give worktreePath or branch."),
-    allowedEdits: z.array(z.string()).min(1).describe("Exact file or directory paths THIS item may change; the item is refused if its patch leaves them."),
-  })
-  .strict();
-
 function formatIntegrationBatchSummary(result, allowedEditsByItem = []) {
   const items = Array.isArray(result.batchItems) ? result.batchItems : [];
   const itemLines = items.map((item) => {
@@ -19544,326 +14087,24 @@ function orchestratorPolicyError(job, lockPlan, executionMode = "single") {
   };
 }
 
-function normalizePathForCompare(value, cwd = "") {
-  const normalized = cwd ? normalizeLockPathForCwd(value, cwd) : normalizeLockPath(value);
-  return normalizeFilesystemCase(normalized, cwd);
-}
+const { normalizeLockType, normalizeLockMode, createLockPlan, directExecutionLockConflictDetails, validateScopeContract, sanitizedJobPolicyError, parallelBatchCapacityError, validateParallelWritePlan, SELF_CHECK_MAX_COMMANDS, SELF_CHECK_FORBIDDEN_CHARACTERS, SELF_CHECK_INTERPRETERS, SELF_CHECK_DEFAULT_PASSES, SELF_CHECK_MAX_PASSES, selfCheckCommandsError, queueOnlyOptionsError, validationFixPassError, validateSingleLockPlan } = createLockPlanRuntime({
+  CONFIG,
+  hasWriteIntent,
+  normalizeOrchestratorMode,
+  userAuthorizedOrchestrator,
+  contractorAuthorizationValid,
+  READ_ONLY_PARALLEL_AGENTS,
+  PARALLEL_LOCK_TYPES,
+  WRITE_CAPABLE_AGENTS,
+  hardLockPathsForPlan,
+  orchestratorPolicyError,
+  validationCommandTrustError,
+});
 
-// A path with glob characters is ambiguous unless it names an existing file or directory
-// literally (Next.js app/[slug]/page.tsx). Bridge git commands run with
-// GIT_LITERAL_PATHSPECS=1 (buildTrustedGitEnv), so such a path is never expanded as a pattern.
-function hasAmbiguousPathPattern(paths, cwd = "") {
-  return normalizeList(paths).some((candidate) => /[*?[\]{}!]/.test(candidate)
-    && !(cwd && !/[*?]/.test(candidate) && existsSync(path.join(cwd, candidate))));
-}
 
-function overlaps(pathsA, pathsB, cwd = "") {
-  for (const a of pathsA) {
-    for (const b of pathsB) {
-      const left = normalizePathForCompare(a, cwd);
-      const right = normalizePathForCompare(b, cwd);
-      if (left === REPOSITORY_SCOPE_LOCK_PATH
-        || right === REPOSITORY_SCOPE_LOCK_PATH
-        || left === right
-        || left.startsWith(`${right}/`)
-        || right.startsWith(`${left}/`)) {
-        return [a, b];
-      }
-    }
-  }
-  return null;
-}
 
-function normalizeLockType(lockType, job) {
-  const raw = String(lockType || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  if (!raw) {
-    return hasWriteIntent(job) ? "write" : "read";
-  }
 
-  if (raw === "readonly" || raw === "read_only") {
-    return "read";
-  }
 
-  if (raw === "serial" || raw === "integration" || raw === "serial_integration_lock") {
-    return "serial_integration";
-  }
-
-  return raw;
-}
-
-function normalizeLockMode(lockMode, lockType) {
-  const raw = String(lockMode || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  if (lockType === "read") {
-    return raw && !["none", "off", "read", "read_only", "readonly"].includes(raw) ? raw : CONFIG.defaultReadLockMode;
-  }
-
-  if (!raw) {
-    return CONFIG.defaultWriteLockMode;
-  }
-
-  if (raw === "none" || raw === "read" || raw === "read_only" || raw === "readonly") {
-    return "off";
-  }
-
-  if (raw === "auto" || raw === "temporary") {
-    return CONFIG.defaultWriteLockMode;
-  }
-
-  return raw;
-}
-
-function createLockPlan(job, index) {
-  const cwd = job.cwd || "";
-  const lockType = normalizeLockType(job.lockType || job.delegation?.lockType, job);
-  const lockMode = normalizeLockMode(job.lockMode || job.delegation?.lockMode, lockType);
-  const scopeContract = normalizeScopeContract(job);
-  const hasExplicitScopeContract = Boolean(job.scopeContract || job.delegation?.scopeContract);
-  const legacyScopeWriteFallback = hasExplicitScopeContract ? [] : scopeContract?.scope.write;
-  const lockedPaths = normalizeLockPathListForCwd(
-    firstNonEmptyList(job.lockedPaths, job.ownedPaths, job.delegation?.lockedPaths),
-    cwd
-  );
-  const allowedEdits = normalizeLockPathListForCwd(
-    firstNonEmptyList(job.allowedEdits, job.delegation?.allowedEdits, scopeContract?.allowedEdits, legacyScopeWriteFallback),
-    cwd
-  );
-  const forbiddenEdits = normalizeLockPathListForCwd(
-    mergePathLists(
-      DEFAULT_FORBIDDEN_EDIT_PATHS,
-      job.forbiddenEdits,
-      job.delegation?.forbiddenEdits,
-      scopeContract?.scope.forbidden
-    ),
-    cwd
-  );
-  const sharedFiles = normalizeLockPathListForCwd(
-    firstNonEmptyList(job.sharedFiles, job.delegation?.sharedFiles, scopeContract?.shared),
-    cwd
-  );
-  const serialOnly = normalizeLockPathListForCwd(
-    firstNonEmptyList(job.serialOnly, job.delegation?.serialOnly, scopeContract?.serialOnly),
-    cwd
-  );
-  const orchestratorMode = normalizeOrchestratorMode(job);
-  const explicitUserAuthorization = userAuthorizedOrchestrator(job);
-  const contractTimeoutMs = scopeContractTimeout(scopeContract, lockType);
-
-  return {
-    index,
-    agent: job.agent,
-    task: job.task,
-    cwd,
-    lockMode,
-    lockType,
-    orchestratorMode,
-    userAuthorizedOrchestrator: explicitUserAuthorization,
-    contractorAuthorizationVerified: orchestratorMode === "contractor" && contractorAuthorizationValid(job),
-    lockedPaths,
-    allowedEdits,
-    forbiddenEdits,
-    sharedFiles,
-    serialOnly,
-    scopeContract,
-    sanitizedWorkspace: job.sanitizedWorkspace || null,
-    validationCommand: job.validationCommand || job.delegation?.validationCommand || scopeContract?.validationCommand || "",
-    timeoutMs: job.timeoutMs || job.delegation?.timeoutMs || contractTimeoutMs || null,
-  };
-}
-
-function directExecutionLockConflictDetails(lockResult, { queueConflict = false, lockType = "write" } = {}) {
-  if (queueConflict) {
-    return {
-      headline: "Queued job is waiting for a conflicting consistency lock.",
-      errorType: "queue_lock_conflict",
-      suggestedFix: "The queue will retry after the conflicting reader/writer lock is released.",
-    };
-  }
-  if (lockResult?.conflict?.origin === "internal") {
-    if (lockType === "read") {
-      return {
-        headline: "Read job is waiting for an active writer.",
-        errorType: "read_lock_conflict",
-        suggestedFix: "Wait for the overlapping writer to finish, retry later, or provide an explicit disjoint scope.read path.",
-      };
-    }
-    return {
-      headline: "Write job is waiting for an active writer.",
-      errorType: "write_lock_conflict",
-      suggestedFix: "Wait for the active writer to finish, retry later, or choose a non-overlapping lockedPaths scope.",
-    };
-  }
-  return {
-    headline: "Manual lock already exists. Do not pre-acquire locks before run_opencode_agent.",
-    errorType: "manual_lock_misuse",
-    suggestedFix: "Release the existing manual lock or wait for it to expire, then call run_opencode_agent with lockedPaths only.",
-  };
-}
-
-function validateScopeContract(job, lockPlan) {
-  const scopeContract = lockPlan.scopeContract;
-  // G-08: stream syntax in any path input is refused before any scope rule compares paths.
-  const streamPath = [
-    ...scopeContractPathInputs(scopeContract),
-    ...(lockPlan.lockedPaths || []),
-    ...(lockPlan.allowedEdits || []),
-    ...(lockPlan.forbiddenEdits || []),
-    ...(lockPlan.sharedFiles || []),
-    ...(lockPlan.serialOnly || []),
-  ].find((value) => windowsStreamSyntax(normalizeLockPath(value)));
-  if (streamPath !== undefined) {
-    return {
-      errorType: "scope_path_unsafe",
-      error: `Unsafe path input: ${unsafePathReason([streamPath])}`,
-      suggestedFix: "Name plain files or directories; the bridge cannot scope-check NTFS alternate data streams or drive-relative paths.",
-    };
-  }
-  if (!scopeContract) {
-    if (lockPlan.lockType === "write" || job.write === true) {
-      return {
-        errorType: "missing_scope_contract",
-        error: "Every write job must include an explicit Scope Contract. Scope Contract is the source of truth for read, write, allowed, forbidden, shared, serial-only, and validation boundaries.",
-        suggestedFix: "Pass scopeContract with mode write, non-empty write and allowedEdits paths, forbidden/shared/serialOnly lists as needed, and validationCommand for risky work.",
-      };
-    }
-    return null;
-  }
-
-  if (scopeContract.agent && scopeContract.agent !== lockPlan.agent) {
-    return {
-      errorType: "scope_contract_invalid",
-      error: `Scope Contract agent "${scopeContract.agent}" does not match requested agent "${lockPlan.agent}".`,
-      suggestedFix: "Use a Scope Contract for the same agent being delegated.",
-    };
-  }
-
-  if (!["read", "write"].includes(scopeContract.mode)) {
-    return {
-      errorType: "scope_contract_invalid",
-      error: `Scope Contract mode "${scopeContract.mode}" is invalid. Use read or write.`,
-      suggestedFix: "Set Scope Contract mode to read or write.",
-    };
-  }
-
-  const unsafeReason = unsafePathReason(scopeContractPathInputs(scopeContract), lockPlan.cwd || process.cwd());
-  if (unsafeReason) {
-    return {
-      errorType: "scope_path_unsafe",
-      error: `Scope Contract has unsafe path input: ${unsafeReason}`,
-      suggestedFix: "Use repo-relative bounded paths without parent traversal, home shortcuts, control characters, or outside-repo absolute paths.",
-    };
-  }
-
-  if (scopeContract.mode === "read" && scopeContract.scope.write.length) {
-    return {
-      errorType: "scope_readonly_write_scope",
-      error: "Read-only Scope Contract cannot include write paths.",
-      suggestedFix: "Remove scope.write for read-only agents, or change the contract mode and job to write with explicit locks.",
-    };
-  }
-
-  if (READ_ONLY_PARALLEL_AGENTS.has(String(lockPlan.agent || "").trim().toLowerCase()) && scopeContract.scope.write.length) {
-    return {
-      errorType: "scope_readonly_write_scope",
-      error: `Read-only agent "${lockPlan.agent}" cannot receive a write scope.`,
-      suggestedFix: "Use an empty scope.write for read-only agents, or delegate write work to builder/debugger with explicit locks.",
-    };
-  }
-
-  if (lockPlan.lockType === "read" && scopeContract.scope.write.length) {
-    return {
-      errorType: "scope_readonly_write_scope",
-      error: `Read-only agent "${lockPlan.agent}" cannot receive a write scope.`,
-      suggestedFix: "Use an empty scope.write for read-only agents, or run a write-capable agent with write true and lockedPaths.",
-    };
-  }
-
-  if (lockPlan.lockType === "write" && scopeContract.mode !== "write") {
-    return {
-      errorType: "scope_contract_invalid",
-      error: "Write jobs with a Scope Contract must use mode write.",
-      suggestedFix: "Set Scope Contract mode to write and provide scope.write paths.",
-    };
-  }
-
-  if (scopeContract.mode === "write" && !scopeContract.scope.write.length) {
-    return {
-      errorType: "empty_allowed_edits",
-      error: "Write Scope Contract requires non-empty scope.write paths.",
-      suggestedFix: "Add bounded scope.write paths and matching allowedEdits.",
-    };
-  }
-
-  if (scopeContract.mode === "write" && !lockPlan.allowedEdits.length) {
-    return {
-      errorType: "empty_allowed_edits",
-      error: "Write Scope Contract requires non-empty allowedEdits.",
-      suggestedFix: "Add explicit allowedEdits; do not rely on lockedPaths as the edit allowlist.",
-    };
-  }
-
-  if (scopeContract.allowedEdits.length) {
-    const outsideScope = scopeContract.scope.write.length
-      ? unsafeChangedFiles(scopeContract.allowedEdits, scopeContract.scope.write, lockPlan.cwd)
-      : [];
-    if (outsideScope.length) {
-      return {
-        errorType: "scope_write_forbidden",
-        error: `Scope Contract allowedEdits contains paths outside scope.write: ${outsideScope.join(", ")}.`,
-        conflictingPaths: outsideScope,
-        suggestedFix: "Keep allowedEdits inside scope.write, or expand scope.write explicitly.",
-      };
-    };
-  }
-
-  const forbiddenWriteOverlap = overlaps(scopeContract.scope.write, scopeContract.scope.forbidden);
-  if (forbiddenWriteOverlap) {
-    return {
-      errorType: "scope_write_forbidden",
-      error: `Scope Contract write path is forbidden: ${forbiddenWriteOverlap[0]} / ${forbiddenWriteOverlap[1]}.`,
-      conflictingPaths: forbiddenWriteOverlap,
-      suggestedFix: "Remove the forbidden path from scope.write, or narrow the write scope so forbidden paths are excluded.",
-    };
-  }
-
-  for (const allowedPath of lockPlan.allowedEdits) {
-    if (scopeContract.scope.write.length && !isWithinAnyPath(allowedPath, scopeContract.scope.write, lockPlan.cwd)) {
-      return {
-        errorType: "scope_write_forbidden",
-        error: `Allowed edit path is outside Scope Contract write paths: ${allowedPath}.`,
-        conflictingPaths: [allowedPath],
-        suggestedFix: "Keep allowedEdits inside scope.write, or expand scope.write explicitly.",
-      };
-    }
-  }
-
-  return null;
-}
-
-function sanitizedJobPolicyError(job) {
-  if (!job?.sanitizedWorkspace) return null;
-  if (hasWriteIntent(job) || job.lockType === "write" || job.lockType === "serial_integration") {
-    return {
-      error: "Sanitized workspace execution is read-only. Writers require a separate Git worktree/output root.",
-      errorType: "sanitized_workspace_write_forbidden",
-      suggestedFix: "Use a managed read-only agent with lockType read/off, or create a separate Git worktree for output.",
-    };
-  }
-  if (String(job.validationCommand || job.scopeContract?.validationCommand || job.delegation?.validationCommand || "").trim()) {
-    return {
-      error: "Sanitized workspace jobs may not execute repository validation commands; verification is manifest-based before and after the wave.",
-      errorType: "sanitized_workspace_command_forbidden",
-      suggestedFix: "Remove validationCommand and use verify_sanitized_workspace plus an externally trusted validation environment.",
-    };
-  }
-  if (job.subagentStrategy && job.subagentStrategy !== "reject") {
-    return {
-      error: "Sanitized workspace jobs require subagentStrategy=reject so the resolved agent is the directly attested read-only role.",
-      errorType: "sanitized_workspace_subagent_forbidden",
-      suggestedFix: "Set subagentStrategy to reject and choose a primary/all managed read-only agent.",
-    };
-  }
-  return null;
-}
 
 function sanitizedDiscoveryContext(job = {}) {
   const forcePure = Boolean(job.sanitizedWorkspace);
@@ -19890,29 +14131,6 @@ async function verifySanitizedJobsBeforeDiscovery(jobs, phase) {
   return { ok: true, index: -1, verification: null, verifications };
 }
 
-// run_opencode_parallel is one synchronous tool call. Jobs beyond the provider slots wait
-// for one (up to their timeout) and then run their full timeout, so the call could take
-// twice the agent timeout and outlive Codex's tool_timeout_sec. Pipelines and queued jobs
-// take a lease per job and are not limited here. Dry runs take no slot.
-// Leases are counted per provider key (providerKeyForMetadata), so once each job's attested
-// metadata is known the limit applies to each provider's jobs; without keys every job counts
-// against one key, which is the conservative reading.
-function parallelBatchCapacityError(jobs, providerKeys = null) {
-  const leasedByKey = new Map();
-  jobs.forEach((job, index) => {
-    if (job.dryRun) return;
-    const key = Array.isArray(providerKeys) && providerKeys[index] ? providerKeys[index] : CONFIG.providerConcurrencyKey;
-    leasedByKey.set(key, (leasedByKey.get(key) || 0) + 1);
-  });
-  const [overKey, leasedJobCount] = [...leasedByKey.entries()].find(([, count]) => count > CONFIG.providerConcurrencyLimit) || [];
-  if (!overKey) return null;
-  const keyed = Array.isArray(providerKeys) && leasedByKey.size > 1;
-  return {
-    error: `${leasedJobCount} parallel jobs${keyed ? ` for provider key ${overKey}` : ""} exceed CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT ${CONFIG.providerConcurrencyLimit}; the extra jobs would run in a second wave inside the same tool call.`,
-    errorType: "parallel_batch_exceeds_provider_capacity",
-    suggestedFix: `Send at most ${CONFIG.providerConcurrencyLimit} jobs per provider per run_opencode_parallel call, or enqueue the rest with enqueue_opencode_job.`,
-  };
-}
 
 function parallelProviderKeys(resolutions = [], metadataResults = [], lockPlans = []) {
   return resolutions.map((resolution, index) => {
@@ -19923,487 +14141,12 @@ function parallelProviderKeys(resolutions = [], metadataResults = [], lockPlans 
   });
 }
 
-function validateParallelWritePlan(jobs) {
-  const lockPlans = jobs.map((job, index) => createLockPlan(job, index));
-  if (jobs.length > CONFIG.parallelLimit) {
-    return {
-      error: `Parallel job count ${jobs.length} exceeds CODEX_OPENCODE_PARALLEL_LIMIT ${CONFIG.parallelLimit}.`,
-      errorType: "parallel_plan_rejected",
-      lockPlans,
-    };
-  }
-  const writePlans = lockPlans.filter((plan) => plan.lockType === "write");
-  if (writePlans.length > 1) {
-    for (const plan of writePlans) {
-      // Parallel writers always lock strictly; record what the caller asked for so the output
-      // can say the mode was changed instead of silently printing "strict".
-      const requested = String(jobs[plan.index]?.lockMode || "").trim().toLowerCase();
-      if (requested && requested !== CONFIG.defaultParallelWriteLockMode) plan.requestedLockMode = requested;
-      plan.lockMode = CONFIG.defaultParallelWriteLockMode;
-    }
-  }
 
-  for (const plan of lockPlans) {
-    const job = jobs[plan.index];
-    const sanitizedError = sanitizedJobPolicyError(job);
-    if (sanitizedError) {
-      return { ...sanitizedError, lockPlans };
-    }
-    const queueOnly = queueOnlyOptionsError(job);
-    if (queueOnly) return { ...queueOnly, lockPlans };
-    if (job.scopeContract?.selfCheckCommands !== undefined) {
-      return {
-        error: "selfCheckCommands is not supported by run_opencode_parallel: the self-check passes are implemented for single and queued jobs only.",
-        errorType: "self_check_unsupported_in_parallel",
-        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove selfCheckCommands.",
-        lockPlans,
-      };
-    }
-    if (job.validationFixPasses) {
-      return {
-        error: "validationFixPasses is not supported by run_opencode_parallel: the fix pass is implemented for single and queued jobs only.",
-        errorType: "validation_fix_pass_unsupported_in_parallel",
-        suggestedFix: "Run the job with run_opencode_agent or enqueue_opencode_job, or remove validationFixPasses.",
-        lockPlans,
-      };
-    }
-    const planPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.forbiddenEdits, plan.sharedFiles, plan.serialOnly, scopeContractPathInputs(plan.scopeContract));
-    const orchestratorError = orchestratorPolicyError(job, plan, "parallel");
-    if (orchestratorError) {
-      return {
-        ...orchestratorError,
-        serialOnlyMatches: orchestratorError.serialOnlyMatches || [],
-        lockPlans,
-      };
-    }
 
-    const scopeError = validateScopeContract(job, plan);
-    if (scopeError) {
-      return {
-        ...scopeError,
-        conflictingPaths: scopeError.conflictingPaths || [],
-        lockPlans,
-      };
-    }
 
-    if (!PARALLEL_LOCK_TYPES.has(plan.lockType)) {
-      return {
-        error: `Parallel job for agent "${plan.agent}" has invalid lockType "${plan.lockType}". Use read, write, or serial_integration.`,
-        errorType: "parallel_plan_rejected",
-        lockPlans,
-      };
-    }
 
-    if (!["off", "simple", "strict"].includes(plan.lockMode)) {
-      return {
-        error: `Parallel job for agent "${plan.agent}" has invalid lockMode "${plan.lockMode}". Use off, simple, or strict.`,
-        errorType: "invalid_write_lock_mode",
-        suggestedFix: "Use lockMode off for read-only jobs, simple for one writer, and strict for parallel writers.",
-        lockPlans,
-      };
-    }
 
-    const unsafeReason = unsafePathReason(planPathInputs, plan.cwd);
-    if (unsafeReason) {
-      return {
-        error: `Parallel job for agent "${plan.agent}" has unsafe path input: ${unsafeReason}`,
-        errorType: "unsafe_path",
-        lockPlans,
-      };
-    }
 
-    if (plan.lockType !== "read" && plan.lockMode === "off") {
-      return {
-        error: `Parallel write job for agent "${plan.agent}" cannot use lockMode off.`,
-        errorType: "invalid_write_lock_mode",
-        suggestedFix: "Use lockMode strict for parallel write jobs.",
-        lockPlans,
-      };
-    }
-
-    if (plan.lockType === "serial_integration") {
-      return {
-        error: `Parallel job for agent "${plan.agent}" requested a serial integration lock. Serial integration locks must run as a single non-parallel integration step.`,
-        errorType: "serial_only_parallel_write",
-        suggestedFix: "Run this task serially, then run reviewer/tester validation.",
-        lockPlans,
-      };
-    }
-
-    if (plan.lockType === "read") {
-      if (job.write === true || plan.allowedEdits.length) {
-        return {
-          error: `Read-only job for agent "${plan.agent}" cannot request edits. Use write: true with lockedPaths for write work.`,
-          lockPlans,
-        };
-      }
-      if (WRITE_CAPABLE_AGENTS.has(String(plan.agent || "").trim().toLowerCase())) {
-        return {
-          error: `Write-capable agent "${plan.agent}" cannot run against the target repository under a read-only lock.`,
-          errorType: "read_only_agent_required",
-          suggestedFix: "Use planner, architect, reviewer, tester, or orchestrator for read-only work. Run builder/debugger only as bounded worktree writers.",
-          lockPlans,
-        };
-      }
-      continue;
-    }
-
-    if (!plan.lockedPaths.length) {
-      return {
-        error: `Parallel write job for agent "${plan.agent}" is missing required lock fields: lockedPaths.`,
-        errorType: "missing_locked_paths",
-        suggestedFix: "Pass explicit lockedPaths and allowedEdits for every write job.",
-        lockPlans,
-      };
-    }
-
-    if (!plan.allowedEdits.length) {
-      return {
-        error: `Parallel write job for agent "${plan.agent}" is missing required lock fields: allowedEdits.`,
-        errorType: "empty_allowed_edits",
-        suggestedFix: "Pass explicit allowedEdits for every write job; do not rely on lockedPaths as the edit allowlist.",
-        lockPlans,
-      };
-    }
-
-    const ambiguousPathInputs = plan.lockedPaths.concat(plan.allowedEdits, plan.sharedFiles, plan.scopeContract?.scope.write || []);
-    if (hasAmbiguousPathPattern(ambiguousPathInputs, plan.cwd)) {
-      return {
-        error: `Parallel write job for agent "${plan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks, or run serially.`,
-        errorType: "parallel_plan_rejected",
-        lockPlans,
-      };
-    }
-
-    const serialOnlyMatches = findSerialOnlyMatches(plan.lockedPaths.concat(plan.allowedEdits), plan.serialOnly);
-    if (serialOnlyMatches.length) {
-      return {
-        error: "This file or path is global/risky and cannot be edited during parallel execution.",
-        errorType: "serial_only_parallel_write",
-        suggestedFix: "Run this task serially, then run reviewer/tester validation.",
-        serialOnlyMatches,
-        lockPlans,
-      };
-    }
-
-    const sharedOverlap = overlaps(plan.allowedEdits, plan.sharedFiles);
-    if (sharedOverlap) {
-      return {
-        error: `Parallel write job for agent "${plan.agent}" attempts to edit a shared/frozen path: ${sharedOverlap[0]} / ${sharedOverlap[1]}.`,
-        errorType: "shared_file_parallel_write",
-        suggestedFix: "Move shared/frozen changes to a separate serial writer step reviewed by Codex.",
-        conflictingPaths: sharedOverlap,
-        lockPlans,
-      };
-    }
-
-    for (const allowedPath of plan.allowedEdits) {
-      if (!isWithinAnyPath(allowedPath, plan.lockedPaths, plan.cwd)) {
-        return {
-          error: `Parallel write job for agent "${plan.agent}" has allowed edit path outside locked paths: ${allowedPath}.`,
-          errorType: "parallel_plan_rejected",
-          lockPlans,
-        };
-      }
-    }
-
-    const forbiddenOverlap = overlaps(plan.allowedEdits, plan.forbiddenEdits);
-    const forbiddenAllowedPaths = plan.allowedEdits.filter((allowedPath) =>
-      isWithinAnyPath(allowedPath, plan.forbiddenEdits, plan.cwd)
-    );
-    if (forbiddenOverlap || forbiddenAllowedPaths.length) {
-      const conflictingPaths = forbiddenOverlap || forbiddenAllowedPaths;
-      return {
-        error: `Parallel write job for agent "${plan.agent}" allows a forbidden edit path: ${conflictingPaths.join(" / ")}.`,
-        errorType: "parallel_plan_rejected",
-        conflictingPaths,
-        lockPlans,
-      };
-    }
-
-  }
-
-  // Paths are repository-relative: the same relative path in two repositories is no overlap.
-  const sameProject = (left, right) => !left.cwd || !right.cwd
-    || normalizeFilesystemCase(path.resolve(left.cwd), left.cwd) === normalizeFilesystemCase(path.resolve(right.cwd), left.cwd);
-  for (let i = 0; i < lockPlans.length; i += 1) {
-    for (let j = i + 1; j < lockPlans.length; j += 1) {
-      const left = lockPlans[i];
-      const right = lockPlans[j];
-      if ((left.lockType === "read") === (right.lockType === "read")) continue;
-      if (!sameProject(left, right)) continue;
-      const overlap = overlaps(hardLockPathsForPlan(left), hardLockPathsForPlan(right), left.cwd || right.cwd);
-      if (overlap) {
-        return {
-          error: `Parallel read/write jobs overlap: "${left.agent}" and "${right.agent}" both require ${overlap[0]} / ${overlap[1]}.`,
-          errorType: "parallel_read_write_conflict",
-          suggestedFix: "Run the reader after the overlapping writer, or give the reader an explicit disjoint scope.read path.",
-          conflictingPaths: overlap,
-          lockPlans,
-        };
-      }
-    }
-  }
-
-  if (writePlans.length > 1) {
-    for (let i = 0; i < writePlans.length; i += 1) {
-      for (let j = i + 1; j < writePlans.length; j += 1) {
-        if (!sameProject(writePlans[i], writePlans[j])) continue;
-        const overlap = overlaps(
-          writePlans[i].allowedEdits.concat(writePlans[i].lockedPaths),
-          writePlans[j].allowedEdits.concat(writePlans[j].lockedPaths),
-          writePlans[i].cwd || writePlans[j].cwd
-        );
-        if (overlap) {
-          return {
-            error: `Parallel write jobs overlap: "${writePlans[i].agent}" and "${writePlans[j].agent}" both include ${overlap[0]} / ${overlap[1]}.`,
-            errorType: "parallel_plan_rejected",
-            conflictingPaths: overlap,
-            lockPlans,
-          };
-        }
-      }
-    }
-  }
-
-  return { error: null, lockPlans };
-}
-
-// Q-009, B-068: self-check commands. Builders have no shell beyond git diagnostics, so in round 3 a
-// builder could not run `node tools/validate.cjs` on the batch it wrote. A write job's Scope
-// Contract may name exact commands that the BRIDGE runs in the worktree after the agent finished
-// (before validationCommand, with the same trust rules and the process supervisor); a failing one
-// gives the agent another run with its output (selfCheckPasses, default 2, at most 3). The agent
-// itself gets no new permission: B-068 removed the first version, which let the agent run these
-// commands through exact bash allow rules, because edits are not restricted while the agent runs
-// (it could rewrite the script, run it as the bridge user, and put it back). Each command is still
-// one plain command (no wildcard, quote, backslash or shell operator) whose executable passes the
-// validationCommand rules, and a script an interpreter runs must not be an allowed edit.
-const SELF_CHECK_MAX_COMMANDS = 8;
-const SELF_CHECK_FORBIDDEN_CHARACTERS = /[*?[\]{}"'`$;&|<>()\\\r\n\t]/;
-const SELF_CHECK_INTERPRETERS = new Set(["node", "python", "python3", "py", "bun", "deno"]);
-
-const SELF_CHECK_DEFAULT_PASSES = 2;
-const SELF_CHECK_MAX_PASSES = 3;
-
-function selfCheckCommandsError(job, lockPlan) {
-  const commands = lockPlan?.scopeContract?.selfCheckCommands ?? job?.scopeContract?.selfCheckCommands;
-  const refuse = (errorType, error) => ({ errorType, error, suggestedFix: "List exact commands such as \"node tools/validate.cjs out/x.json\" for a builder or debugger write job, or remove selfCheckCommands." });
-  const passes = job?.selfCheckPasses;
-  if (passes !== undefined && passes !== null) {
-    if (typeof passes !== "number" || !Number.isInteger(passes) || passes < 0 || passes > SELF_CHECK_MAX_PASSES) {
-      return refuse("self_check_invalid", `selfCheckPasses must be an integer from 0 to ${SELF_CHECK_MAX_PASSES}; got ${JSON.stringify(passes)}.`);
-    }
-    if (commands === undefined || commands === null) return refuse("self_check_not_applicable", "selfCheckPasses needs scopeContract.selfCheckCommands: the passes run after a self-check failed.");
-  }
-  if (commands === undefined || commands === null) return null;
-  if (!Array.isArray(commands) || !commands.length || commands.length > SELF_CHECK_MAX_COMMANDS) {
-    return refuse("self_check_invalid", `selfCheckCommands must list 1 to ${SELF_CHECK_MAX_COMMANDS} commands.`);
-  }
-  const agent = String(job?.agent || "").toLowerCase();
-  if (lockPlan?.lockType === "read" || job?.sanitizedWorkspace || !WRITE_CAPABLE_AGENTS.has(agent) || job?.orchestratorMode === "contractor") {
-    return refuse("self_check_not_applicable", "selfCheckCommands apply to builder and debugger write jobs only (read-only roles and sanitized readers have no shell; a contractor delegates its checks).");
-  }
-  const allowedEdits = normalizeLockPathList(lockPlan?.allowedEdits || job?.allowedEdits || []);
-  const editable = (candidate) => {
-    const normalized = normalizeLockPathList([candidate])[0] || "";
-    return Boolean(normalized) && allowedEdits.some((edit) => normalized === edit || normalized.startsWith(`${edit}/`));
-  };
-  const seen = new Set();
-  for (const raw of commands) {
-    const command = String(raw ?? "").trim();
-    if (!command || SELF_CHECK_FORBIDDEN_CHARACTERS.test(command) || /\s{2,}/.test(command)) {
-      return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} must be one plain command with single spaces: no wildcards, quotes, backslashes, shell operators or substitutions.`);
-    }
-    if (seen.has(command)) return refuse("self_check_invalid", `Self-check command ${JSON.stringify(command)} is listed twice.`);
-    seen.add(command);
-    const parsed = command.split(" ");
-    if (/[\\/]/.test(parsed[0])) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)} must start with a bare executable name from CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST.`);
-    const trust = validationCommandTrustError(parsed);
-    if (trust) return refuse("self_check_untrusted", `Self-check command ${JSON.stringify(command)}: ${trust}`);
-    const executable = parsed[0].toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-    if (SELF_CHECK_INTERPRETERS.has(executable)) {
-      const script = parsed.slice(1).find((argument) => !argument.startsWith("-"));
-      if (script && editable(script)) {
-        return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs ${script}, which this job may edit; the agent could change it and run its own code.`);
-      }
-    }
-    if (["npm", "pnpm", "yarn"].includes(executable) && editable("package.json")) {
-      return refuse("self_check_script_editable", `Self-check command ${JSON.stringify(command)} runs package.json scripts, and package.json is an allowed edit of this job.`);
-    }
-  }
-  return null;
-}
-
-// Q-007: options only the durable queue can honour (it requeues, waits and integrates after the
-// run); a direct or parallel run would silently ignore them, so they are refused there.
-function queueOnlyOptionsError(job) {
-  const named = ["models", "maxAttempts", "autoIntegrate"].filter((key) => job?.[key] !== undefined && job?.[key] !== null);
-  if (!named.length) return null;
-  return {
-    errorType: "queue_only_option",
-    error: `${named.join(", ")} ${named.length === 1 ? "is" : "are"} honoured by enqueue_opencode_job only: the queue retries, waits for paused models and integrates after the run; this tool would ignore ${named.length === 1 ? "it" : "them"}.`,
-    suggestedFix: "Enqueue the job with enqueue_opencode_job, or remove the option.",
-  };
-}
-
-// Q-004: validationFixPasses is 0 or 1 and only means something for a write job whose
-// validationCommand the bridge runs; anything else would be an option that silently does nothing.
-function validationFixPassError(job, lockPlan) {
-  const requested = job?.validationFixPasses;
-  if (requested === undefined || requested === null || requested === 0) return null;
-  if (requested !== 1) {
-    return { errorType: "validation_fix_pass_invalid", error: `validationFixPasses must be 0 or 1; got ${JSON.stringify(requested)}.`, suggestedFix: "Use validationFixPasses 0 (default) or 1." };
-  }
-  if (lockPlan.lockType === "read" || job.sanitizedWorkspace) {
-    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses applies to write jobs only; a read-only or sanitized-workspace job has no validation to fix.", suggestedFix: "Remove validationFixPasses." };
-  }
-  if (!String(lockPlan.validationCommand || "").trim()) {
-    return { errorType: "validation_fix_pass_not_applicable", error: "validationFixPasses needs a validationCommand: the fix pass runs after that command fails.", suggestedFix: "Add a validationCommand, or remove validationFixPasses." };
-  }
-  return null;
-}
-
-function validateSingleLockPlan(job) {
-  const sanitizedError = sanitizedJobPolicyError(job);
-  if (sanitizedError) {
-    return {
-      ...sanitizedError,
-      lockPlan: createLockPlan({ ...job, write: false, lockType: "read", lockMode: "off" }, 0),
-    };
-  }
-  const lockPlan = createLockPlan(job, 0);
-  const planPathInputs = lockPlan.lockedPaths.concat(lockPlan.allowedEdits, lockPlan.forbiddenEdits, lockPlan.sharedFiles, lockPlan.serialOnly, scopeContractPathInputs(lockPlan.scopeContract));
-  const orchestratorError = orchestratorPolicyError(job, lockPlan, "single");
-  if (orchestratorError) {
-    return {
-      ...orchestratorError,
-      serialOnlyMatches: orchestratorError.serialOnlyMatches || [],
-      lockPlan,
-    };
-  }
-
-  const scopeError = validateScopeContract(job, lockPlan);
-  if (scopeError) {
-    return {
-      ...scopeError,
-      conflictingPaths: scopeError.conflictingPaths || [],
-      lockPlan,
-    };
-  }
-
-  if (!PARALLEL_LOCK_TYPES.has(lockPlan.lockType)) {
-    return {
-      error: `OpenCode job for agent "${lockPlan.agent}" has invalid lockType "${lockPlan.lockType}". Use read, write, or serial_integration.`,
-      errorType: "lock_plan_rejected",
-      lockPlan,
-    };
-  }
-
-  if (!["off", "simple", "strict"].includes(lockPlan.lockMode)) {
-    return {
-      error: `OpenCode job for agent "${lockPlan.agent}" has invalid lockMode "${lockPlan.lockMode}". Use off, simple, or strict.`,
-      errorType: "invalid_write_lock_mode",
-      suggestedFix: "Use lockMode off for read-only jobs and simple/strict for write jobs.",
-      lockPlan,
-    };
-  }
-
-  if (lockPlan.lockType !== "read" && lockPlan.lockMode === "off") {
-    return {
-      error: `Write job for agent "${lockPlan.agent}" cannot use lockMode off.`,
-      errorType: "invalid_write_lock_mode",
-      suggestedFix: "Use lockMode simple for a single writer or strict for coordinated writer work.",
-      lockPlan,
-    };
-  }
-
-  const fixPassError = validationFixPassError(job, lockPlan);
-  if (fixPassError) return { ...fixPassError, lockPlan };
-  const selfCheckError = selfCheckCommandsError(job, lockPlan);
-  if (selfCheckError) return { ...selfCheckError, lockPlan };
-
-  const unsafeReason = unsafePathReason(planPathInputs, lockPlan.cwd);
-  if (unsafeReason) {
-    return {
-      error: `OpenCode job for agent "${lockPlan.agent}" has unsafe path input: ${unsafeReason}`,
-      errorType: "unsafe_path",
-      lockPlan,
-    };
-  }
-
-  if (lockPlan.lockType === "read") {
-    if (job.write === true || lockPlan.allowedEdits.length) {
-      return {
-        error: `Read-only job for agent "${lockPlan.agent}" cannot request edits. Use write: true with lockedPaths for write work.`,
-        errorType: "read_only_edit_forbidden",
-        lockPlan,
-      };
-    }
-    if (WRITE_CAPABLE_AGENTS.has(String(lockPlan.agent || "").trim().toLowerCase())) {
-      return {
-        error: `Write-capable agent "${lockPlan.agent}" cannot run against the target repository under a read-only lock.`,
-        errorType: "read_only_agent_required",
-        suggestedFix: "Use planner, architect, reviewer, tester, or orchestrator for read-only work. Run builder/debugger only as bounded worktree writers.",
-        lockPlan,
-      };
-    }
-    return { error: null, lockPlan };
-  }
-
-  if (!lockPlan.lockedPaths.length) {
-    return {
-      error: `Write job for agent "${lockPlan.agent}" is missing required lock fields: lockedPaths.`,
-      errorType: "missing_locked_paths",
-      suggestedFix: "Pass explicit lockedPaths and allowedEdits for every write job.",
-      lockPlan,
-    };
-  }
-
-  if (!lockPlan.allowedEdits.length) {
-    return {
-      error: `Write job for agent "${lockPlan.agent}" is missing required lock fields: allowedEdits.`,
-      errorType: "empty_allowed_edits",
-      suggestedFix: "Pass explicit allowedEdits for every write job; do not rely on lockedPaths as the edit allowlist.",
-      lockPlan,
-    };
-  }
-
-  const ambiguousPathInputs = lockPlan.lockedPaths.concat(lockPlan.allowedEdits, lockPlan.sharedFiles, lockPlan.scopeContract?.scope.write || []);
-  if (hasAmbiguousPathPattern(ambiguousPathInputs, lockPlan.cwd)) {
-    return {
-      error: `Write job for agent "${lockPlan.agent}" uses wildcard or ambiguous paths. Use concrete file/directory locks.`,
-      errorType: "lock_plan_rejected",
-      lockPlan,
-    };
-  }
-
-  for (const allowedPath of lockPlan.allowedEdits) {
-    if (!isWithinAnyPath(allowedPath, lockPlan.lockedPaths, lockPlan.cwd)) {
-      return {
-        error: `Write job for agent "${lockPlan.agent}" has allowed edit path outside locked paths: ${allowedPath}.`,
-        errorType: "lock_plan_rejected",
-        lockPlan,
-      };
-    }
-  }
-
-  const forbiddenOverlap = overlaps(lockPlan.allowedEdits, lockPlan.forbiddenEdits);
-  const forbiddenAllowedPaths = lockPlan.allowedEdits.filter((allowedPath) =>
-    isWithinAnyPath(allowedPath, lockPlan.forbiddenEdits, lockPlan.cwd)
-  );
-  if (forbiddenOverlap || forbiddenAllowedPaths.length) {
-    const conflictingPaths = forbiddenOverlap || forbiddenAllowedPaths;
-    return {
-      error: `Write job for agent "${lockPlan.agent}" allows a forbidden edit path: ${conflictingPaths.join(" / ")}.`,
-      errorType: "lock_plan_rejected",
-      conflictingPaths,
-      lockPlan,
-    };
-  }
-
-  return { error: null, lockPlan };
-}
 
 function jobAgentRuntime() {
   const hook = process.argv.includes("--self-test") ? agentRuntimeTestHook : null;
@@ -21619,14 +15362,6 @@ async function executeOpenCodeJob(requestedJob, {
   }
 }
 
-// A queued job is "running" from the moment a worker claims it, but it may then wait minutes for
-// a provider slot before the agent starts, so status alone cannot tell waiting from working and
-// durationMs includes the wait. runStage and agentRunMs separate the two.
-function queueStartAfterPending(record, now = Date.now()) {
-  const at = Date.parse(record?.startAfter || "");
-  return Number.isFinite(at) && at > now;
-}
-
 function queueRunStage(record) {
   if (record.status !== "running") {
     // Q-007: a retry that waits for the provider/model pause of every candidate model to end.
@@ -21644,33 +15379,6 @@ function queueRunStage(record) {
   return providerSlotWaitingJobs.has(record.jobId) ? "waiting_for_provider_slot" : "starting_agent";
 }
 
-// B-024: once the job has finished, agentRunMs is the agent process alone (the same number as
-// "Agent run ms" in the result text) and afterAgentMs is the post-agent work (snapshots,
-// validation, patch collection), so waitBeforeAgentMs + agentRunMs + afterAgentMs ~ durationMs.
-// While the job runs, agentRunMs is the time since the supervisor started.
-function queueAgentTiming(record, now = Date.now()) {
-  const agentStartedMs = Date.parse(record.agentStartedAt || "");
-  if (!Number.isFinite(agentStartedMs)) return { agentRunMs: 0, waitBeforeAgentMs: 0 };
-  const finishedMs = Date.parse(record.finishedAt || "");
-  const startedMs = Date.parse(record.startedAt || "");
-  const waitBeforeAgentMs = Number.isFinite(startedMs) ? Math.max(0, agentStartedMs - startedMs) : 0;
-  const processMs = record.phaseTimings?.agentProcessMs;
-  if (Number.isFinite(finishedMs) && Number.isFinite(processMs)) {
-    // afterAgentMs comes from the job clock (last agent exit to the end): with read-only retries
-    // agentStartedAt is the first attempt and agentProcessMs the last, so their difference would
-    // count earlier attempts and backoff as post-agent work. Earlier attempts are in neither.
-    const afterAgentMs = record.phaseTimings?.afterAgentMs;
-    return {
-      agentRunMs: Math.max(0, processMs),
-      waitBeforeAgentMs,
-      afterAgentMs: Number.isFinite(afterAgentMs) ? Math.max(0, afterAgentMs) : Math.max(0, finishedMs - agentStartedMs - processMs),
-    };
-  }
-  return {
-    agentRunMs: Math.max(0, (Number.isFinite(finishedMs) ? finishedMs : now) - agentStartedMs),
-    waitBeforeAgentMs,
-  };
-}
 
 // B-046: last output of a running agent. Derived when read, never stored: a stored value would be
 // stale the moment it was written. Empty for jobs of another bridge process and for jobs whose
@@ -21682,473 +15390,51 @@ function queueAgentActivity(record, now = Date.now()) {
   return { lastActivityAt: new Date(lastMs).toISOString(), idleMs: Math.max(0, now - lastMs) };
 }
 
-function queueRecordSnapshot(record, includeResult = true) {
-  const persistedResultText = redactSensitiveText(record.resultText || "");
-  const persistedDetailText = redactSensitiveText(record.resultDetailText || "");
-  // Truncated means the agent's report was cut (or an unstructured text exceeded the limit); a
-  // patch preview the bridge kept apart is not a truncation.
-  const resultCut = Boolean(record.resultReportTruncated) || Boolean(record.resultTextTruncated)
-    || persistedResultText.length > CONFIG.queueResultMaxChars;
-  const essentialResultTruncated = record.status === "completed" && resultCut;
-  return sanitizePersistedValue({
-    jobId: record.jobId,
-    parentJobId: record.parentJobId || "",
-    idempotencyKey: record.idempotencyKey || "",
-    requestFingerprint: record.requestFingerprint || "",
-    requeuedFrom: record.requeuedFrom || "",
-    requeuedAs: record.requeuedAs || "",
-    requeueSequence: record.requeueSequence || 0,
-    requeuedAt: record.requeuedAt || "",
-    // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
-    retryAttempt: record.retryAttempt || 0,
-    maxAttempts: record.maxAttempts || 0,
-    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_HISTORY_MAX) : [],
-    startAfter: record.startAfter || "",
-    // B-080: "provider_pause" when startAfter waits for provider/model pauses to end; any bridge
-    // process releases such a wait as soon as none of the job's models is paused any more.
-    startAfterReason: record.startAfter ? record.startAfterReason || "" : "",
-    slotWaitRequeues: record.slotWaitRequeues || 0,
-    // B-078: requeues after a slot refusal for a paused provider/model (not attempts), and the
-    // pause end such a refusal reported (set only when the agent never started).
-    pauseWaitRequeues: record.pauseWaitRequeues || 0,
-    providerRefusedUntil: record.providerRefusedUntil || "",
-    // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
-    // (a restart reschedules completed jobs that asked and are not integrated yet).
-    autoIntegration: record.autoIntegration || null,
-    autoIntegrateRequested: Boolean(record.autoIntegrateRequested),
-    agent: record.agent,
-    taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
-    taskChars: String(record.task || "").length,
-    cwd: record.cwd || "",
-    mode: record.mode,
-    scopeContract: record.scopeContract || null,
-    sanitizedWorkspace: record.sanitizedWorkspace || null,
-    sanitizedWorkspaceVerification: record.sanitizedWorkspaceVerification || null,
-    lockMode: record.lockMode,
-    lockedPaths: record.lockedPaths || [],
-    allowedEdits: record.allowedEdits || [],
-    worktreePath: record.worktreePath || "",
-    worktreeBranch: record.worktreeBranch || "",
-    worktreeBaseCommit: record.worktreeBaseCommit || "",
-    worktreeBaseTree: record.worktreeBaseTree || "",
-    worktreePatchSha256: record.worktreePatchSha256 || "",
-    worktreeSourceStateSha256: record.worktreeSourceStateSha256 || "",
-    status: record.status,
-    runStage: queueRunStage(record),
-    createdAt: record.createdAt,
-    startedAt: record.startedAt || "",
-    agentStartedAt: record.agentStartedAt || "",
-    finishedAt: record.finishedAt || "",
-    durationMs: record.durationMs || 0,
-    ...queueAgentTiming(record),
-    providerWaitMs: record.providerWaitMs || 0,
-    providerRetryWarningCount: record.providerRetryWarningCount || 0,
-    usage: record.usage || null,
-    heavyToolCalls: record.heavyToolCalls || null,
-    validationFixPass: record.validationFixPass || null,
-    selfCheck: record.selfCheck || null,
-    phaseTimings: record.phaseTimings || null,
-    readOnlyHeadMove: record.readOnlyHeadMove || null,
-    retryCount: record.retryCount || 0,
-    maxRetries: record.maxRetries || 0,
-    errorType: record.errorType || "",
-    errorReason: record.errorReason || "",
-    dependencyRequest: record.dependencyRequest || null,
-    completionOutcome: record.completionOutcome || (essentialResultTruncated ? "completed_with_truncated_output" : ""),
-    changedFiles: record.changedFiles || [],
-    noChanges: Boolean(record.noChanges),
-    dirtyFiles: record.dirtyFiles || [],
-    overlappingFiles: record.overlappingFiles || [],
-    disjointFiles: record.disjointFiles || [],
-    validationResult: record.validationResult || null,
-    configuredProvider: record.configuredProvider || "",
-    configuredModel: record.configuredModel || "",
-    configuredVariant: record.configuredVariant || "",
-    runtimeObservedProvider: record.runtimeObservedProvider || "",
-    runtimeObservedModel: record.runtimeObservedModel || "",
-    actualProvider: record.actualProvider || "",
-    actualModel: record.actualModel || "",
-    actualModelEvidence: record.actualModelEvidence || "",
-    cancellationRequested: Boolean(record.cancellationRequested),
-    cancellationRequestedAt: record.cancellationRequestedAt || "",
-    ownerInstanceId: record.ownerInstanceId || "",
-    ownerProcessId: record.ownerProcessId || 0,
-    ownerGeneration: record.ownerGeneration || "",
-    heartbeatAt: record.heartbeatAt || "",
-    leaseExpiresAt: record.leaseExpiresAt || "",
-    childProcessId: record.childProcessId || 0,
-    childProcessStartedAt: record.childProcessStartedAt || "",
-    childProcessRole: record.childProcessRole || "",
-    childContainmentIdentity: record.childContainmentIdentity || "",
-    containmentQuarantined: Boolean(record.containmentQuarantined),
-    orphanChildProcessId: record.orphanChildProcessId || 0,
-    orphanChildProcessStartedAt: record.orphanChildProcessStartedAt || "",
-    orphanChildProcessAlive: Boolean(record.orphanChildProcessAlive),
-    revision: record.revision || 0,
-    resultText: includeResult ? truncateResultText(persistedResultText, CONFIG.queueResultMaxChars) : "",
-    resultTextChars: includeResult ? Math.max(persistedResultText.length, Number(record.resultFullChars) || 0, Number(record.resultTextChars) || 0) : 0,
-    resultTextSha256: includeResult ? createHash("sha256").update(persistedResultText).digest("hex") : "",
-    resultTextTruncated: includeResult ? resultCut : false,
-    resultDetailText: includeResult ? truncateText(persistedDetailText, CONFIG.queueResultMaxChars) : "",
-    resultDetailTextChars: includeResult ? persistedDetailText.length : 0,
-  });
-}
+const {
+  queueRecordSnapshot,
+  queuePrivateDetails,
+  queueRecordDurableSummary,
+  encryptQueuePrivateDetails,
+  decryptQueuePrivateDetails,
+  enforceQueueResultEvidence,
+  persistedQueueRecordFromRow,
+  loadPersistedQueueRecord,
+  applyDurableCancellationOutcome,
+  cancelPersistedQueueJob,
+  heartbeatOnlyQueueAdvance,
+  persistTerminalQueueRecord,
+  persistQueueRecord,
+  updateQueueRecordDurable,
+  readPersistedQueueRecord,
+  listPersistedQueueRecords,
+  authoritativeQueueRecord,
+} = createQueueStoreRuntime({
+  CONFIG,
+  BRIDGE_INSTANCE_ID,
+  QUEUE_JOBS,
+  queueRunStage: (...args) => queueRunStage(...args),
+  truncateResultText,
+  truncateText,
+  encryptIntegrationJournalBytes,
+  decryptIntegrationJournalBytes,
+  effectiveQueueMode,
+  openLockDb,
+  closeDb,
+  stateCapacityError,
+  propagatePipelineTerminalInTransaction: (...args) => propagatePipelineTerminalInTransaction(...args),
+  getQueueCancellationTestHook: () => queueCancellationTestHook,
+  getQueuePersistTestHook: () => queuePersistTestHook,
+});
 
-// L-025/L-026: the queue keeps the runner's report-priority result (`resultText`, without the
-// worktree patch preview) and the detail apart (`resultDetailText`: the patch preview, and the
-// bridge preamble when it had to be shortened). Executions that carry no resultRecord (a
-// rejection, a test hook) keep their response text as before.
-function queueResultFields(execution) {
-  const stored = execution?.resultRecord;
-  if (stored && typeof stored.text === "string") {
-    return {
-      resultText: stored.text,
-      resultDetailText: stored.detailText || "",
-      resultReportTruncated: Boolean(stored.reportTruncated),
-      resultFullChars: Number(stored.chars) || 0,
-    };
-  }
-  return { resultText: execution?.response?.content?.[0]?.text || "", resultDetailText: "", resultReportTruncated: false, resultFullChars: 0 };
-}
 
-function queuePrivateDetails(record) {
-  const resultText = redactSensitiveText(record.resultText || "");
-  const resultDetailText = redactSensitiveText(record.resultDetailText || "");
-  const details = sanitizePersistedValue({
-    resultText: truncateResultText(resultText, CONFIG.queueResultMaxChars),
-    // A record read back keeps the original length and the truncation it was stored with.
-    resultTextChars: Math.max(resultText.length, Number(record.resultFullChars) || 0, Number(record.resultTextChars) || 0),
-    resultTextSha256: createHash("sha256").update(resultText).digest("hex"),
-    resultTextTruncated: Boolean(record.resultReportTruncated) || Boolean(record.resultTextTruncated) || resultText.length > CONFIG.queueResultMaxChars,
-    resultDetailText: truncateText(resultDetailText, CONFIG.queueResultMaxChars),
-    resultDetailTextChars: resultDetailText.length,
-    errorReason: truncateText(String(record.errorReason || ""), 12000),
-    validationResult: record.validationResult || null,
-    sanitizedWorkspaceVerification: record.sanitizedWorkspaceVerification || null,
-    actualModelEvidence: record.actualModelEvidence || "",
-    dependencyRequest: record.dependencyRequest || null,
-  });
-  const serialized = JSON.stringify(details);
-  if (Buffer.byteLength(serialized, "utf8") <= CONFIG.maxSnapshotFileBytes) return details;
-  return sanitizePersistedValue({
-    resultText: details.resultText || "",
-    resultTextChars: details.resultTextChars || 0,
-    resultTextSha256: details.resultTextSha256 || "",
-    resultTextTruncated: Boolean(details.resultTextTruncated),
-    resultDetailText: details.resultDetailText || "",
-    resultDetailTextChars: details.resultDetailTextChars || 0,
-    errorReason: details.errorReason || "",
-    validationResult: {
-      truncated: true,
-      chars: JSON.stringify(details.validationResult || null).length,
-      sha256: createHash("sha256").update(JSON.stringify(details.validationResult || null)).digest("hex"),
-    },
-    sanitizedWorkspaceVerification: null,
-    actualModelEvidence: details.actualModelEvidence || "",
-    dependencyRequest: details.dependencyRequest || null,
-  });
-}
 
-function commandFingerprintFields(value, prefix = "validationCommand") {
-  const text = String(value || "");
-  return {
-    [`${prefix}Chars`]: text.length,
-    [`${prefix}Sha256`]: createHash("sha256").update(text).digest("hex"),
-  };
-}
 
-function scopeContractDurableSummary(contract) {
-  if (!contract) return null;
-  // An already-summarized contract carries an empty command and its original fingerprint;
-  // re-summarizing it must keep that fingerprint instead of replacing it with sha256("").
-  const alreadySummarized = !contract.validationCommand
-    && Object.prototype.hasOwnProperty.call(contract, "validationCommandSha256")
-    && Object.prototype.hasOwnProperty.call(contract, "validationCommandChars");
-  return sanitizePersistedValue({
-    ...contract,
-    validationCommand: "",
-    ...(alreadySummarized
-      ? { validationCommandChars: contract.validationCommandChars, validationCommandSha256: contract.validationCommandSha256 }
-      : commandFingerprintFields(contract.validationCommand)),
-  });
-}
 
-function queueRecordDurableSummary(record) {
-  const hasRawTask = Object.prototype.hasOwnProperty.call(record || {}, "task");
-  const hasRawPrivateDetails = [
-    "resultText",
-    "resultDetailText",
-    "errorReason",
-    "validationResult",
-    "sanitizedWorkspaceVerification",
-    "actualModelEvidence",
-  ].some((key) => Object.prototype.hasOwnProperty.call(record || {}, key));
-  const preservePrivateMetadata = !hasRawPrivateDetails && Boolean(record?.privateDetailsSha256);
-  const summary = queueRecordSnapshot(record, false);
-  const privateDetails = queuePrivateDetails(record);
-  const privateJson = JSON.stringify(privateDetails);
-  delete summary.resultText;
-  delete summary.resultDetailText;
-  delete summary.errorReason;
-  delete summary.validationResult;
-  delete summary.sanitizedWorkspaceVerification;
-  delete summary.actualModelEvidence;
-  summary.scopeContract = scopeContractDurableSummary(record.scopeContract);
-  summary.resultTextChars = Number(privateDetails.resultTextChars || 0);
-  summary.resultTextSha256 = privateDetails.resultTextSha256 || "";
-  summary.resultTextTruncated = Boolean(privateDetails.resultTextTruncated);
-  summary.resultDetailTextChars = Number(privateDetails.resultDetailTextChars || 0);
-  summary.errorReasonChars = String(privateDetails.errorReason || "").length;
-  summary.errorReasonSha256 = createHash("sha256").update(String(privateDetails.errorReason || "")).digest("hex");
-  summary.validationResultSha256 = createHash("sha256")
-    .update(JSON.stringify(privateDetails.validationResult || null))
-    .digest("hex");
-  if (!hasRawTask) {
-    summary.taskSha256 = String(record.taskSha256 || summary.taskSha256 || "");
-    summary.taskChars = Number(record.taskChars || 0);
-  }
-  if (preservePrivateMetadata) {
-    summary.resultTextChars = Number(record.resultTextChars || 0);
-    summary.resultTextSha256 = String(record.resultTextSha256 || "");
-    summary.resultTextTruncated = Boolean(record.resultTextTruncated);
-    summary.resultDetailTextChars = Number(record.resultDetailTextChars || 0);
-    summary.errorReasonChars = Number(record.errorReasonChars || 0);
-    summary.errorReasonSha256 = String(record.errorReasonSha256 || "");
-    summary.validationResultSha256 = String(record.validationResultSha256 || "");
-  }
-  return sanitizePersistedValue({
-    ...summary,
-    privateDetailsChars: preservePrivateMetadata ? Number(record.privateDetailsChars || 0) : privateJson.length,
-    privateDetailsSha256: preservePrivateMetadata
-      ? String(record.privateDetailsSha256 || "")
-      : createHash("sha256").update(privateJson).digest("hex"),
-  });
-}
 
-async function encryptQueuePrivateDetails(record) {
-  return encryptIntegrationJournalBytes(
-    Buffer.from(JSON.stringify(queuePrivateDetails(record)), "utf8"),
-    `queue-result\0${record.jobId}`
-  );
-}
 
-async function decryptQueuePrivateDetails(envelope, jobId) {
-  if (!envelope) return {};
-  return JSON.parse((await decryptIntegrationJournalBytes(envelope, `queue-result\0${jobId}`)).toString("utf8"));
-}
 
-function enforceQueueResultEvidence(record) {
-  const persistedResultText = redactSensitiveText(record.resultText || "");
-  const completedWithoutFinal = record.status === "completed" && !persistedResultText.trim();
-  // A writer whose verified worktree diff was empty (noChanges) legitimately has no changed
-  // files or patch hash: the empty worktree is removed and there is nothing to integrate.
-  // Failing it here made a successful "nothing needed" run fail its pipeline.
-  const completedWriteWithoutEvidence = record.status === "completed"
-    && record.mode === "write"
-    && !record.noChanges
-    && !(record.changedFiles || []).length
-    && !record.worktreePatchSha256;
-  if (completedWithoutFinal || completedWriteWithoutEvidence) {
-    Object.assign(record, {
-      status: "failed",
-      errorType: completedWithoutFinal ? "completion_evidence_missing" : "write_completion_evidence_missing",
-      errorReason: completedWithoutFinal
-        ? "A completed job must include a non-empty verified final response."
-        : "A completed write job must include changed-file or patch evidence.",
-    });
-  } else if (record.status === "completed" && (record.resultReportTruncated || persistedResultText.length > CONFIG.queueResultMaxChars)) {
-    // Only a cut report (or an unstructured text over the limit) is truncated output; the patch
-    // preview kept apart in resultDetailText is not.
-    record.completionOutcome = "completed_with_truncated_output";
-  } else if (record.status === "completed" && record.mode === "write" && record.noChanges && !record.completionOutcome) {
-    // Still a success ("nothing needed" is legitimate), but a writer that changed nothing is
-    // flagged so a list of finished batch jobs does not hide it among the real outputs.
-    record.completionOutcome = "completed_no_changes";
-  } else if (record.status === "failed" && record.mode === "write" && !record.completionOutcome
-    && (record.errorType === "agent_timeout" || record.errorType === "agent_idle_timeout") && (record.changedFiles || []).length) {
-    // B-044: failed, but not empty-handed: the worktree holds changes to inspect or integrate.
-    record.completionOutcome = "timed_out_with_changes";
-  }
-  return record;
-}
 
-function persistedQueueRecordFromRow(row) {
-  let snapshot = {};
-  try {
-    snapshot = row?.record_json ? JSON.parse(row.record_json) : {};
-  } catch {
-    snapshot = {};
-  }
-  return {
-    ...snapshot,
-    status: row ? row.status : snapshot.status || "",
-    startedAt: row ? row.started_at || "" : snapshot.startedAt || "",
-    finishedAt: row ? row.finished_at || "" : snapshot.finishedAt || "",
-    ownerInstanceId: row ? row.owner_instance_id || "" : snapshot.ownerInstanceId || "",
-    ownerProcessId: row ? row.owner_process_id || 0 : snapshot.ownerProcessId || 0,
-    ownerGeneration: row ? row.owner_generation || "" : snapshot.ownerGeneration || "",
-    heartbeatAt: row ? row.heartbeat_at || "" : snapshot.heartbeatAt || "",
-    leaseExpiresAt: row ? row.lease_expires_at || "" : snapshot.leaseExpiresAt || "",
-    cancellationRequested: row ? Boolean(row.cancellation_requested_at) : Boolean(snapshot.cancellationRequestedAt),
-    cancellationRequestedAt: row ? row.cancellation_requested_at || "" : snapshot.cancellationRequestedAt || "",
-    childProcessId: row ? row.child_process_id || 0 : snapshot.childProcessId || 0,
-    childProcessStartedAt: row ? row.child_process_started_at || "" : snapshot.childProcessStartedAt || "",
-    revision: row ? row.revision || 0 : snapshot.revision || 0,
-    idempotencyKey: row ? row.idempotency_key || snapshot.idempotencyKey || "" : snapshot.idempotencyKey || "",
-  };
-}
 
-function loadPersistedQueueRecord(record, row) {
-  if (row) {
-    Object.assign(record, persistedQueueRecordFromRow(row));
-  }
-  return record;
-}
-
-const DURABLE_CANCELLATION_REASON = "Cancellation won the durable terminal-write race.";
-
-function applyDurableCancellationOutcome(record, requestedAt = "") {
-  return {
-    ...record,
-    status: "cancelled",
-    cancellationRequested: true,
-    cancellationRequestedAt: requestedAt || record.cancellationRequestedAt || "",
-    errorType: "agent_cancelled",
-    errorReason: DURABLE_CANCELLATION_REASON,
-    resultText: "",
-    resultDetailText: "",
-    resultReportTruncated: false,
-    resultFullChars: 0,
-    resultTextChars: 0,
-    resultTextTruncated: false,
-    validationResult: null,
-    sanitizedWorkspaceVerification: null,
-    actualModelEvidence: "",
-  };
-}
-
-async function cancelPersistedQueueJob(db, jobId, maxAttempts = 8) {
-  const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted", "not_resumable"]);
-  const preExecutionStatuses = new Set(["held", "pending", "planned", "blocked"]);
-  const activeStatuses = new Set(["running", "validating", "reviewing", "testing"]);
-  const selectCurrent = db.prepare(`
-    SELECT job_id, status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
-           heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
-           child_process_started_at, revision, idempotency_key, request_encrypted, result_encrypted, record_json
-    FROM opencode_jobs WHERE job_id = ?
-  `);
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const row = selectCurrent.get(jobId);
-    if (!row) return { ok: false, outcome: "missing", status: "missing" };
-    if (terminalStatuses.has(row.status)) {
-      return { ok: true, outcome: "already_terminal", status: row.status };
-    }
-    if (!preExecutionStatuses.has(row.status) && !activeStatuses.has(row.status)) {
-      return { ok: false, outcome: "unsupported_status", status: row.status };
-    }
-
-    const requestedAt = row.cancellation_requested_at || new Date().toISOString();
-    const currentRecord = {
-      ...persistedQueueRecordFromRow(row),
-      jobId,
-      revision: Number(row.revision || 0),
-    };
-    const preExecution = preExecutionStatuses.has(row.status);
-    const nextRecord = preExecution
-      ? {
-          ...applyDurableCancellationOutcome(currentRecord, requestedAt),
-          status: "cancelled",
-          finishedAt: requestedAt,
-          heartbeatAt: "",
-          leaseExpiresAt: "",
-          childProcessId: 0,
-          childProcessStartedAt: "",
-          revision: Number(row.revision || 0) + 1,
-        }
-      : {
-          ...currentRecord,
-          cancellationRequested: true,
-          cancellationRequestedAt: requestedAt,
-          revision: Number(row.revision || 0) + 1,
-        };
-    const recordJson = JSON.stringify(queueRecordDurableSummary(nextRecord));
-    const encryptedDetails = preExecution ? await encryptQueuePrivateDetails(nextRecord) : null;
-    if (typeof queueCancellationTestHook === "function") {
-      await queueCancellationTestHook({ attempt, row: { ...row }, nextRecord: { ...nextRecord } });
-    }
-    let transactionOpen = false;
-    try {
-      db.exec("BEGIN IMMEDIATE");
-      transactionOpen = true;
-      const changed = preExecution
-        ? db.prepare(`
-            UPDATE opencode_jobs
-            SET status = 'cancelled', finished_at = ?, cancellation_requested_at = ?, updated_at = ?,
-                heartbeat_at = '', lease_expires_at = '', child_process_id = 0, child_process_started_at = '',
-                record_json = ?, result_encrypted = ?, revision = revision + 1
-            WHERE job_id = ? AND status = ? AND revision = ?
-              AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
-          `).run(
-            requestedAt,
-            requestedAt,
-            requestedAt,
-            recordJson,
-            encryptedDetails,
-            jobId,
-            row.status,
-            Number(row.revision || 0),
-            row.owner_instance_id || "",
-            row.owner_generation || ""
-          )
-        : db.prepare(`
-            UPDATE opencode_jobs
-            SET cancellation_requested_at = CASE
-                  WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
-                  ELSE cancellation_requested_at
-                END,
-                updated_at = ?, record_json = ?, revision = revision + 1
-            WHERE job_id = ? AND status = ? AND revision = ?
-              AND COALESCE(owner_instance_id, '') = ? AND COALESCE(owner_generation, '') = ?
-          `).run(
-            requestedAt,
-            requestedAt,
-            recordJson,
-            jobId,
-            row.status,
-            Number(row.revision || 0),
-            row.owner_instance_id || "",
-            row.owner_generation || ""
-          );
-      const pipelinePropagation = Number(changed.changes || 0) === 1 && preExecution
-        ? propagatePipelineTerminalInTransaction(db, jobId, "cancelled", requestedAt)
-        : null;
-      db.exec("COMMIT");
-      transactionOpen = false;
-      if (Number(changed.changes || 0) === 1) {
-        return {
-          ok: true,
-          outcome: preExecution ? "cancelled" : "cancellation_requested",
-          status: preExecution ? "cancelled" : row.status,
-          requestedAt,
-          revision: Number(row.revision || 0) + 1,
-          pipelinePropagation,
-        };
-      }
-    } catch (error) {
-      if (transactionOpen) {
-        try { db.exec("ROLLBACK"); } catch { /* Preserve the cancellation error. */ }
-      }
-      throw error;
-    }
-  }
-  const current = selectCurrent.get(jobId);
-  return {
-    ok: false,
-    outcome: "contention",
-    status: current?.status || "missing",
-  };
-}
 
 function propagatePipelineTerminalInTransaction(db, childJobId, terminalStatus, at = new Date().toISOString()) {
   const relation = db.prepare(`
@@ -22238,447 +15524,12 @@ function propagatePipelineTerminalInTransaction(db, childJobId, terminalStatus, 
   };
 }
 
-// Lease renewal bumps the row revision without touching record_json. A terminal commit
-// built from a copy taken before that bump used to lose its exact-revision compare, mark
-// ownership lost and drop the job from QUEUE_JOBS, so it stayed "running" forever while
-// the owning bridge lived. A bump that only a heartbeat made is not a competing write.
-function heartbeatOnlyQueueAdvance(current, record, attemptedRevision) {
-  if (!current
-    || current.owner_instance_id !== BRIDGE_INSTANCE_ID
-    || !record.ownerGeneration
-    || String(current.owner_generation || "") !== String(record.ownerGeneration)
-    || Number(current.revision || 0) <= attemptedRevision) return false;
-  try {
-    const summary = JSON.parse(current.record_json || "{}");
-    const summaryRevision = Number(summary.revision ?? -1);
-    return summaryRevision >= 0 && summaryRevision <= attemptedRevision && String(summary.status || "") === current.status;
-  } catch {
-    return false;
-  }
-}
 
-function persistTerminalQueueRecord(db, record) {
-  const activeStatuses = "'running', 'validating', 'reviewing', 'testing'";
-  let attemptedRevision = Number(record.revision || 0);
-  const attemptedOwnerGeneration = String(record.ownerGeneration || "");
-  const selectCurrent = db.prepare(`
-    SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
-           heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
-           child_process_started_at, revision, idempotency_key, request_encrypted, record_json
-    FROM opencode_jobs WHERE job_id = ?
-  `);
-  let transactionOpen = false;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    transactionOpen = true;
-    let current = selectCurrent.get(record.jobId);
-    if (heartbeatOnlyQueueAdvance(current, record, attemptedRevision)) attemptedRevision = Number(current.revision || 0);
-    const terminalRecord = {
-      ...record,
-      ownerInstanceId: current?.owner_instance_id || record.ownerInstanceId || "",
-      ownerProcessId: current?.owner_process_id || record.ownerProcessId || 0,
-      ownerGeneration: current?.owner_generation || record.ownerGeneration || "",
-      revision: attemptedRevision + 1,
-    };
-    if (current
-      && ["held", "pending", "planned", "blocked"].includes(current.status)
-      && current.owner_instance_id === BRIDGE_INSTANCE_ID
-      && String(current.owner_generation || "") === String(record.ownerGeneration || "")
-      && ["failed", "cancelled"].includes(record.status)) {
-      Object.assign(terminalRecord, {
-        finishedAt: terminalRecord.finishedAt || new Date().toISOString(),
-        heartbeatAt: "",
-        leaseExpiresAt: "",
-        childProcessId: 0,
-        childProcessStartedAt: "",
-      });
-      if (current.cancellation_requested_at) {
-        Object.assign(terminalRecord, applyDurableCancellationOutcome(terminalRecord, current.cancellation_requested_at));
-      }
-      const preExecutionChange = db.prepare(`
-        UPDATE opencode_jobs
-        SET status = ?, started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
-            child_process_id = 0, child_process_started_at = '', record_json = ?, result_encrypted = ?, revision = revision + 1
-        WHERE job_id = ? AND status = ? AND revision = ?
-          AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
-      `).run(
-        terminalRecord.status,
-        terminalRecord.startedAt || "",
-        terminalRecord.finishedAt,
-        new Date().toISOString(),
-        JSON.stringify(queueRecordDurableSummary(terminalRecord)),
-        terminalRecord.status === "cancelled"
-          ? record.cancellationResultEncrypted || null
-          : record.resultEncrypted || null,
-        terminalRecord.jobId,
-        current.status,
-        attemptedRevision,
-        BRIDGE_INSTANCE_ID,
-        attemptedOwnerGeneration
-      );
-      if (Number(preExecutionChange.changes || 0) === 1) {
-        record.pipelinePropagation = propagatePipelineTerminalInTransaction(
-          db,
-          terminalRecord.jobId,
-          terminalRecord.status,
-          terminalRecord.finishedAt || new Date().toISOString()
-        );
-        db.exec("COMMIT");
-        transactionOpen = false;
-        Object.assign(record, terminalRecord);
-        return { persisted: true, status: terminalRecord.status, cancellationWon: terminalRecord.status === "cancelled" };
-      }
-      current = selectCurrent.get(record.jobId);
-    }
-    // No lease predicate: a lapsed lease is not a lost one. A takeover always writes a new
-    // generation and every foreign write bumps the revision, so generation + revision fence a
-    // stale owner; requiring an unexpired lease left a finished job "running" forever after
-    // its lease lapsed (the owner instance stays alive, so recovery never reclaimed it).
-    const terminalCommitAt = new Date().toISOString();
-    const terminalChange = db.prepare(`
-      UPDATE opencode_jobs
-      SET status = ?, started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = ?, lease_expires_at = ?,
-          child_process_id = ?, child_process_started_at = ?, record_json = ?, result_encrypted = ?, revision = revision + 1
-      WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
-        AND owner_generation <> ''
-        AND revision = ?
-        AND status IN (${activeStatuses})
-        AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
-        AND EXISTS (
-          SELECT 1 FROM bridge_instances
-          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
-        )
-    `).run(
-      terminalRecord.status,
-      terminalRecord.startedAt || "",
-      terminalRecord.finishedAt || "",
-      new Date().toISOString(),
-      terminalRecord.heartbeatAt || "",
-      terminalRecord.leaseExpiresAt || "",
-      terminalRecord.childProcessId || 0,
-      terminalRecord.childProcessStartedAt || "",
-      JSON.stringify(queueRecordDurableSummary(terminalRecord)),
-      record.resultEncrypted || null,
-      terminalRecord.jobId,
-      BRIDGE_INSTANCE_ID,
-      attemptedOwnerGeneration,
-      attemptedRevision,
-      terminalCommitAt
-    );
-    if (Number(terminalChange.changes || 0) === 1) {
-      record.pipelinePropagation = propagatePipelineTerminalInTransaction(
-        db,
-        terminalRecord.jobId,
-        terminalRecord.status,
-        terminalRecord.finishedAt || new Date().toISOString()
-      );
-      db.exec("COMMIT");
-      transactionOpen = false;
-      Object.assign(record, terminalRecord);
-      return { persisted: true, status: terminalRecord.status, cancellationWon: false };
-    }
-
-    current = selectCurrent.get(record.jobId);
-    const ownsCurrentGeneration = current
-      && current.owner_instance_id === BRIDGE_INSTANCE_ID
-      && String(current.owner_generation || "") === attemptedOwnerGeneration;
-    if (ownsCurrentGeneration
-      && ["running", "validating", "reviewing", "testing"].includes(current.status)
-      && current.cancellation_requested_at) {
-      const cancelledRecord = {
-        ...applyDurableCancellationOutcome(record, current.cancellation_requested_at),
-        finishedAt: record.finishedAt || new Date().toISOString(),
-        heartbeatAt: "",
-        leaseExpiresAt: "",
-        ownerInstanceId: current.owner_instance_id,
-        ownerProcessId: current.owner_process_id || 0,
-        ownerGeneration: current.owner_generation || "",
-        childProcessId: 0,
-        childProcessStartedAt: "",
-        revision: Number(current.revision || 0) + 1,
-      };
-      const cancellationChange = db.prepare(`
-        UPDATE opencode_jobs
-        SET status = 'cancelled', started_at = ?, finished_at = ?, updated_at = ?, heartbeat_at = '', lease_expires_at = '',
-            child_process_id = 0, child_process_started_at = '', record_json = ?, result_encrypted = ?, revision = revision + 1
-        WHERE job_id = ? AND owner_instance_id = ? AND owner_generation = ?
-          AND owner_generation <> ''
-          AND revision = ?
-          AND status IN (${activeStatuses})
-          AND cancellation_requested_at IS NOT NULL AND cancellation_requested_at <> ''
-      `).run(
-        cancelledRecord.startedAt || "",
-        cancelledRecord.finishedAt,
-        new Date().toISOString(),
-        JSON.stringify(queueRecordDurableSummary(cancelledRecord)),
-        record.cancellationResultEncrypted || null,
-        cancelledRecord.jobId,
-        BRIDGE_INSTANCE_ID,
-        attemptedOwnerGeneration,
-        Number(current.revision || 0)
-      );
-      if (Number(cancellationChange.changes || 0) === 1) {
-        record.pipelinePropagation = propagatePipelineTerminalInTransaction(
-          db,
-          cancelledRecord.jobId,
-          cancelledRecord.status,
-          cancelledRecord.finishedAt || new Date().toISOString()
-        );
-        db.exec("COMMIT");
-        transactionOpen = false;
-        Object.assign(record, cancelledRecord);
-        return { persisted: true, status: "cancelled", cancellationWon: true };
-      }
-      current = selectCurrent.get(record.jobId);
-    }
-
-    db.exec("COMMIT");
-    transactionOpen = false;
-    const ownershipLost = Boolean(current) && (
-      current.owner_instance_id !== BRIDGE_INSTANCE_ID
-      || String(current.owner_generation || "") !== attemptedOwnerGeneration
-      || Number(current.revision || 0) !== attemptedRevision
-    );
-    loadPersistedQueueRecord(record, current);
-    return {
-      persisted: false,
-      status: current?.status || "missing",
-      cancellationWon: Boolean(current?.cancellation_requested_at),
-      ownershipLost,
-    };
-  } catch (error) {
-    if (transactionOpen) {
-      try { db.exec("ROLLBACK"); } catch { /* Preserve the terminal persistence error. */ }
-    }
-    throw error;
-  }
-}
 
 // Test-only: runs before every queue persistence write (a throw simulates SQLITE_BUSY).
 let queuePersistTestHook = null;
 
-async function persistQueueRecord(record) {
-  enforceQueueResultEvidence(record);
-  if (typeof queuePersistTestHook === "function") await queuePersistTestHook(record);
-  if (effectiveQueueMode() !== "sqlite") {
-    record.revision = Number(record.revision || 0) + 1;
-    return { persisted: true, status: record.status };
-  }
 
-  record.resultEncrypted = await encryptQueuePrivateDetails(record);
-  record.cancellationResultEncrypted = await encryptQueuePrivateDetails(applyDurableCancellationOutcome(record));
-
-  const db = await openLockDb(record.cwd);
-  let transactionOpen = false;
-  try {
-    if (["completed", "failed", "cancelled"].includes(record.status)) {
-      return persistTerminalQueueRecord(db, record);
-    }
-    db.exec("BEGIN IMMEDIATE");
-    transactionOpen = true;
-    const selectCurrent = db.prepare(`
-      SELECT status, started_at, finished_at, owner_instance_id, owner_process_id, owner_generation,
-             heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id,
-             child_process_started_at, revision, idempotency_key, request_encrypted, record_json
-      FROM opencode_jobs WHERE job_id = ?
-    `);
-    let current = selectCurrent.get(record.jobId);
-    if (!current) {
-      if (record.idempotencyKey) {
-        const existing = db.prepare("SELECT job_id, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(record.idempotencyKey);
-        if (existing) {
-          let existingSnapshot = {};
-          try { existingSnapshot = JSON.parse(existing.record_json || "{}"); } catch { /* Treat unreadable evidence as a mismatch. */ }
-          if (!existingSnapshot.requestFingerprint || existingSnapshot.requestFingerprint !== record.requestFingerprint) {
-            db.exec("ROLLBACK");
-            transactionOpen = false;
-            return { persisted: false, idempotencyConflict: true, jobId: existing.job_id };
-          }
-          db.exec("COMMIT");
-          transactionOpen = false;
-          return { persisted: true, deduplicated: true, jobId: existing.job_id };
-        }
-      }
-      const capacity = stateCapacityError(db);
-      if (capacity) {
-        db.exec("ROLLBACK");
-        transactionOpen = false;
-        return { persisted: false, ...capacity };
-      }
-      try {
-        db.prepare(`
-        INSERT INTO opencode_jobs
-        (job_id, cwd, status, agent, mode, created_at, started_at, finished_at, record_json,
-         owner_instance_id, owner_process_id, owner_generation, updated_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
-         child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, result_encrypted)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        record.jobId,
-        record.cwd || "",
-        record.status,
-        record.agent,
-        record.mode,
-        record.createdAt,
-        record.startedAt || "",
-        record.finishedAt || "",
-        JSON.stringify(queueRecordDurableSummary(record)),
-        record.ownerInstanceId || "",
-        record.ownerProcessId || 0,
-        record.ownerGeneration || "",
-        new Date().toISOString(),
-        record.heartbeatAt || "",
-        record.leaseExpiresAt || "",
-        record.cancellationRequestedAt || "",
-        record.childProcessId || 0,
-        record.childProcessStartedAt || "",
-        Number(record.revision || 0),
-        record.idempotencyKey || null,
-        record.requestEncrypted || null,
-        record.resultEncrypted || null
-      );
-      } catch (error) {
-        if (record.idempotencyKey && /UNIQUE constraint failed: opencode_jobs\.idempotency_key/i.test(error.message || String(error))) {
-          const existing = db.prepare("SELECT job_id, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(record.idempotencyKey);
-          let existingSnapshot = {};
-          try { existingSnapshot = JSON.parse(existing?.record_json || "{}"); } catch { /* Treat unreadable evidence as a mismatch. */ }
-          if (!existingSnapshot.requestFingerprint || existingSnapshot.requestFingerprint !== record.requestFingerprint) {
-            db.exec("ROLLBACK");
-            transactionOpen = false;
-            return { persisted: false, idempotencyConflict: true, jobId: existing?.job_id || "" };
-          }
-          db.exec("COMMIT");
-          transactionOpen = false;
-          return { persisted: true, deduplicated: true, jobId: existing?.job_id || "" };
-        }
-        throw error;
-      }
-      db.exec("COMMIT");
-      transactionOpen = false;
-      return { persisted: true, status: record.status, revision: Number(record.revision || 0) };
-    }
-
-    let currentRevision = Number(current.revision || 0);
-    const sameOwner = current.owner_instance_id === BRIDGE_INSTANCE_ID
-      && String(current.owner_generation || "") === String(record.ownerGeneration || "")
-      && Boolean(record.ownerGeneration);
-    const currentTerminal = ["completed", "failed", "cancelled", "interrupted", "not_resumable"].includes(current.status);
-    let currentSummaryRevision = -1;
-    let currentSummaryStatus = "";
-    try {
-      const currentSummary = JSON.parse(current.record_json || "{}");
-      currentSummaryRevision = Number(currentSummary.revision ?? -1);
-      currentSummaryStatus = String(currentSummary.status || "");
-    } catch { /* Fail closed below. */ }
-    const attemptedRevision = Number(record.revision || 0);
-    const heartbeatOnlyAdvance = sameOwner
-      && currentRevision > attemptedRevision
-      && currentSummaryRevision >= 0
-      && currentSummaryRevision <= attemptedRevision
-      && currentSummaryStatus === current.status;
-    if (heartbeatOnlyAdvance) {
-      Object.assign(record, {
-        revision: currentRevision,
-        heartbeatAt: current.heartbeat_at || record.heartbeatAt || "",
-        leaseExpiresAt: current.lease_expires_at || record.leaseExpiresAt || "",
-      });
-    }
-    if (currentTerminal || !sameOwner || (currentRevision !== attemptedRevision && !heartbeatOnlyAdvance)) {
-      db.exec("COMMIT");
-      transactionOpen = false;
-      loadPersistedQueueRecord(record, current);
-      return { persisted: false, status: current.status, revision: currentRevision };
-    }
-
-    const nextRecord = {
-      ...record,
-      cancellationRequested: Boolean(current.cancellation_requested_at || record.cancellationRequested),
-      cancellationRequestedAt: current.cancellation_requested_at || record.cancellationRequestedAt || "",
-      revision: currentRevision + 1,
-    };
-    const updateAt = new Date().toISOString();
-    const changed = db.prepare(`
-      UPDATE opencode_jobs
-      SET cwd = ?, status = ?, agent = ?, mode = ?, started_at = ?, finished_at = ?, record_json = ?,
-          owner_instance_id = ?, owner_process_id = ?, owner_generation = ?, updated_at = ?, heartbeat_at = ?, lease_expires_at = ?,
-          cancellation_requested_at = CASE
-            WHEN cancellation_requested_at IS NULL OR cancellation_requested_at = '' THEN ?
-            ELSE cancellation_requested_at
-          END,
-          child_process_id = ?, child_process_started_at = ?, result_encrypted = ?, revision = revision + 1
-      WHERE job_id = ? AND status = ? AND revision = ?
-        AND owner_instance_id = ? AND owner_generation = ? AND owner_generation <> ''
-        AND lease_expires_at > ?
-        AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
-        AND EXISTS (
-          SELECT 1 FROM bridge_instances
-          WHERE instance_id = opencode_jobs.owner_instance_id AND lease_expires_at > ?
-        )
-    `).run(
-      nextRecord.cwd || "",
-      nextRecord.status,
-      nextRecord.agent,
-      nextRecord.mode,
-      nextRecord.startedAt || "",
-      nextRecord.finishedAt || "",
-      JSON.stringify(queueRecordDurableSummary(nextRecord)),
-      nextRecord.ownerInstanceId || "",
-      nextRecord.ownerProcessId || 0,
-      nextRecord.ownerGeneration || "",
-      updateAt,
-      nextRecord.heartbeatAt || "",
-      nextRecord.leaseExpiresAt || "",
-      nextRecord.cancellationRequestedAt || "",
-      nextRecord.childProcessId || 0,
-      nextRecord.childProcessStartedAt || "",
-      record.resultEncrypted || null,
-      nextRecord.jobId,
-      current.status,
-      currentRevision,
-      BRIDGE_INSTANCE_ID,
-      record.ownerGeneration || "",
-      updateAt,
-      updateAt
-    );
-    if (Number(changed.changes || 0) === 1) {
-      db.exec("COMMIT");
-      transactionOpen = false;
-      Object.assign(record, nextRecord);
-      return { persisted: true, status: nextRecord.status, revision: nextRecord.revision };
-    }
-    current = selectCurrent.get(record.jobId);
-    db.exec("COMMIT");
-    transactionOpen = false;
-    loadPersistedQueueRecord(record, current);
-    return { persisted: false, status: current?.status || "missing", revision: Number(current?.revision || 0) };
-  } catch (error) {
-    if (transactionOpen) {
-      try { db.exec("ROLLBACK"); } catch { /* Preserve the queue persistence error. */ }
-    }
-    throw error;
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function updateQueueRecordDurable(record, patch = {}) {
-  const candidate = { ...record, ...patch };
-  const result = await persistQueueRecord(candidate);
-  const runtimeState = {
-    abortController: record.abortController,
-    executionPromise: record.executionPromise,
-    queueLeaseFenceTimer: record.queueLeaseFenceTimer,
-    queueOwnershipLost: record.queueOwnershipLost,
-  };
-  if (Number(record.revision || 0) > Number(candidate.revision || 0)
-    && record.ownerGeneration === candidate.ownerGeneration) {
-    candidate.revision = record.revision;
-    candidate.heartbeatAt = record.heartbeatAt;
-    candidate.leaseExpiresAt = record.leaseExpiresAt;
-  }
-  Object.assign(record, candidate);
-  Object.assign(record, runtimeState);
-  return result;
-}
 
 function queueLockPathsForRecord(record) {
   const paths = record.mode === "read"
@@ -23025,172 +15876,15 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   return { ok: true, record };
 }
 
-// Q-001: requeue_opencode_job. Terminal states, from the queue state machine:
-//   failed, cancelled     the run (or its start) ended without a result: requeue is the retry.
-//   interrupted           the owner's lease lapsed while the job was active: retry-able, but the
-//                         previous child may still be alive, which is checked below.
-//   not_resumable         a never-started job that recovery could not resume. Requeue works only
-//                         when the encrypted request survived; the usual cause (a legacy record
-//                         without one) is refused with what is missing.
-//   completed             a success: re-running finished work is a deliberate new enqueue.
-// Every other status is unfinished and has to be cancelled or awaited first.
-const REQUEUE_ELIGIBLE_STATUSES = new Set(["failed", "cancelled", "interrupted", "not_resumable"]);
-const REQUEUE_UNFINISHED_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
-const REQUEUE_KEY_SUFFIX = /(?::requeue:\d+)+$/;
 
-// <original key>:requeue:<n>, where n counts the requeues down the chain (a requeue of a requeue
-// keeps the root key, so keys do not grow); a job without a key uses its job id. The key is
-// deterministic, so a repeated or concurrent requeue of the same job deduplicates to one job.
-function requeueIdempotencyKey(original, sequence) {
-  const base = String(original.idempotencyKey || "").replace(REQUEUE_KEY_SUFFIX, "") || String(original.jobId);
-  const suffix = `:requeue:${sequence}`;
-  if (base.length + suffix.length <= 200) return `${base}${suffix}`;
-  const digest = createHash("sha256").update(base).digest("hex").slice(0, 16);
-  return `${base.slice(0, 200 - suffix.length - digest.length - 1)}~${digest}${suffix}`;
-}
 
-function requeueRefusal(errorType, error, suggestedFix = "") {
-  return { ok: false, errorType, error, suggestedFix };
-}
 
-// Records the successor on the terminal row of the original. A terminal row is not rewritten by
-// the owner any more, so this is a guarded single UPDATE on the revision it read.
-async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
-  const db = await openLockDb(projectRoot);
-  try {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
-      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { marked: false, reason: "the original is no longer a terminal job" };
-      let summary = {};
-      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { marked: false, reason: "the original record is unreadable" }; }
-      if (summary.requeuedAs && summary.requeuedAs !== newJobId) return { marked: false, reason: `already requeued as ${summary.requeuedAs}`, requeuedAs: summary.requeuedAs };
-      if (summary.requeuedAs === newJobId) return { marked: true };
-      const requeuedAt = new Date().toISOString();
-      const changed = db.prepare(`
-        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
-        WHERE job_id = ? AND revision = ? AND status = ?
-      `).run(
-        JSON.stringify({ ...summary, requeuedAs: newJobId, requeuedAt, revision: Number(row.revision || 0) + 1 }),
-        requeuedAt,
-        jobId,
-        Number(row.revision || 0),
-        row.status
-      );
-      if (Number(changed.changes || 0) === 1) {
-        const live = QUEUE_JOBS.get(jobId);
-        if (live) Object.assign(live, { requeuedAs: newJobId, requeuedAt });
-        return { marked: true };
-      }
-    }
-    return { marked: false, reason: "the original record kept changing" };
-  } finally {
-    closeDb(db);
-  }
-}
 
-// Q-007: model fallback for queued jobs (the round-6 orchestrator's TOOL_ORDER + attempts). A job
-// that names `models` and/or `maxAttempts` carries a retry policy: when it fails for a reason
-// another model or another try can fix, the bridge requeues it itself through requeueQueueJob (the
-// same validation as requeue_opencode_job, the same lineage fields) on the next model that is not
-// paused, and after maxAttempts it marks the last job outcome=gave_up. The policy lives in the
-// stored encrypted request, so it survives a restart and a requeue keeps it.
-const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
-const RETRY_POLICY_MAX_ATTEMPTS = 10;
-const RETRY_POLICY_MAX_SLOT_WAITS = 12;
-// B-078: a slot request refused because the provider or model was paused (by the operator, a rate
-// limit or a quota) never started the agent either; such refusals are not attempts, up to this many.
-const RETRY_POLICY_MAX_PAUSE_WAITS = 24;
-const RETRY_POLICY_HISTORY_MAX = RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS + RETRY_POLICY_MAX_PAUSE_WAITS;
 
-// B-072: removes the worktree of a failed write attempt only when it holds nothing: no changed
-// file in the record, and git sees no change, untracked file or commit in it.
-async function removeEmptyRetryWorktree(projectRoot, summary) {
-  const worktreePath = String(summary?.worktreePath || "");
-  if (summary?.mode !== "write" || !worktreePath || (summary.changedFiles || []).length || !existsSync(worktreePath)) return { removed: false };
-  // B-074: fail closed. `worktree remove --force` deletes ignored files too, so they count as
-  // content; and the base commit must be known and still be HEAD.
-  const baseCommit = String(summary.worktreeBaseCommit || "");
-  if (!/^[0-9a-f]{40,64}$/i.test(baseCommit)) return { removed: false, reason: "the worktree's base commit is not recorded" };
-  const status = await runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"], worktreePath, 30_000);
-  if (status.exitCode !== 0 || String(status.stdout || "").trim()) return { removed: false, reason: "the worktree has changes, untracked or ignored files" };
-  const head = await runCommand("git", ["rev-parse", "HEAD"], worktreePath, 15_000);
-  if (head.exitCode !== 0 || head.stdout.trim().toLowerCase() !== baseCommit.toLowerCase()) return { removed: false, reason: "the worktree is not at its base commit" };
-  const cleanup = await cleanupWorktree({ path: worktreePath, branch: summary.worktreeBranch || "", repoRoot: projectRoot }, "always", true).catch((error) => ({ cleanup: "failed", error: error?.message || String(error) }));
-  return { removed: cleanup?.cleanup === "removed" || !existsSync(worktreePath), cleanup: cleanup?.cleanup || "" };
-}
-const RETRY_POLICY_ERROR_TYPES = new Set([
-  // The provider: limits, pauses, quotas and outages another model (or a later try) avoids.
-  "provider_rate_limited", "provider_paused", "provider_slot_wait_timeout",
-  "opencode_rate_limited", "opencode_quota_exhausted", "opencode_billing_error", "opencode_auth_error",
-  "opencode_model_error", "opencode_transient_provider_error", "opencode_provider_unavailable",
-  "opencode_transport_error", "opencode_api_error", "opencode_native_fallback", "opencode_stream_malformed",
-  // The run: stalled, too slow, or ended without a usable result.
-  "agent_idle_timeout", "agent_timeout", "agent_empty_final_response", "agent_exit_nonzero",
-  "essential_output_truncated", "validation_command_failed", "self_check_failed", "writer_no_changes",
-  // Q-008: the owner died while the job ran (a client restart).
-  "queue_job_interrupted",
-]);
 
-function retryPolicyRequirement(parsed) {
-  return { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
-}
 
-function retryPolicyModelSpec(parsed) {
-  return `${parsed.provider}/${parsed.model}${parsed.variant ? `@${parsed.variant}` : ""}`;
-}
 
-// { ok, policy } with policy null when the job asks for none; refusals name what is wrong.
-function jobRetryPolicy(job) {
-  const models = Array.isArray(job?.models) ? job.models : [];
-  const hasModels = job?.models !== undefined && job?.models !== null;
-  const hasMax = job?.maxAttempts !== undefined && job?.maxAttempts !== null;
-  if (!hasModels && !hasMax) return { ok: true, policy: null };
-  if (hasModels && (!Array.isArray(job.models) || !models.length || models.length > 8)) {
-    return { ok: false, errorType: "retry_policy_invalid", error: "models must be a list of 1 to 8 provider/model[@variant] entries." };
-  }
-  if (hasMax && (typeof job.maxAttempts !== "number" || !Number.isInteger(job.maxAttempts) || job.maxAttempts < 1 || job.maxAttempts > RETRY_POLICY_MAX_ATTEMPTS)) {
-    return { ok: false, errorType: "retry_policy_invalid", error: `maxAttempts must be an integer from 1 to ${RETRY_POLICY_MAX_ATTEMPTS}; got ${JSON.stringify(job.maxAttempts)}.` };
-  }
-  const parsed = [];
-  for (const entry of models) {
-    const item = parseModelAllowlistEntry(entry);
-    if (!item) return { ok: false, errorType: "retry_policy_invalid", error: `models entry ${JSON.stringify(entry)} is not in provider/model[@variant] form.` };
-    if (!allowlistedModelOverride(retryPolicyRequirement(item), job?.agent)) {
-      const allowlist = activeModelOverrideAllowlist();
-      return {
-        ok: false,
-        errorType: "retry_policy_model_not_allowlisted",
-        error: `models entry ${retryPolicyModelSpec(item)} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or agent ${job?.agent || "?"} cannot be overridden.`,
-        suggestedFix: "List only allowlisted models, or ask the operator to add the model to CODEX_OPENCODE_MODEL_ALLOWLIST.",
-      };
-    }
-    parsed.push({ ...item, spec: retryPolicyModelSpec(item) });
-  }
-  return { ok: true, policy: { models: parsed, maxAttempts: hasMax ? job.maxAttempts : RETRY_POLICY_DEFAULT_ATTEMPTS } };
-}
 
-// Applied by enqueueQueueJob: refuses a policy where it cannot work and pins the first model.
-function applyRetryPolicyToJob(job, parentJobId = "") {
-  const checked = jobRetryPolicy(job);
-  if (!checked.ok || !checked.policy) return { ...checked, job };
-  // B-072: retries are requeues of the stored request, which only the SQLite queue keeps.
-  if (effectiveQueueMode() !== "sqlite") return { ok: false, errorType: "retry_policy_not_applicable", error: `models/maxAttempts need CODEX_OPENCODE_QUEUE_MODE=sqlite (the queue mode is ${effectiveQueueMode()}): a retry is a requeue of the stored request, which the other modes drop.` };
-  if (parentJobId) return { ok: false, errorType: "retry_policy_not_applicable", error: "A pipeline job is retried by its pipeline, not by models/maxAttempts." };
-  if (job.sanitizedWorkspace) return { ok: false, errorType: "retry_policy_not_applicable", error: "A sanitized-workspace job always runs the bridge's reader model; models/maxAttempts do not apply." };
-  if (job.orchestratorMode === "contractor") return { ok: false, errorType: "retry_policy_not_applicable", error: "A contractor job cannot be replayed (its authorization token is never stored), so it cannot be retried." };
-  const { models } = checked.policy;
-  const requirement = job.scopeContract?.modelRequirement;
-  if (models.length && requirement) {
-    const matches = models.some((item) => item.provider === requirement.provider && item.model === requirement.model && (!requirement.variant || requirement.variant === item.variant));
-    if (!matches) return { ok: false, errorType: "retry_policy_invalid", error: `scopeContract.modelRequirement ${requirement.provider}/${requirement.model} is not one of models; give the model order in models only.` };
-    return { ok: true, policy: checked.policy, job };
-  }
-  if (!models.length) return { ok: true, policy: checked.policy, job };
-  const scopeContract = { ...(job.scopeContract || { mode: hasWriteIntent(job) ? "write" : "read" }) };
-  const previous = scopeContract.modelRequirement;
-  scopeContract.modelRequirement = { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...retryPolicyRequirement(models[0]) };
-  return { ok: true, policy: checked.policy, job: { ...job, scopeContract } };
-}
 
 // Active pauses by key (until, epoch ms), from the shared provider database.
 async function activeProviderPauses() {
@@ -23202,161 +15896,14 @@ async function activeProviderPauses() {
   return pauses;
 }
 
-// The model of attempt `attempt + 1`: the next one in order that is not paused (by its provider or
-// by itself). When every one is paused, the one whose pause ends first, with startAfter set to that
-// time, so the attempt waits in the queue instead of failing at once and burning an attempt.
-async function chooseRetryModel(policy, attempt, failed = {}) {
-  const pauses = await activeProviderPauses();
-  const pausedUntil = (provider, model) => Math.max(
-    pauses.get(providerKeyForMetadata({ provider })) || 0,
-    model ? pauses.get(modelPauseKeyForMetadata({ provider, model })) || 0 : 0,
-  );
-  const candidates = policy.models.length
-    ? policy.models.map((_, index) => policy.models[(attempt + index) % policy.models.length])
-    : [{ spec: "", provider: failed.configuredProvider || "", model: failed.configuredModel || "" }];
-  let best = null;
-  for (const candidate of candidates) {
-    const until = candidate.provider ? pausedUntil(candidate.provider, candidate.model) : 0;
-    if (!until || until <= Date.now()) return { spec: candidate.spec, startAfter: "" };
-    if (!best || until < best.until) best = { spec: candidate.spec, until };
-  }
-  return { spec: best.spec, startAfter: new Date(best.until).toISOString() };
-}
 
-// A guarded update of a terminal row's summary (as markQueueJobRequeued does): the owner never
-// rewrites a terminal row, so this only races another such update and retries on the revision.
-async function patchTerminalQueueSummary(projectRoot, jobId, fields, { onlyIf = null } = {}) {
-  const db = await openLockDb(projectRoot);
-  try {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const row = db.prepare("SELECT status, revision, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
-      if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { patched: false, reason: "the job is not terminal" };
-      let summary = {};
-      try { summary = JSON.parse(row.record_json || "{}"); } catch { return { patched: false, reason: "the record is unreadable" }; }
-      // B-069: a claim (auto-integration) is decided on the revision it is written on.
-      if (typeof onlyIf === "function" && !onlyIf(summary, row, db)) return { patched: false, reason: "condition", summary };
-      const updatedAt = new Date().toISOString();
-      const changed = db.prepare(`
-        UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
-        WHERE job_id = ? AND revision = ? AND status = ?
-      `).run(JSON.stringify(sanitizePersistedValue({ ...summary, ...fields, revision: Number(row.revision || 0) + 1 })), updatedAt, jobId, Number(row.revision || 0), row.status);
-      if (Number(changed.changes || 0) === 1) {
-        const live = QUEUE_JOBS.get(jobId);
-        if (live) Object.assign(live, fields);
-        return { patched: true };
-      }
-    }
-    return { patched: false, reason: "the record kept changing" };
-  } finally {
-    closeDb(db);
-  }
-}
 
-const retryPolicyModelLabel = (summary) => (summary?.configuredModel ? `${summary.configuredProvider || "?"}/${summary.configuredModel}` : summary?.scopeContract?.modelRequirement?.model ? `${summary.scopeContract.modelRequirement.provider}/${summary.scopeContract.modelRequirement.model}` : "profile model");
 
-// Runs after a job of a retry policy reached failed or interrupted. Returns what it did.
-async function applyQueueRetryPolicy({ cwd, jobId }) {
-  if (effectiveQueueMode() !== "sqlite" || !jobId) return { action: "none" };
-  const projectRoot = await resolveProjectStateRoot(cwd);
-  const db = await openLockDb(projectRoot);
-  let row;
-  try {
-    row = db.prepare("SELECT status, record_json, request_encrypted FROM opencode_jobs WHERE job_id = ?").get(jobId);
-  } finally {
-    closeDb(db);
-  }
-  if (!row || !["failed", "interrupted"].includes(row.status) || !row.request_encrypted) return { action: "none" };
-  let summary = {};
-  try { summary = JSON.parse(row.record_json || "{}"); } catch { return { action: "none" }; }
-  if (summary.requeuedAs || summary.completionOutcome === "gave_up" || summary.parentJobId) return { action: "none" };
-  let request;
-  try {
-    request = await decryptQueueRequest(row.request_encrypted, jobId);
-  } catch {
-    return { action: "none" };
-  }
-  const checked = jobRetryPolicy(request);
-  if (!checked.ok || !checked.policy) return { action: "none" };
-  const errorType = row.status === "interrupted" ? "queue_job_interrupted" : String(summary.errorType || "");
-  if (!RETRY_POLICY_ERROR_TYPES.has(errorType)) return { action: "not_eligible", errorType };
-  if (errorType === "queue_job_interrupted" && !(autoResumeInterruptedOverride ?? CONFIG.autoResumeInterrupted)) return { action: "resume_disabled" };
-  const attempt = Math.max(1, Number(summary.retryAttempt || 1));
-  const maxAttempts = checked.policy.maxAttempts;
-  // B-071: a job that timed out waiting for a provider slot (the global worker cap or a full
-  // provider) never started its agent, so it is requeued without counting an attempt, up to
-  // RETRY_POLICY_MAX_SLOT_WAITS times (a cap held for hours must not loop forever).
-  const slotWaits = Number(summary.slotWaitRequeues || 0);
-  const uncountedSlotWait = errorType === "provider_slot_wait_timeout" && slotWaits < RETRY_POLICY_MAX_SLOT_WAITS;
-  // B-078: the slot request was refused because the provider or model is paused (providerRefusedUntil
-  // is set only when the agent never started). Counting it let a job whose next model got paused,
-  // or whose models were all paused at enqueue, give up without one real run; it now waits instead.
-  const pauseWaits = Number(summary.pauseWaitRequeues || 0);
-  const uncountedPauseWait = !uncountedSlotWait && Boolean(summary.providerRefusedUntil) && pauseWaits < RETRY_POLICY_MAX_PAUSE_WAITS;
-  const uncounted = uncountedSlotWait || uncountedPauseWait;
-  const uncountedNote = uncountedSlotWait ? " (not counted: the agent never started)" : uncountedPauseWait ? " (not counted: the model was paused, the agent never started)" : "";
-  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedNote}`].slice(-RETRY_POLICY_HISTORY_MAX);
-  const giveUp = async (why) => {
-    await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
-    logEvent("warn", "queue.job_gave_up", {
-      jobId,
-      agent: summary.agent || "",
-      model: retryPolicyModelLabel(summary),
-      errorType,
-      summary: failureSummary(`${why} Attempts: ${history.join("; ")}`),
-    });
-    return { action: "gave_up", attempts: attempt, history };
-  };
-  if (!uncounted && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
-  const nextAttempt = uncounted ? attempt : attempt + 1;
-  // The model order follows the counted attempts; a slot wait or a paused-model refusal tries the
-  // next model all the same (another provider may have a free slot or no pause), without spending
-  // an attempt; when every model is paused, chooseRetryModel makes the retry wait (startAfter).
-  const next = await chooseRetryModel(checked.policy, uncounted ? attempt + slotWaits + pauseWaits : attempt, summary);
-  const requeued = await requeueQueueJob({
-    cwd: projectRoot,
-    jobId,
-    model: next.spec || "",
-    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", startAfterReason: next.startAfter ? "provider_pause" : "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits, pauseWaitRequeues: uncountedPauseWait ? pauseWaits + 1 : pauseWaits },
-  });
-  // Q-008: a previous child that is still alive may still write its worktree; the job stays
-  // interrupted (not gave_up) so the operator can stop the child and requeue it.
-  if (!requeued.ok && requeued.errorType === "requeue_orphan_child_alive") {
-    logEvent("warn", "queue.retry_deferred", { jobId, agent: summary.agent || "", errorType: requeued.errorType, summary: failureSummary(requeued.error) });
-    return { action: "deferred", errorType: requeued.errorType };
-  }
-  if (!requeued.ok) return await giveUp(`The retry could not be enqueued (${requeued.errorType}: ${requeued.error}).`);
-  logEvent("warn", "queue.job_retried", {
-    jobId: requeued.record.jobId,
-    agent: summary.agent || "",
-    model: next.spec || retryPolicyModelLabel(summary),
-    errorType,
-    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${uncountedPauseWait ? `; the paused-model refusal was not counted (${pauseWaits + 1} of ${RETRY_POLICY_MAX_PAUSE_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
-  });
-  // B-072: a failed write attempt that changed nothing leaves an empty worktree; the retry gets
-  // its own, so the empty one is removed (a worktree with any change is kept for review).
-  const emptyWorktree = row.status === "failed" ? await removeEmptyRetryWorktree(projectRoot, summary) : null;
-  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, uncountedPauseWait, emptyWorktree };
-}
 
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
 let autoResumeInterruptedOverride = null;
 
-// Never blocks or fails the caller (a terminal commit, a recovery pass): the policy runs after it.
-// B-075: retries being decided right now. Between a failed attempt and its requeue the queue looks
-// empty, so the worker's --until-empty must not exit while one is in flight.
-let queueRetryPoliciesInFlight = 0;
 
-function scheduleQueueRetryPolicy(cwd, jobId) {
-  if (!jobId || effectiveQueueMode() !== "sqlite") return;
-  queueRetryPoliciesInFlight += 1;
-  setImmediate(() => {
-    applyQueueRetryPolicy({ cwd, jobId }).catch((error) => {
-      logEvent("warn", "queue.retry_policy_failed", { jobId, errorType: error?.errorType || "retry_policy_failed", summary: failureSummary(error?.message || String(error)) });
-    }).finally(() => {
-      queueRetryPoliciesInFlight = Math.max(0, queueRetryPoliciesInFlight - 1);
-    });
-  });
-}
 
 // Q-010: auto-integration of new-file-only patches (the round-6 orchestrator's LANDED step). Up to
 // 300 batches each needed a dry run, an apply and a receipt. A queued writer that asks for it
@@ -23389,11 +15936,6 @@ const AUTO_INTEGRATION_RETRYABLE_ERRORS = new Set(["integration_lock_conflict", 
 // AUTO_INTEGRATION_LATER_MAX tries (an hour by default).
 const AUTO_INTEGRATION_ROUNDS = 3;
 const AUTO_INTEGRATION_LATER_MAX = 60;
-
-function autoIntegrationRetryDelayMs(round) {
-  const baseMs = process.argv.includes("--self-test") ? 25 : 5000;
-  return Math.min(baseMs * 12, baseMs * 2 ** round);
-}
 
 function autoIntegrationLaterDelayMs() {
   return process.argv.includes("--self-test") ? 150 : 60_000;
@@ -23655,139 +16197,6 @@ function scheduleAutoIntegration(details) {
   return run;
 }
 
-// Creates a new queue job from the stored request of a failed, cancelled, interrupted or
-// not_resumable one. The request goes through enqueueQueueJob, the path enqueue_opencode_job uses
-// (lock plan, Scope Contract rules, worktree requirement, fingerprint, idempotency), after a
-// zod check against the current job input schema; nothing is replayed unchecked.
-async function requeueQueueJob({ cwd, jobId, model = "", timeoutMs = undefined, recordFields = null }) {
-  if (typeof jobId !== "string" || !jobId.trim()) return requeueRefusal("requeue_invalid_arguments", "jobId must be a non-empty string.");
-  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_AGENT_TIMEOUT_MS)) {
-    return requeueRefusal("requeue_invalid_arguments", `timeoutMs must be a positive integer of at most ${MAX_AGENT_TIMEOUT_MS} ms; got ${JSON.stringify(timeoutMs)}.`);
-  }
-  if (model !== undefined && model !== "" && typeof model !== "string") {
-    return requeueRefusal("requeue_invalid_arguments", `model must be a "provider/model[@variant]" string; got ${JSON.stringify(model)}.`);
-  }
-  if (effectiveQueueMode() !== "sqlite") {
-    return requeueRefusal("requeue_requires_sqlite_queue", "Only the SQLite queue keeps the original request (encrypted); in the other modes it is dropped when the job ends.", "Re-enqueue the job with enqueue_opencode_job and a new idempotencyKey.");
-  }
-
-  let modelRequirement = null;
-  if (model) {
-    const parsed = parseModelAllowlistEntry(model);
-    if (!parsed) return requeueRefusal("requeue_model_invalid", `model "${model}" is not in provider/model[@variant] form.`, "Use the form of CODEX_OPENCODE_MODEL_ALLOWLIST entries, for example google/antigravity-gemini-3.8-flash@high.");
-    modelRequirement = { provider: parsed.provider, model: parsed.model, ...(parsed.variant ? { variant: parsed.variant } : {}) };
-  }
-
-  const projectRoot = await resolveProjectStateRoot(cwd);
-  const db = await openLockDb(projectRoot);
-  let row;
-  try {
-    row = db.prepare("SELECT job_id, cwd, status, revision, idempotency_key, request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
-  } finally {
-    closeDb(db);
-  }
-  if (!row) return requeueRefusal("requeue_job_not_found", `No queue job ${jobId} in ${projectRoot}.`, "Check the job id and cwd with list_opencode_jobs.");
-  let summary = {};
-  try { summary = JSON.parse(row.record_json || "{}"); } catch { summary = {}; }
-  if (row.status === "completed") {
-    return requeueRefusal("requeue_job_completed", `Job ${jobId} completed. Only failed, cancelled, interrupted or not_resumable jobs can be requeued; re-running finished work would duplicate it.`, "If the work really must run again, use enqueue_opencode_job with a new idempotencyKey.");
-  }
-  if (REQUEUE_UNFINISHED_STATUSES.has(row.status)) {
-    return requeueRefusal("requeue_job_not_terminal", `Job ${jobId} is still ${row.status}.`, "Wait for it to finish, or cancel_opencode_job it first.");
-  }
-  if (!REQUEUE_ELIGIBLE_STATUSES.has(row.status)) {
-    return requeueRefusal("requeue_job_status_unsupported", `Job ${jobId} has status "${row.status}", which requeue does not handle.`);
-  }
-  if (summary.parentJobId) {
-    return requeueRefusal("requeue_pipeline_child", `Job ${jobId} belongs to pipeline/parent ${summary.parentJobId}; a requeued copy would not be tracked by it.`, "Re-run it through the pipeline, or enqueue a standalone job.");
-  }
-  if (summary.requeuedAs) {
-    return requeueRefusal("requeue_already_requeued", `Job ${jobId} was already requeued as ${summary.requeuedAs}.`, `Requeue ${summary.requeuedAs} if that one failed.`);
-  }
-  if (row.status === "interrupted" && summary.orphanChildProcessAlive && processIsAlive(Number(summary.orphanChildProcessId || 0))) {
-    return requeueRefusal("requeue_orphan_child_alive", `The previous run of ${jobId} left a child process (pid ${summary.orphanChildProcessId}) that is still alive and may still be writing its worktree.`, "Inspect it with diagnose_opencode_bridge and stop it before requeuing.");
-  }
-  if (!row.request_encrypted) {
-    return requeueRefusal(
-      "requeue_request_not_stored",
-      `The original request of ${jobId} (agent, task, model pin, Scope Contract, locks, validationCommand, timeout) is not stored: this record has no encrypted request. It predates encrypted requests or was never persisted with one.`,
-      "Enqueue the work again with enqueue_opencode_job."
-    );
-  }
-  let stored;
-  try {
-    stored = await decryptQueueRequest(row.request_encrypted, row.job_id);
-  } catch (error) {
-    return requeueRefusal("requeue_request_unreadable", `The stored request of ${jobId} could not be decrypted (${redactSensitiveText(error?.message || String(error))}); queue-request.key may have changed.`, "Enqueue the work again with enqueue_opencode_job.");
-  }
-  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
-    return requeueRefusal("requeue_request_not_stored", `The stored request of ${jobId} is empty or not an object.`, "Enqueue the work again with enqueue_opencode_job.");
-  }
-  if (stored.orchestratorMode === "contractor" || stored.internalQueueContractorProof || stored.internalQueueJobId) {
-    return requeueRefusal("requeue_contractor_unsupported", `Job ${jobId} ran in contractor mode. Its authorization token is never stored, so it cannot be replayed.`, "Enqueue it again with a fresh contractorAuthorizationToken.");
-  }
-  const checked = z.object(jobInputShape).strict().safeParse(stored);
-  if (!checked.success) {
-    const problems = checked.error.issues.map((issue) => `${issue.path.join(".") || "(request)"}: ${issue.message}`).slice(0, 8);
-    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} does not satisfy the current job input schema: ${problems.join("; ")}.`, "Enqueue the work again with enqueue_opencode_job.");
-  }
-  const request = checked.data;
-  if (!request.sanitizedWorkspace && !recordMatchesProject({ cwd: request.cwd }, projectRoot)) {
-    return requeueRefusal("requeue_request_invalid", `The stored request of ${jobId} names ${request.cwd}, not ${projectRoot}.`);
-  }
-
-  const warnings = [];
-  const overrides = [];
-  const job = { ...request };
-  if (modelRequirement) {
-    if (!allowlistedModelOverride(modelRequirement, request.agent)) {
-      const allowlist = activeModelOverrideAllowlist();
-      return requeueRefusal(
-        "requeue_model_not_allowlisted",
-        `model ${model} is not in CODEX_OPENCODE_MODEL_ALLOWLIST (${allowlist.length ? allowlist.join(", ") : "empty: managed profiles only"}), or the agent ${request.agent} cannot be overridden.`,
-        "Pick a listed model, or ask the operator to add it to the allowlist."
-      );
-    }
-    const previous = request.scopeContract?.modelRequirement;
-    job.scopeContract = {
-      ...(request.scopeContract || {}),
-      modelRequirement: { ...(previous?.requireRuntimeEvidence !== undefined ? { requireRuntimeEvidence: previous.requireRuntimeEvidence } : {}), ...modelRequirement },
-    };
-    overrides.push(`model=${model}`);
-  } else if (request.scopeContract?.modelRequirement && !allowlistedModelOverride(request.scopeContract.modelRequirement, request.agent)) {
-    warnings.push(`The stored model pin ${request.scopeContract.modelRequirement.provider}/${request.scopeContract.modelRequirement.model} is not in the current allowlist; the job runs only if it matches the agent's managed profile.`);
-  }
-  if (timeoutMs !== undefined) {
-    job.timeoutMs = timeoutMs;
-    overrides.push(`timeoutMs=${timeoutMs}`);
-  }
-
-  const sequence = Number(summary.requeueSequence || 0) + 1;
-  const idempotencyKey = requeueIdempotencyKey({ idempotencyKey: row.idempotency_key || summary.idempotencyKey || "", jobId }, sequence);
-  job.idempotencyKey = idempotencyKey;
-  // Q-007: the retry policy passes the attempt counters and a start time; a manual requeue none.
-  const enqueued = await enqueueQueueJob(job, "", { recordFields: { ...(recordFields || {}), requeuedFrom: jobId, requeueSequence: sequence, requeuedAt: new Date().toISOString() } });
-  if (!enqueued.ok) {
-    return { ...requeueRefusal(enqueued.errorType || "queue_rejected", `The stored request was rejected by the normal enqueue validation: ${enqueued.error}`, enqueued.suggestedFix || "Fix the job contract and enqueue it again."), serialOnlyMatches: enqueued.serialOnlyMatches || [] };
-  }
-  const marked = await markQueueJobRequeued(projectRoot, jobId, enqueued.record.jobId);
-  if (!marked.marked) {
-    warnings.push(`The original job could not be marked as requeued (${marked.reason}); the new job ${enqueued.record.jobId} exists.`);
-  }
-  return {
-    ok: true,
-    record: enqueued.record,
-    deduplicated: Boolean(enqueued.deduplicated),
-    originalJobId: jobId,
-    originalStatus: row.status,
-    originalErrorType: summary.errorType || "",
-    originalWorktreePath: summary.worktreePath || "",
-    idempotencyKey,
-    sequence,
-    overrides,
-    warnings,
-  };
-}
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
 // code in errcode (2067 = SQLITE_CONSTRAINT_UNIQUE); there is no "SQLITE_CONSTRAINT_UNIQUE" code.
@@ -24228,9 +16637,46 @@ async function claimQueueRecord(record) {
 let queueJobExecutorTestHook = null;
 const QUEUE_ACTIVE_STATUSES = ["running", "validating", "reviewing", "testing"];
 const QUEUE_TERMINAL_STATUSES = ["completed", "failed", "cancelled", "interrupted", "not_resumable"];
+
+const {
+  markQueueJobRequeued,
+  removeEmptyRetryWorktree,
+  jobRetryPolicy,
+  applyRetryPolicyToJob,
+  chooseRetryModel,
+  patchTerminalQueueSummary,
+  applyQueueRetryPolicy,
+  scheduleQueueRetryPolicy,
+  requeueQueueJob,
+  getQueueRetryPoliciesInFlight,
+} = createQueueRetryRuntime({
+  CONFIG,
+  QUEUE_TERMINAL_STATUSES,
+  QUEUE_JOBS,
+  openLockDb,
+  closeDb,
+  runCommand,
+  cleanupWorktree,
+  parseModelAllowlistEntry,
+  allowlistedModelOverride,
+  activeModelOverrideAllowlist,
+  effectiveQueueMode,
+  hasWriteIntent,
+  activeProviderPauses,
+  providerKeyForMetadata,
+  modelPauseKeyForMetadata,
+  resolveProjectStateRoot,
+  decryptQueueRequest,
+  getAutoResumeInterruptedOverride: () => autoResumeInterruptedOverride,
+  logEvent,
+  jobInputShape,
+  recordMatchesProject,
+  processIsAlive,
+  enqueueQueueJob,
+});
+
 // Lock refusals of a queued job that clear by themselves; the job waits (blocked) and retries.
 const QUEUE_RETRYABLE_LOCK_ERROR_TYPES = new Set(["queue_lock_conflict", "integration_recovery_pending"]);
-const QUEUE_BLOCKED_BACKOFF_MAX_MS = 60 * 1000;
 const QUEUE_TERMINAL_COMMIT_ATTEMPTS = 5;
 
 // Each consecutive block of the same job after a claim doubles its wait (up to 60 s): a job
@@ -24330,29 +16776,6 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
   return lastResult || { persisted: false, status: record.status };
 }
 
-// What acquireHardLock refuses before it looks at other locks; such a refusal never clears.
-function queueHardLockRequestRefusal(record) {
-  const rawPaths = record.mode === "read"
-    ? firstNonEmptyList(record.lockedPaths, record.scopeContract?.scope?.read, [REPOSITORY_SCOPE_LOCK_PATH])
-    : firstNonEmptyList(record.allowedEdits, record.lockedPaths);
-  const repositoryScope = rawPaths.length === 1 && rawPaths[0] === REPOSITORY_SCOPE_LOCK_PATH;
-  if (repositoryScope && record.mode !== "read") {
-    return "Repository-wide scope is reserved for internal read or serial-integration consistency leases.";
-  }
-  if (!repositoryScope) {
-    const unsafe = unsafePathReason(rawPaths, record.cwd || "");
-    if (unsafe) return `Write lock rejected: ${unsafe}`;
-  }
-  let normalizedPaths = [];
-  try {
-    normalizedPaths = repositoryScope ? [REPOSITORY_SCOPE_LOCK_PATH] : normalizeLockPathListForCwd(rawPaths, record.cwd || "");
-  } catch (error) {
-    return `Write lock rejected: ${error?.message || String(error)}`;
-  }
-  if (!normalizedPaths.length) return "Write lock rejected: paths are required.";
-  if (hasAmbiguousPathPattern(normalizedPaths, record.cwd || "")) return "Write lock rejected: wildcard or ambiguous paths are not allowed.";
-  return "";
-}
 
 // After a claimed job's lock was refused: name the real cause (an integration operation, a
 // direct or manual lock), fail a request the lock layer can never accept, and otherwise
@@ -24876,122 +17299,11 @@ function scheduleQueue(delayMs = 0) {
   }, delay);
 }
 
-async function readPersistedQueueRecord(jobId, cwd = "") {
-  if (effectiveQueueMode() !== "sqlite") {
-    return null;
-  }
 
-  const db = await openLockDb(cwd);
-  try {
-    const row = db.prepare(`
-      SELECT status, finished_at, heartbeat_at, lease_expires_at, cancellation_requested_at,
-             child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted,
-             result_encrypted, record_json
-      FROM opencode_jobs WHERE job_id = ?
-    `).get(jobId);
-    if (!row?.record_json) return null;
-    const privateDetails = row.result_encrypted
-      ? await decryptQueuePrivateDetails(row.result_encrypted, jobId)
-      : {};
-    return {
-      ...JSON.parse(row.record_json),
-      ...privateDetails,
-      privateDetailsAvailable: Boolean(row.result_encrypted),
-      status: row.status,
-      finishedAt: row.finished_at || "",
-      heartbeatAt: row.heartbeat_at || "",
-      leaseExpiresAt: row.lease_expires_at || "",
-      cancellationRequested: Boolean(row.cancellation_requested_at),
-      cancellationRequestedAt: row.cancellation_requested_at || "",
-      childProcessId: row.child_process_id || 0,
-      childProcessStartedAt: row.child_process_started_at || "",
-      revision: row.revision || 0,
-    };
-  } finally {
-    closeDb(db);
-  }
-}
 
-async function listPersistedQueueRecords(cwd = "", status = "") {
-  if (effectiveQueueMode() !== "sqlite") {
-    return [];
-  }
-
-  const db = await openLockDb(cwd);
-  try {
-    const fields = "status, finished_at, heartbeat_at, lease_expires_at, cancellation_requested_at, child_process_id, child_process_started_at, revision, idempotency_key, request_encrypted, record_json";
-    const rows = status
-      ? db.prepare(`SELECT ${fields} FROM opencode_jobs WHERE status = ? ORDER BY created_at DESC`).all(status)
-      : db.prepare(`SELECT ${fields} FROM opencode_jobs ORDER BY created_at DESC`).all();
-    return rows.map((row) => ({
-      ...JSON.parse(row.record_json),
-      status: row.status,
-      finishedAt: row.finished_at || "",
-      heartbeatAt: row.heartbeat_at || "",
-      leaseExpiresAt: row.lease_expires_at || "",
-      cancellationRequested: Boolean(row.cancellation_requested_at),
-      cancellationRequestedAt: row.cancellation_requested_at || "",
-      childProcessId: row.child_process_id || 0,
-      childProcessStartedAt: row.child_process_started_at || "",
-      revision: row.revision || 0,
-    }));
-  } finally {
-    closeDb(db);
-  }
-}
-
-async function authoritativeQueueRecord(jobId, cwd = "") {
-  if (effectiveQueueMode() !== "sqlite") return QUEUE_JOBS.get(jobId) || null;
-  return await readPersistedQueueRecord(jobId, cwd);
-}
 
 function makePipelineId(name = "pipeline") {
   return `${safeNamePart(name, "pipeline")}-${Date.now()}-${randomBytes(4).toString("hex")}`;
-}
-
-function pipelineRecordSnapshot(record) {
-  const finalValidationSource = record.finalValidationSource
-    || (record.policy?.path && record.finalValidationCommand ? "legacy_unknown" : "none");
-  return sanitizePersistedValue({
-    pipelineId: record.pipelineId,
-    revision: Number(record.revision || 0),
-    ownerInstanceId: record.ownerInstanceId || "",
-    ownerGeneration: record.ownerGeneration || "",
-    ownerHeartbeatAt: record.ownerHeartbeatAt || "",
-    ownerLeaseExpiresAt: record.ownerLeaseExpiresAt || "",
-    name: record.name || "",
-    cwd: record.cwd || "",
-    status: record.status,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-    startedAt: record.startedAt || "",
-    finishedAt: record.finishedAt || "",
-    strategy: record.strategy || "queue",
-    requiresWorktrees: Boolean(record.requiresWorktrees),
-    policy: record.policy || null,
-    jobs: record.jobs || [],
-    lockPlans: record.lockPlans || [],
-    queueJobIds: record.queueJobIds || [],
-    expectedChildCount: Number(record.expectedChildCount || 0),
-    batchState: record.batchState || "unstarted",
-    cleanupState: record.cleanupState || "none",
-    queueMode: record.queueMode || "legacy",
-    integrationQueue: record.integrationQueue || [],
-    finalValidationCommand: record.finalValidationCommand || "",
-    finalValidationSource,
-    finalValidationSpec: record.finalValidationSpec || null,
-    finalValidationResult: record.finalValidationResult || null,
-    reviewerJob: record.reviewerJob || null,
-    reviewerResult: record.reviewerResult || null,
-    testerJob: record.testerJob || null,
-    testerResult: record.testerResult || null,
-    sourceCleanupResults: record.sourceCleanupResults || [],
-    cleanupPending: Boolean(record.cleanupPending),
-    events: record.events || [],
-    errors: record.errors || [],
-    sanitizedWorkspace: record.sanitizedWorkspace || null,
-    sanitizedWorkspaceAttestation: record.sanitizedWorkspaceAttestation || null,
-  });
 }
 
 function pipelinePrivateDetails(record) {
@@ -25125,19 +17437,6 @@ async function encryptPipelinePrivateDetails(record) {
 async function decryptPipelinePrivateDetails(envelope, pipelineId) {
   if (!envelope) return {};
   return JSON.parse((await decryptIntegrationJournalBytes(envelope, `pipeline-details\0${pipelineId}`)).toString("utf8"));
-}
-
-function pipelineReplayRequest(record) {
-  return {
-    jobs: record.jobs || [],
-    reviewerJob: record.reviewerJob || null,
-    testerJob: record.testerJob || null,
-    finalValidationCommand: record.finalValidationCommand || "",
-  };
-}
-
-function pipelinePersistenceKey(record) {
-  return JSON.stringify([record.cwd || "", record.pipelineId]);
 }
 
 function pipelineOwnedByThisInstance(record) {
@@ -25331,19 +17630,6 @@ function enqueuePipelinePersistence(record, operation) {
   });
 }
 
-function pipelineConcurrentUpdateError(snapshot, authoritative = null) {
-  const error = new Error(`Pipeline ${snapshot.pipelineId} changed in another process; the stale update was rejected.`);
-  error.code = "pipeline_concurrent_update";
-  error.errorType = "pipeline_concurrent_update";
-  error.authoritative = authoritative;
-  return error;
-}
-
-function pipelineRecordJson(snapshot) {
-  const { requestEncrypted, detailsEncrypted, ...summary } = snapshot;
-  return JSON.stringify(sanitizePersistedValue(summary));
-}
-
 async function writePipelineRecordSnapshot(snapshot, { create = false, expectedRevision = null } = {}) {
   const db = await openLockDb(snapshot.cwd);
   try {
@@ -25481,13 +17767,6 @@ function persistPipelineRecord(record) {
 // re-checks for a reserved item inside its own write, so either the cancellation or the
 // reservation wins, never both.
 const PIPELINE_INTEGRATION_CLOSED_STATUSES = new Set(["completed", "failed", "cancelled"]);
-
-function pipelineTerminalError(record) {
-  const error = new Error(`Pipeline ${record?.pipelineId || "unknown"} is ${record?.status}; it does not integrate any more.`);
-  error.code = "pipeline_terminal";
-  error.errorType = "pipeline_terminal";
-  return error;
-}
 
 async function updatePipelineRecord(record, patch = {}) {
   if (!pipelineOwnedByThisInstance(record)) {
@@ -25763,47 +18042,6 @@ function mergePipelineIntegrationQueue(existingQueue = [], queueSnapshots = []) 
   });
 }
 
-// Pipeline items are named by their retained worktree or branch. On a case-insensitive
-// filesystem the caller may spell the same worktree with different case or slashes.
-function pipelineIntegrationItemMatches(record, item, { worktreePath = "", branch = "" } = {}) {
-  const cwd = record?.cwd || "";
-  const sameWorktree = Boolean(worktreePath && item?.worktreePath)
-    && normalizeFilesystemCase(path.resolve(item.worktreePath), cwd) === normalizeFilesystemCase(path.resolve(worktreePath), cwd);
-  const sameBranch = Boolean(branch) && item?.branch === branch;
-  return sameWorktree || sameBranch;
-}
-
-const PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES = new Set([
-  "forbidden_file_changed",
-  "changed_file_validation_error",
-  "shared_file_parallel_write",
-  "serial_only_parallel_write",
-]);
-
-// Only a result that says this exact source can never be integrated rejects its item: the
-// source changed after the writer completed, its patch conflicts with the target, or the
-// patch itself touches paths outside its contract. The same scope types after an apply
-// (appliedFiles present) mean another process wrote the checkout during it, which a retry
-// can clear, as can every lock, dirty-target, stale-preview, review, validation and journal
-// outcome.
-function pipelineIntegrationFailureIsDefinitive(result) {
-  const errorType = String(result?.errorType || "");
-  if (["pipeline_source_identity_changed", "integration_merge_conflict", "empty_allowed_edits"].includes(errorType)) return true;
-  return PIPELINE_SOURCE_SCOPE_VIOLATION_TYPES.has(errorType) && !Array.isArray(result?.appliedFiles);
-}
-
-function nextPipelineIntegrationItemStatus(item, result, { dryRun = false } = {}) {
-  // A dry run never prepares a journal operation, so it cannot change what the item is.
-  if (dryRun) return item.status;
-  if (result?.ok && ["applied", "no_changes"].includes(result.status)) return "integrated";
-  if (result?.ok) return item.status === "integrating" ? "pending" : item.status;
-  if (result?.errorType === "integration_recovery_quarantined") {
-    const quarantinedOperations = [result.operationId, ...(result.operationIds || [])].filter(Boolean);
-    return item.operationId && quarantinedOperations.includes(item.operationId) ? "quarantined" : "pending";
-  }
-  return pipelineIntegrationFailureIsDefinitive(result) ? "rejected" : "pending";
-}
-
 async function refreshPipelineRecord(record, { persist = true } = {}) {
   if (["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"].includes(record.status)) {
     return record;
@@ -25928,10 +18166,6 @@ async function reconcileParentPipelineAfterQueueTerminal(childRecord) {
   return parent;
 }
 
-function pipelineHasPendingIntegrations(record) {
-  const queue = record.integrationQueue || [];
-  return queue.some((item) => item.status !== "integrated");
-}
 
 // Finalization judges the reviewed result: HEAD, tree, status, working patch and index.
 // captureIntegrationTargetState also fingerprints ignored files (mtime/ctime), so a test run
@@ -28086,7 +20320,6 @@ server.tool(
   }
 );
 
-
 async function sha256File(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
@@ -28543,30 +20776,39 @@ function scheduleDeferredRecovery(delayMs) {
   deferredRecoveryTimer.unref?.();
 }
 
-// Feature 10 (log.md B-075..B-077): the unattended queue worker, bin/queue-worker.js. A bridge runs
-// only while an MCP client keeps it alive, so a batch of hundreds of jobs could not run for hours
-// without one. The worker is this module imported by a plain Node process: it runs the same
-// startup checks and recovery, then the same queue runner (leases, bridge_instances, provider
-// leases, pauses, integration journal, operations log) for ONE repository, without a transport.
-// Nothing new is stored in the database; small files sit beside it in <state-dir>/workers/:
-// <projectKey>.json (presence: pid, instance, heartbeat, counts), <projectKey>.stop (a stop
-// request, the primary stop signal because Windows has no SIGTERM) and <projectKey>.parked (B-079:
-// a stopped worker left jobs behind for the next worker).
-const QUEUE_WORKER_PRESENCE_FRESH_MS = 2 * 60 * 1000;
-// B-082: a heartbeat this old is stale even when the recorded pid is alive: a live worker refreshes
-// it every 15 s, so after 10 minutes the pid belongs to another process (a reused pid would
-// otherwise block every restart for good) or the worker hung; in both cases it is taken over.
-const QUEUE_WORKER_PRESENCE_ABANDONED_MS = 10 * 60 * 1000;
-// B-087: a heartbeat in the future (a clock that moved back) counts only within this skew.
-const QUEUE_WORKER_CLOCK_SKEW_MS = 60 * 1000;
 // { repo, dbPath, projectKey, startedAt } while this process is a queue worker.
 let queueWorkerMode = null;
 // The worker holds every start until its --enqueue file is in (all lines valid and enqueued).
 let queueStartsHeld = false;
 // A stop was requested: nothing new starts, running jobs finish.
 let queueDrainFlag = false;
-// dbPath of a repository whose live or parked worker this client bridge already logged (once per episode).
-const QUEUE_WORKER_PRESENT_LOGGED = new Set();
+const {
+  queueWorkerFiles,
+  readQueueWorkerText,
+  readQueueWorkerFile,
+  assertQueueWorkerDirectory,
+  writeQueueWorkerFileAtomically,
+  queueWorkerPresenceRecord,
+  takeOverStalePresence,
+  claimQueueWorkerPresence,
+  refreshQueueWorkerPresence,
+  releaseQueueWorkerPresence,
+  writeQueueWorkerParked,
+  removeQueueWorkerParked,
+  writeQueueWorkerStop,
+  readQueueWorkerStop,
+  foreignQueueWorkerPresence,
+  forgetQueueWorkerPresent,
+  noteQueueWorkerPresent,
+} = createQueueWorkerFilesRuntime({
+  projectStateKey,
+  effectiveBridgeStateDirectory,
+  BRIDGE_INSTANCE_ID,
+  getQueueWorkerMode: () => queueWorkerMode,
+  getQueueDrainFlag: () => queueDrainFlag,
+  sameStateDbPath,
+  logEvent,
+});
 const QUEUE_WORKER_NON_TERMINAL_STATUSES = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
 // Every line of an --enqueue file: the enqueue_opencode_job input, with a required idempotency key
 // (re-running the same file must deduplicate instead of doubling a 220-job batch) and no unknown
@@ -28585,275 +20827,22 @@ function sameStateDbPath(left, right) {
   return normalizeFilesystemCase(path.resolve(String(left || ""))) === normalizeFilesystemCase(path.resolve(String(right || "")));
 }
 
-// <projectKey>.parked (B-079): a worker that stopped with jobs left behind keeps the repository's
-// queue for the next worker; client bridges do not adopt it until --release removes the file.
-function queueWorkerFiles(projectRoot) {
-  const projectKey = projectStateKey(projectRoot);
-  const directory = path.join(effectiveBridgeStateDirectory(), "workers");
-  return {
-    projectKey,
-    directory,
-    presence: path.join(directory, `${projectKey}.json`),
-    stop: path.join(directory, `${projectKey}.stop`),
-    parked: path.join(directory, `${projectKey}.parked`),
-  };
-}
 
-// A regular file's text, or null (missing, a link or unreadable).
-function readQueueWorkerText(file) {
-  try {
-    if (!lstatSync(file).isFile()) return null;
-    return readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-}
 
-// A regular file's JSON object, or null (missing, a link, unreadable or not an object).
-function readQueueWorkerFile(file) {
-  const text = readQueueWorkerText(file);
-  if (text === null) return null;
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
 
-function queueWorkerHeartbeatAgeMs(presence, now = Date.now()) {
-  const at = Date.parse(presence?.heartbeatAt || "");
-  return Number.isFinite(at) ? now - at : Number.POSITIVE_INFINITY;
-}
 
-// Fresh: written less than 2 minutes ago, and not more than the clock skew in the future (B-087).
-function queueWorkerPresenceFresh(presence, now = Date.now()) {
-  const age = queueWorkerHeartbeatAgeMs(presence, now);
-  return age >= -QUEUE_WORKER_CLOCK_SKEW_MS && age < QUEUE_WORKER_PRESENCE_FRESH_MS;
-}
 
-// EPERM means the process exists but belongs to someone else: alive, unlike processIsAlive.
-function queueWorkerPidAlive(pid) {
-  const value = Number(pid);
-  if (!Number.isInteger(value) || value <= 0) return false;
-  try {
-    process.kill(value, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
 
-// The one rule for "a worker runs here" (start refusal, --stop, --status, --release): a fresh
-// heartbeat, or a live pid whose heartbeat is younger than 10 minutes (B-082).
-function queueWorkerPresenceLive(presence, now = Date.now()) {
-  if (!presence) return false;
-  if (queueWorkerPresenceFresh(presence, now)) return true;
-  const age = queueWorkerHeartbeatAgeMs(presence, now);
-  return age >= -QUEUE_WORKER_CLOCK_SKEW_MS && age < QUEUE_WORKER_PRESENCE_ABANDONED_MS && queueWorkerPidAlive(presence.pid);
-}
 
-function assertQueueWorkerDirectory(directory) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const details = lstatSync(directory);
-  if (details.isSymbolicLink() || !details.isDirectory()) throw new Error(`${directory} must be a plain directory, not a link.`);
-}
 
-// Written through a temporary file and a rename, so a reader never sees half a file. The rename
-// is retried: on Windows a client bridge reading the file at that moment makes it fail with EPERM.
-function writeQueueWorkerFileAtomically(file, value) {
-  const temporary = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  let lastError = null;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      renameSync(temporary, file);
-      return true;
-    } catch (error) {
-      lastError = error;
-      if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) break;
-      // A short synchronous pause (the callers are synchronous; the tick runs every 15 s).
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
-    }
-  }
-  try { rmSync(temporary, { force: true }); } catch { /* Best effort. */ }
-  throw lastError;
-}
 
-function queueWorkerPresenceRecord(files, fields = {}) {
-  const now = new Date().toISOString();
-  return {
-    version: 1,
-    pid: process.pid,
-    instanceId: BRIDGE_INSTANCE_ID,
-    projectKey: files.projectKey,
-    repo: queueWorkerMode?.repo || fields.repo || "",
-    startedAt: queueWorkerMode?.startedAt || now,
-    heartbeatAt: now,
-    draining: queueDrainFlag,
-    ...fields,
-  };
-}
 
-// B-081: a stale presence file is taken over by renaming it to a name only this process uses and
-// checking that the renamed file is still the stale content that was judged. A plain remove could
-// delete a fresh file another worker created between the judgement and the remove; a rename of a
-// file that changed meanwhile is put back (linkSync refuses to replace one that exists again).
-function takeOverStalePresence(files, staleText) {
-  const aside = `${files.presence}.stale-${process.pid}-${randomBytes(4).toString("hex")}`;
-  try {
-    renameSync(files.presence, aside);
-  } catch (error) {
-    if (error?.code === "ENOENT") return { ok: true };
-    return { ok: false, error: `could not move the stale presence file aside (${error?.code || error?.message || error})` };
-  }
-  const moved = readQueueWorkerText(aside);
-  if (moved === staleText) {
-    try { rmSync(aside, { force: true }); } catch { /* A leftover .stale file is inert. */ }
-    return { ok: true };
-  }
-  try {
-    linkSync(aside, files.presence);
-    rmSync(aside, { force: true });
-  } catch { /* Another worker's file is in place again; the moved one stays aside for inspection. */ }
-  return { ok: false, error: "the presence file changed while it was being taken over" };
-}
 
-// B-076: one worker per repository. The presence file is created exclusively; an existing one
-// blocks the start while queueWorkerPresenceLive says a worker runs. A stale one is taken over.
-function claimQueueWorkerPresence(projectRoot, { now = Date.now() } = {}) {
-  const files = queueWorkerFiles(projectRoot);
-  assertQueueWorkerDirectory(files.directory);
-  let takenOver = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const descriptor = openSync(files.presence, "wx", 0o600);
-      try {
-        writeSync(descriptor, `${JSON.stringify(queueWorkerPresenceRecord(files, { repo: projectRoot }), null, 2)}\n`, null, "utf8");
-      } finally {
-        closeSync(descriptor);
-      }
-      return { ok: true, files, takenOver };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-    }
-    const existingText = readQueueWorkerText(files.presence);
-    if (existingText === null) continue;
-    let existing = null;
-    try { existing = JSON.parse(existingText); } catch { existing = null; }
-    if (existing && (typeof existing !== "object" || Array.isArray(existing))) existing = null;
-    let modifiedMs = 0;
-    try { modifiedMs = lstatSync(files.presence).mtimeMs; } catch { /* Gone meanwhile: try the create again. */ }
-    // An unreadable file is judged by its age alone.
-    const live = existing ? queueWorkerPresenceLive(existing, now) : (modifiedMs && now - modifiedMs < QUEUE_WORKER_PRESENCE_FRESH_MS);
-    if (live) {
-      const alive = existing ? queueWorkerPidAlive(existing.pid) : false;
-      return {
-        ok: false,
-        errorType: "queue_worker_already_running",
-        existing,
-        error: existing
-          ? `A queue worker already runs for this repository: pid ${existing.pid} (${alive ? "alive" : "not alive"}), last heartbeat ${existing.heartbeatAt || "unknown"}, presence file ${files.presence}. Stop it with --stop, or wait until its heartbeat is older than 2 minutes (its process gone) or 10 minutes.`
-          : `The presence file ${files.presence} is unreadable and younger than 2 minutes; another worker may be starting. Try again in 2 minutes.`,
-      };
-    }
-    const taken = takeOverStalePresence(files, existingText);
-    if (!taken.ok) return { ok: false, errorType: "queue_worker_presence_race", error: `Another worker took ${files.presence} at the same moment: ${taken.error}.` };
-    takenOver = existing || { unreadable: true };
-  }
-  return { ok: false, errorType: "queue_worker_presence_race", error: `Another worker took ${files.presence} at the same moment.` };
-}
 
-// false when the file now belongs to another worker (taken over after this one stalled for 10
-// minutes, or created by another worker after someone removed this one's): never overwritten.
-function refreshQueueWorkerPresence(files, fields = {}) {
-  const current = readQueueWorkerFile(files.presence);
-  if (current && current.instanceId !== BRIDGE_INSTANCE_ID) return { ok: false, owner: current };
-  writeQueueWorkerFileAtomically(files.presence, queueWorkerPresenceRecord(files, fields));
-  return { ok: true };
-}
 
-// B-083: the stop file belongs to the worker whose presence file this is; a worker that lost its
-// presence file leaves the new owner's stop request alone.
-function releaseQueueWorkerPresence(files) {
-  const current = readQueueWorkerFile(files.presence);
-  if (!current || current.instanceId !== BRIDGE_INSTANCE_ID) return { released: false };
-  try { rmSync(files.stop, { force: true }); } catch { /* The next worker removes it at its start. */ }
-  try { rmSync(files.presence, { force: true }); } catch { /* A stale file is taken over after 2 minutes. */ }
-  return { released: true };
-}
 
-// B-079: written by a worker that stops (drain or --now) with non-terminal jobs left.
-function writeQueueWorkerParked(files, fields = {}) {
-  assertQueueWorkerDirectory(files.directory);
-  writeQueueWorkerFileAtomically(files.parked, {
-    version: 1,
-    parkedAt: new Date().toISOString(),
-    pid: process.pid,
-    instanceId: BRIDGE_INSTANCE_ID,
-    projectKey: files.projectKey,
-    repo: queueWorkerMode?.repo || "",
-    ...fields,
-  });
-  return true;
-}
 
-function removeQueueWorkerParked(files) {
-  const parked = readQueueWorkerFile(files.parked);
-  if (!parked && !existsSync(files.parked)) return { removed: false, parked: null };
-  rmSync(files.parked, { force: true });
-  return { removed: true, parked };
-}
 
-// --stop (now: false) drains, --stop --now aborts the running jobs too. A later "now" upgrades.
-function writeQueueWorkerStop(projectRoot, { now = false } = {}) {
-  const files = queueWorkerFiles(projectRoot);
-  assertQueueWorkerDirectory(files.directory);
-  const previous = readQueueWorkerFile(files.stop);
-  writeQueueWorkerFileAtomically(files.stop, { requestedAt: new Date().toISOString(), now: Boolean(now || previous?.now), byPid: process.pid });
-  return files;
-}
-
-function readQueueWorkerStop(files) {
-  const stop = readQueueWorkerFile(files.stop);
-  return stop ? { now: stop.now === true, requestedAt: String(stop.requestedAt || "") } : null;
-}
-
-// B-077 / B-079: a client bridge leaves a repository alone while another process's worker is alive
-// there, or while a stopped worker parked its queue. The parked file has no age: it stays until a
-// worker starts or the operator runs --release.
-function foreignQueueWorkerPresence(dbPath) {
-  const stateRoot = effectiveBridgeStateDirectory();
-  if (!sameStateDbPath(path.dirname(dbPath), path.join(stateRoot, "projects"))) return null;
-  const projectKey = path.basename(dbPath, ".sqlite");
-  const presence = readQueueWorkerFile(path.join(stateRoot, "workers", `${projectKey}.json`));
-  if (presence && presence.instanceId !== BRIDGE_INSTANCE_ID && queueWorkerPresenceFresh(presence)) return { ...presence, parked: false };
-  if (presence && presence.instanceId === BRIDGE_INSTANCE_ID) return null;
-  const parkedPath = path.join(stateRoot, "workers", `${projectKey}.parked`);
-  const parked = readQueueWorkerFile(parkedPath) || (existsSync(parkedPath) ? {} : null);
-  if (parked) return { ...parked, parked: true };
-  return null;
-}
-
-function forgetQueueWorkerPresent(dbPath) {
-  for (const logged of [...QUEUE_WORKER_PRESENT_LOGGED]) if (logged.startsWith(`${dbPath}\0`)) QUEUE_WORKER_PRESENT_LOGGED.delete(logged);
-}
-
-function noteQueueWorkerPresent(dbPath, presence) {
-  const key = `${dbPath}\0${presence.parked ? "parked" : "live"}`;
-  if (QUEUE_WORKER_PRESENT_LOGGED.has(key)) return;
-  forgetQueueWorkerPresent(dbPath);
-  QUEUE_WORKER_PRESENT_LOGGED.add(key);
-  logEvent("info", "queue.worker_present", {
-    projectKey: path.basename(dbPath, ".sqlite"),
-    workerPid: Number(presence.pid) || 0,
-    workerInstanceId: String(presence.instanceId || ""),
-    parked: Boolean(presence.parked),
-    summary: presence.parked
-      ? `A stopped queue worker (pid ${Number(presence.pid) || "?"}) parked this repository's queue; this bridge does not adopt its pending or interrupted jobs until a worker starts there or the operator runs queue-worker.js --release.`
-      : `A queue worker (pid ${Number(presence.pid) || "?"}) owns this repository's queue; this bridge does not adopt its pending or interrupted jobs while the worker's heartbeat is under 2 minutes old.`,
-  });
-}
 
 async function startWorkerMode({ repo } = {}) {
   if (queueWorkerMode) throw Object.assign(new Error("This process is already a queue worker."), { errorType: "queue_worker_already_started" });
@@ -29132,7 +21121,7 @@ function queueWorkerActivity() {
   const running = runningQueueRecords().filter((record) => record.ownerInstanceId === BRIDGE_INSTANCE_ID).length;
   const integrating = AUTO_INTEGRATION_CHAINS.size;
   const waitingIntegrations = AUTO_INTEGRATION_WAITING.size;
-  const retries = queueRetryPoliciesInFlight;
+  const retries = getQueueRetryPoliciesInFlight();
   return {
     running,
     autoIntegrations: integrating + waitingIntegrations,
@@ -30006,8 +21995,8 @@ export const __selfTest = {
     set selfTestModelOverrideAllowlist(value) { selfTestModelOverrideAllowlist = value; },
     get stateDirectoryOverride() { return stateDirectoryOverride; },
     set stateDirectoryOverride(value) { stateDirectoryOverride = value; },
-    get worktreeCleanupTestHook() { return worktreeCleanupTestHook; },
-    set worktreeCleanupTestHook(value) { worktreeCleanupTestHook = value; },
+    get worktreeCleanupTestHook() { return worktreeTestHooks.cleanup; },
+    set worktreeCleanupTestHook(value) { worktreeTestHooks.cleanup = value; },
     get integrationScratchCleanupTestHook() { return integrationScratchCleanupTestHook; },
     set integrationScratchCleanupTestHook(value) { integrationScratchCleanupTestHook = value; },
     get pipelineGateExecutorTestHook() { return pipelineGateExecutorTestHook; },
