@@ -153,10 +153,12 @@ async function runParent() {
   };
 
   // runQueueWorker in this process; the result promise and the captured output.
-  function startWorker(args, { tickMs = 40, api = queueWorkerApi } = {}) {
+  // signals: true listens on this process (the tests emit the signal with process.emit); exit is
+  // what a third Ctrl+C calls.
+  function startWorker(args, { tickMs = 40, api = queueWorkerApi, signals = false, exit = undefined } = {}) {
     const out = { text: "", write(chunk) { this.text += chunk; return true; } };
     const err = { text: "", write(chunk) { this.text += chunk; return true; } };
-    const done = runQueueWorker(args, { out, err, tickMs, summaryMs: 150, signals: false, importServer: async () => ({ queueWorkerApi: api }) });
+    const done = runQueueWorker(args, { out, err, tickMs, summaryMs: 150, signals, ...(exit ? { exit } : {}), importServer: async () => ({ queueWorkerApi: api }) });
     return { done, out, err };
   }
 
@@ -477,6 +479,8 @@ async function runParent() {
       assert.match(run.out.text, /Stop now: cancelled 1 running job\(s\)/);
       const [row] = rowsOf(repo);
       assert.equal(row.status, "cancelled");
+      // B-126: the record says it was the worker's --now, not cancel_opencode_job.
+      assert.equal((await durableIn(repo, row.job_id)).errorReason, "The queue worker was stopped with --now.");
       assert.equal(existsSync(queueWorkerApi.files(repo).parked), false, "nothing left behind, nothing parked");
       behaviours = {};
       // B-088: running the file again deduplicates into the cancelled job; the worker says so.
@@ -816,6 +820,137 @@ async function runParent() {
       worker.release();
       await internals.setRuntimeConcurrency({ reset: true });
       if (worker.child.exitCode === null) worker.child.kill();
+    }
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Review fixes B-120..B-124 (2026-10-03).
+
+  test("B-120: a failing snapshot stops neither the presence refresh nor a drain; one tick_failed line per streak", async () => {
+    const { repo } = await makeRepo("snapshot-fails");
+    calls.length = 0;
+    behaviours = { "Review for sf-1.": "hold" };
+    let failing = false;
+    const api = Object.create(queueWorkerApi, {
+      queueWorkerSnapshot: { value: async (args) => {
+        if (failing && !args?.readOnly) throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+        return queueWorkerApi.queueWorkerSnapshot(args);
+      } },
+    });
+    const tickFailures = () => readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.tick_failed" && line.stage === "snapshot").length;
+    const before = tickFailures();
+    const files = queueWorkerApi.files(repo);
+    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("snapshot-fails", [readJob(repo, "sf-1")])], { api });
+    try {
+      assert.ok(await waitFor(() => calls.includes("Review for sf-1.")), "the job runs");
+      failing = true;
+      await sleep(200);
+      const first = queueWorkerApi.readFile(files.presence)?.heartbeatAt;
+      await sleep(300);
+      const second = queueWorkerApi.readFile(files.presence)?.heartbeatAt;
+      assert.ok(Date.parse(second) > Date.parse(first), `the presence file is still refreshed: ${first} -> ${second}`);
+      queueWorkerApi.writeStop(repo);
+      assert.ok(await waitFor(() => /Stop requested: no new jobs start/.test(run.out.text)), "the stop request is seen while the snapshot fails");
+      released.add("Review for sf-1.");
+      assert.equal(await withTimeout(run.done, 10_000, "the drained worker"), 0, run.err.text);
+      assert.match(run.out.text, /Queue worker stopped \(stop_requested\)/);
+      assert.equal((run.err.text.match(/Queue worker check failed \(snapshot\): database is locked/g) || []).length, 1, run.err.text);
+      assert.equal(tickFailures() - before, 1, "one queue_worker.tick_failed line for the whole streak");
+    } finally {
+      failing = false;
+      behaviours = {};
+      released.add("Review for sf-1.");
+      // Without a fresh final snapshot the stop parks on the last counts read (the safe side).
+      queueWorkerApi.removeParked(files);
+    }
+  });
+
+  test("B-121: a Ctrl+C while the file is enqueued cancels what it added and exits 1 with queue_worker.refused; nothing starts", async () => {
+    const { repo } = await makeRepo("startup-signal");
+    calls.length = 0;
+    const listenersBefore = process.listenerCount("SIGINT");
+    let enqueues = 0;
+    const api = Object.create(queueWorkerApi, {
+      enqueueFromToolInput: { value: async (job) => {
+        const result = await queueWorkerApi.enqueueFromToolInput(job);
+        if (++enqueues === 2) process.emit("SIGINT");
+        return result;
+      } },
+    });
+    const file = jobsFile("startup-signal", [1, 2, 3, 4].map((n) => readJob(repo, `ss-${n}`)));
+    const run = startWorker(["--repo", repo, "--enqueue", file], { api, signals: true });
+    assert.equal(await withTimeout(run.done, 20_000, "the worker"), 1, run.err.text);
+    assert.match(run.err.text, /Ctrl\+C during the start: no job starts/);
+    assert.match(run.err.text, /the 2 job\(s\) this file had added are cancelled/);
+    assert.match(run.err.text, /line 3: queue_worker_interrupted/);
+    await sleep(200);
+    assert.equal(calls.length, 0, "nothing started");
+    assert.deepEqual(rowsOf(repo).map((row) => row.status), ["cancelled", "cancelled"], "the two jobs it added are cancelled, the rest never enqueued");
+    assert.equal(existsSync(queueWorkerApi.files(repo).presence), false, "the presence file is released");
+    assert.equal(process.listenerCount("SIGINT"), listenersBefore, "the start-up handler is removed");
+    const refusedLine = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.refused").pop();
+    assert.equal(refusedLine?.level, "warn");
+    assert.equal(refusedLine.errorType, "queue_worker_interrupted");
+  });
+
+  test("B-122: the heartbeat of a client bridge leaves the rows of a repository with a live worker alone", async () => {
+    const { repo } = await makeRepo("heartbeat-skip");
+    calls.length = 0;
+    behaviours = { "Review for hb-mine.": "hold" };
+    const files = queueWorkerApi.files(repo);
+    try {
+      // This process runs a job in the repository, so its heartbeat opens that database.
+      const mine = await enqueueQueueJob(readJob(repo, "hb-mine"));
+      assert.equal(mine.ok, true, mine.error);
+      assert.ok(await waitFor(() => calls.includes("Review for hb-mine.")));
+      await mkdir(files.directory, { recursive: true });
+      writeFileSync(files.presence, JSON.stringify({ version: 1, pid: process.pid, instanceId: "another-worker-instance", projectKey: files.projectKey, repo, startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString() }), "utf8");
+      // A running job of that worker whose lease lapsed (a laptop sleep).
+      const theirs = await enqueueQueueJob(readJob(repo, "hb-theirs"), "", { schedule: false });
+      orphanRow(repo, theirs.record.jobId);
+      const db = new DatabaseSync(internals.stateDbPath(repo));
+      try {
+        db.exec("PRAGMA busy_timeout = 5000;");
+        db.prepare("UPDATE opencode_jobs SET status = 'running' WHERE job_id = ?").run(theirs.record.jobId);
+      } finally {
+        db.close();
+      }
+      const statusOf = () => rowsOf(repo).find((row) => row.job_id === theirs.record.jobId)?.status;
+      internals.heartbeatKnownQueueState();
+      assert.equal(statusOf(), "running", "the worker's job is not marked interrupted (nor retried here)");
+      rmSync(files.presence, { force: true });
+      internals.heartbeatKnownQueueState();
+      assert.equal(statusOf(), "interrupted", "without a worker it is reconciled as before");
+    } finally {
+      rmSync(files.presence, { force: true });
+      behaviours = {};
+      released.add("Review for hb-mine.");
+    }
+  });
+
+  test("B-124: a third Ctrl+C logs queue_worker.stopped (forced_exit, exit 2) before it exits", async () => {
+    const { repo } = await makeRepo("forced-exit");
+    calls.length = 0;
+    behaviours = { "Review for fe-1.": "hold" };
+    const exits = [];
+    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("forced-exit", [readJob(repo, "fe-1")])], { signals: true, exit: (code) => exits.push(code) });
+    try {
+      assert.ok(await waitFor(() => calls.includes("Review for fe-1.")));
+      process.emit("SIGINT");
+      process.emit("SIGINT");
+      process.emit("SIGINT");
+      assert.deepEqual(exits, [2]);
+      assert.match(run.err.text, /Third Ctrl\+C: exiting now \(exit code 2\)/);
+      const stopped = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.stopped" && line.stopReason === "forced_exit").pop();
+      assert.ok(stopped, "queue_worker.stopped is logged");
+      assert.equal(stopped.level, "warn");
+      assert.equal(stopped.exitCode, 2);
+      assert.equal(stopped.runningHere, 1);
+      // The recorder does not exit: the second Ctrl+C's stop-now ends this run.
+      assert.equal(await withTimeout(run.done, 10_000, "the worker"), 0, run.err.text);
+    } finally {
+      behaviours = {};
+      released.add("Review for fe-1.");
     }
   });
 

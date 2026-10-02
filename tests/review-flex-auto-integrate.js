@@ -3,7 +3,8 @@
 // Q-010 (log.md, 2026-10-02): auto-integration of new-file-only patches. A queued writer with
 // autoIntegrate: true whose finished patch only adds files is integrated by the bridge itself
 // (dry run + receipt-bound apply of the integrate_opencode_worktree engine, validation in the
-// target, rollback) and committed by pathspec with the identity of the target's last commit; any
+// target, rollback) and committed by pathspec with the target's configured identity, else the
+// identity of the target's last commit (B-125; these repositories configure none); any
 // other patch stays for the reviewed flow. The worktrees are real git worktrees in a scratch
 // folder; only the agent run is the queue executor test hook.
 //   node tests/review-flex-auto-integrate.js
@@ -327,6 +328,29 @@ test("Q-010: without autoIntegrate a finished writer is not touched", async () =
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(await head(), before);
   assert.equal((await durable(enqueued.record.jobId)).autoIntegration || null, null);
+});
+
+test("B-125: the commit uses the target's configured user.name/user.email, not the author of its last commit", async () => {
+  const { autoIntegrationCommitHooks } = internals;
+  const file = "out/batch-013.json";
+  await mkdir(path.join(repo, "out"), { recursive: true });
+  await writeFile(path.join(repo, "out", "batch-013.json"), "[13]\n", "utf8");
+  const blob = (await git(["hash-object", "--path", file, path.join(repo, "out", "batch-013.json")])).trim();
+  await git(["config", "user.name", "Configured Owner"]);
+  await git(["config", "user.email", "configured@example.invalid"]);
+  try {
+    const before = await head();
+    assert.notEqual((await git(["log", "-1", "--format=%an"])).trim(), "Configured Owner", "the last commit is someone else's");
+    const hooks = autoIntegrationCommitHooks({ jobId: "identity-test", agent: "builder", worktreePath: path.join(root, "no-such-worktree") });
+    const committed = await hooks.commit({ changedFiles: [file] }, { targetCwd: repo, prepared: { ok: true, files: [{ path: file, blob, mode: "100644" }] } });
+    assert.equal(committed.ok, true, JSON.stringify(committed));
+    assert.equal(committed.authorName, "Configured Owner");
+    assert.equal((await git(["log", "-1", "--format=%an <%ae>|%cn <%ce>"])).trim(), "Configured Owner <configured@example.invalid>|Configured Owner <configured@example.invalid>");
+    assert.equal((await git(["log", "-1", "--format=%P"])).trim(), before);
+  } finally {
+    await git(["config", "--unset", "user.name"]);
+    await git(["config", "--unset", "user.email"]);
+  }
 });
 
 await runFlexTests({ isolatedStateDir, file: "tests/review-flex-auto-integrate.js", tests, cleanup: fixture.cleanup, finishSkips, label: "auto-integration" });

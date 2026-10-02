@@ -13,7 +13,8 @@
 //   node bin/queue-worker.js --repo <abs> --status [--json]
 //
 // Exit codes: 0 clean stop (drained, stopped, or --until-empty found the queue empty), 1 refused
-// to start (bad arguments or file, another worker, a failed startup check), 2 stopped by an error.
+// to start (bad arguments or file, another worker, a failed startup check, a Ctrl+C during the start:
+// B-121), 2 stopped by an error (also a third Ctrl+C).
 
 import { readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -30,6 +31,13 @@ const EXIT_ERROR = 2;
 const TICK_MS = 15_000;
 const SUMMARY_MS = 10 * 60_000;
 const OWN_SERVER_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "server.js");
+const SIGNAL_NAMES = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGINT", "SIGTERM"];
+// B-120: what the worker reports before its first snapshot, or when every snapshot failed.
+const emptySnapshot = () => ({
+  counts: { pending: 0, running: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0, interrupted: 0, notResumable: 0, waitingForPause: 0, gaveUp: 0, autoIntegrated: 0, open: 0 },
+  pausedKeys: [],
+  freeMemoryMb: 0,
+});
 
 const USAGE = [
   "Usage:",
@@ -263,9 +271,13 @@ const DEAD_DEDUPLICATED_STATUSES = new Set(["cancelled", "failed", "interrupted"
 // The full enqueue checks for every line first, then the enqueue; a line refused at the enqueue
 // itself (a key taken meanwhile), or an exception there (B-085), cancels what this file already
 // added, before anything started.
-async function enqueueLines(api, lines) {
+// B-121: `interrupted` (a Ctrl+C during the start) is checked before every line; the jobs this
+// file added are then cancelled as for a refused line.
+async function enqueueLines(api, lines, { interrupted = () => false } = {}) {
+  const stoppedAt = (line) => `line ${line}: queue_worker_interrupted: the worker was stopped (Ctrl+C) before this line was enqueued`;
   const errors = [];
   for (const { line, job } of lines) {
+    if (interrupted()) return { ok: false, interrupted: true, errors: [stoppedAt(line)], created: [], deduplicated: [] };
     const checked = await api.checkJob(job);
     if (!checked.ok) errors.push(`line ${line}: ${checked.errorType}: ${checked.error}${checked.suggestedFix ? ` (${checked.suggestedFix})` : ""}`);
   }
@@ -276,6 +288,10 @@ async function enqueueLines(api, lines) {
   try {
     for (const { line, job } of lines) {
       current = line;
+      if (interrupted()) {
+        const cancelled = await api.cancelUnstartedJobs(created, `The queue worker was stopped (Ctrl+C) while enqueueing its --enqueue file, before line ${line}; nothing of the file was started.`);
+        return { ok: false, interrupted: true, errors: [stoppedAt(line)], created, deduplicated, cancelled };
+      }
       const result = await api.enqueueFromToolInput(job);
       if (!result.ok) {
         const cancelled = await api.cancelUnstartedJobs(created, `The queue worker refused its --enqueue file at line ${line} (${result.errorType}); nothing of the file was started.`);
@@ -302,11 +318,35 @@ function summaryFields(api, snapshot, activity, extra = {}) {
   };
 }
 
-// Resolves { code, reason } once the worker should exit. Ctrl+C (or SIGTERM / SIGBREAK) writes the
-// stop file like --stop does, the second one like --stop --now; the file is what the tick acts on.
-// A third one exits at once with code 2 (B-090); the exit handler still removes the presence file,
-// and the running jobs' agents end with this process (their records become interrupted).
-function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signals }) {
+// The signal handlers of the worker (none when a test passes signals: false); returns the remover.
+function listenSignals(signals, handler) {
+  if (!signals) return () => {};
+  for (const name of SIGNAL_NAMES) process.on(name, handler);
+  return () => { for (const name of SIGNAL_NAMES) process.removeListener(name, handler); };
+}
+
+// B-124: a third Ctrl+C exits at once (B-090). The stop is logged here as queue_worker.stopped
+// (stopReason forced_exit, with the last counts the worker read), and the exit code is marked as
+// logged, so the exit handler writes no process.exited error for it.
+function forcedExit(api, { err, exit = process.exit }, snapshot) {
+  err.write("Third Ctrl+C: exiting now (exit code 2); jobs still running end as interrupted.\n");
+  try {
+    const activity = api.activity();
+    api.logEvent("warn", "queue_worker.stopped", {
+      ...summaryFields(api, snapshot, activity, { stopReason: "forced_exit", exitCode: EXIT_ERROR, parked: false }),
+      summary: `Queue worker stopped (forced_exit, exit ${EXIT_ERROR}): a third Ctrl+C; ${activity.running} running job(s) end as interrupted; last counts read: ${jobCountsLine(snapshot.counts)}.`,
+    });
+    api.suppressExitLog(EXIT_ERROR);
+  } catch { /* The process exits all the same. */ }
+  exit(EXIT_ERROR);
+}
+
+// Resolves { code, reason, snapshot } once the worker should exit. Ctrl+C (or SIGTERM / SIGBREAK)
+// writes the stop file like --stop does, the second one like --stop --now; the file is what the
+// tick acts on. A third one exits at once with code 2 (B-090, B-124); the exit handler still
+// removes the presence file, and the running jobs' agents end with this process (their records
+// become interrupted).
+function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signals, exit }, initialSnapshot = emptySnapshot()) {
   return new Promise((resolve) => {
     let draining = false;
     let stopNow = false;
@@ -317,12 +357,15 @@ function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signa
     let reason = "";
     let lastSummaryAt = Date.now();
     let signalCount = 0;
-    const signalNames = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGINT", "SIGTERM"];
+    // B-120: the last snapshot that could be read, and the length of the current streak of failed
+    // checks (one queue_worker.tick_failed line per streak, not one every tick).
+    let lastSnapshot = initialSnapshot;
+    let failedTicks = 0;
     const onSignal = () => {
       signalCount += 1;
       if (signalCount >= 3) {
-        err.write("Third Ctrl+C: exiting now (exit code 2); jobs still running end as interrupted.\n");
-        process.exit(EXIT_ERROR);
+        forcedExit(api, { err, exit }, lastSnapshot);
+        return;
       }
       try {
         api.writeStop(repo, { now: signalCount > 1 });
@@ -338,12 +381,20 @@ function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signa
       if (finished) return;
       finished = true;
       clearInterval(timer);
-      if (signals) for (const name of signalNames) process.removeListener(name, onSignal);
-      resolve({ code, reason: why });
+      removeSignals();
+      resolve({ code, reason: why, snapshot: lastSnapshot });
     };
     async function tick() {
       if (ticking || finished) return;
       ticking = true;
+      let failedNow = false;
+      const failed = (stage, error) => {
+        failedNow = true;
+        failedTicks += 1;
+        if (failedTicks > 1) return;
+        err.write(`Queue worker check failed (${stage}): ${error?.message || error}\n`);
+        api.logEvent("warn", "queue_worker.tick_failed", { stage, errorType: error?.errorType || error?.code || "", summary: String(error?.message || error).slice(0, 400) });
+      };
       try {
         const stop = api.readStop(files);
         if (stop && !draining) {
@@ -359,19 +410,38 @@ function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signa
         // B-089: on every tick while stopping now: a job whose start was in progress at the first
         // pass becomes running only afterwards.
         if (stopNow) {
-          const aborted = await api.abortRunningQueueJobs();
-          if (aborted.length) out.write(`Stop now: cancelled ${aborted.length} running job(s).\n`);
+          try {
+            const aborted = await api.abortRunningQueueJobs();
+            if (aborted.length) out.write(`Stop now: cancelled ${aborted.length} running job(s).\n`);
+          } catch (error) {
+            failed("abort", error);
+          }
         }
-        const snapshot = await api.queueWorkerSnapshot({ repo });
+        // B-120: a snapshot that cannot be read (SQLITE_BUSY, a full disk) must not stop the
+        // presence refresh or the exit checks below: they go on with the last snapshot read, so a
+        // --stop still drains and the presence file never goes stale under a live worker.
+        let snapshot = lastSnapshot;
+        let snapshotRead = false;
+        try {
+          snapshot = await api.queueWorkerSnapshot({ repo });
+          lastSnapshot = snapshot;
+          snapshotRead = true;
+        } catch (error) {
+          failed("snapshot", error);
+        }
         const activity = api.activity();
         if (!presenceLost) {
-          const refreshed = api.refreshPresence(files, { counts: snapshot.counts, runningHere: activity.running, stopRequested: Boolean(stop) });
-          if (!refreshed.ok) {
-            presenceLost = true;
-            draining = true;
-            reason = "presence_lost";
-            api.requestQueueDrain();
-            err.write(`The presence file ${files.presence} now belongs to another worker (pid ${refreshed.owner?.pid || "?"}); this worker stops starting jobs and exits when its running ones end.\n`);
+          try {
+            const refreshed = api.refreshPresence(files, { counts: snapshot.counts, runningHere: activity.running, stopRequested: Boolean(stop) });
+            if (!refreshed.ok) {
+              presenceLost = true;
+              draining = true;
+              reason = "presence_lost";
+              api.requestQueueDrain();
+              err.write(`The presence file ${files.presence} now belongs to another worker (pid ${refreshed.owner?.pid || "?"}); this worker stops starting jobs and exits when its running ones end.\n`);
+            }
+          } catch (error) {
+            failed("presence", error);
           }
         }
         if (Date.now() - lastSummaryAt >= summaryMs) {
@@ -385,33 +455,62 @@ function runLoop(api, repo, files, options, { out, err, tickMs, summaryMs, signa
         if (presenceLost && activity.quietForStop) return finish(EXIT_ERROR, reason);
         if (draining && activity.quietForStop) return finish(EXIT_CLEAN, reason);
         // Twice in a row: a retry that is being requeued between two ticks must not look empty.
-        if (options.untilEmpty && !draining && activity.quiet && snapshot.counts.open === 0) {
+        // B-120: only on a snapshot read now, never on the last good one.
+        if (options.untilEmpty && !draining && snapshotRead && activity.quiet && snapshot.counts.open === 0) {
           quietTicks += 1;
           if (quietTicks >= 2) return finish(EXIT_CLEAN, "queue_empty");
         } else {
           quietTicks = 0;
         }
       } catch (error) {
-        err.write(`Queue worker check failed: ${error?.message || error}\n`);
-        api.logEvent("warn", "queue_worker.tick_failed", { errorType: error?.errorType || error?.code || "", summary: String(error?.message || error).slice(0, 400) });
+        failed("tick", error);
       } finally {
+        if (!failedNow && failedTicks) {
+          err.write(`Queue worker checks work again after ${failedTicks} failed one(s).\n`);
+          api.logEvent("info", "queue_worker.tick_recovered", { failedTicks, summary: `Queue worker checks work again after ${failedTicks} failed one(s).` });
+          failedTicks = 0;
+        }
         ticking = false;
       }
       return undefined;
     }
     // Referenced on purpose: it is the worker's keep-alive.
     const timer = setInterval(() => { void tick(); }, Math.max(10, tickMs));
-    if (signals) for (const name of signalNames) process.on(name, onSignal);
+    const removeSignals = listenSignals(signals, onSignal);
     void tick();
   });
 }
 
+// B-121: the signal handlers are in place before anything is claimed or enqueued; Node's default
+// Ctrl+C used to end the process in the middle of an --enqueue file, leaving the jobs added so far
+// pending under a dead instance, unparked, for the client bridges to adopt. During the start a
+// signal only marks the start as interrupted: the next check refuses (exit 1, one
+// queue_worker.refused line) and cancels what this run enqueued (the B-085 rollback). runLoop takes
+// the signals over synchronously, so none falls between the two.
 async function runWorker(api, repo, options, io) {
+  let startupSignals = 0;
+  const removeStartupSignals = listenSignals(io.signals, () => {
+    startupSignals += 1;
+    if (startupSignals >= 3) {
+      forcedExit(api, io, emptySnapshot());
+      return;
+    }
+    if (startupSignals === 1) io.err.write("Ctrl+C during the start: no job starts, and the jobs this run enqueued are cancelled.\n");
+  });
+  try {
+    return await startAndRunWorker(api, repo, options, io, { interrupted: () => startupSignals > 0, handOverSignals: removeStartupSignals });
+  } finally {
+    removeStartupSignals();
+  }
+}
+
+async function startAndRunWorker(api, repo, options, io, { interrupted, handOverSignals }) {
   const refuse = (message, errorType = "queue_worker_refused") => {
     io.err.write(`${message}\n`);
     io.refusal = { reason: message, errorType };
     return EXIT_REFUSED;
   };
+  const refuseInterrupted = (cancelled = []) => refuse(`Stopped during the start (Ctrl+C); nothing was started${cancelled.length ? ` (the ${cancelled.length} job(s) this run had enqueued are cancelled)` : ""}.`, "queue_worker_interrupted");
   const lines = options.enqueue ? readJobFile(api, options.enqueue) : [];
   const claim = api.claimPresence(repo);
   if (!claim.ok) return refuse(`Refused to start: ${claim.error}`, claim.errorType);
@@ -429,6 +528,7 @@ async function runWorker(api, repo, options, io) {
   process.once("exit", release);
   let started = false;
   try {
+    if (interrupted()) return refuseInterrupted();
     let start;
     try {
       start = await api.startWorkerMode({ repo });
@@ -436,17 +536,20 @@ async function runWorker(api, repo, options, io) {
       return refuse(`Refused to start: ${error?.message || error}`, error?.errorType);
     }
     started = true;
+    if (interrupted()) return refuseInterrupted();
     // B-081: the first refresh decides too: a worker that lost its presence file to another one
     // between the claim and now must not start anything.
     const first = api.refreshPresence(files, { runningHere: 0, stopRequested: false });
     if (!first.ok) return refuse(`Refused to start: the presence file ${files.presence} now belongs to another worker (pid ${first.owner?.pid || "?"}).`, "queue_worker_presence_race");
-    const enqueued = await enqueueLines(api, lines);
+    const enqueued = await enqueueLines(api, lines, { interrupted });
     if (!enqueued.ok) {
-      return refuse(`Refused ${options.enqueue}; nothing was started${enqueued.cancelled?.length ? ` (the ${enqueued.cancelled.length} job(s) this file had added are cancelled)` : ""}:\n  ${enqueued.errors.join("\n  ")}`, "queue_worker_enqueue_refused");
+      return refuse(`Refused ${options.enqueue}; nothing was started${enqueued.cancelled?.length ? ` (the ${enqueued.cancelled.length} job(s) this file had added are cancelled)` : ""}:\n  ${enqueued.errors.join("\n  ")}`, enqueued.interrupted ? "queue_worker_interrupted" : "queue_worker_enqueue_refused");
     }
     const snapshot = await api.queueWorkerSnapshot({ repo });
     const refreshed = api.refreshPresence(files, { counts: snapshot.counts, runningHere: 0, stopRequested: false });
     if (!refreshed.ok) return refuse(`Refused to start: the presence file ${files.presence} now belongs to another worker (pid ${refreshed.owner?.pid || "?"}).`, "queue_worker_presence_race");
+    // B-121: a Ctrl+C during the last line: nothing has started yet (queue starts are held).
+    if (interrupted()) return refuseInterrupted(await api.cancelUnstartedJobs(enqueued.created, "The queue worker was stopped (Ctrl+C) after enqueueing its --enqueue file, before any job started."));
     // B-079: this worker takes a parked queue over (its own recovery ignores the mark); removed only
     // now, so a refused start leaves the queue parked.
     const parked = api.removeParked(files);
@@ -471,9 +574,11 @@ async function runWorker(api, repo, options, io) {
     });
     io.out.write(`Queue worker for ${start.repo} (pid ${process.pid}, project ${start.projectKey}): ${enqueued.created.length} job(s) enqueued, ${enqueued.deduplicated.length} already queued, ${start.adopted} adopted${parked?.removed ? " (the parked queue is taken over)" : ""}.\n`);
     io.out.write(`Stop it with: node bin/queue-worker.js --repo "${start.repo}" --stop   (or Ctrl+C; --now / a second Ctrl+C cancels the running jobs)\n`);
+    // B-121: no await between the hand-over and runLoop installing its own handlers.
+    handOverSignals();
     api.releaseQueueStarts();
-    const result = await runLoop(api, repo, files, options, io);
-    const finalSnapshot = await api.queueWorkerSnapshot({ repo }).catch(() => snapshot);
+    const result = await runLoop(api, repo, files, options, io, snapshot);
+    const finalSnapshot = await api.queueWorkerSnapshot({ repo }).catch(() => result.snapshot || snapshot);
     // B-079: a stop that leaves jobs behind parks the queue for the next worker; without the mark
     // the client bridges would adopt the rest of the batch once the leases lapse, and it would end
     // with whichever client ran it.
@@ -494,7 +599,8 @@ async function runWorker(api, repo, options, io) {
 }
 
 // The whole command; returns the exit code (tests call it in-process with a short tick).
-async function runQueueWorker(argv, { out = process.stdout, err = process.stderr, tickMs = TICK_MS, summaryMs = SUMMARY_MS, signals = true, importServer = () => import("../server.js") } = {}) {
+// `exit` is what a third Ctrl+C calls (tests pass a recorder).
+async function runQueueWorker(argv, { out = process.stdout, err = process.stderr, tickMs = TICK_MS, summaryMs = SUMMARY_MS, signals = true, exit = (code) => process.exit(code), importServer = () => import("../server.js") } = {}) {
   let options;
   try {
     options = parseWorkerArguments(argv);
@@ -507,7 +613,7 @@ async function runQueueWorker(argv, { out = process.stdout, err = process.stderr
     return EXIT_CLEAN;
   }
   let api = null;
-  const io = { out, err, tickMs, summaryMs, signals, refusal: null };
+  const io = { out, err, tickMs, summaryMs, signals, exit, refusal: null };
   try {
     if (options.envFrom) {
       const client = await clientEntryEnvironment(options.envFrom, { codexConfig: options.codexConfig, claudeConfig: options.claudeConfig });

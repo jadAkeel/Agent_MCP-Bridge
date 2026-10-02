@@ -2758,7 +2758,7 @@ const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTable
 
 const statePruneTimes = new Map();
 
-const { reconcileStaleQueueRecords, processIsAlive, renewPersistedQueueRecordLease, QUEUE_PRE_EXECUTION_STATUSES, reacquirePersistedQueueRecordLease, queueOwnershipLossError, clearQueueLeaseFence, loseQueueOwnership, resetQueueLeaseFence, noteQueueLeaseRenewalFailure, assertQueueRecordDurableOwnership, renewQueueRecordDurableOwnership, heartbeatKnownQueueState, ensureQueueHeartbeatTimer, pruneInMemoryState, sqliteUsedBytes, stateCapacityError, prunePersistedState, maintainKnownStateDatabases, ensureStateMaintenanceTimer } = createQueueLeaseRuntime({ BRIDGE_INSTANCE_ID, CONFIG, KNOWN_STATE_DB_PATHS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, effectiveQueueMode, expireLocksFromDb, logEvent, openLockDb, propagatePipelineTerminalInTransaction, scheduleQueueRetryPolicy: (...args) => scheduleQueueRetryPolicy(...args), stateDbPath, statePruneTimes });
+const { reconcileStaleQueueRecords, processIsAlive, renewPersistedQueueRecordLease, QUEUE_PRE_EXECUTION_STATUSES, reacquirePersistedQueueRecordLease, queueOwnershipLossError, clearQueueLeaseFence, loseQueueOwnership, resetQueueLeaseFence, noteQueueLeaseRenewalFailure, assertQueueRecordDurableOwnership, renewQueueRecordDurableOwnership, heartbeatKnownQueueState, ensureQueueHeartbeatTimer, pruneInMemoryState, sqliteUsedBytes, stateCapacityError, prunePersistedState, maintainKnownStateDatabases, ensureStateMaintenanceTimer } = createQueueLeaseRuntime({ BRIDGE_INSTANCE_ID, CONFIG, KNOWN_STATE_DB_PATHS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, effectiveQueueMode, expireLocksFromDb, foreignQueueWorkerPresence: (dbPath) => foreignQueueWorkerPresence(dbPath), logEvent, openLockDb, propagatePipelineTerminalInTransaction, scheduleQueueRetryPolicy: (...args) => scheduleQueueRetryPolicy(...args), stateDbPath, statePruneTimes });
 
 
 async function normalizeJobCwd(job) {
@@ -4387,6 +4387,8 @@ async function abortRunningQueueJobs(reason = "The queue worker was stopped with
       cancellationRequested: true,
       cancellationRequestedAt: new Date().toISOString(),
       errorReason: reason,
+      // B-126: kept through the terminal write, so the record tells --now from cancel_opencode_job.
+      cancellationReason: reason,
     });
     try {
       await persistQueueRecord(record);
@@ -4612,6 +4614,41 @@ function recordQueueWorkerRefusal(reason, fields = {}) {
   });
 }
 
+// B-124: an exit code whose stop the queue worker already logged (queue_worker.stopped after a
+// third Ctrl+C) is not logged again as a process.exited error.
+function suppressQueueWorkerExitLog(code) {
+  processExitLogSuppressedCode = code;
+}
+
+// B-127: retries the retry policy deferred because the interrupted run's child was still alive
+// (requeue_orphan_child_alive, marked retryDeferredAt). Once that child is gone the policy runs
+// again, once per job and process; true while such a child still lives, so the unchanged-file memo
+// keeps this database in the pass (a process ending does not touch the database file).
+const QUEUE_DEFERRED_RETRIES_SCHEDULED = new Set();
+function retryDeferredByOrphans(db) {
+  let waiting = false;
+  const rows = db.prepare(`
+    SELECT job_id, cwd, record_json FROM opencode_jobs
+    WHERE status = 'interrupted' AND request_encrypted IS NOT NULL AND request_encrypted <> ''
+      AND json_valid(record_json)
+      AND COALESCE(json_extract(record_json, '$.retryDeferredAt'), '') <> ''
+      AND COALESCE(json_extract(record_json, '$.requeuedAs'), '') = ''
+      AND COALESCE(json_extract(record_json, '$.completionOutcome'), '') <> 'gave_up'
+  `).all();
+  for (const row of rows) {
+    if (QUEUE_DEFERRED_RETRIES_SCHEDULED.has(row.job_id)) continue;
+    let summary = {};
+    try { summary = JSON.parse(row.record_json || "{}"); } catch { continue; }
+    if (summary.orphanChildProcessAlive && processIsAlive(Number(summary.orphanChildProcessId || 0))) {
+      waiting = true;
+      continue;
+    }
+    QUEUE_DEFERRED_RETRIES_SCHEDULED.add(row.job_id);
+    scheduleQueueRetryPolicy(row.cwd || summary.cwd || "", row.job_id);
+  }
+  return waiting;
+}
+
 // dbPath -> repository root keys with non-terminal integration operations at its last
 // successful scan, so a failed scan keeps its roots blocked.
 const INTEGRATION_RECOVERY_ROOTS_BY_DB = new Map();
@@ -4798,6 +4835,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       forgetQueueWorkerPresent(dbPath);
       reconcileStaleQueueRecords(db);
       await rescheduleOpenAutoIntegrations(db);
+      if (retryDeferredByOrphans(db)) dbPending = true;
       if (db.prepare(`
         SELECT 1 FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
@@ -5526,6 +5564,7 @@ export const queueWorkerApi = Object.freeze({
   writeParked: writeQueueWorkerParked,
   removeParked: removeQueueWorkerParked,
   recordRefusal: recordQueueWorkerRefusal,
+  suppressExitLog: suppressQueueWorkerExitLog,
   claimPresence: claimQueueWorkerPresence,
   refreshPresence: refreshQueueWorkerPresence,
   releasePresence: releaseQueueWorkerPresence,
