@@ -52,8 +52,8 @@ await writeFile(process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH, "", "utf8");
 const MUSE = "muse-spark-1.3-contributor-free";
 const FINAL_ERROR = "AI_APICallError: Rate limit exceeded. Please try again later.";
 const RETRIED_ERROR = "AI_APICallError: Rate limit exceeded. Please retry after a brief wait.";
-const logLine = ({ error = FINAL_ERROR, level = "ERROR", model = MUSE, session = "ses_b096", at = "2026-10-02T18:05:23.604Z" } = {}) =>
-  `timestamp=${at} level=${level} run=c45be722 message="stream error" providerID=opencode modelID=${model} session.id=${session} small=false agent=builder mode=all error.error="${error}"`;
+const logLine = ({ error = FINAL_ERROR, level = "ERROR", model = MUSE, session = "ses_b096", at = "2026-10-02T18:05:23.604Z", agent = "builder" } = {}) =>
+  `timestamp=${at} level=${level} run=c45be722 message="stream error" providerID=opencode modelID=${model} session.id=${session} small=false agent=${agent} mode=all error.error="${error}"`;
 // The JSON stream's error event (OpenCode run --format json) for a session that gave up.
 const errorEvent = (message = "Rate limit exceeded. Please try again later.", extra = {}) => JSON.stringify({
   type: "error",
@@ -87,7 +87,8 @@ const fixtureAgentDebug = {
 };
 const stepStart = JSON.stringify({ type: "step_start", sessionID: "ses_b096" });
 const outputs = {
-  B096_STDERR: { stdout: `${stepStart}\n`, stderr: `${logLine()}\n` },
+  // OpenCode logs the agent it runs (B-130: a line of another agent, e.g. compaction, never trips).
+  B096_STDERR: { stdout: `${stepStart}\n`, stderr: `${logLine({ agent: fixtureAgentName })}\n` },
   B096_EVENT: { stdout: `${stepStart}\n${errorEvent()}\n`, stderr: "" },
 };
 async function buildFakeOpenCode() {
@@ -302,6 +303,87 @@ test("B-097: a model report that mentions the usage limit never trips", async ()
   assert.equal(result.rateLimited, false);
   assert.equal(result.exitCode, 0);
   assert.equal(result.rateLimitHits, 0);
+});
+
+// B-130: lines that are not this run's provider failure never arm the grace trip.
+test("B-130: a final line of a subagent session, of the compaction agent, or without a model never trips", async () => {
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch(), finalGraceMs: 50, onTrip: () => { trips += 1; } });
+  watcher.stdoutText(stepStart);
+  watcher.stdoutLine(stepStart);
+  assert.equal(watcher.state.sessionId, "ses_b096");
+  watcher.stderrLine(logLine({ session: "ses_child" }));
+  watcher.stderrLine(logLine({ agent: "compaction", at: "2026-10-02T18:05:24.000Z" }));
+  const webfetch = `timestamp=2026-10-02T18:05:25.000Z level=ERROR service=webfetch error="Rate limit exceeded. Please try again later."`;
+  assert.equal(openCodeRateLimitHit(webfetch)?.final, true, "the wording alone is final");
+  watcher.stderrLine(webfetch);
+  await sleep(150);
+  assert.equal(trips, 0);
+  assert.equal(watcher.state.finalTimer, null, "no grace trip armed");
+  // The run's own line still trips.
+  watcher.stderrLine(logLine({ at: "2026-10-02T18:05:26.000Z" }));
+  await sleep(150);
+  assert.equal(trips, 1);
+  watcher.stop();
+});
+
+test("B-130: a stdout event of the run's session after a final line cancels the grace trip; another session's does not", async () => {
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch(), finalGraceMs: 200, onTrip: () => { trips += 1; } });
+  watcher.stdoutText(stepStart);
+  watcher.stdoutLine(stepStart);
+  watcher.stderrLine(logLine());
+  assert.ok(watcher.state.finalTimer, "armed");
+  await sleep(50);
+  const child = JSON.stringify({ type: "text", sessionID: "ses_child", part: { type: "text", text: "still working" } });
+  watcher.stdoutText(child);
+  watcher.stdoutLine(child);
+  assert.ok(watcher.state.finalTimer, "a subagent's progress is not the run's");
+  const own = JSON.stringify({ type: "text", sessionID: "ses_b096", part: { type: "text", text: "recovered" } });
+  watcher.stdoutText(own);
+  watcher.stdoutLine(own);
+  assert.equal(watcher.state.finalTimer, null);
+  await sleep(300);
+  assert.equal(trips, 0);
+  assert.equal(watcher.state.tripped, false);
+  // The same for a structured error event followed by progress.
+  watcher.stdoutLine(errorEvent());
+  assert.ok(watcher.state.finalTimer);
+  watcher.stdoutLine(JSON.stringify({ type: "step_finish", sessionID: "ses_b096" }));
+  assert.equal(watcher.state.finalTimer, null);
+  await sleep(300);
+  assert.equal(trips, 0);
+  // stop() also ends any later arming: a line drained after the payload exited counts, never trips.
+  watcher.stop();
+  watcher.stderrLine(logLine({ at: "2026-10-02T18:06:00.000Z" }));
+  assert.equal(watcher.state.finalTimer, null);
+  assert.equal(watcher.state.hits, 3);
+});
+
+test("B-130: a payload that exits on its own after a final line keeps its result when the close comes later than the grace", async () => {
+  // A supervisor that reports the payload's exit (code 0) at once but closes its pipes 4 s later,
+  // past the 3 s grace: the grace trip used to fire on the exited payload and force exit 1.
+  const fakeSupervisor = path.join(scratch, "slow-close-supervisor.cjs");
+  await writeFile(fakeSupervisor, [
+    "const fs = require('node:fs');",
+    "const identity = process.argv[process.argv.indexOf('--identity') + 1];",
+    "const emit = (type, extra = {}) => fs.writeSync(3, JSON.stringify({ type, supervisorIdentity: identity, ...extra }) + '\\n');",
+    "emit('ready', { protocolVersion: 1, supervisorPid: process.pid });",
+    "let buffered = '';",
+    "let launched = false;",
+    "process.stdin.on('data', (chunk) => {",
+    "  buffered += chunk;",
+    "  if (launched || !buffered.includes('\"launch\"')) return;",
+    "  launched = true;",
+    `  process.stderr.write(${JSON.stringify(`${logLine()}\n`)});`,
+    "  setTimeout(() => emit('exit', { payloadExitCode: 0, reason: 'payload_closed', treeTerminationConfirmed: true, containmentGuarantee: 'posix_process_group' }), 100);",
+    "  setTimeout(() => process.exit(0), 4000);",
+    "});",
+  ].join("\n"), "utf8");
+  const result = await runSpawnCommand(process.execPath, ["-e", "0"], scratch, 30_000, null, { rateLimitWatch: watch(), supervisorScriptForTest: fakeSupervisor });
+  assert.equal(result.rateLimited, false, "the payload's own result stands");
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.rateLimitHits, 1, "the line was seen");
 });
 
 test("B-096: end to end, the real stderr line ends a silent run in seconds as provider_rate_limited and pauses the model", async () => {

@@ -276,7 +276,12 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
   model is paused for 30 minutes, then 60.
 - **Pause and resume** a provider or one model yourself with `pause_opencode_provider` /
   `resume_opencode_provider`; cap all agents on all providers with
-  `set_opencode_concurrency({ globalWorkerLimit: 8 })`.
+  `set_opencode_concurrency({ globalWorkerLimit: 8 })`, and give single providers their own slots
+  with `set_opencode_concurrency({ providerLimits: { codex: 5, agy: 2 } })` (`null` clears one,
+  `reset: true` clears all); the queue worker and the other client pick it up within seconds.
+- **Shared quotas.** With `CODEX_OPENCODE_QUOTA_GROUPS=chatgpt:codex,openai` a rate limit on
+  either side (the codex runner or an OpenCode `openai/...` model) pauses both, and a job with
+  `models: ["codex/...", "openai/..."]` waits for the pause instead of trying the other one.
 - **Self-checks.** The bridge runs the exact commands you list in
   `scopeContract.selfCheckCommands` (for example `node tools/validate.cjs out/x.json`) in the
   worktree after the agent finished, and gives the agent another run with a failing check's
@@ -609,7 +614,7 @@ You normally let Codex call these tools. They are listed so you recognise them i
 | | `cancel_opencode_job` | Cancel a queued or running job. |
 | | (job option) `validationFixPasses: 1` | A write job whose validation command failed gets one more agent run in the same worktree with the validation output (builders cannot run checks themselves), then validates again. |
 | | `requeue_opencode_job` | Run a failed, cancelled or interrupted job again as a new job from its stored request (optional new `model` from the allowlist, new `timeoutMs`). Completed and unfinished jobs are refused. |
-| | `set_opencode_concurrency` | Raise or lower the provider slot limit, the queue parallel limit and the global worker cap over all providers (`globalWorkerLimit`) without restarting (running jobs keep going). `reset: true` returns to the environment values. |
+| | `set_opencode_concurrency` | Raise or lower the provider slot limit, the slots of single providers (`providerLimits: { codex: 5 }`, `null` clears one), the queue parallel limit and the global worker cap over all providers (`globalWorkerLimit`) without restarting (running jobs keep going). A provider with its own limit keeps it when you change `providerLimit`. `reset: true` returns to the environment values. |
 | | `pause_opencode_provider` / `resume_opencode_provider` | Pause a provider or one model until a time or for some minutes, in every bridge process, and end a pause early (also an automatic one). |
 | | (job options) `models`, `maxAttempts`, `autoIntegrate`, `scopeContract.selfCheckCommands`, `selfCheckPasses` | Fallback models and retries, auto-integration of new-file-only patches, and checks the bridge runs for a builder with fix passes; see [Long batches in the queue](#long-batches-in-the-queue). |
 | | `inspect_opencode_queue_recovery` | Recovery state after a crash. |
