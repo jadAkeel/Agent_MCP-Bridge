@@ -299,7 +299,56 @@ Example job (one of many, each with its own file):
     "selfCheckCommands": ["node tools/validate.cjs out/backend/batch-012.json"] } }
 ```
 
-The queue still runs only while a bridge process runs, and a bridge ends with its client.
+A bridge ends with its client, and so do the jobs it runs. For a run that must outlast the client,
+use the queue worker below.
+
+### Unattended runs (queue worker)
+
+`bin/queue-worker.js` (`npm run worker`) runs the queue of one repository without Codex or Claude
+Code open (log.md Q-011). It is the bridge itself, started without a client: the same jobs,
+retries, fallback models, pauses, auto-integration and logs.
+
+1. **Write `jobs.jsonl`**: one job per line, exactly the `enqueue_opencode_job` input (the example
+   above, on one line), each with its own `idempotencyKey`. A misspelt field is refused, not
+   ignored, and `cwd` must be the repository the worker runs for.
+2. **Start the worker** from the bridge folder your clients run (the same `server.js`, so the
+   integrity pins match):
+
+   ```powershell
+   node <bridge-dir>\bin\queue-worker.js --repo C:\path\to\repo --enqueue C:\path\to\jobs.jsonl --env-from codex
+   ```
+
+   `--env-from codex` (or `claude`) copies the environment of your registered client entry, so the
+   state directory, model allowlist, pins and limits are the clients'; a variable you set in the
+   shell wins. Every line is checked before anything starts: one bad line is reported with its
+   line number and nothing runs. Running the same file again adds only the new lines; jobs that
+   already ran are not run again. Add `--until-empty` to exit by itself when nothing is left.
+3. **Watch it**: `list_opencode_jobs` from Codex or Claude Code shows the jobs as usual (same state
+   directory), or run `node bin\queue-worker.js --repo C:\path\to\repo --status` for the worker's
+   pid and heartbeat, the counts (pending, waiting for a pause, running, completed, auto-integrated,
+   failed, gave up) and the paused providers. Every 10 minutes the worker writes a
+   `queue_worker.summary` line to the operations log.
+4. **Stop it**: `--repo C:\path\to\repo --stop`, or Ctrl+C in its window. Nothing new starts and
+   the worker exits when its running jobs end. `--stop --now` (or a second Ctrl+C) cancels the
+   running jobs; they end `cancelled` and `requeue_opencode_job` can run them again. Pending jobs
+   stay pending for the next worker.
+5. **Afterwards**: `npm run issues` lists one line per failure (rate limit, idle stop, timeout,
+   failed validation, no output, retry, gave up, failed auto-integration) between the worker's
+   `queue_worker.started` and `queue_worker.stopped` lines; `npm run incidents` groups the
+   recurring warnings and errors (the worker's progress lines are not incidents).
+
+Good to know:
+
+- One worker per repository. A second one exits with code 1 while the first is alive. After a
+  crash a normal restart works at once; after a killed process, wait until its heartbeat in
+  `<state-dir>\workers\<projectKey>.json` is 2 minutes old.
+- While a worker runs, client bridges leave that repository's waiting jobs to it. Jobs you
+  enqueue through MCP still run in the client that enqueued them and end with it: put unattended
+  work in the worker's file.
+- The global worker cap (`set_opencode_concurrency({ globalWorkerLimit })`) counts the worker's
+  agents together with the clients'.
+- Exit codes: 0 clean stop, 1 refused to start, 2 stopped by an error. Details in
+  [REFERENCE](REFERENCE.md#queue-worker-binqueue-workerjs).
 
 ---
 
@@ -633,6 +682,7 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 | `bin/release-gate.js` | `npm run test:release`; the gate and receipt `release:activate` requires |
 | `bin/fresh-healthcheck.js` | Fresh-process health check used during activation. |
 | `bin/tui.js` | `npm run tui` dashboard. |
+| `bin/queue-worker.js` | `npm run worker`: the unattended queue worker (section 8). |
 | `bin/e2e*.js` | Live and concurrency end-to-end tests. |
 | `tests/server-self-test.js` | The bridge's self-test suite (`npm test` runs it). |
 | `tests/pipeline-*.js` | Pipeline admin and abandonment tests. |

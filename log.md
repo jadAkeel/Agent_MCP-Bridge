@@ -16,6 +16,49 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-02
 
+### Unattended queue worker (Claude, 2026-10-02)
+
+Branch `bridge/queue-worker`, isolated worktree `<bridge-worker>` from `bridge/flex-scheduling`
+(`0f2faa0`, B-074), with its own `npm ci`. Feature 10 of the approved design (section 2 of
+`flex-design-9-10.md`): the owner's pain point 9, a 220-batch run that had to go through a
+standalone orchestrator because the bridge lives only as long as its client. Commits: `0356f31`
+(B-078) and `297f694` (Q-011, B-075..B-077; its message calls the feature itself B-075). Tests:
+`tests/review-flex-queue-worker.js` (in `npm test` right after `tests/review-flex-state-isolation.js`;
+workers in this process and in child processes, fake agents through `queueJobExecutorTestHook`),
+and B-078 in `tests/review-flex-fallback.js`.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| Q-011 | An unattended run of hundreds of queued jobs (take a batch, check it, commit it, requeue the failed one, for hours) needed the round-6 orchestrator, or a client window kept open for the whole run. | A bridge runs only while its MCP client keeps it alive: its timers are unref'd and its jobs end with it. | `bin/queue-worker.js` (`npm run worker`): `--repo <abs> [--enqueue jobs.jsonl] [--until-empty] [--env-from claude\|codex]`, `--stop [--now]`, `--status [--json]`. It imports `server.js` (an import starts nothing) and drives the new `queueWorkerApi`: `startWorkerMode` runs the main start sequence without a transport (failure handlers, release integrity, managed runtime sync, plugin policy for the repository, startup recovery, provider quarantine reclaim), with recovery and scheduling limited to that repository's state database. Every `--enqueue` line is parsed with the `enqueue_opencode_job` schema (`jobInputShape` plus a required `idempotencyKey`, unknown fields refused), then checked by the full enqueue validation without a durable write and against existing keys; one refused line (named by its number) exits 1 before anything starts, and re-running the file deduplicates. A referenced 15 s tick checks `<state-dir>/workers/<projectKey>.stop`, refreshes the presence file and logs `queue_worker.summary` every 10 minutes; `--stop` or Ctrl+C drains (a `queueDrainRequested` check in `scheduleQueue`, before planning and before `startQueueRecord`), `--stop --now` or a second Ctrl+C cancels the running jobs (`cancelled`, requeue-able); `--until-empty` exits when the repository's queue is empty and nothing runs in the process (no job, auto-integration or retry decision, twice in a row). `--env-from` copies the client entry's env read only (`loadMcpEntry` for Codex, the exported `readClaudeUserEntry` for Claude Code); the explicit environment wins. Exit 0 clean stop, 1 refused to start, 2 stopped by an error (`crashAndExit` uses 2 in worker mode). No new state format. | (this commit) | fixed |
+| B-075 | The worker's progress would have been invisible: nobody reads its stderr, and the operations log took only warn and error events. | `logEvent` writes the operations log for warn and error only; `npm run incidents` groups every line it reads. | `queue_worker.started`, `queue_worker.summary`, `queue_worker.stopped` (and a bridge's `queue.worker_present`) are info events that still go to the operations log (`OPS_LOG_INFO_EVENTS`); started and stopped are also issue-log lines; `npm run incidents` and the doctor skip info lines. | (this commit) | fixed |
+| B-076 | Two workers on one repository would double its parallelism (claims are compare-and-swap, so a job still runs once). | Nothing marked a repository as served by a worker. | `<state-dir>/workers/<projectKey>.json` (pid, instance id, repo, heartbeat, counts) is created exclusively; a second worker exits 1 with the first one's pid and heartbeat unless the recorded process is dead and the heartbeat is older than 2 minutes (then it takes over; two takers race on the exclusive create again). The file is removed at the exit, also after a crash through the failure handlers. Tests: a second worker is refused while the first runs and `--status`/`--stop` reach the first; a killed worker's file blocks a restart until it is stale, and the next worker adopts the lapsed pending job while the killed one's running job ends `interrupted`. | (this commit) | fixed |
+| B-077 | A client bridge's deferred recovery could adopt a worker's lapsed pending jobs (or resume its interrupted ones), which would then die with that client. | Recovery adopts every pending row whose job and owner leases expired, in every state database. | While a repository's presence file is fresh (heartbeat under 2 minutes) and belongs to another process, the recovery pass leaves that database's queue rows alone (no adoption, no interrupted marking or resume, no auto-integration reschedule), keeps the database pending, and logs `queue.worker_present` once per episode. Jobs enqueued through MCP still run in the client bridge; the docs say to enqueue unattended work through the worker. | (this commit) | fixed |
+| B-078 | Verifying the worker's claims: a new job whose every model was paused failed its first attempt at the slot (with `maxAttempts: 1` it gave up at once), and a slot refused for a paused provider/model counted as an attempt, so a job whose next model got paused (after a real rate limit on the first) could give up without a second real run. | Q-007 chose a waiting `startAfter` only for retries, and only `provider_slot_wait_timeout` (B-071) was exempt from counting; a pause refusal and a real rate limit had the same error type. | The terminal record keeps `providerRefusedUntil` when the slot request was refused for a pause (exit code `provider_capacity_unavailable` with a cooldown end); the policy requeues such a refusal without counting it (`pauseWaitRequeues`, at most 24, history line `not counted: the model was paused`), on the next model that is not paused or waiting until the first pause ends. `enqueueQueueJob` sets `startAfter` when every model of a new job is paused; the request keeps its first model, so the idempotency fingerprint is unchanged. One history cap for record and policy. `tests/review-flex-fallback.js` (+2; the Q-007 all-paused retry test now pauses while attempt 1 runs). | (this commit) | fixed |
+
+Claims of the design checked before relying on them (brief "Also verify"): (1) a job whose
+candidate models are all paused waits instead of failing: false for a new job's first attempt,
+fixed by B-078. (2) A quota or rate-limit failure does not consume an attempt beyond the first
+model switch, and `provider_slot_wait_timeout` does not count: the slot wait was true (B-071,
+its test); a slot refused for a paused model counted, fixed by B-078. (3) Each retry runs in a
+fresh worktree from the current target HEAD: true (a retry is a new job id, and
+`createWorktreeForJob` reads HEAD when it creates the worktree); verified with the real
+`executeOpenCodeJob` (agent run replaced) while another commit lands between the attempts.
+(4) Auto-integration re-runs `validationCommand` in the target before the commit and removes the
+worktree after it: true (`integratePatchSerially` validates after the apply and calls the B-069
+commit hook only after a passing validation; `cleanupAfterSuccess`); verified with two batches
+that pass alone and fail together: the first lands and its worktree is gone, the second is rolled
+back and kept. The global worker cap (Q-005) already counted the worker's agents (provider leases
+of the shared state directory); a child-process worker holding a slot now proves it.
+
+Not built here: the rest of the design's "still missing for a 220-batch run" list (a
+`timed_out_with_changes` writer to auto-integrate, dirt on patched paths, validation arguments
+bound to `allowedEdits`, a task generator); adding jobs to a running worker (a second `--enqueue`
+is refused while it runs: stop, then start it with the new file). Not tested: Ctrl+C itself (the
+signal handler writes the same stop file the tests use). Open: after a drain stop the pending jobs
+are adopted by any bridge once their 60 s lease lapsed, not only by the next worker; a killed (not
+crashed) worker blocks a restart for up to 2 minutes; `--until-empty` also waits for jobs of the
+repository that a client bridge owns or that a quarantined integration blocks.
+
 ### Flexible scheduling: silent rate limits, model fallback, auto-integrate, restart re-attach (Claude, 2026-10-02)
 
 Branch `bridge/flex-scheduling`, isolated worktree `<bridge-flex>` from `bridge/ops-log-coverage`
