@@ -23,6 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadMcpEntry } from "./fresh-healthcheck.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const PROJECT_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
@@ -459,6 +460,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
+    recordCliFailure("sync-managed-runtime", error);
     process.exitCode = 1;
   });
 }

@@ -9,6 +9,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const USAGE = "node bin/setup.js [--yes] [--dry-run] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--provider-limit N] [--self-test]";
@@ -286,13 +287,38 @@ async function selfTest() {
   } finally { await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 }
 
+// B-058: a failed setup is recorded in the operations log of the state directory it was
+// setting up (--state-dir, default <codex-home>/codex-opencode-mcp), so `npm run incidents`
+// finds an install problem too. A dry run promises to create nothing, so it records only into
+// a state directory that already exists.
+function recordSetupFailure(options, error, exitCode) {
+  const stateDir = options?.stateDir || "";
+  if (options?.dryRun && !existsSync(stateDir)) return false;
+  return recordCliFailure("setup", error, { stateDir, exitCode });
+}
+
 if (isMainModule(import.meta.url)) {
+  let options = null;
   (async () => {
-    const options = parseArguments(process.argv.slice(2));
+    options = parseArguments(process.argv.slice(2));
     if (options.help) { process.stdout.write(`Usage: ${USAGE}\n`); return; }
     if (options.selfTest) { await selfTest(); return; }
-    process.exitCode = await runSetup(options);
-  })().catch((error) => { process.stderr.write(`Setup failed: ${error.message}\n`); process.exitCode = 2; });
+    // The preflight lines say which prerequisite failed; keep them for the log line.
+    const problems = [];
+    const log = (line) => {
+      process.stdout.write(`${line}\n`);
+      if (/: (?:missing|wrong version)\b/.test(String(line))) problems.push(String(line));
+    };
+    const code = await runSetup(options, { log });
+    if (code === 1) recordSetupFailure(options, { name: "setup_preflight_failed", message: `Setup preflight failed: ${problems.join("; ") || "a prerequisite check failed"}` }, 1);
+    if (code === 2) recordSetupFailure(options, { name: "setup_write_refused", message: "Setup write refused: the displayed changes were not accepted. Re-run with --yes to accept them." }, 2);
+    process.exitCode = code;
+  })().catch((error) => {
+    process.stderr.write(`Setup failed: ${error.message}\n`);
+    if (options && !options.selfTest) recordSetupFailure(options, error, 2);
+    else if (!options) recordCliFailure("setup", error, { exitCode: 2 });
+    process.exitCode = 2;
+  });
 }
 
 export { findCommand, parseArguments, preflight, preview, runSetup };

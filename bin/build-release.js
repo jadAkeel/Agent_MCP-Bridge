@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
@@ -581,6 +582,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.message || String(error)}\n`);
+    recordCliFailure("build-release", error);
     process.exitCode = 1;
   });
 }

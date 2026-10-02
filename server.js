@@ -1964,6 +1964,151 @@ function opsLogEnabled() {
   return !process.argv.includes("--self-test") || Boolean(stateDirectoryOverride);
 }
 
+// B-056: SDK errors (unknown tool, input validation: "MCP error -32602 ...") and handler
+// exceptions become `isError` answers inside @modelcontextprotocol/sdk, and the bridge's own
+// refusals and failed agent runs are normal answers with an errorType line; none reached
+// logEvent, so the operations log stayed empty while the user saw failures. Every answer is
+// inspected once, at the transport (installMcpFailureLogging), instead of in 26 handlers.
+// The text goes under `summary`, not `error`/`message`/`reason`: sanitizeLogValue hashes those
+// keys, and this line exists to be read. It is redacted before it is cut, so a cut can never
+// leave half a credential that the redactor no longer recognizes.
+const FAILED_ANSWER_SUMMARY_CHARS = 400;
+const MCP_PENDING_REQUEST_CAP = 1000;
+
+function failureSummary(text) {
+  return redactSensitiveText(String(text ?? "").slice(0, 16_000)).slice(0, FAILED_ANSWER_SUMMARY_CHARS);
+}
+
+function mcpAnswerText(result) {
+  const content = Array.isArray(result?.content) ? result.content : [];
+  return content.filter((item) => item && item.type === "text" && typeof item.text === "string").map((item) => item.text).join("\n");
+}
+
+// Remembers a request the client sent, until its answer goes out. Bounded: a client that never
+// receives its answers (or cancels without one) cannot grow the map past the cap.
+function rememberMcpRequest(pending, message, { now = Date.now(), cap = MCP_PENDING_REQUEST_CAP } = {}) {
+  if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.method !== "string") return;
+  if (message.method === "notifications/cancelled") {
+    pending.delete(message.params?.requestId);
+    return;
+  }
+  if (message.id === undefined || message.id === null) return;
+  while (pending.size >= cap) pending.delete(pending.keys().next().value);
+  const tool = message.method === "tools/call" && typeof message.params?.name === "string" ? message.params.name : "";
+  pending.set(message.id, { method: message.method, tool, startedAt: now });
+}
+
+// The ops-log record for one outgoing message, or null when it is not a failed answer.
+// Pure: it reads `pending` but never changes it or the message.
+function describeFailedMcpMessage(message, pending = new Map(), now = Date.now()) {
+  if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.method === "string") return null;
+  if (message.id === undefined) return null;
+  const request = pending.get(message.id) || null;
+  const durationMs = request ? Math.max(0, now - request.startedAt) : null;
+  const method = request?.method || "";
+  const tool = request?.tool || "";
+  if (message.error && typeof message.error === "object") {
+    const code = Number.isSafeInteger(message.error.code) ? message.error.code : null;
+    return { level: "error", event: "mcp.request_failed", data: { method, tool, code, summary: failureSummary(message.error.message || "JSON-RPC error without a message"), durationMs } };
+  }
+  const result = message.result;
+  if (!result || typeof result !== "object") return null;
+  const text = mcpAnswerText(result);
+  if (result.isError === true) {
+    // McpServer turns its own McpErrors (unknown tool, input validation) into isError results
+    // whose text starts "MCP error <code>:"; those are request failures, not bridge refusals.
+    const sdkError = /^MCP error (-?\d+):/.exec(text);
+    if (sdkError) {
+      return { level: "error", event: "mcp.request_failed", data: { method, tool, code: Number(sdkError[1]), summary: failureSummary(text), durationMs } };
+    }
+    const errorType = /^errorType:\s*([A-Za-z0-9_.:-]+)/m.exec(text)?.[1] || "";
+    return { level: "warn", event: "tool.refused", data: { tool, errorType, summary: failureSummary(text || "isError answer without text"), durationMs } };
+  }
+  if (method && method !== "tools/call") return null;
+  // Most bridge refusals are not isError: formatRejectedExecution and formatToolRefusal answer
+  // a normal result whose first lines carry "errorType: <type>" (an unsafe cwd, a lock conflict,
+  // a refused integration). Only the head of the first text block is read, where those put it.
+  const firstText = Array.isArray(result.content) ? result.content.find((item) => item?.type === "text" && typeof item.text === "string")?.text || "" : "";
+  const headType = /^errorType:\s*([A-Za-z0-9_.:-]+)/m.exec(firstText.split(/\r?\n/, 5).join("\n"))?.[1] || "";
+  if (headType && headType !== "none") {
+    return { level: "warn", event: "tool.refused", data: { tool, errorType: headType, summary: failureSummary(text), durationMs } };
+  }
+  // An agent run that started and failed (timeout, provider error, validation) is also a normal
+  // result: its job lines say "Status: failed; error type: <type>" (compact) or
+  // "Error type: <type>" (detail), once per job of a parallel run.
+  if (AGENT_RUN_TOOLS.has(tool)) {
+    const errorTypes = [...new Set([...text.matchAll(/^(?:Error type: |Status: (?:failed|rejected); error type: )([A-Za-z0-9_.:-]+)/gm)].map((match) => match[1]).filter((value) => value !== "none"))];
+    if (errorTypes.length) {
+      return { level: "warn", event: "agent.run_failed", data: { tool, errorType: errorTypes[0], errorTypes: errorTypes.slice(0, 10), summary: failureSummary(text), durationMs } };
+    }
+  }
+  return null;
+}
+
+const AGENT_RUN_TOOLS = new Set(["run_opencode_agent", "run_opencode_parallel", "run_multi_agent_pipeline"]);
+
+// Wraps a connected transport: onmessage remembers each request, send logs each failed
+// answer before forwarding it. Neither wrapper throws or changes a message.
+function installMcpFailureLogging(transport, { record = logEvent, cap = MCP_PENDING_REQUEST_CAP } = {}) {
+  const pending = new Map();
+  const received = transport.onmessage;
+  transport.onmessage = (message, extra) => {
+    try {
+      rememberMcpRequest(pending, message, { cap });
+    } catch { /* Logging must never stop a request. */ }
+    return received?.(message, extra);
+  };
+  const send = transport.send.bind(transport);
+  transport.send = (message, options) => {
+    try {
+      const failed = describeFailedMcpMessage(message, pending);
+      if (message && typeof message === "object" && typeof message.method !== "string" && message.id !== undefined) pending.delete(message.id);
+      if (failed) record(failed.level, failed.event, failed.data);
+    } catch { /* Logging must never stop an answer. */ }
+    return send(message, options);
+  };
+  return pending;
+}
+
+// B-057: an uncaught exception or unhandled rejection used to end the bridge with nothing in
+// the operations log (stderr goes to the client and is lost). appendOpsLogLine is synchronous,
+// so the line is on disk before the process exits.
+function recordProcessFailure(kind, error, { origin = "" } = {}) {
+  try {
+    const isObject = error !== null && typeof error === "object";
+    logEvent("error", `process.${kind}`, {
+      origin: String(origin || ""),
+      errorType: String((isObject && (error.code || error.name)) || ""),
+      summary: failureSummary(isObject ? error.message ?? String(error) : String(error)),
+      stack: isObject && typeof error.stack === "string" ? error.stack.split(/\r?\n/).slice(0, 10).join("\n") : "",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Only the real start path installs these (never an import or --self-test): the bridge still
+// prints the error and exits 1, as Node does without a handler.
+function installProcessFailureHandlers() {
+  process.on("uncaughtException", (error, origin) => crashAndExit("uncaught_exception", error, origin || "uncaughtException"));
+  // The second argument of unhandledRejection is the promise, not an origin string.
+  process.on("unhandledRejection", (reason) => crashAndExit("unhandled_rejection", reason, "unhandledRejection"));
+  process.on("exit", (code) => {
+    try {
+      if (code) logEvent("error", "process.exited", { code });
+    } catch { /* The process is ending; nothing else can be done. */ }
+  });
+}
+
+function crashAndExit(kind, error, origin) {
+  recordProcessFailure(kind, error, { origin });
+  try {
+    process.stderr.write(`${error?.stack || error}\n`);
+  } catch { /* stderr may already be closed. */ }
+  process.exit(1);
+}
+
 // encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
 // The default utf8 decoding turned every non-UTF-8 byte of a patch into U+FFFD.
 async function runCommand(command, args, cwd, timeoutMs = 1000 * 90, env = null, { signal = null, encoding = "utf8" } = {}) {
@@ -22684,6 +22829,17 @@ async function commitQueueTerminalRecord(record, patch, { attempts = QUEUE_TERMI
     try {
       lastResult = await updateQueueTerminalRecordDurable(record, patch);
       lastError = null;
+      // B-056: a queued job fails in the background, never as a tool answer, so the transport
+      // wrapper cannot see it; its durable failed record is logged here, once.
+      if (lastResult.persisted && patch.status === "failed") {
+        logEvent("warn", "queue.job_failed", {
+          jobId: record.jobId,
+          agent: record.agent || "",
+          errorType: patch.errorType || "",
+          summary: failureSummary(patch.errorReason || patch.errorType || "Queued job failed."),
+          durationMs: Number.isFinite(patch.durationMs) ? patch.durationMs : null,
+        });
+      }
       if (lastResult.persisted || lastResult.ownershipLost || !QUEUE_ACTIVE_STATUSES.includes(lastResult.status)) return lastResult;
     } catch (error) {
       lastError = error;
@@ -27470,6 +27626,10 @@ export const __selfTest = {
     patchLikelySecretLines,
     LIKELY_SECRET_PATTERNS,
     logEvent,
+    describeFailedMcpMessage,
+    installMcpFailureLogging,
+    recordProcessFailure,
+    rememberMcpRequest,
     containmentStillPossible,
     buildCompactPrompt,
     callerPathSpellings,
@@ -27689,6 +27849,9 @@ if (!BRIDGE_RUN_AS_MAIN) {
     child.on("exit", (code) => resolve(code ?? 1));
   });
 } else {
+  // First, so a failed integrity check or plugin policy at startup (a rejected top-level
+  // await reaches uncaughtException) is in the operations log too.
+  installProcessFailureHandlers();
   await verifyReleaseIntegrity();
   await syncManagedRuntimeAtStartup();
   const startupPluginPolicy = await verifyExternalPluginPolicy(process.cwd());
@@ -27699,7 +27862,13 @@ if (!BRIDGE_RUN_AS_MAIN) {
   // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
   beginBridgeStartupRecovery();
   const transport = new StdioServerTransport();
+  // Protocol.onerror: unparseable frames, failed sends, handler errors the SDK cannot answer.
+  server.server.onerror = (error) => {
+    logEvent("error", "mcp.protocol_error", { errorType: String(error?.code || error?.name || ""), summary: failureSummary(error?.message || String(error)) });
+  };
   await server.connect(transport);
+  // After connect: the SDK sets transport.onmessage during connect (B-056).
+  installMcpFailureLogging(transport);
   // A failed recovery is already logged and answered per tool call; it must not end the process.
   await bridgeStartupRecovery.catch(() => {});
   void reclaimProvenGoneProviderQuarantines({ force: true });

@@ -449,6 +449,12 @@ test("Q-001: an unfinished job, a pipeline child and an already requeued job are
   assert.match(textOf(unfinished), /errorType: requeue_job_not_terminal[\s\S]*still running/);
   release.shift()();
   assert.ok(await waitFor(async () => (await durable(running.record.jobId))?.status === "failed"));
+  // B-056: a queued job fails in the background, so its failed record is in the operations log.
+  const { readOpsLog } = await import("../bin/ops-log.js");
+  const failedLine = readOpsLog(stateDir, { days: 1 }).lines.find((line) => line.event === "queue.job_failed" && line.jobId === running.record.jobId);
+  assert.ok(failedLine, "queue.job_failed is logged for the failed job");
+  assert.deepEqual([failedLine.level, failedLine.agent, failedLine.errorType], ["warn", "reviewer", "agent_timeout"]);
+  assert.ok(failedLine.summary.length > 0);
 
   await patchSummary(running.record.jobId, { parentJobId: "some-pipeline-1" });
   const child = await callTool("requeue_opencode_job", { cwd: repo, jobId: running.record.jobId });

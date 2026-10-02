@@ -18,6 +18,7 @@ import { readdir } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { loadMcpEntry } from "./fresh-healthcheck.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -280,10 +281,20 @@ async function main() {
     }
     process.stdout.write(`${lines.join("\n")}\n`);
   }
-  if (!report.ok) process.exitCode = 1;
+  if (!report.ok) {
+    // B-058: a failed smoke goes to the operations log of the bridge it started.
+    const failedPart = /healthy/i.test(report.health.status || "")
+      ? `agent run error type ${report.run?.errorType || "unknown"}, responded ${report.run?.responded ? "yes" : "no"}`
+      : `health ${report.health.status || "unknown"}`;
+    const missing = report.health.missingAgents && report.health.missingAgents !== "none" ? `; missing agents ${report.health.missingAgents}` : "";
+    const stateDir = path.resolve(String(entry.env.CODEX_OPENCODE_STATE_DIR || path.join(homedir(), ".codex", "codex-opencode-mcp")));
+    recordCliFailure("live-smoke", { name: "smoke_failed", message: `Live smoke failed: ${failedPart}${missing}.` }, { stateDir });
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error) => {
   process.stderr.write(`${error?.stack || error}\n`);
+  recordCliFailure("live-smoke", error);
   process.exitCode = 1;
 });

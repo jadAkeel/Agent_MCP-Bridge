@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { recordCliFailure } from "./ops-log.js";
 
 requireSelfTestRun(import.meta.url);
 
@@ -329,6 +330,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
+    recordCliFailure("state-audit", error);
     process.exitCode = 1;
   });
 }

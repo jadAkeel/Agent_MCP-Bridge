@@ -11,7 +11,7 @@ import { auditHasFailures, auditStateDirectory } from "./state-audit.js";
 import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { inventory as gcInventory } from "./bridge-gc.js";
 import { isMainModule } from "./main-module.js";
-import { opencodeDatabaseHealth, readOpsLog, summarizeIncidents } from "./ops-log.js";
+import { opencodeDatabaseHealth, readOpsLog, recordCliFailure, summarizeIncidents } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER_NAME = "opencode";
@@ -253,6 +253,7 @@ async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaud
     configPath: path.resolve(configPath),
     claudeConfigPath: path.resolve(claudeConfigPath),
     cwd: path.resolve(cwd),
+    stateDir,
     bridge: {
       serverPath: entry?.args[0] || "",
       integrityMode: release.integrityMode,
@@ -286,12 +287,23 @@ async function main() {
   const options = parseArguments(process.argv.slice(2));
   const report = await runDailyDoctor(options);
   process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));
-  if (!report.ok) process.exitCode = 1;
+  if (!report.ok) {
+    // B-058: "attention required" is a failure the developer must find later, in the same
+    // operations log as the bridge's own lines (the state directory the doctor checked).
+    const causes = [
+      ...report.failures.map((failure) => `[${failure.check}] ${failure.message}`),
+      report.git.ok ? "" : "git unavailable",
+      report.state.integrityFailures || report.state.foreignKeyViolations ? "state audit failed" : "",
+    ].filter(Boolean);
+    recordCliFailure("daily-doctor", { name: "doctor_attention_required", message: `Bridge daily doctor: attention required. ${causes.join("; ") || "See the doctor report."}` }, { stateDir: report.stateDir });
+    process.exitCode = 1;
+  }
 }
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`Bridge daily doctor failed: ${errorMessage(error)}\n`);
+    recordCliFailure("daily-doctor", error);
     process.exitCode = 1;
   });
 }

@@ -33,6 +33,7 @@ import { LEGACY_PUBLISH_ENTRIES } from "./build-release.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
 import { digestTree } from "./plugin-tree-digest.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 requireSelfTestRun(import.meta.url);
@@ -552,12 +553,17 @@ async function main() {
     return;
   }
   const { receipt } = await runReleaseGate({ receiptPath: options.receiptPath, configPath: options.configPath });
-  if (!receipt.ok) process.exitCode = 1;
+  if (!receipt.ok) {
+    // B-058: a failed gate step is not an exception, but it is a failure to find later.
+    recordCliFailure("release-gate", { name: "release_gate_failed", message: `Release gate failed: ${receipt.failure || "a step failed"}` });
+    process.exitCode = 1;
+  }
 }
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`\nrelease gate failed: ${error?.message || error}\n`);
+    recordCliFailure("release-gate", error);
     process.exitCode = 1;
   });
 }

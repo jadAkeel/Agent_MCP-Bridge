@@ -174,7 +174,14 @@ try {
     const result = cli(missing, [], { ...process.env, PATH: path.join(scratch, "empty-path") });
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stdout, /codex: missing; install: npm install -g @openai\/codex/);
-    assert.equal(existsSync(missing.codexHome), false);
+    // B-058: the only write is the failure line in the operations log of the target state dir.
+    assert.equal(existsSync(missing.configPath), false);
+    assert.deepEqual(await readdir(missing.codexHome), ["codex-opencode-mcp"]);
+    assert.deepEqual(await readdir(missing.stateDir), ["logs"]);
+    const [logName] = await readdir(path.join(missing.stateDir, "logs"));
+    const logged = (await readFile(path.join(missing.stateDir, "logs", logName), "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.deepEqual(logged.map((line) => [line.event, line.exitCode]), [["cli.setup.failed", 1]]);
+    assert.match(logged[0].summary, /codex: missing/);
   });
 
   await check("Gemini stages runtime-bound manifest and refuses host version mismatch", async () => {

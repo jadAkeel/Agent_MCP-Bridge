@@ -9,8 +9,10 @@
 // 4 GB WAL, every OpenCode start failed on its first insert).
 //   node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json]
 //   node bin/ops-log.js --self-test
+// The bin/ commands record their own top-level failure here too (recordCliFailure), so a
+// failed setup, doctor or release step is in the same file as the bridge's own errors.
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -34,25 +36,53 @@ function logDirectory(stateDir) {
 // One writer per process: the size and retention checks run once per day and file.
 const writerState = { day: "", file: "", bytes: 0, capped: false, pruned: "" };
 
+// lstat, not stat: a junction or symlink must be seen as itself, never as its target.
+function entryKind(target) {
+  try {
+    const details = lstatSync(target);
+    if (details.isSymbolicLink()) return "link";
+    return details.isFile() ? "file" : details.isDirectory() ? "directory" : "other";
+  } catch (error) {
+    if (error?.code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
+// Deletes only regular files: a link named like an old log file is left alone, so retention
+// can never delete outside the state directory (independent review, B-059).
 function pruneOldLogs(directory, now = Date.now()) {
   const cutoff = now - RETENTION_DAYS * 86_400_000;
   for (const name of readdirSync(directory)) {
     const match = LOG_FILE_PATTERN.exec(name);
-    if (match && Date.parse(`${match[1]}T00:00:00Z`) < cutoff) rmSync(path.join(directory, name), { force: true });
+    if (!match || Date.parse(`${match[1]}T00:00:00Z`) >= cutoff) continue;
+    const file = path.join(directory, name);
+    try {
+      if (entryKind(file) === "file") rmSync(file, { force: true });
+    } catch { /* One entry that cannot be checked or removed must not stop the line. */ }
   }
 }
 
+// O_NOFOLLOW closes the gap between the lstat check and the open on POSIX; Windows has no
+// such flag, and there the lstat check before every write is the guard.
+const APPEND_FLAGS = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW || 0);
+
 // Never throws: the operations log must not turn a logged failure into a second one.
+// It never follows a link: if <state-dir>/logs or today's file is a junction or symlink, the
+// line is dropped (false) instead of being written, or pruning deleting, outside the state dir.
 function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
   try {
     const directory = logDirectory(stateDir);
     const day = dayOf(now);
     const file = path.join(directory, `bridge-${day}.jsonl`);
+    const directoryKind = entryKind(directory);
+    if (directoryKind !== "missing" && directoryKind !== "directory") return false;
+    if (directoryKind === "missing") mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const fileKind = entryKind(file);
+    if (fileKind !== "missing" && fileKind !== "file") return false;
     if (writerState.file !== file) {
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
       writerState.day = day;
       writerState.file = file;
-      writerState.bytes = existsSync(file) ? statSync(file).size : 0;
+      writerState.bytes = fileKind === "file" ? lstatSync(file).size : 0;
       writerState.capped = writerState.bytes >= DAILY_MAX_BYTES;
     }
     if (writerState.pruned !== day) {
@@ -65,9 +95,79 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
       writerState.capped = true;
       line = `${JSON.stringify({ ts: now.toISOString(), level: "warn", event: "ops_log.daily_cap_reached", maxBytes: DAILY_MAX_BYTES, pid: process.pid })}\n`;
     }
-    appendFileSync(file, line, { encoding: "utf8", mode: 0o600 });
+    const descriptor = openSync(file, APPEND_FLAGS, 0o600);
+    try {
+      if (!fstatSync(descriptor).isFile()) return false;
+      writeSync(descriptor, line, null, "utf8");
+    } finally {
+      closeSync(descriptor);
+    }
     writerState.bytes += Buffer.byteLength(line);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+// server.js owns the full redactor (redactSensitiveText) and imports this module, so this
+// module cannot import it back. bin/ has no shared redaction module; this is the minimum copy
+// of its broad log rules, enough for a CLI error message (a command line, a path, an HTTP
+// error). Keep it in step with BROAD_LOG_REDACTIONS in server.js.
+const CLI_REDACTIONS = [
+  [/-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|$)/gi, "[private key redacted]"],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [redacted]"],
+  [/\b(?:ya29\.[A-Za-z0-9._-]+|1\/\/[A-Za-z0-9._-]+)\b/g, "[oauth token redacted]"],
+  [/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}/g, "[jwt redacted]"],
+  [/\b(?:sk|rk|pk|xox[baprs])-[_A-Za-z0-9-]{12,}\b/gi, "[credential redacted]"],
+  [/\b(?:gh[pousr]_|github_pat_)[_A-Za-z0-9-]{12,}\b/g, "[github credential redacted]"],
+  [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[google api key redacted]"],
+  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/[^\s:\/@]{1,256}:)[^\s\/@]{1,256}@/gi, "$1[redacted]@"],
+  [/((?:"|')?(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|password|passwd|secret|client[-_]?secret|credential|contractorAuthorizationToken)(?:"|')?\s*[:=]\s*)((?:"[^"]*")|(?:'[^']*')|[^\s,;}]+)/gi, "$1[redacted]"],
+  [/([?&](?:access_token|refresh_token|id_token|api_key|key|code|client_secret)=)[^&#\s]+/gi, "$1[redacted]"],
+];
+
+function redactCliText(value) {
+  let text = String(value ?? "");
+  for (const [pattern, replacement] of CLI_REDACTIONS) text = text.replace(pattern, replacement);
+  return text;
+}
+
+const SUMMARY_CHARS = 400;
+
+function opsLogDisabled(env = process.env) {
+  return String(env.CODEX_OPENCODE_OPS_LOG || "").trim().toLowerCase() === "off";
+}
+
+// `--state-dir <absolute>` on the failed command line names the state directory (setup,
+// bridge-gc, state-audit, ops-log), even when the failure was the argument parsing itself.
+function stateDirectoryFromArgv(argv) {
+  const index = argv.indexOf("--state-dir");
+  const value = index >= 0 ? String(argv[index + 1] || "") : "";
+  return value && path.isAbsolute(value) ? value : "";
+}
+
+// One line for a bin/ command that is about to exit non-zero. Like the bridge, a --self-test
+// run never writes into the operator's state directory unless a directory was given. Returns
+// whether a line was written; never throws.
+function recordCliFailure(scriptName, error, { stateDir = "", exitCode = 1, argv = process.argv, now = new Date() } = {}) {
+  try {
+    if (opsLogDisabled()) return false;
+    if (!stateDir && argv.includes("--self-test")) return false;
+    const directory = stateDir || stateDirectoryFromArgv(argv) || defaultStateDirectory();
+    const message = redactCliText(error?.message ?? (error === undefined || error === null ? "" : String(error)));
+    const record = {
+      ts: now.toISOString(),
+      level: "error",
+      event: `cli.${scriptName}.failed`,
+      errorType: String(error?.code || error?.errorType || error?.name || ""),
+      summary: message.slice(0, SUMMARY_CHARS),
+      exitCode,
+    };
+    // A child-process failure prints the command first and the cause last (a traceback's
+    // final line), so a long message also keeps its last line where a reader can act on it.
+    const lastLine = message.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() || "";
+    if (message.length > SUMMARY_CHARS && lastLine && !record.summary.includes(lastLine)) record.lastLine = lastLine.slice(0, 200);
+    return appendOpsLogLine(directory, record, { now });
   } catch {
     return false;
   }
@@ -116,12 +216,17 @@ function summarizeIncidents(lines) {
   for (const line of lines) {
     const errorType = String(line.errorType || "");
     const key = `${line.event || "unknown"}|${errorType}`;
-    const group = groups.get(key) || { event: line.event || "unknown", errorType, level: line.level || "warn", count: 0, firstAt: line.ts, lastAt: line.ts, samples: [] };
+    const group = groups.get(key) || { event: line.event || "unknown", errorType, level: line.level || "warn", count: 0, firstAt: line.ts, lastAt: line.ts, samples: [], summary: "" };
     group.count += 1;
     if (line.level === "error") group.level = "error";
     if (line.ts < group.firstAt) group.firstAt = line.ts;
-    if (line.ts > group.lastAt) group.lastAt = line.ts;
-    const sample = line.operationId || line.jobId || line.runId || line.pipelineId || "";
+    if (line.ts >= group.lastAt) {
+      group.lastAt = line.ts;
+      // The newest readable text of the group, so the report says what went wrong.
+      if (line.summary) group.summary = String(line.summary).replace(/\s+/g, " ").trim().slice(0, 200);
+    }
+    if (!group.summary && line.summary) group.summary = String(line.summary).replace(/\s+/g, " ").trim().slice(0, 200);
+    const sample = line.operationId || line.jobId || line.runId || line.pipelineId || line.tool || "";
     if (sample && group.samples.length < 3 && !group.samples.includes(sample)) group.samples.push(sample);
     groups.set(key, group);
   }
@@ -167,6 +272,7 @@ function formatIncidents({ days, read, groups, opencode }) {
   if (!groups.length) out.push("Nothing logged.");
   for (const group of groups) {
     out.push(`${group.level === "error" ? "ERROR" : "warn "} ${String(group.count).padStart(4)}x  ${group.event}${group.errorType ? ` [${group.errorType}]` : ""}  last ${group.lastAt}${group.samples.length ? `  (${group.samples.join(", ")})` : ""}`);
+    if (group.summary) out.push(`             ${group.summary}`);
   }
   if (recurring.length) {
     out.push("", "Draft log.md rows for the recurring ones (check each before adding it):");
@@ -230,6 +336,36 @@ function selfTest() {
     if (appendOpsLogLine(path.join(root, "\0bad"), { ts: now.toISOString(), event: "x" }) !== false) throw new Error("a bad path must not throw or report success");
     const health = opencodeDatabaseHealth({ XDG_DATA_HOME: root });
     if (health.warnings.length) throw new Error("no database, no warning");
+
+    // B-059: a junction (a symlink on POSIX) as <state>/logs is never written through, and
+    // retention never deletes a link named like an old log file. Junctions need no privilege.
+    const outside = path.join(root, "outside");
+    mkdirSync(outside);
+    const linkedState = path.join(root, "linked-state");
+    mkdirSync(linkedState);
+    symlinkSync(outside, logDirectory(linkedState), "junction");
+    if (appendOpsLogLine(linkedState, { ts: now.toISOString(), level: "warn", event: "x" }, { now }) !== false) throw new Error("a linked logs directory must refuse the write");
+    if (readdirSync(outside).length) throw new Error("nothing may be written through the logs link");
+    const pruneState = path.join(root, "prune-state");
+    mkdirSync(logDirectory(pruneState), { recursive: true });
+    writeFileSync(path.join(outside, "keep.txt"), "keep");
+    const oldName = path.join(logDirectory(pruneState), "bridge-2000-01-01.jsonl");
+    symlinkSync(outside, oldName, "junction");
+    writerState.pruned = "";
+    if (!appendOpsLogLine(pruneState, { ts: now.toISOString(), level: "warn", event: "x" }, { now })) throw new Error("a plain logs directory takes the line");
+    if (entryKind(oldName) !== "link" || !existsSync(path.join(outside, "keep.txt"))) throw new Error("retention must leave a link and its target alone");
+
+    // recordCliFailure: readable, redacted, exit code kept; skipped for a --self-test run
+    // without an explicit directory; never throws.
+    const cliState = path.join(root, "cli-state");
+    const failure = Object.assign(new Error(`Command failed: python -I -c ${"x".repeat(420)} ghp_FAKE0123456789abcdefFAKE0123456789abcd\nTraceback (most recent call last):\nFileNotFoundError: [Errno 2] No such file`), { code: "ENOENT" });
+    if (!recordCliFailure("sync-managed-runtime", failure, { stateDir: cliState, exitCode: 1, argv: ["node", "x.js"], now })) throw new Error("recordCliFailure must write");
+    const [cliLine] = readOpsLog(cliState, { days: 1 }).lines;
+    if (cliLine?.event !== "cli.sync-managed-runtime.failed" || cliLine.errorType !== "ENOENT" || cliLine.exitCode !== 1 || cliLine.summary.length !== 400) throw new Error(`cli line: ${JSON.stringify(cliLine)}`);
+    if (!/^FileNotFoundError/.test(cliLine.lastLine || "")) throw new Error("a long message keeps its last line");
+    if (JSON.stringify(readOpsLog(cliState, { days: 1 }).lines).includes("ghp_FAKE")) throw new Error("the CLI message must be redacted");
+    if (recordCliFailure("x", new Error("y"), { argv: ["node", "x.js", "--self-test"] }) !== false) throw new Error("a self-test without a state dir writes nothing");
+    if (recordCliFailure("x", null, { stateDir: path.join(root, "\0bad") }) !== false) throw new Error("recordCliFailure never throws");
     process.stdout.write("ops-log self-test passed.\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -258,4 +394,4 @@ if (isMainModule(import.meta.url)) {
   }
 }
 
-export { appendOpsLogLine, draftLogRow, formatIncidents, opencodeDatabaseHealth, readOpsLog, summarizeIncidents };
+export { appendOpsLogLine, draftLogRow, formatIncidents, opencodeDatabaseHealth, readOpsLog, recordCliFailure, redactCliText, summarizeIncidents };

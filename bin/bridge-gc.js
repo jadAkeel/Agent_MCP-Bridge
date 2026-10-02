@@ -15,6 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { detachWorktreeLinks } from "./worktree-links.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 requireSelfTestRun(import.meta.url);
@@ -957,6 +958,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
+    recordCliFailure("bridge-gc", error);
     process.exitCode = 1;
   });
 }

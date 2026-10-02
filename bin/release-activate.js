@@ -65,6 +65,7 @@ import { buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 requireSelfTestRun(import.meta.url);
@@ -1647,6 +1648,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`\nrelease:activate failed: ${error?.message || error}\n`);
+    recordCliFailure("release-activate", error);
     process.exitCode = 1;
   });
 }

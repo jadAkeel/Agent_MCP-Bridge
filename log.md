@@ -14,6 +14,38 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-02
+
+### Operations log coverage (Claude, 2026-10-02)
+
+Branch `bridge/ops-log-coverage`, isolated worktree `<bridge-opslog2>` from `bridge/setup-cli`
+(`d9b7337`), with its own `npm ci`. Requirement from the owner: a developer who installs the
+bridge must find every error, from any stage (install, setup, doctor, tool call, agent run,
+crash), in the operations log afterwards, readable enough to act on. Covered by
+`tests/review-ops-log-coverage.js` (in `npm test` right after `tests/review-setup-cli.js`),
+`bin/ops-log.js --self-test`, and one added check each in `tests/review-setup-cli.js` and
+`tests/review-queue-features.js`.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-056 | The operations log missed every error a user sees from a tool call. A probe against a scratch state dir (bridge over stdio: an unknown tool, invalid arguments, `run_opencode_agent` with an unsafe `cwd`) got three failure answers and wrote no line; `logs/` was never created. The live state dir had no `logs/` folder after a day of real use. | `@modelcontextprotocol/sdk` 1.30.0 `McpServer` turns its own McpErrors (unknown tool, input validation) into `isError` results ("MCP error -32602: ..."), and the bridge's own refusals (`formatRejectedExecution`, `formatToolRefusal`) and agent-run failures are normal results carrying `errorType: <type>` / `Status: failed; error type: <type>`: none passes through `logEvent`. Queued jobs fail in the background, not as an answer. | `installMcpFailureLogging` wraps the connected stdio transport once (no change to the 26 handlers): `onmessage` remembers method, tool and start per request id (capped at 1000, dropped on answer or `notifications/cancelled`); `send` classifies each outgoing answer with the pure `describeFailedMcpMessage` and logs `mcp.request_failed` (JSON-RPC error or SDK "MCP error <code>"), `tool.refused` (isError, or an `errorType:` line in the head of the first text block) or `agent.run_failed` (run tools only), then forwards the message unchanged; it never throws. `commitQueueTerminalRecord` logs `queue.job_failed` once per durable failed record. `server.server.onerror` logs `mcp.protocol_error`. The readable text is `summary` (redacted, then cut to 400 characters), because `sanitizeLogValue` hashes `error/detail/reason/message`. `npm run incidents` prints each group's latest summary. | (this commit) | fixed |
+| B-057 | A bridge crash left nothing in the operations log. | No `uncaughtException`/`unhandledRejection` handler; stderr goes to the client and is lost. A rejected top-level await (failed integrity check or plugin policy at startup) is reported as an uncaught exception. | The real start path only (not an import, not `--self-test`) installs the handlers first, before the integrity check: `process.uncaught_exception` / `process.unhandled_rejection` (`origin`, `errorType` = code or name, `summary`, first 10 stack lines), the error still printed to stderr, then `process.exit(1)`; an `exit` handler adds `process.exited` with a non-zero `code`. `appendOpsLogLine` is synchronous, so the lines land before exit. | (this commit) | fixed |
+| B-058 | The `bin/` commands printed their failures to the terminal only. | No command wrote to the operations log. | `recordCliFailure(script, error, { stateDir, exitCode, argv })` in `bin/ops-log.js` (`cli.<script>.failed`, `errorType`, `summary`, `exitCode`, and `lastLine` when a long message ends in the real cause, such as a Python traceback). Called from the top-level catch of setup, daily-doctor, release-activate, sync-managed-runtime, live-smoke, release-gate, fresh-healthcheck, bridge-gc, state-audit and build-release, and for the non-exception failures: setup preflight (exit 1, with the failing prerequisite lines) and refused write (exit 2), doctor "attention required", a failed live smoke and a failed release-gate step. Directory: `--state-dir`, else the state dir of the checked entry (doctor, smoke) or setup's target, else `CODEX_OPENCODE_STATE_DIR`, else the default; a `--self-test` run without one writes nothing; a setup dry run writes only into an existing state dir. Redaction: bin/ had no shared redaction module and server.js (which imports ops-log.js) owns `redactSensitiveText`, so `redactCliText` is a minimum copy of its broad rules (private key blocks, Bearer/Basic, OAuth, JWT, sk-/gh*_/AIza keys, URL passwords, credential-named keys, token query parameters); keep it in step with `BROAD_LOG_REDACTIONS`. `tests/review-setup-cli.js` "missing codex" now expects the log line as the only write. | (this commit) | fixed |
+| B-059 | `appendOpsLogLine` followed a junction or symlink: a linked `<state-dir>/logs` or day file was written through, and retention could delete outside the state directory (independent review). | `mkdirSync`/`appendFileSync`/`statSync`/`rmSync` all follow links. | Before every write, `lstat` `logs` and today's file; a link (junction or symlink) or other non-regular entry drops the line (`false`). The file is opened with `O_NOFOLLOW` where the platform has it and checked with `fstat`. `pruneOldLogs` deletes only entries whose `lstat` is a regular file. | (this commit) | fixed |
+
+Corrections to the brief: `run_opencode_agent` with an unsafe `cwd` does not answer `isError`
+(it is a normal result with `errorType: unsafe_path`), and the unknown-tool and validation errors
+are `isError` results, not JSON-RPC `error` messages; both are classified as above. Only 4 bridge
+answers set `isError` at all, so an `isError`-only rule would have missed nearly every refusal.
+
+Verification: `node bin/ops-log.js --self-test` passed; `node tests/review-ops-log-coverage.js`
+passed 6 of 6 (one optional part skipped: a file symlink needs Developer Mode or admin; the
+junction case runs). Final `npm test` with scratch HOME/USERPROFILE, CODEX_HOME, Claude config dir
+and bridge state: `Self tests passed.` and
+`Total skipped: 4 across 10 reporting test file(s) (tests/review-ops-log-coverage.js 1, tests/review-spawn.js 1, tests/review-b030.js 1, tests/review2-e.js 1).`
+All skips optional; no required-skip override. The live state dir still has no `logs/` folder
+afterwards. `git diff --check` passed.
+
 ## 2026-10-01
 
 ### One-command setup (Claude, 2026-10-01)

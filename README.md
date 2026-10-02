@@ -64,6 +64,8 @@ Run these from `<bridge-dir>`.
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
+Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them.
+
 ## Status
 
 - Production-tested: the owner's daily use from Codex and Claude Code on Windows 11, and the release gate `npm run test:release`.

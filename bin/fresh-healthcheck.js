@@ -13,6 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
+import { recordCliFailure } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -536,6 +537,7 @@ async function main() {
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.message || String(error)}\n`);
+    recordCliFailure("fresh-healthcheck", error);
     process.exitCode = 1;
   });
 }
