@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { readBridgeSource } from "../tests/bridge-source.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { builderFallbackEligible, runBuilderModelFallback, terminationContained } from "./builder-model-fallback.js";
@@ -52,7 +53,7 @@ test("an uncontained Windows termination is not eligible", () => {
 });
 
 test("server.js passes the Windows containment fields into the run result", () => {
-  const server = readFileSync(new URL("../server.js", import.meta.url), "utf8");
+  const server = readBridgeSource();
   assert.match(server, /containmentGuarantee: result\.containmentGuarantee \|\| ""/);
   assert.match(server, /terminationBestEffortSucceeded: result\.terminationBestEffortSucceeded === true/);
 });
