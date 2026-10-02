@@ -227,13 +227,13 @@ The same bridge works from Claude Code. It was registered once with the same com
 claude mcp get opencode
 ```
 
-If it is missing, or the bridge fails to start with `External plugin manifest hash mismatch` or a `server.js` hash mismatch, run the sync (it reads the active entry from `~/.codex/config.toml`):
+If it is missing, or the bridge fails to start with `External plugin manifest hash mismatch`, a `server.js` hash mismatch, `lib/ does not match CODEX_OPENCODE_EXPECTED_LIB_SHA256`, or `CODEX_OPENCODE_EXPECTED_LIB_SHA256 is not set`, run the sync (it reads the active entry from `~/.codex/config.toml`):
 
 ```bash
 npm run release:activate -- --sync-clients
 ```
 
-The sync first re-pins `CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256` from the manifest file itself (a model switch or an OpenCode upgrade regenerates the manifest, so the hash is never copied by hand) and `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` from the `server.js` the entry points at (this only moves while the entry runs a working tree instead of an immutable release), health-checks the result, then re-registers Claude Code with the same command and environment. Every `release:activate` does both automatically, so both clients always run the same release. Restart the Claude Code session afterwards. Claude's delegation rules live in `~/.claude/CLAUDE.md` (a copy is kept in `claude/CLAUDE.md`). Codex and Claude Code may work on the same repository at the same time: locks and the provider limit are shared, so overlapping writers wait or fail with a clear lock message.
+The sync first re-pins `CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256` from the manifest file itself (a model switch or an OpenCode upgrade regenerates the manifest, so the hash is never copied by hand), `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` from the `server.js` the entry points at, and `CODEX_OPENCODE_EXPECTED_LIB_SHA256` from the `lib/` folder next to it (these two only move while the entry runs a working tree instead of an immutable release), health-checks the result, then re-registers Claude Code with the same command and environment. The lib pin exists since the server.js split (log.md B-092): most of the bridge's code lives in `lib/`, so the server pin alone no longer covers it. A config written before the split has no lib pin yet; a server-pinned bridge started from it refuses to start until the first sync adds the line. Every `release:activate` does both automatically, so both clients always run the same release. Restart the Claude Code session afterwards. Claude's delegation rules live in `~/.claude/CLAUDE.md` (a copy is kept in `claude/CLAUDE.md`). Codex and Claude Code may work on the same repository at the same time: locks and the provider limit are shared, so overlapping writers wait or fail with a clear lock message.
 
 ---
 
@@ -526,7 +526,7 @@ The command prints `Writers unblocked: yes`, or names another operation that sti
 
 ## 12. Updating and rolling back
 
-The client entry runs either this checkout or a **release folder**, and in both cases the `server.js` hash is pinned in `~/.codex/config.toml` (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`). A release is the stricter profile, and a release builds from any clone (log.md B-037; ONBOARDING step 15). A new install may still run the checkout, re-pinned with `npm run release:activate -- --sync-clients` after every change to `server.js`.
+The client entry runs either this checkout or a **release folder**, and in both cases the `server.js` hash and the digest of the `lib/` folder next to it are pinned in `~/.codex/config.toml` (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, `CODEX_OPENCODE_EXPECTED_LIB_SHA256`; REFERENCE "lib/ pin"). A release is the stricter profile, and a release builds from any clone (log.md B-037; ONBOARDING step 15). A new install may still run the checkout, re-pinned with `npm run release:activate -- --sync-clients` after every change to `server.js` or a file under `lib/`; `npm run doctor` reports a stale pin as `Failure [server-pin]` or `Failure [lib-pin]`.
 
 ### Changing bridge code, agent profiles, or skills
 
@@ -635,6 +635,7 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git,npm,node,pnpm,yarn,python,pytest` | Programs a job's `validationCommand` may start. The built-in default is `git` only. |
 | `CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS` | default (30 min) | Reuses agent and plugin checks between jobs. Any change to an agent, skill, or config file resets it. `0` turns it off. |
 | `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | release hash | Pins the exact bridge build. It must match the release. |
+| `CODEX_OPENCODE_EXPECTED_LIB_SHA256` | written by the sync | Pins the `lib/` folder next to that `server.js` (the bridge's modules since the split). Required with the server pin unless a release manifest pin is set; never copied by hand. |
 | `startup_timeout_sec` / `tool_timeout_sec` | `120` / `3000` | Needed so long agent jobs are not cut off at 60 s. `3000` fits the built-in timeouts; a 45 min builder with a 15 min validation needs `5100`, which is the operator's current value. See [Timeouts](#timeouts). |
 
 ### Timeouts

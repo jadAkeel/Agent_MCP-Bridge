@@ -652,11 +652,16 @@ test("D12 blocked roots compare case-insensitively on win32", async () => {
 
 test("D13 verifyReleaseIntegrity hashes server.js, not the importer or argv[1]", async () => {
   const expected = createHash("sha256").update(await readFile(BRIDGE_SERVER_PATH)).digest("hex");
+  // B-092: a server pin without the lib/ pin is refused, so the test pins both.
+  const { libDigest } = await import("../bin/lib-digest.js");
+  const expectedLib = (await libDigest(path.dirname(BRIDGE_SERVER_PATH))).sha256;
   const previousExpected = process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256;
+  const previousLib = process.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256;
   const previousManifest = process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
   const previousArgv1 = process.argv[1];
   try {
     process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = expected;
+    process.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256 = expectedLib;
     delete process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
     await verifyReleaseIntegrity();
     process.argv[1] = "";
@@ -665,6 +670,8 @@ test("D13 verifyReleaseIntegrity hashes server.js, not the importer or argv[1]",
     process.argv[1] = previousArgv1;
     if (previousExpected === undefined) delete process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256;
     else process.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = previousExpected;
+    if (previousLib === undefined) delete process.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256;
+    else process.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256 = previousLib;
     if (previousManifest !== undefined) process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 = previousManifest;
   }
 });

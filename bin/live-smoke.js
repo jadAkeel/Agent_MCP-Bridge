@@ -155,11 +155,14 @@ async function main() {
   const env = { ...process.env, ...entry.env };
   // A --server override means "test this candidate", so the production hash pins
   // that belong to the active release are dropped; the report says so explicitly.
+  // B-092: the lib/ pin belongs to the same active tree as the server pin, so it goes with it
+  // (left behind, it would make the candidate refuse to start over the active tree's lib/).
   const candidateUnpinned = Boolean(options.serverPath)
-    && (Boolean(env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256) || Boolean(env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256));
+    && (Boolean(env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256) || Boolean(env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256) || Boolean(env.CODEX_OPENCODE_EXPECTED_LIB_SHA256));
   if (options.serverPath) {
     delete env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256;
     delete env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
+    delete env.CODEX_OPENCODE_EXPECTED_LIB_SHA256;
   }
   let modelRequirement = null;
   if (options.model) {
@@ -260,7 +263,7 @@ async function main() {
     const lines = [
       `Live smoke: ${report.ok ? "passed" : "FAILED"}`,
       `Server: ${report.serverPath}`,
-      ...(report.candidateUnpinned ? ["Pins: production server/release hash pins removed because --server names a candidate"] : []),
+      ...(report.candidateUnpinned ? ["Pins: production server/lib/release hash pins removed because --server names a candidate"] : []),
       `Health: ${report.health.status} (connect ${report.health.connectMs} ms, status ${report.health.durationMs} ms)${report.health.integrity ? `; integrity ${report.health.integrity}` : ""}${report.health.externalPlugins ? `; external plugins ${report.health.externalPlugins}` : ""}`,
     ];
     lines.push(`Cleanup: smoke project database ${report.cleanup?.removed ? "removed" : `kept (${report.cleanup?.reason || "unknown"})`}`);

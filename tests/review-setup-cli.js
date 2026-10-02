@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findCommand, parseArguments, preflight, runSetup } from "../bin/setup.js";
 import { loadMcpEntry } from "../bin/fresh-healthcheck.js";
+import { libDigest } from "../bin/lib-digest.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const scratch = await realpath(await mkdtemp(path.join(tmpdir(), "review-setup-cli-")));
@@ -81,6 +82,8 @@ try {
     assert.equal(entry.command, process.execPath);
     assert.deepEqual(entry.args, [path.join(ROOT, "server.js")]);
     assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, hash(await readFile(entry.args[0])));
+    // B-092: lib/ next to that server.js is pinned too, or the bridge (and the smoke below) refuses to start.
+    assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256, (await libDigest(path.dirname(entry.args[0]))).sha256);
     const expected = { CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "false", CODEX_OPENCODE_WORKTREE_MODE: "write", CODEX_OPENCODE_WORKTREE_ROOT: "global",
       CODEX_OPENCODE_QUEUE_MODE: "sqlite", CODEX_OPENCODE_QUEUE_RETENTION_DAYS: "30", CODEX_OPENCODE_SOURCE_DIRT_POLICY: "unrelated_ok",
       CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT: "3", CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST: "git", CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE: "false" };

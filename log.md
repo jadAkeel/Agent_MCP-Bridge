@@ -19,11 +19,26 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 ### server.js split: integrity of lib/ (Claude, 2026-10-02)
 
 Branch `bridge/server-modules`, worktree `<bridge-modules>`, on the split (`457a86b`, M-001):
-`server.js` is 22,115 lines and imports 25 modules under `lib/` statically.
+`server.js` is 22,115 lines and imports 25 modules under `lib/` statically. Tests:
+`tests/review-split-lib-pin.js` (in `npm test` right after `tests/review-flex-queue-worker.js`,
+9 cases; its two refusal cases were checked to fail without the `server.js` change), plus the
+self-tests of `bin/release-activate.js`, `bin/fresh-healthcheck.js`, `bin/setup.js`,
+`bin/release-gate.js`, `bin/build-release.js`, `bin/daily-doctor.test.js`,
+`tests/review-setup-cli.js` and D13 of `tests/review-queue.js`.
 
 | ID | Problem | Cause | Fix | Commit | Status |
 |---|---|---|---|---|---|
-| B-093 | `node bin/release-gate.js --self-test` failed with `ENOENT ... lstat '...\release-gate-self-test-XXXX\source\lib'`. | The split made `lib` a publish entry (`LEGACY_PUBLISH_ENTRIES`), and the source-tree digest refuses a missing entry, but the self-test's source fixture had no `lib/`. The fixtures of `bin/build-release.js` and `bin/release-activate.js` (checked build) passed their own entry lists, which lacked `tests`. | `writeSourceFixture` writes `lib/module.js`, and the self-test proves a missing `lib/` is not digested as absent. Both other fixtures now build from `LEGACY_PUBLISH_ENTRIES` itself (plus a `tests/` file and a nested `lib/queue/store.js`), so they cannot drift from what a release copies. `tests/review-b037-portable-release.js` checks out the committed tree, which holds `lib/`, so it already matched. | (this commit) | fixed |
+| B-092 | The `server.js` pin no longer covered the bridge's code: after the split about 9,000 lines live in `lib/**/*.js`, so a `lib/` file changed after `--sync-clients` kept starting in both clients (which run the working-tree `server.js`), and `npm run doctor` said the pin was fine. | `verifyReleaseIntegrity` hashes `server.js` only (`CODEX_OPENCODE_EXPECTED_SERVER_SHA256`); the release manifest covers `lib/` only for an immutable release with `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256`, which the hybrid and working-tree profiles leave unset. | New pin `CODEX_OPENCODE_EXPECTED_LIB_SHA256`: SHA-256 over the sorted `lib/**` regular files, one `<relative posix path>\0<sha256>\n` entry each, a link or junction anywhere under `lib/` refused (lstat). One implementation, `bin/lib-digest.js` (`libDigest`, `libPinError`), imported by `server.js` and the `bin/` tools. `verifyReleaseIntegrity` checks it right after the server pin: a set lib pin must match; a server pin without a lib pin while `lib/` exists next to `server.js` (and no manifest pin) refuses to start naming `npm run release:activate -- --sync-clients`; a manifest pin covers `lib/` without it; with neither pin nothing is read. Writers from the same tree as the server pin: `rewriteConfig` (inserts the line after the server pin when a config predates it, replaces it, or removes it for a tree without `lib/`; `assertRewritePreservesConfig` allows it), `repinnableLibSha256` (a working tree's digest; an immutable release's `lib/` only while it equals its manifest file for file), `--sync-clients` and activation (`refreshIntegrityPins`, the candidate parse-back check), the Claude Code entry (copied from the Codex entry), `npm run setup`. The re-pin's clean-tree report covers `lib/` and is also printed when only the lib pin moved; `bridgeWorkingTreeStatus` also lists git-ignored files under `lib/` (the digest includes them, a build copies them). Readers: doctor check `lib-pin`, the fresh health check (server-pinned and manifest-pinned candidates), `bin/live-smoke.js --server` drops it with the server pin. The `bin/release-activate.js` checked-build fixture now builds from `LEGACY_PUBLISH_ENTRIES` (B-093). Docs: REFERENCE "lib/ pin", USER_GUIDE sections 7b, 12 and its variable table, ONBOARDING step 7. | (this commit) | fixed |
+| B-093 | `node bin/release-gate.js --self-test` failed with `ENOENT ... lstat '...\release-gate-self-test-XXXX\source\lib'`. | The split made `lib` a publish entry (`LEGACY_PUBLISH_ENTRIES`), and the source-tree digest refuses a missing entry, but the self-test's source fixture had no `lib/`. The fixtures of `bin/build-release.js` and `bin/release-activate.js` (checked build) passed their own entry lists, which lacked `tests`. | `writeSourceFixture` writes `lib/module.js`, and the self-test proves a missing `lib/` is not digested as absent. The build-release fixture builds from `LEGACY_PUBLISH_ENTRIES` itself (plus a `tests/` file and a nested `lib/queue/store.js`); the release-activate one does too since B-092's commit. `tests/review-b037-portable-release.js` checks out the committed tree, which holds `lib/`, so it already matched. | `3a87ff4` | fixed |
+
+Deploy: the first `npm run release:activate -- --sync-clients` after this merge writes the lib
+pin into both client configs (the Codex config gains the line after the server pin; the Claude
+Code entry is re-registered with it). Until then a client bridge started from the new tree with
+the old config refuses to start with the `--sync-clients` hint. Open: the bridge also loads a few
+`bin/` modules (`bin/ops-log.js`, `bin/worktree-links.js`, `bin/direct-run-audit.js`,
+`bin/builder-model-fallback.js`, `bin/plugin-manifest-paths.js`, `bin/lib-digest.js`, and
+`bin/sync-managed-runtime.js` and `bin/process-supervisor.js` at run time); in the working-tree
+and hybrid profiles no pin covers them (true before the split as well).
 
 ### Unattended queue worker (Claude, 2026-10-02)
 

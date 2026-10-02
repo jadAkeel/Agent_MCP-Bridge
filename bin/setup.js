@@ -137,13 +137,16 @@ async function runSetup(options, dependencies = {}) {
   const env = { ...(dependencies.env || process.env), CODEX_HOME: options.codexHome, CLAUDE_CONFIG_DIR: path.dirname(options.claudeConfigPath), XDG_CONFIG_HOME: options.runtimeDir };
   const checked = preflight(options, { ...dependencies, env, log });
   if (!checked.ok) return 1;
-  const { clientToolTimeoutSeconds, rewriteCodexConfig, rewriteClaudeConfig, repinnableServerSha256, syncClaudeCodeEntry, replaceConfigAtomically } = await import("./release-activate.js");
+  const { clientToolTimeoutSeconds, rewriteCodexConfig, rewriteClaudeConfig, repinnableLibSha256, repinnableServerSha256, syncClaudeCodeEntry, replaceConfigAtomically } = await import("./release-activate.js");
   const { runSync, assertNoLinkedComponents } = await import("./sync-managed-runtime.js");
   const { resolvePluginManifestEntryPath } = await import("./plugin-manifest-paths.js");
   const { createHash } = await import("node:crypto");
   const hash = (content) => createHash("sha256").update(content).digest("hex");
   const source = path.join(ROOT, "opencode");
   const runtime = path.join(options.runtimeDir, "opencode");
+  // B-092: lib/ is pinned with server.js, from the same checkout; a server pin without it
+  // would make the bridge refuse to start.
+  const libSha256 = await repinnableLibSha256(path.join(ROOT, "server.js"));
   const bridgeEnv = {
     XDG_CONFIG_HOME: options.runtimeDir,
     CODEX_OPENCODE_AGENT_DIR: path.join(runtime, "agents"),
@@ -159,6 +162,7 @@ async function runSetup(options, dependencies = {}) {
     CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST: "git",
     CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE: "false",
     CODEX_OPENCODE_EXPECTED_SERVER_SHA256: await repinnableServerSha256(path.join(ROOT, "server.js")),
+    ...(libSha256 ? { CODEX_OPENCODE_EXPECTED_LIB_SHA256: libSha256 } : {}),
   };
   const files = [];
   const planned = new Map();
@@ -283,6 +287,10 @@ async function selfTest() {
     assert.equal(dry, 0);
     assert.equal(existsSync(options.codexHome), false, "dry-run creates no directories");
     assert.match(messages.join("\n"), /No files written/);
+    // B-092: the planned entry pins lib/ next to server.js, with this checkout's digest.
+    const { libDigest } = await import("./lib-digest.js");
+    const libSha256 = (await libDigest(ROOT)).sha256;
+    assert.match(messages.join("\n"), new RegExp(`CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = "[a-f0-9]{64}"\\nCODEX_OPENCODE_EXPECTED_LIB_SHA256 = "${libSha256}"`));
     selfTestPassed("setup");
   } finally { await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 }

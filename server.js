@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createDirectRunAudit, directRunMetrics } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { resolvePluginManifestEntryPath } from "./bin/plugin-manifest-paths.js";
+import { libPinError } from "./bin/lib-digest.js";
 import { LIKELY_SECRET_PATTERNS, redactLikelySecrets, redactSensitiveText, patchLikelySecretLines, sanitizePersistedValue, sanitizeLogValue, failureSummary } from "./lib/redaction.js";
 import { binaryTextFilesInPatch, patchFileEntries, diffStatFromPatch } from "./lib/git-patch.js";
 import { createBridgeConfig } from "./lib/config.js";
@@ -20465,6 +20466,14 @@ async function verifyReleaseIntegrity() {
     if (actual !== expected) {
       throw new Error(`Bridge release integrity check failed. Expected ${expected}, got ${actual}.`);
     }
+  }
+  // B-092: since the split server.js imports most of the bridge from lib/, so the server pin
+  // alone no longer covers the code that runs. CODEX_OPENCODE_EXPECTED_LIB_SHA256 pins lib/
+  // (bin/lib-digest.js); a server-pinned entry without it fails closed, a manifest-pinned
+  // release is covered by its manifest, and with neither pin nothing is checked.
+  const libError = await libPinError(BRIDGE_RUNTIME_DIR, process.env);
+  if (libError) {
+    throw new Error(`Bridge release integrity check failed. ${libError}`);
   }
   await verifyReleaseManifest(BRIDGE_RUNTIME_DIR);
   if (String(process.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim()) {
