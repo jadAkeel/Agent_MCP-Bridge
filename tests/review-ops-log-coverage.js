@@ -231,7 +231,8 @@ test("B-057 a bridge that dies at startup leaves process.uncaught_exception and 
   assert.ok(crash, JSON.stringify(lines));
   assert.equal(crash.origin, "unhandledRejection");
   assert.equal(crash.errorType, "Error");
-  assert.match(crash.summary, /^Bridge release integrity check failed\. Expected 0{64}, got [a-f0-9]{64}\.$/);
+  // B-104: the summary goes on to name server.js and the --sync-clients remedy.
+  assert.match(crash.summary, /^Bridge release integrity check failed\. Expected 0{64}, got [a-f0-9]{64}\. server\.js \(.*\) does not match CODEX_OPENCODE_EXPECTED_SERVER_SHA256/);
   assert.match(crash.stack, /verifyReleaseIntegrity/);
   const exited = lines.find((line) => line.event === "process.exited");
   assert.ok(exited && exited.code === 1, JSON.stringify(lines));
