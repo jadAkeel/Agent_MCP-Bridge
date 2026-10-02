@@ -73,7 +73,9 @@ CODEX_OPENCODE_READ_ONLY_RETRY_BASE_DELAY_MS = "1000"
 CODEX_OPENCODE_READ_ONLY_RETRY_MAX_ELAPSED_MS = "480000"
 # Model calls allowed at once across all sessions (per provider, or per account pool when
 # CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY is set, as below). 4 is the operator's current value;
-# the built-in default is 2.
+# the built-in default is 2. The bridge refuses to start when the key is set together with
+# CODEX_OPENCODE_EXTERNAL_RUNNERS, CODEX_OPENCODE_PROVIDER_LIMITS or CODEX_OPENCODE_QUOTA_GROUPS
+# (B-143): remove the key line to use those.
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "4"
 CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY = "reviewed-provider-account-pool"
 CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git"
