@@ -76,6 +76,8 @@ if (process.argv.includes("--child")) {
     result.secondFiles = await listFiles(second);
   } else if (scenario === "default-use") {
     const env = buildTrustedGitEnv();
+    // B-073: without an override a self-test's state directory is its own temporary folder.
+    result.bridgeStateDir = __selfTest.internals.effectiveBridgeStateDirectory();
     result.config = env.GIT_CONFIG_GLOBAL;
     result.content = await readFile(env.GIT_CONFIG_GLOBAL, "utf8");
   } else if (scenario === "no-user-config") {
@@ -155,12 +157,13 @@ test("R-173: the gitconfig is created on first use under stateDirectoryOverride,
   assert.deepEqual(result.afterUse ?? [], [], "the default state directory is still untouched after use");
 });
 
-test("R-173: with no override the first use creates the file in the default state directory", async () => {
+test("R-173: with no override the first use creates the file in the bridge state directory (B-073: a self-test's temporary one)", async () => {
   const result = await runChild("default-use");
   assert.deepEqual(result.afterImport ?? [], []);
-  assert.ok(samePath(path.dirname(result.config), result.defaultStateDir), `${result.config} is not in ${result.defaultStateDir}`);
+  assert.ok(samePath(path.dirname(result.config), result.bridgeStateDir), `${result.config} is not in ${result.bridgeStateDir}`);
+  assert.ok(!samePath(result.bridgeStateDir, result.defaultStateDir), "a self-test never uses <home>/.codex/codex-opencode-mcp");
   assert.equal(result.content, "[core]\n\tautocrlf = true\n");
-  assert.deepEqual(result.afterUse, [path.basename(result.config)]);
+  assert.deepEqual(result.afterUse ?? [], [], "the operator's default state directory stays untouched");
 });
 
 test("R-173: without an operator line-ending config bridge Git gets the null config and nothing is written", async () => {

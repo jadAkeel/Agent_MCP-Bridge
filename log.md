@@ -37,6 +37,12 @@ feature commits name Q-005..Q-010 as B-062..B-067 (renamed here, before the merg
 | Q-009 | A builder could not run `node tools/validate.cjs` on the batch it wrote (round 3). | The managed builder profile allows only git diagnostics in bash; the attestation refuses any other allow rule. | `scopeContract.selfCheckCommands` (1 to 8, builder/debugger write jobs): exact commands that pass the `validationCommand` rules, written without wildcard, quote, backslash or shell operator, and that run no script (interpreters) or package.json scripts (npm, pnpm, yarn) the job may edit. For that run only, an AsyncLocalStorage overlay sets `OPENCODE_CONFIG_CONTENT` with exact bash allow rules for the agent; `buildOpenCodeEnv` adds it, the attestation cache key includes it, and the effective-permission check accepts exactly those rules. The prompt lists the commands. Refused in `run_opencode_parallel`. OpenCode 1.18.32 was checked (real `debug agent`, scratch XDG home) to append the rules after the profile's `"*": deny`. `tests/review-flex-self-check.js`. | `c43bf04` | fixed |
 | Q-010 | Landing each new-file batch took a dry run, an apply and a receipt (I-002 made it one pair per batch of up to 25). | Writer output is never merged without a reviewed receipt. | `enqueue_opencode_job` takes `autoIntegrate: true` (write jobs with a `validationCommand`; env `CODEX_OPENCODE_AUTO_INTEGRATE=false` refuses it). When such a job completed and every file of its patch is new, the bridge runs the `integrate_opencode_worktree` engine itself (dry run with the new structured `patchFiles`, receipt-bound apply, validation in the target, rollback, worktree cleanup), then commits exactly those files by pathspec with the author of the target's last commit (unsigned, hooks off). One repository at a time; an in-place writer or another integration on the files makes it wait (`waiting_for_lock`, retried every minute for an hour). Any other patch is `skipped_not_new_files` and keeps the reviewed flow. The record carries `autoIntegration` (list line `autoIntegration=committed@<commit>`). `tests/review-flex-auto-integrate.js`. | `941ad00` | fixed |
 
+Review fixes (independent review of this branch, 2026-10-02):
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-073 | Test suites wrote into the operator's `~/.codex/codex-opencode-mcp` (job rows of scratch repositories, databases holding only a `bridge_instances` row, the new `provider_pause_strikes` table, and with Q-006 `logs/issues.md`). | Most suites set only `hooks.stateDirectoryOverride`; a timer that fires after their cleanup reset it (queue heartbeat, scheduler pass, retry, recovery) fell back to the default state directory. | A process started with `--self-test` and without `CODEX_OPENCODE_STATE_DIR` gets a per-process `mkdtemp` state directory under `os.tmpdir()` (`codex-opencode-selftest-state-<pid>-...`, removed at exit, best effort), and the variable is set so child processes share it. A normal start is unchanged. `tests/review-flex-state-isolation.js`; `tests/review2-i.js` "default-use" now expects the bridge's (temporary) state directory and an untouched `<home>/.codex/codex-opencode-mcp`. | (this commit) | fixed |
+
 Not built here: external CLI runners (feature 9) and an unattended queue worker (feature 10) were
 handed to a separate design session. Open: the rate-limit watcher matches file lines without a
 session id by provider, model and agent, so another process's rate limit on the same model and
@@ -44,7 +50,7 @@ account (another OpenCode session) can stop a silent bridge run; that is the sam
 but it is not proof for that run. A `startAfter` is kept when a pause is resumed by another bridge
 process (only this process's waiting retries are released).
 
-Found while testing (open, not fixed here): tests that set only `hooks.stateDirectoryOverride`
+Found while testing (fixed by B-073 below): tests that set only `hooks.stateDirectoryOverride`
 and not `CODEX_OPENCODE_STATE_DIR` (`tests/review-queue-features.js`, `review-round5.js`,
 `review-provider-quota.js` and others) write into the operator's `~/.codex/codex-opencode-mcp`
 when a timer fires after their cleanup reset the override: during this session the live state
@@ -54,7 +60,7 @@ holding only a `bridge_instances` row, and the new empty `provider_pause_strikes
 `provider-concurrency.sqlite`. All are inert (scratch paths, no rows; `npm run gc:apply` prunes
 the dead databases). The `review-flex-*` tests set `CODEX_OPENCODE_STATE_DIR` to a scratch folder
 before importing the bridge (`tests/flex-fixture.js`); the other tests need the same, or a
-self-test run without the variable should default to a temporary state directory.
+self-test run without the variable should default to a temporary state directory, which B-073 does.
 
 ### Operations log coverage (Claude, 2026-10-02)
 

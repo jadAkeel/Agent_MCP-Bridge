@@ -9,7 +9,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -135,8 +135,23 @@ const REQUIRED_MANAGED_SKILLS = Object.freeze([
   "test-failure-diagnosis",
 ]);
 const PARALLEL_LOCK_TYPES = new Set(["read", "write", "serial_integration"]);
+// B-073: a self-test run without CODEX_OPENCODE_STATE_DIR gets a per-process temporary state
+// directory, never the operator's ~/.codex/codex-opencode-mcp. Suites that set only
+// hooks.stateDirectoryOverride fell back to the operator's directory whenever a timer fired after
+// their cleanup reset the override (job rows, empty databases and schema changes landed there).
+// The variable is set too, so a child process started with this environment shares the folder.
+const SELF_TEST_TEMP_STATE_DIR = process.argv.some((argument) => String(argument).startsWith("--self-test"))
+  && !String(process.env.CODEX_OPENCODE_STATE_DIR || "").trim()
+  ? mkdtempSync(path.join(tmpdir(), `codex-opencode-selftest-state-${process.pid}-`))
+  : "";
+if (SELF_TEST_TEMP_STATE_DIR) {
+  process.env.CODEX_OPENCODE_STATE_DIR = SELF_TEST_TEMP_STATE_DIR;
+  process.once("exit", () => {
+    try { rmSync(SELF_TEST_TEMP_STATE_DIR, { recursive: true, force: true }); } catch { /* Best effort; it is in the temp folder. */ }
+  });
+}
 const GLOBAL_BRIDGE_STATE_DIR = path.resolve(
-  String(process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
+  String(SELF_TEST_TEMP_STATE_DIR || process.env.CODEX_OPENCODE_STATE_DIR || path.join(CODEX_STATE_HOME, "codex-opencode-mcp")).trim()
 );
 const DISABLED_GIT_HOOKS_PATH = path.join(
   GLOBAL_BRIDGE_STATE_DIR,
@@ -28961,6 +28976,8 @@ export const __selfTest = {
     autoIntegrateJobError,
     autoIntegrateQueueJob,
     patchFileEntries,
+    SELF_TEST_TEMP_STATE_DIR,
+    effectiveBridgeStateDirectory,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
