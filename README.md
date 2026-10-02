@@ -71,7 +71,7 @@ Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.c
 
 ## Unattended runs
 
-A bridge lives only as long as its MCP client, so a batch of hundreds of queued jobs used to need a client open for hours. `npm run worker -- --repo <project> --enqueue jobs.jsonl --env-from codex` runs the bridge's own queue for one repository without a client: write one `enqueue_opencode_job` input per line (each with an `idempotencyKey`), start the worker, watch it with `list_opencode_jobs` or `--status`, and stop it with `--stop` (`--now` cancels the running jobs) or Ctrl+C; `--until-empty` exits when the queue is done. Retries, fallback models, pauses and auto-integration work as in a client ([USER_GUIDE section 8](docs/USER_GUIDE.md#unattended-runs-queue-worker), [REFERENCE](docs/REFERENCE.md#queue-worker-binqueue-workerjs)).
+A bridge lives only as long as its MCP client, so a batch of hundreds of queued jobs used to need a client open for hours. `npm run worker -- --repo <project> --enqueue jobs.jsonl --env-from codex` runs the bridge's own queue for one repository without a client: write one `enqueue_opencode_job` input per line (each with an `idempotencyKey`), start the worker, watch it with `list_opencode_jobs` or `--status`, and stop it with `--stop` (`--now` cancels the running jobs) or Ctrl+C; jobs a stopped worker leaves behind stay parked for the next worker until `--release` hands them to the clients; `--until-empty` exits when the queue is done. Retries, fallback models, pauses and auto-integration work as in a client ([USER_GUIDE section 8](docs/USER_GUIDE.md#unattended-runs-queue-worker), [REFERENCE](docs/REFERENCE.md#queue-worker-binqueue-workerjs)).
 
 ## Status
 
