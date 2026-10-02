@@ -12,6 +12,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { libDigest, libPinError } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { recordCliFailure } from "./ops-log.js";
 
@@ -183,6 +184,12 @@ async function validateCandidateReleaseEntry(entry) {
   const expectedServerSha256 = requiredSha256(env, "CODEX_OPENCODE_EXPECTED_SERVER_SHA256");
   if (await sha256File(serverPath) !== expectedServerSha256) {
     throw new Error("Candidate bridge server does not match CODEX_OPENCODE_EXPECTED_SERVER_SHA256.");
+  }
+  // B-092: the candidate's lib/ by the bridge's own startup rule, so a candidate the bridge
+  // would refuse (stale lib pin, or a server-pinned entry with an unpinned lib/) is not healthy.
+  const libError = await libPinError(releaseRoot, env);
+  if (libError) {
+    throw new Error(`Candidate bridge lib/ check failed: ${libError}`);
   }
 
   const expectedReleaseManifestSha256 = optionalSha256(env, "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256");
@@ -484,6 +491,39 @@ async function runSelfTest() {
       /CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 .* does not match/,
       "a stale plugin manifest pin is not healthy in server-pinned mode"
     );
+
+    // B-092: a candidate with lib/ next to server.js. Server-pinned, the lib pin is required and
+    // must match; manifest-pinned, the manifest covers lib/, so the lib pin is checked when set
+    // but never required.
+    const releaseLibDir = path.join(releaseRoot, "lib");
+    await mkdir(path.join(releaseLibDir, "queue"), { recursive: true });
+    await writeFile(path.join(releaseLibDir, "module.js"), "// module\n", "utf8");
+    await writeFile(path.join(releaseLibDir, "queue", "store.js"), "// store\n", "utf8");
+    const libSha256 = (await libDigest(releaseRoot)).sha256;
+    const healthcheck = () => runFreshHealthcheck({ configPath, cwd: fixture, timeoutMs: 10_000 });
+    await writeCandidateConfig(serverPinnedEnv);
+    await assert.rejects(healthcheck(), /Candidate bridge lib\/ check failed: .*CODEX_OPENCODE_EXPECTED_LIB_SHA256 is not set.*npm run release:activate -- --sync-clients/s);
+    await writeCandidateConfig({ ...serverPinnedEnv, CODEX_OPENCODE_EXPECTED_LIB_SHA256: libSha256 });
+    assert.equal((await healthcheck()).integrityMode, "server-pinned");
+    await writeCandidateConfig({ ...serverPinnedEnv, CODEX_OPENCODE_EXPECTED_LIB_SHA256: "0".repeat(64) });
+    await assert.rejects(healthcheck(), /lib\/ does not match CODEX_OPENCODE_EXPECTED_LIB_SHA256/);
+    const writeReleaseManifest = async () => {
+      await writeFile(releaseManifestPath, `${JSON.stringify({ version: 1, files: releaseDigests }, null, 2)}\n`, "utf8");
+      candidateEnv.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 = await sha256File(releaseManifestPath);
+    };
+    for (const relative of ["lib/module.js", "lib/queue/store.js"]) releaseDigests[relative] = await sha256File(path.join(releaseRoot, ...relative.split("/")));
+    await writeReleaseManifest();
+    await writeCandidateConfig(candidateEnv);
+    assert.equal((await healthcheck()).integrityMode, "immutable-release", "the manifest pin covers lib/ without a lib pin");
+    await writeCandidateConfig({ ...candidateEnv, CODEX_OPENCODE_EXPECTED_LIB_SHA256: libSha256 });
+    assert.equal((await healthcheck()).integrityMode, "immutable-release");
+    await writeCandidateConfig({ ...candidateEnv, CODEX_OPENCODE_EXPECTED_LIB_SHA256: "0".repeat(64) });
+    await assert.rejects(healthcheck(), /lib\/ does not match CODEX_OPENCODE_EXPECTED_LIB_SHA256/, "a lib pin next to the manifest pin is still checked");
+    await rm(releaseLibDir, { recursive: true });
+    delete releaseDigests["lib/module.js"];
+    delete releaseDigests["lib/queue/store.js"];
+    await writeReleaseManifest();
+
     await writeCandidateConfig(candidateEnv);
     await writeCandidateConfig({ ...candidateEnv, CODEX_OPENCODE_AGENT_DIR: path.join(fixture, "mutable-agents") });
     await assert.rejects(

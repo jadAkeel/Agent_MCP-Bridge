@@ -351,13 +351,17 @@ function parseArguments(argv) {
   return options;
 }
 
+// One file or directory per publish entry (build-release.js LEGACY_PUBLISH_ENTRIES without
+// node_modules). lib/ is one since the server.js split; a fixture without it failed the
+// digest with ENOENT before any assertion ran.
 async function writeSourceFixture(root) {
-  for (const directory of ["bin", "tests", "opencode/agents", "opencode/skills"]) await mkdir(path.join(root, directory), { recursive: true });
+  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills"]) await mkdir(path.join(root, directory), { recursive: true });
   for (const [file, text] of Object.entries({
     "server.js": "// server\n",
     "package.json": "{}\n",
     "package-lock.json": "{}\n",
     "bin/tool.js": "// tool\n",
+    "lib/module.js": "// module\n",
     "tests/case.js": "// case\n",
     "opencode/agents/builder.md": "builder\n",
     "opencode/.gitignore": "log/\n",
@@ -466,6 +470,10 @@ async function selfTest() {
     await rename(path.join(source, "tests"), path.join(fixture, "tests-away"));
     await assert.rejects(sourceTreeDigest(source), /ENOENT/, "a missing tests/ is not digested as absent");
     await rename(path.join(fixture, "tests-away"), path.join(source, "tests"));
+    // lib/ holds most of the bridge since the split, so a tree without it is not a source tree.
+    await rename(path.join(source, "lib"), path.join(fixture, "lib-away"));
+    await assert.rejects(sourceTreeDigest(source), /ENOENT/, "a missing lib/ is not digested as absent");
+    await rename(path.join(fixture, "lib-away"), path.join(source, "lib"));
 
     // Before the gate: every publish entry must exist and the plugin manifest must bind this
     // tree's opencode.jsonc and antigravity.json; every problem is named at once.

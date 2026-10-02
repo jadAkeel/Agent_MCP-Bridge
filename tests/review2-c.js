@@ -13,6 +13,7 @@
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 
 import { spawn } from "node:child_process";
+import { readBridgeSource } from "./bridge-source.js";
 import { strict as assert } from "node:assert";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,7 +28,7 @@ const { __selfTest } = await import("../server.js");
 const { internals } = __selfTest;
 const { CONFIG } = internals;
 
-const serverSource = await readFile(new URL("../server.js", import.meta.url), "utf8");
+const serverSource = readBridgeSource();
 const supervisorPath = fileURLToPath(new URL("../bin/process-supervisor.js", import.meta.url));
 // A containment record naming a process that is provably alive (this one), so the
 // quarantine is not reclaimed as "payload gone" while a test still needs it.

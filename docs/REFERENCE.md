@@ -271,6 +271,7 @@ CODEX_OPENCODE_PROVIDER_HEARTBEAT_MS=20000
 CODEX_OPENCODE_QUEUE_RESULT_MAX_CHARS=24000
 CODEX_OPENCODE_INTEGRATION_PREVIEW_MAX_CHARS=400000
 CODEX_OPENCODE_EXPECTED_SERVER_SHA256=<sha256-of-the-published-server.js>
+CODEX_OPENCODE_EXPECTED_LIB_SHA256=<lib/-digest-of-the-same-tree>
 CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256=<sha256-of-release-manifest.json>
 ```
 
@@ -294,17 +295,35 @@ Authentication: OpenCode built-in Codex OAuth transport
 
 The release embeds only reviewed, nonsecret `opencode.jsonc` and `antigravity.json` files plus managed agents and skills. `XDG_CONFIG_HOME` points at the immutable release root, while built-in OAuth data remains in provider-owned OpenCode data storage. The builder and manifest never publish or hash `auth.json`, `antigravity-accounts.json`, or credential values. At runtime, isolated-role discovery may read a bounded, valid built-in `auth.json` object and pass it only as `OPENCODE_AUTH_CONTENT` to the one-shot child; it exists only in that child's environment for the lifetime of the single command and is never written to the isolated runtime disk, logged, returned, added to prompts, or persisted by the bridge. The Antigravity account file is never read by bridge code.
 
+### lib/ pin
+
+log.md B-092. Since the server.js split most of the bridge lives in `lib/**/*.js`, which `server.js` imports statically, so the server pin alone no longer covers the code that runs. `CODEX_OPENCODE_EXPECTED_LIB_SHA256` pins the `lib/` directory next to the `server.js` the entry runs. One implementation computes it for the bridge and every `bin/` tool: `bin/lib-digest.js`.
+
+Digest format: SHA-256 over the regular files under `lib/`, sorted by their path relative to the bridge root in UTF-16 code unit order (the default JavaScript sort, the order of the release manifest's keys), one entry per file: `<relative posix path, for example lib/queue/store.js>` NUL `<sha256 hex of the file's bytes>` LF. Directories are not entries of their own. A symbolic link or junction anywhere under `lib/`, `lib/` itself included, is refused, like the release file listing.
+
+Startup (`verifyReleaseIntegrity`, right after the server pin):
+
+| Server pin | Release manifest pin | Lib pin | `lib/` next to `server.js` | Result |
+|---|---|---|---|---|
+| any | any | set | must exist and match | starts; a mismatch, a missing `lib/` or a link under it refuses to start with `Bridge release integrity check failed. lib/ does not match CODEX_OPENCODE_EXPECTED_LIB_SHA256. Expected ..., got ... (<n> files in <dir>).` |
+| set | unset | unset | present | refuses to start (fail closed): `CODEX_OPENCODE_EXPECTED_SERVER_SHA256 pins server.js, but CODEX_OPENCODE_EXPECTED_LIB_SHA256 is not set although <dir> exists ... Run npm run release:activate -- --sync-clients to pin them.` |
+| set | unset | unset | absent | starts (a bridge from before the split) |
+| any | set | unset | any | starts; the manifest hashes every shipped file, `lib/` included, so the lib pin is never required in its place |
+| unset | unset | unset | any | starts; `lib/` is not read (development, self-tests) |
+
+Writers: `release:activate` pins the new release's `lib/` with its `server.js`; `--sync-clients` re-pins it from the tree of the `server.js` the entry runs (it adds the line right after the server pin when a config predates it, and removes it for a tree without `lib/`); an immutable release's `lib/` is re-pinned only while it equals its manifest file for file; `npm run setup` writes it. The Claude Code entry is copied from the Codex entry, so both clients carry both pins. Readers: `npm run doctor` reports `Failure [lib-pin]` by the same rule, the fresh health check refuses such a candidate, and `bin/live-smoke.js --server <candidate>` drops the lib pin together with the server pin. The release-activate clean-tree check covers `lib/`, including git-ignored files there (the digest includes them).
+
 ### Managed Gemini OAuth profile
 
 The current local Codex entry uses the tested source `server.js` with its exact SHA-256 pin and the
-managed writable OAuth profile. After editing server code, re-test it and update the server pin.
+managed writable OAuth profile. After editing server code (`server.js` or `lib/`), re-test it and update the server and lib pins (`npm run release:activate -- --sync-clients`).
 `CODEX_OPENCODE_BUILDER_MODEL_FALLBACK=true` permits one recorded switch from Muse to Gemini
 for an eligible builder provider failure before any tools execute. Exact per-job model requirements
 disable this switch; other agents do not receive this fallback.
 
-The managed non-sanitized agents default to `opencode/muse-spark-1.3-contributor-free` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
+The managed non-sanitized agents default to `opencode/muse-spark-1.3-contributor-free` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` and `CODEX_OPENCODE_EXPECTED_LIB_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
 
-`bin/fresh-healthcheck.js` supports both profiles. With a release-manifest pin it performs the complete immutable tree verification. Without that pin it verifies the exact server hash, starts a fresh MCP process, and relies on bridge health to attest the managed Gemini runtime and external-plugin policy; the result identifies this as `server-pinned` mode.
+`bin/fresh-healthcheck.js` supports both profiles. With a release-manifest pin it performs the complete immutable tree verification. Without that pin it verifies the exact server hash and the lib/ pin, starts a fresh MCP process, and relies on bridge health to attest the managed Gemini runtime and external-plugin policy; the result identifies this as `server-pinned` mode.
 
 This is a deliberate reduction from full immutable-release assurance: OAuth refresh requires a writable runtime, and the managed agent and skill files in that runtime are attested against their effective OpenCode metadata but are not pinned by the release manifest. The bridge passes `--model opencode/muse-spark-1.3-contributor-free --variant high` explicitly and disables silent fallback. OpenCode (observed on `1.17.13`) does not emit authoritative runtime model identity in every JSON stream, so successful live smoke tests prove the configured command and provider response, not cryptographic runtime-model attestation.
 
@@ -446,7 +465,8 @@ Every `CODEX_OPENCODE_*` variable that `server.js` reads is listed here with its
 | `CODEX_OPENCODE_TRUSTED_POLICY_SHA256` | unset | Operator-held exact hash of trusted policy bytes. Required with the policy root and path; caller arguments cannot replace it. |
 | `CODEX_OPENCODE_STATE_DIR` | `<CODEX_HOME>/codex-opencode-mcp` (`CODEX_HOME` defaults to `~/.codex`) | Bridge state directory: per-repository SQLite databases, generated worktrees (with `CODEX_OPENCODE_WORKTREE_ROOT=global`), the queue encryption key and the bridge's own OpenCode home. A process started with `--self-test` and without this variable uses a temporary folder of its own instead (log.md B-073), so a test never writes into the operator's directory. |
 | `CODEX_OPENCODE_EXECUTABLE` | `OPENCODE_EXE`, else `opencode` from `PATH` | OpenCode executable to run. |
-| `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | unset | When set, startup fails unless `server.js` has exactly this SHA-256. Used by both the strict and the server-pinned Gemini profile; `release:activate --sync-clients` re-pins it. |
+| `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` | unset | When set, startup fails unless `server.js` has exactly this SHA-256. Used by both the strict and the server-pinned Gemini profile; `release:activate --sync-clients` re-pins it. Without a release manifest pin it requires `CODEX_OPENCODE_EXPECTED_LIB_SHA256` too (when `lib/` exists). |
+| `CODEX_OPENCODE_EXPECTED_LIB_SHA256` | unset | The `bin/lib-digest.js` digest of the `lib/` next to `server.js` (see "lib/ pin"). When set, startup fails unless `lib/` has exactly this digest. Required next to a server pin without a release manifest pin; optional (still checked) next to a manifest pin. `release:activate`, `--sync-clients` and `npm run setup` write it. |
 | `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` | unset | Strict immutable-release pin: the SHA-256 (64 hex characters) of the release manifest. When set, startup verifies every shipped file, requires external plugins to be off, and requires the agent, skill and config paths to be release subtrees. Must stay unset in the Gemini hybrid profile. |
 | `CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST` | unset | Comma-separated exact `name@version` plugins allowed when `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`. |
 | `CODEX_OPENCODE_PLUGIN_MANIFEST_PATH` | unset | Path of the plugin integrity manifest. Required, with the next variable, when external plugins are allowed. |

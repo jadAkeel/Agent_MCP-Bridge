@@ -95,6 +95,39 @@ test("a server.js that no longer matches its pin is reported, not thrown", async
   }
 });
 
+test("B-092 an unpinned or stale lib/ next to server.js is a lib-pin failure", async () => {
+  const f = fixture();
+  try {
+    const { libDigest } = await import("./lib-digest.js");
+    const tree = path.dirname(f.serverPath);
+    mkdirSync(path.join(tree, "lib", "queue"), { recursive: true });
+    writeFileSync(path.join(tree, "lib", "a.js"), "// a\n");
+    writeFileSync(path.join(tree, "lib", "queue", "b.js"), "// b\n");
+    // Server pinned, lib/ present, no lib pin: what --sync-clients must fix before a restart.
+    const unpinned = await f.run();
+    assert.equal(unpinned.ok, false);
+    assert.deepEqual(unpinned.failures.map((item) => item.check), ["lib-pin"]);
+    assert.match(unpinned.failures[0].message, /CODEX_OPENCODE_EXPECTED_LIB_SHA256 is not set.*npm run release:activate -- --sync-clients/);
+    const pinned = { ...f.env, CODEX_OPENCODE_EXPECTED_LIB_SHA256: (await libDigest(tree)).sha256 };
+    f.writeCodex(pinned);
+    f.writeClaude({ env: pinned });
+    const healthy = await f.run();
+    assert.equal(healthy.ok, true, formatReport(healthy));
+    // A lib/ edit after the pin: reported as a stale lib pin, the server pin still matches.
+    writeFileSync(path.join(tree, "lib", "queue", "b.js"), "// b, edited\n");
+    const stale = await f.run();
+    assert.equal(stale.ok, false);
+    assert.deepEqual(stale.failures.map((item) => item.check), ["lib-pin"]);
+    assert.match(stale.failures[0].message, /lib\/ does not match CODEX_OPENCODE_EXPECTED_LIB_SHA256\. Expected [a-f0-9]{64}, got [a-f0-9]{64} \(2 files/);
+    assert.match(formatReport(stale), /^Failure \[lib-pin\]: /m);
+    // A Claude Code entry with another lib pin is a mismatch of its own.
+    f.writeClaude({ env: { ...pinned, CODEX_OPENCODE_EXPECTED_LIB_SHA256: "0".repeat(64) } });
+    assert.ok((await f.run()).failures.some((item) => item.check === "claude-entry" && /CODEX_OPENCODE_EXPECTED_LIB_SHA256 is 000000000000\.\.\./.test(item.message)));
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("a Claude Code entry with other args or pins is a failure per mismatch", async () => {
   const f = fixture();
   try {

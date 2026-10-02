@@ -8,6 +8,7 @@
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 
 import { execFile as execFileCallback } from "node:child_process";
+import { readBridgeSource } from "./bridge-source.js";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -389,7 +390,7 @@ await test("#9 binary hunks are rejected unless the extension is a known binary 
   assert.deepEqual(gate("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x\n+y"), []);
 });
 await test("#9 integrate_opencode_worktree accepts an explicit acceptBinaryHunks flag", async () => {
-  const source = await readFile(new URL("../server.js", import.meta.url), "utf8");
+  const source = readBridgeSource();
   assert.match(source, /acceptBinaryHunks: z\.boolean\(\)\.optional\(\)/);
   assert.match(source, /binaryTextFiles\.length && !acceptBinaryHunks/);
 });
@@ -669,7 +670,7 @@ await test("#21 subagentStrategy direct is no longer advertised by the job schem
   const schema = internals.z.object(need("jobInputShape"));
   assert.equal(schema.safeParse({ agent: "explore", task: "t", cwd: workCwd, subagentStrategy: "direct" }).success, false);
   assert.equal(schema.safeParse({ agent: "explore", task: "t", cwd: workCwd, subagentStrategy: "proxy" }).success, true);
-  const source = await readFile(new URL("../server.js", import.meta.url), "utf8");
+  const source = readBridgeSource();
   assert.doesNotMatch(source, /or "direct" only if you want to test native CLI behavior/);
 });
 

@@ -226,8 +226,10 @@ Setup passes that explicit path itself. Its Claude registration uses the shared 
 with atomic JSON file writes, so an arbitrary `--claude-config <file>` cannot accidentally
 route `claude mcp add-json` to the real `.claude.json`.
 
-`--sync-clients` re-pins `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` (and the plugin manifest hash
-in the Gemini profile) from the files themselves, health-checks a fresh bridge process, and
+`--sync-clients` re-pins `CODEX_OPENCODE_EXPECTED_SERVER_SHA256`, adds or re-pins
+`CODEX_OPENCODE_EXPECTED_LIB_SHA256` (the digest of `lib/` next to `server.js`; without it a
+server-pinned bridge refuses to start, log.md B-092), and the plugin manifest hash in the Gemini
+profile, all from the files themselves, health-checks a fresh bridge process, and
 re-registers Claude Code with exactly the Codex entry. It exits 1 when the two are left
 different. Pass `--skip-claude-code` when Claude Code does not use the bridge.
 

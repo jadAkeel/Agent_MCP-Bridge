@@ -15,7 +15,9 @@
 //   npm run release:activate -- --prune      also delete releases/backups beyond the kept set
 //   npm run release:activate -- --inspect    show the active release, releases still in use, and
 //                                            what --prune would delete; builds nothing
-//   npm run release:activate -- --sync-clients  re-pin the plugin manifest and server.js hashes
+//   npm run release:activate -- --sync-clients  re-pin the plugin manifest, server.js and lib/
+//                                            hashes (CODEX_OPENCODE_EXPECTED_LIB_SHA256, the
+//                                            bin/lib-digest.js digest, is added when missing)
 //                                            from the files themselves and re-register the
 //                                            active entry with Claude Code (done automatically
 //                                            after every activation)
@@ -55,14 +57,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-import { buildRelease } from "./build-release.js";
+import { LEGACY_PUBLISH_ENTRIES, buildRelease } from "./build-release.js";
 import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
+import { LIB_PIN_ENV, libDigest, libDigestOf } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
 import { recordCliFailure } from "./ops-log.js";
@@ -73,7 +76,7 @@ const SERVER_NAME = "opencode";
 const KEEP_CONFIG_BACKUPS = 2;
 const RELEASE_MANIFEST = "release-manifest.json";
 // Files a release copies from the source tree (build-release.js LEGACY_PUBLISH_ENTRIES).
-const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "opencode", "tests", "package.json", "package-lock.json"];
+const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "lib", "opencode", "tests", "package.json", "package-lock.json"];
 const RENAME_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000];
 const SKIP_TESTS_NEEDS_RECEIPT = "--skip-tests needs --gate-receipt <file>: the receipt of a green `npm run test:release` of this source tree (written to .release-gate/receipt.json), at most 24 h old. Nothing was built or activated.";
 
@@ -234,38 +237,65 @@ function tomlHeader(line) {
 // The plugin manifest hash is recomputed from the manifest file the config names, never
 // copied by hand, so a regenerated manifest (new model, new OpenCode version) cannot
 // leave a stale pin behind. A config without that line (pure mode) is left alone.
-function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifestSha256 = "" } = {}) {
+// B-092: the lib/ pin (libSha256) is the one pin a config may not hold yet: every config
+// written before the server.js split lacks it, so a missing line is inserted right after the
+// server pin line (else right after the env header) instead of refused. removeLibPin drops
+// the line, for an entry whose tree has no lib/ (a release built before the split).
+function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifestSha256 = "", libSha256 = "", removeLibPin = false } = {}) {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const lines = text.split(/\r?\n/);
+  const libLine = `${LIB_PIN_ENV} = "${libSha256}"`;
   let section = "";
   let argsDone = false;
   let hashDone = false;
   let manifestDone = false;
-  const out = lines.map((line) => {
+  let libDone = false;
+  let envHeaderAt = -1;
+  let serverPinAt = -1;
+  const out = [];
+  for (const line of lines) {
     const header = tomlHeader(line);
     if (header !== null) {
       section = header;
-      return line;
+      if (header === `mcp_servers.${SERVER_NAME}.env`) envHeaderAt = out.length;
+      out.push(line);
+      continue;
     }
     if (serverPath && section === `mcp_servers.${SERVER_NAME}` && /^\s*args\s*=/.test(line)) {
       argsDone = true;
-      return `args = ['${serverPath}']`;
+      out.push(`args = ['${serverPath}']`);
+      continue;
     }
     if (section === `mcp_servers.${SERVER_NAME}.env`) {
-      if (serverSha256 && /^\s*CODEX_OPENCODE_EXPECTED_SERVER_SHA256\s*=/.test(line)) {
-        hashDone = true;
-        return `CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = "${serverSha256}"`;
+      if (/^\s*CODEX_OPENCODE_EXPECTED_SERVER_SHA256\s*=/.test(line)) {
+        serverPinAt = out.length;
+        if (serverSha256) {
+          hashDone = true;
+          out.push(`CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = "${serverSha256}"`);
+          continue;
+        }
       }
       if (pluginManifestSha256 && /^\s*CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256\s*=/.test(line)) {
         manifestDone = true;
-        return `CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = "${pluginManifestSha256}"`;
+        out.push(`CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = "${pluginManifestSha256}"`);
+        continue;
+      }
+      if ((libSha256 || removeLibPin) && /^\s*CODEX_OPENCODE_EXPECTED_LIB_SHA256\s*=/.test(line)) {
+        libDone = true;
+        if (libSha256) out.push(libLine);
+        continue;
       }
     }
-    return line;
-  });
+    out.push(line);
+  }
   if (serverPath && !argsDone) throw new Error(`Config has no args line under [mcp_servers.${SERVER_NAME}].`);
   if (serverSha256 && !hashDone) throw new Error(`Config has no CODEX_OPENCODE_EXPECTED_SERVER_SHA256 under [mcp_servers.${SERVER_NAME}.env].`);
   if (serverPath.includes("'")) throw new Error("Release path must not contain a single quote.");
+  if (libSha256 && !libDone) {
+    const insertAfter = serverPinAt >= 0 ? serverPinAt : envHeaderAt;
+    if (insertAfter < 0) throw new Error(`Config has no [mcp_servers.${SERVER_NAME}.env] table to hold ${LIB_PIN_ENV}.`);
+    out.splice(insertAfter + 1, 0, libLine);
+  }
   return { text: out.join(eol), pluginManifestPinned: manifestDone };
 }
 
@@ -297,6 +327,7 @@ function withoutRewrittenFields(document) {
     if (entry.env && typeof entry.env === "object") {
       delete entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256;
       delete entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256;
+      delete entry.env[LIB_PIN_ENV];
     }
   }
   return copy;
@@ -469,6 +500,21 @@ async function restoreConfigFrom(configPath, backupPath, stamp, expected, rename
   }
 }
 
+// The manifest of an immutable release, refused when it no longer matches its own pin.
+async function readRepinnableManifest(releaseDir, env = {}) {
+  const manifestPath = path.join(releaseDir, RELEASE_MANIFEST);
+  const manifestContent = await readFile(manifestPath);
+  const pinnedManifest = String(env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim().toLowerCase();
+  if (pinnedManifest && createHash("sha256").update(manifestContent).digest("hex") !== pinnedManifest) {
+    throw new Error(`${manifestPath} does not match CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256; the immutable release was modified, so nothing is re-pinned.`);
+  }
+  try {
+    return JSON.parse(manifestContent.toString("utf8"));
+  } catch (error) {
+    throw new Error(`${manifestPath} is not valid JSON (${error.message}); nothing is re-pinned.`);
+  }
+}
+
 // The server.js hash --sync-clients may pin. A working tree may move, so its current hash
 // is pinned. An immutable release (its folder holds release-manifest.json) must not: its
 // server.js is re-pinned only while it still equals the manifest's digest (and the manifest
@@ -477,18 +523,7 @@ async function repinnableServerSha256(serverPath, env = {}) {
   const actual = await sha256File(serverPath);
   const releaseDir = path.dirname(serverPath);
   if (!isReleaseDirectory(releaseDir)) return actual;
-  const manifestPath = path.join(releaseDir, RELEASE_MANIFEST);
-  const manifestContent = await readFile(manifestPath);
-  const pinnedManifest = String(env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim().toLowerCase();
-  if (pinnedManifest && createHash("sha256").update(manifestContent).digest("hex") !== pinnedManifest) {
-    throw new Error(`${manifestPath} does not match CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256; the immutable release was modified, so nothing is re-pinned.`);
-  }
-  let manifest;
-  try {
-    manifest = JSON.parse(manifestContent.toString("utf8"));
-  } catch (error) {
-    throw new Error(`${manifestPath} is not valid JSON (${error.message}); nothing is re-pinned.`);
-  }
+  const manifest = await readRepinnableManifest(releaseDir, env);
   const expected = String(manifest?.files?.["server.js"] || "").trim().toLowerCase();
   if (actual !== expected) {
     throw new Error(`${serverPath} belongs to an immutable release, but its SHA-256 ${short(actual)} differs from ${RELEASE_MANIFEST} (${short(expected)}). Refusing to re-pin a modified release; build a new one with npm run release:activate.`);
@@ -496,10 +531,31 @@ async function repinnableServerSha256(serverPath, env = {}) {
   return actual;
 }
 
+// B-092: the lib/ digest (bin/lib-digest.js) --sync-clients may pin, always from the same tree
+// as the server.js pin (the folder of the server.js the entry runs). "" when that tree has no
+// lib/ (a release built before the split). The same rule as repinnableServerSha256: a working
+// tree's current digest is pinned, while an immutable release's lib/ is pinned only while it
+// still equals its manifest file for file (same paths, same digests).
+async function repinnableLibSha256(serverPath, env = {}) {
+  const releaseDir = path.dirname(serverPath);
+  const digest = await libDigest(releaseDir);
+  if (!digest) return "";
+  if (!isReleaseDirectory(releaseDir)) return digest.sha256;
+  const manifest = await readRepinnableManifest(releaseDir, env);
+  const files = manifest?.files && typeof manifest.files === "object" ? manifest.files : {};
+  const listed = Object.keys(files).filter((relative) => relative.startsWith("lib/")).sort()
+    .map((relative) => ({ path: relative, sha256: String(files[relative] || "").trim().toLowerCase() }));
+  const expected = libDigestOf(listed);
+  if (digest.sha256 !== expected) {
+    throw new Error(`${path.join(releaseDir, "lib")} belongs to an immutable release, but its digest ${short(digest.sha256)} differs from the lib/ entries of ${RELEASE_MANIFEST} (${short(expected)}). Refusing to re-pin a modified release; build a new one with npm run release:activate.`);
+  }
+  return digest.sha256;
+}
+
 // Re-pins the integrity hashes in the live config when the files they guard changed
 // underneath it: the plugin manifest (a model switch or OpenCode upgrade regenerates it)
-// and the server.js the entry runs (only moves while the entry points at a working tree
-// instead of an immutable release). Same safety net as an activation: backup, atomic
+// and the server.js and lib/ the entry runs (only move while the entry points at a working
+// tree instead of an immutable release). Same safety net as an activation: backup, atomic
 // replace, fresh health smoke, restore on failure.
 async function refreshIntegrityPins(configPath, entry, { smoke = runHealthSmoke } = {}) {
   const drift = [];
@@ -520,15 +576,25 @@ async function refreshIntegrityPins(configPath, entry, { smoke = runHealthSmoke 
       rewrite.serverSha256 = serverActual;
       drift.push(`server.js ${short(pinned)} -> ${short(serverActual)}`);
     }
+    // B-092: lib/ next to that server.js, so both pins always name one tree.
+    const libActual = await repinnableLibSha256(serverPath, entry.env);
+    const pinnedLib = String(entry.env[LIB_PIN_ENV] || "").trim().toLowerCase();
+    if (pinnedLib !== libActual) {
+      if (libActual) rewrite.libSha256 = libActual;
+      else rewrite.removeLibPin = true;
+      drift.push(`lib/ ${short(pinnedLib)} -> ${libActual ? short(libActual) : "(no lib/, pin removed)"}`);
+    }
   }
-  if (!drift.length) return "Integrity pins are current (plugin manifest, server.js).";
+  if (!drift.length) return "Integrity pins are current (plugin manifest, server.js, lib/).";
   const original = await readFile(configPath, "utf8");
   const { text, pluginManifestPinned } = rewriteConfig(original, rewrite);
   if (rewrite.pluginManifestSha256 && !pluginManifestPinned) throw new Error(`Config has no CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 under [mcp_servers.${SERVER_NAME}.env].`);
   const parsed = assertRewritePreservesConfig(original, text);
   const parsedEnv = parsed?.mcp_servers?.[SERVER_NAME]?.env || {};
   if ((rewrite.serverSha256 && parsedEnv.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 !== rewrite.serverSha256)
-    || (rewrite.pluginManifestSha256 && parsedEnv.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 !== rewrite.pluginManifestSha256)) {
+    || (rewrite.pluginManifestSha256 && parsedEnv.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 !== rewrite.pluginManifestSha256)
+    || (rewrite.libSha256 && parsedEnv[LIB_PIN_ENV] !== rewrite.libSha256)
+    || (rewrite.removeLibPin && Object.hasOwn(parsedEnv, LIB_PIN_ENV))) {
     throw new Error("The rewritten config did not parse back to the new pins; nothing was written.");
   }
   const stamp = timestamp();
@@ -546,16 +612,25 @@ async function refreshIntegrityPins(configPath, entry, { smoke = runHealthSmoke 
   }
   return [
     `Integrity pins updated: ${drift.join("; ")} (backup: ${backupPath})`,
-    ...(rewrite.serverSha256 ? uncommittedBridgeFiles(path.dirname(serverPath)) : []),
+    // The tree status names what a moved server.js or lib/ pin now trusts; an immutable
+    // release was just checked against its manifest instead and is not a git checkout.
+    ...((rewrite.serverSha256 || rewrite.libSha256) && !isReleaseDirectory(path.dirname(serverPath)) ? uncommittedBridgeFiles(path.dirname(serverPath)) : []),
   ].join("\n");
 }
 
 function bridgeWorkingTreeStatus(repoDir) {
-  const status = spawnSync("git", ["-C", repoDir, "status", "--porcelain=v1", "--untracked-files=all", "--", ...BRIDGE_SOURCE_PATHS], { encoding: "utf8", windowsHide: true });
-  if (status.error || status.status !== 0) {
-    return { ok: false, lines: [], error: String(status.error?.message || status.stderr || `exit ${status.status}`).trim() };
-  }
-  return { ok: true, lines: String(status.stdout || "").split(/\r?\n/).filter(Boolean), error: "" };
+  const run = (args) => spawnSync("git", ["-C", repoDir, "status", "--porcelain=v1", "--untracked-files=all", ...args], { encoding: "utf8", windowsHide: true });
+  const failed = (result) => result.error || result.status !== 0;
+  const failure = (result) => ({ ok: false, lines: [], error: String(result.error?.message || result.stderr || `exit ${result.status}`).trim() });
+  const status = run(["--", ...BRIDGE_SOURCE_PATHS]);
+  if (failed(status)) return failure(status);
+  // B-092: the lib/ pin digests every file under lib/, git-ignored ones included (and a build
+  // copies them too), so an ignored file there is as unreviewed as an untracked one. Only lib/:
+  // elsewhere ignored files (opencode/log/) are expected and never pinned.
+  const ignored = run(["--ignored=matching", "--", "lib"]);
+  if (failed(ignored)) return failure(ignored);
+  const ignoredLib = String(ignored.stdout || "").split(/\r?\n/).filter((line) => line.startsWith("!! "));
+  return { ok: true, lines: [...String(status.stdout || "").split(/\r?\n/).filter(Boolean), ...ignoredLib], error: "" };
 }
 
 function listStatusLines(lines) {
@@ -570,7 +645,7 @@ function listStatusLines(lines) {
 function uncommittedBridgeFiles(repoDir) {
   const status = bridgeWorkingTreeStatus(repoDir);
   if (!status.ok) return ["Could not list uncommitted bridge files; review the working tree before trusting this pin."];
-  if (!status.lines.length) return ["The pinned server.js matches a clean working tree."];
+  if (!status.lines.length) return ["The pinned server.js and lib/ match a clean working tree."];
   return [
     `Now trusted with uncommitted changes (${status.lines.length} files); make sure you reviewed them:`,
     ...listStatusLines(status.lines),
@@ -970,6 +1045,27 @@ function selfTestRewrite() {
   assert.equal(pure.pluginManifestPinned, false);
   assert.ok(!pure.text.includes("new-manifest"), "pure mode gains no manifest line");
 
+  // B-092: the lib/ pin is inserted after the server pin when the config predates it, replaced
+  // when present, removed on request, and the parse check accepts all three.
+  const libA = "a".repeat(64);
+  const libB = "b".repeat(64);
+  const added = rewriteConfig(fixture, { serverPath: "C:\\new\\server.js", serverSha256: "new-server", libSha256: libA });
+  assert.ok(added.text.includes(`CODEX_OPENCODE_EXPECTED_SERVER_SHA256 = "new-server"\r\n${LIB_PIN_ENV} = "${libA}"\r\n`), added.text);
+  assert.equal(added.text.split(LIB_PIN_ENV).length, 2, "exactly one lib pin line");
+  assertRewritePreservesConfig(fixture, added.text);
+  const replaced = rewriteConfig(added.text, { libSha256: libB });
+  assert.equal(replaced.text, added.text.replace(libA, libB));
+  const removed = rewriteConfig(added.text, { removeLibPin: true });
+  assert.equal(removed.text, added.text.replace(`${LIB_PIN_ENV} = "${libA}"\r\n`, ""));
+  assertRewritePreservesConfig(added.text, removed.text);
+  assert.equal(rewriteConfig(fixture, { removeLibPin: true }).text, fixture, "removing an absent lib pin changes nothing");
+  const noServerPin = "[mcp_servers.opencode]\nargs = ['a']\n\n[mcp_servers.opencode.env]\nCODEX_OPENCODE_LOG_LEVEL = \"warn\"\n";
+  assert.equal(rewriteConfig(noServerPin, { libSha256: libA }).text, noServerPin.replace("[mcp_servers.opencode.env]\n", `[mcp_servers.opencode.env]\n${LIB_PIN_ENV} = "${libA}"\n`));
+  assert.throws(() => rewriteConfig("[mcp_servers.opencode]\nargs = ['a']\n", { libSha256: libA }), /no \[mcp_servers\.opencode\.env\] table/);
+  // A lib pin line in another server's env table is not ours.
+  const otherEnv = `[mcp_servers.other.env]\n${LIB_PIN_ENV} = "keep"\n${noServerPin}`;
+  assert.ok(rewriteConfig(otherEnv, { libSha256: libA }).text.startsWith(`[mcp_servers.other.env]\n${LIB_PIN_ENV} = "keep"\n`));
+
   assert.throws(() => rewriteConfig("[mcp_servers.opencode]\n", { serverPath: "C:\\x.js", serverSha256: "s" }), /no args line/);
   assert.throws(() => rewriteConfig("[mcp_servers.opencode]\nargs = ['a']\n", { serverPath: "C:\\x.js", serverSha256: "s" }), /no CODEX_OPENCODE_EXPECTED_SERVER_SHA256/);
   assert.throws(() => rewriteConfig(fixture, { serverPath: "C:\\it's.js", serverSha256: "s" }), /single quote/);
@@ -1104,6 +1200,65 @@ async function selfTestRepin(fixture) {
   assert.equal(await readFile(configPath, "utf8"), before);
 }
 
+// B-092: --sync-clients writes the lib/ pin from the tree of the server.js it pins (inserting
+// the line into a config written before the split), re-pins it when lib/ moves, removes it
+// for a tree without lib/, and the Claude Code entry is written with both pins.
+async function selfTestLibPin(fixture) {
+  const tree = path.join(fixture, "lib-pin-tree");
+  await mkdir(path.join(tree, "lib", "queue"), { recursive: true });
+  const serverPath = path.join(tree, "server.js");
+  await writeFile(serverPath, "server\n", "utf8");
+  await writeFile(path.join(tree, "lib", "a.js"), "a\n", "utf8");
+  await writeFile(path.join(tree, "lib", "queue", "b.js"), "b\n", "utf8");
+  const serverSha256 = await sha256File(serverPath);
+  const firstLib = (await libDigest(tree)).sha256;
+  assert.equal(await repinnableLibSha256(serverPath, {}), firstLib, "a working tree pins its current lib/ digest");
+
+  const configPath = path.join(fixture, "lib-pin-config.toml");
+  // A config written before the split: a correct server pin and no lib pin line at all.
+  await writeCodexConfig(configPath, { serverPath, env: { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: serverSha256, CODEX_OPENCODE_LOG_LEVEL: "warn" } });
+  const smoke = () => ({ ok: true, output: "" });
+  const first = await refreshIntegrityPins(configPath, await loadMcpEntry(configPath, SERVER_NAME), { smoke });
+  assert.match(first, /Integrity pins updated: lib\/ \(none\) -> [a-f0-9]{12}\.\.\./);
+  let entry = await loadMcpEntry(configPath, SERVER_NAME);
+  assert.equal(entry.env[LIB_PIN_ENV], firstLib);
+  assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, serverSha256, "the server pin is untouched");
+  assert.equal(await refreshIntegrityPins(configPath, entry, { smoke }), "Integrity pins are current (plugin manifest, server.js, lib/).");
+
+  // A lib/ edit moves only the lib pin.
+  await writeFile(path.join(tree, "lib", "queue", "b.js"), "b, edited\n", "utf8");
+  const secondLib = (await libDigest(tree)).sha256;
+  assert.notEqual(secondLib, firstLib);
+  assert.match(await refreshIntegrityPins(configPath, entry, { smoke }), new RegExp(`lib/ ${firstLib.slice(0, 12)}\\.\\.\\. -> ${secondLib.slice(0, 12)}\\.\\.\\.`));
+  entry = await loadMcpEntry(configPath, SERVER_NAME);
+  assert.equal(entry.env[LIB_PIN_ENV], secondLib);
+
+  // The Claude Code entry is built from the Codex entry: both pins, the same values.
+  const claudeText = rewriteClaudeConfig(null, entry);
+  const claudeEntry = JSON.parse(claudeText).mcpServers.opencode;
+  assert.equal(claudeEntry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, serverSha256);
+  assert.equal(claudeEntry.env[LIB_PIN_ENV], secondLib);
+  const configOnly = await syncClaudeCodeEntry(configPath, { configOnly: true, claudeConfigPath: path.join(fixture, "lib-pin-claude", ".claude.json") });
+  assert.equal(configOnly.ok, true, configOnly.message);
+  const written = JSON.parse(await readFile(path.join(fixture, "lib-pin-claude", ".claude.json"), "utf8")).mcpServers.opencode;
+  assert.deepEqual([written.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, written.env[LIB_PIN_ENV]], [serverSha256, secondLib]);
+
+  // A tree without lib/ (a release built before the split) loses the pin instead of keeping a stale one.
+  await rm(path.join(tree, "lib"), { recursive: true });
+  assert.equal(await repinnableLibSha256(serverPath, {}), "");
+  assert.match(await refreshIntegrityPins(configPath, entry, { smoke }), /lib\/ [a-f0-9]{12}\.\.\. -> \(no lib\/, pin removed\)/);
+  assert.equal(Object.hasOwn((await loadMcpEntry(configPath, SERVER_NAME)).env, LIB_PIN_ENV), false);
+
+  // A link under lib/ is refused before anything is written.
+  await mkdir(path.join(tree, "lib"), { recursive: true });
+  const outside = path.join(fixture, "lib-pin-outside");
+  await mkdir(outside, { recursive: true });
+  await symlink(outside, path.join(tree, "lib", "linked"), process.platform === "win32" ? "junction" : "dir");
+  const before = await readFile(configPath, "utf8");
+  await assert.rejects(refreshIntegrityPins(configPath, await loadMcpEntry(configPath, SERVER_NAME), { smoke }), /Symbolic links and junctions are not allowed under lib\/: lib\/linked/);
+  assert.equal(await readFile(configPath, "utf8"), before);
+}
+
 async function selfTestRestoreAndCleanup(fixture) {
   let calls = 0;
   const flakyRename = async (from, to) => {
@@ -1203,6 +1358,28 @@ async function selfTestCleanTree(fixture) {
   await writeFile(path.join(repo, "bin", "new-tool.js"), "untracked\n", "utf8");
   assert.throws(() => assertCleanSourceTree(repo, false), /2 uncommitted bridge file/);
   assert.match(assertCleanSourceTree(repo, true)[0], /WARNING \(--allow-dirty\)/);
+
+  // B-092: lib/ is pinned with server.js, so a dirty lib/ file fails the check and is named when
+  // a re-pin trusts it; a git-ignored file under lib/ counts too (the lib digest includes it).
+  await writeFile(path.join(repo, "server.js"), "committed\n", "utf8");
+  await rm(path.join(repo, "bin", "new-tool.js"));
+  await mkdir(path.join(repo, "lib"), { recursive: true });
+  await writeFile(path.join(repo, "lib", "module.js"), "committed\n", "utf8");
+  await writeFile(path.join(repo, ".gitignore"), "*.log\n", "utf8");
+  git("add", "lib/module.js", ".gitignore");
+  git("commit", "--quiet", "-m", "lib");
+  assert.deepEqual(assertCleanSourceTree(repo, false), []);
+  assert.deepEqual(uncommittedBridgeFiles(repo), ["The pinned server.js and lib/ match a clean working tree."]);
+  await writeFile(path.join(repo, "lib", "module.js"), "edited, not committed\n", "utf8");
+  assert.throws(() => assertCleanSourceTree(repo, false), /1 uncommitted bridge file.*lib\/module\.js/s);
+  assert.match(uncommittedBridgeFiles(repo).join("\n"), /Now trusted with uncommitted changes \(1 files\).*lib\/module\.js/s);
+  await writeFile(path.join(repo, "lib", "module.js"), "committed\n", "utf8");
+  await writeFile(path.join(repo, "lib", "ignored.log"), "git-ignored, still digested\n", "utf8");
+  assert.throws(() => assertCleanSourceTree(repo, false), /1 uncommitted bridge file.*!! lib\/ignored\.log/s);
+  await rm(path.join(repo, "lib", "ignored.log"));
+  await writeFile(path.join(repo, "notes.log"), "ignored outside lib/ does not count\n", "utf8");
+  assert.deepEqual(assertCleanSourceTree(repo, false), []);
+
   const notARepo = path.join(fixture, "not-a-repo");
   await mkdir(notARepo, { recursive: true });
   assert.throws(() => assertCleanSourceTree(notARepo, false), /Could not read the git status/);
@@ -1222,6 +1399,9 @@ async function selfTestCheckedBuild(fixture) {
   await write("package.json", "{}\n");
   await write("package-lock.json", "{}\n");
   await write("bin/tool.js", "committed\n");
+  await write("lib/redaction.js", "module\n");
+  await write("lib/git-patch.js", "module\n");
+  await write("tests/case.js", "test\n");
   await write("opencode/agents/a.md", "agent\n");
   await write("opencode/skills/s/SKILL.md", "skill\n");
   await write("opencode/.gitignore", "log/\n");
@@ -1242,7 +1422,9 @@ async function selfTestCheckedBuild(fixture) {
   git("init", "--quiet");
   git("add", ".");
   git("commit", "--quiet", "-m", "init");
-  const publishEntries = ["server.js", "package.json", "package-lock.json", "bin", "opencode/agents", "opencode/skills", "opencode/.gitignore", "opencode/plugin-integrity-manifest.json", "node_modules"];
+  // The real publish entries, so the fixture cannot drift from what a release copies (lib/
+  // since the split, tests/ since B-037).
+  const publishEntries = [...LEGACY_PUBLISH_ENTRIES];
   const installFromLockfile = async (staging) => {
     assert.equal(existsSync(path.join(staging, "node_modules")), false, "the working tree's node_modules is not copied into the release");
     await mkdir(path.join(staging, "node_modules", "dep"), { recursive: true });
@@ -1252,6 +1434,18 @@ async function selfTestCheckedBuild(fixture) {
   const clean = path.join(releases, "clean");
   await buildCheckedRelease({ destination: clean, sourceRoot: repo, publishEntries, dependencyInstaller: installFromLockfile });
   assert.equal(await readFile(path.join(clean, "node_modules", "dep", "index.js"), "utf8"), "installed from the lockfile\n", "the hand-edited, git-ignored node_modules is not published");
+  // B-092: the built release's lib/ re-pins to the source digest, checked against its manifest;
+  // an edited or an added lib/ file inside the release is refused.
+  const sourceLib = (await libDigest(repo)).sha256;
+  assert.equal(await repinnableLibSha256(path.join(clean, "server.js"), {}), sourceLib);
+  const releasedModule = path.join(clean, "lib", "redaction.js");
+  await writeFile(releasedModule, "edited inside the release\n", "utf8");
+  await assert.rejects(repinnableLibSha256(path.join(clean, "server.js"), {}), /belongs to an immutable release.*Refusing to re-pin/s);
+  await writeFile(releasedModule, "module\n", "utf8");
+  await writeFile(path.join(clean, "lib", "added.js"), "added inside the release\n", "utf8");
+  await assert.rejects(repinnableLibSha256(path.join(clean, "server.js"), {}), /Refusing to re-pin/);
+  await rm(path.join(clean, "lib", "added.js"));
+  assert.equal(await repinnableLibSha256(path.join(clean, "server.js"), {}), sourceLib);
 
   // The tree becomes dirty after the first check (npm test wrote a file, an editor saved one):
   // nothing is published and no staging folder is left behind.
@@ -1493,6 +1687,7 @@ async function selfTest() {
   try {
     await selfTestReleasesRoot(fixture);
     await selfTestRepin(fixture);
+    await selfTestLibPin(fixture);
     await selfTestRestoreAndCleanup(fixture);
     await selfTestConcurrentConfigEdits(fixture);
     await selfTestCleanTree(fixture);
@@ -1576,14 +1771,19 @@ async function main() {
     process.stdout.write(`Gate receipt: ${receiptCopy}\n`);
 
     const pluginManifestSha256 = await pluginManifestSha256For(activeEntry);
+    // B-092: the new release's lib/ is pinned with its server.js. A server-pinned (hybrid)
+    // entry would refuse to start without it; a manifest-pinned one carries it as a second check.
+    const libSha256 = await repinnableLibSha256(serverPath, {});
+    process.stdout.write(`lib/ digest: ${libSha256 || "(no lib/)"}\n`);
     const originalConfig = await readFile(options.configPath, "utf8");
-    const { text: candidateText, pluginManifestPinned } = rewriteConfig(originalConfig, { serverPath, serverSha256, pluginManifestSha256 });
+    const { text: candidateText, pluginManifestPinned } = rewriteConfig(originalConfig, { serverPath, serverSha256, pluginManifestSha256, libSha256, removeLibPin: !libSha256 });
     if (pluginManifestPinned) process.stdout.write(`plugin manifest SHA-256: ${pluginManifestSha256}\n`);
     assertRewritePreservesConfig(originalConfig, candidateText);
     await writeFile(candidateConfig, candidateText, "utf8");
     const candidateEntry = await loadMcpEntry(candidateConfig, SERVER_NAME);
     if (path.resolve(candidateEntry.args[0]) !== path.resolve(serverPath)
       || candidateEntry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 !== serverSha256
+      || (candidateEntry.env[LIB_PIN_ENV] || "") !== libSha256
       || (pluginManifestPinned && candidateEntry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 !== pluginManifestSha256)) {
       throw new Error("Candidate config did not parse back to the new release path and hashes.");
     }
@@ -1663,6 +1863,7 @@ export {
   listReleases,
   // B-075: bin/queue-worker.js --env-from claude reads the entry, never writes it.
   readClaudeUserEntry,
+  repinnableLibSha256,
   repinnableServerSha256,
   resolveReleasesRoot,
   rewriteConfig,

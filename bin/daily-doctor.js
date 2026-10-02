@@ -10,6 +10,7 @@ import { isDeepStrictEqual, promisify } from "node:util";
 import { auditHasFailures, auditStateDirectory } from "./state-audit.js";
 import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { inventory as gcInventory } from "./bridge-gc.js";
+import { libPinError } from "./lib-digest.js";
 import { isMainModule } from "./main-module.js";
 import { opencodeDatabaseHealth, readOpsLog, recordCliFailure, summarizeIncidents } from "./ops-log.js";
 
@@ -117,7 +118,7 @@ function comparable(value) {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-// The pins the running bridge verifies only at startup: server.js and, when the entry names
+// The pins the running bridge verifies only at startup: server.js, lib/ and, when the entry names
 // one, the plugin manifest. Each mismatch is its own failure line.
 async function integrityPinFailures(entry) {
   const failures = [];
@@ -130,6 +131,12 @@ async function integrityPinFailures(entry) {
     }
   } catch (error) {
     failures.push({ check: "server-pin", message: `Cannot hash ${serverPath || "(no server.js in args)"}: ${errorMessage(error)}` });
+  }
+  // B-092: lib/ next to that server.js, by the bridge's own startup rule (bin/lib-digest.js),
+  // so a stale or missing lib pin is reported here before the next bridge refuses to start.
+  if (serverPath) {
+    const libError = await libPinError(path.dirname(serverPath), entry.env);
+    if (libError) failures.push({ check: "lib-pin", message: libError });
   }
   const manifestPath = String(entry.env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || "").trim();
   const pinnedManifest = String(entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 || "").trim().toLowerCase();
