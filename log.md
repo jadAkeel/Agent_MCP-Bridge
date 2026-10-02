@@ -1,4 +1,4 @@
-# Bridge problem log
+| deployed at 64d8a8c || deployed at 64d8a8c || deployed at 64d8a8c || deployed at 64d8a8c || deployed at 64d8a8c |# Bridge problem log
 
 Every problem found while using the bridge for real work, with its cause, its fix, and the
 rule that keeps it from coming back. Newest first within each day. IDs `L-0xx` refer to the
@@ -37,6 +37,11 @@ shared module-level variable through a getter (Codex), `persistPipelineRecord` a
 uses moved into it (timers, the scheduler flags, test hooks; `__selfTest` reaches the hooks through
 accessors). A factory that needs a function produced further down gets it as a call-time wrapper
 `name: (...args) => name(...args)`.
+Before the deploy, every test file not run during the steps passed (the bin self-tests,
+`tests/server-self-test.js`, review-setup-cli, review2-f/g/i, direct-run-audit, main-module, tui
+--smoke). Merged into the live tree at `64d8a8c` without the full `npm test` or the release gate
+(owner's choice); `npm run release:activate -- --sync-clients` pinned `server.js` `3db036d42d7b...`
+and `lib/` `064000a13eda...` in both clients. Restart Claude Code and Codex to load it.
 
 | ID | Problem | Cause | Fix | Commit | Status |
 |---|---|---|---|---|---|
