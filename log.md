@@ -16,6 +16,35 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-02
 
+### server.js split into lib/ modules (Codex and Claude, 2026-10-02)
+
+Branch `bridge/server-modules`, worktree `<bridge-modules>`, from the deployed tree (`e46e655` merged
+with `d0c24f7`). Waves 1-4 by Codex (gpt-6.1-sol high, owner-run, committed by the integrator as
+`457a86b`); the rest by the integrator with a mechanical extractor (two muse-spark runs through the
+bridge hit the provider rate limit; see B-096). `server.js` 30,127 -> 5,568 lines; 56 modules under
+`lib/` (config, logging, state, redaction, paths, queue/*, pipelines/*, integration-*, opencode-*,
+provider-*, tools/*, ...). A module either exports plain functions or a factory
+`createXRuntime(deps)` / `registerXTools(deps)` that `server.js` calls at the place the code used to
+be, so import order and initialization are unchanged. Checks per step (owner: no full test or gate
+per step): `node --check` on every file; a whole-tree comparison against `e46e655` of every
+top-level declaration and tool registration (final: 808 moved unchanged, 0 missing, 0 duplicated,
+0 import cycles, 28 tool registrations); an undefined-name check over `server.js` and `lib/`; an
+import smoke; a live server started from the tree lists the same 28 tools; the targeted tests of
+each moved domain, plus the source-pattern tests. Changed bodies (12, all mechanical): 9 read a
+shared module-level variable through a getter (Codex), `persistPipelineRecord` and
+`updatePipelineRecord` read the pipeline persistence test hook through a getter, and
+`verifyReleaseIntegrity` gained the lib pin (B-092). Module-level variables that only one module
+uses moved into it (timers, the scheduler flags, test hooks; `__selfTest` reaches the hooks through
+accessors). A factory that needs a function produced further down gets it as a call-time wrapper
+`name: (...args) => name(...args)`.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| M-001 | `server.js` was one 30,127-line file, so every feature round touched the same file and parallel fix sessions conflicted. | Growth over many rounds. | The split above, one commit per module (`457a86b`..`e75c8be`), behaviour-preserving. Left in `server.js`: configuration wiring, the MCP server and its failure logging, queue enqueue/claim, startup recovery and the deferred recovery timers (they share four module-level variables with the worker mode and `queueWorkerApi`), the worker mode, `__selfTest`, `queueWorkerApi` and the start block. | `457a86b`..`e75c8be` | fixed |
+| B-094 | `tests/review-flex-queue-worker.js` B-080 failed in 1 to 2 of 3 runs with `database is locked`. | Its `rowsOf` helper opened the worker child's state database without a busy timeout, so a poll that met the child's write lock failed at once. | `PRAGMA busy_timeout = 5000` in the helper; 4 of 4 runs pass. | `bcf804e` | fixed |
+| B-095 | `tests/review-spawn.js` #9/#21, `tests/review2-c.js` and `bin/builder-model-fallback.test.js` assert that guards are written into the code, by reading `server.js` as text; after the split the guards live in `lib/` (#9 failed from the integration-apply step, which did not run it). | The tests read `server.js` alone. | `tests/bridge-source.js` returns `server.js` plus every `lib/` module; the four tests read it. These tests then ran at every step. | `a058190` | fixed |
+| B-096 | Two builder runs pinned to `opencode/muse-spark-1.3-contributor-free` hung 10 minutes each: OpenCode logged `Rate limit exceeded` at once, the bridge reported `opencode_rate_limited` only when the idle watchdog stopped the agent after 600 s. | The provider error arrives as a stream error and OpenCode keeps the process alive; the bridge waits for the agent instead of ending the run on the first rate-limit line. | Open: end a run (and pause the model) on the first provider rate-limit line instead of waiting for the idle watchdog. Seen on the client bridge started before `e46e655`. | | open |
+
 ### server.js split: integrity of lib/ (Claude, 2026-10-02)
 
 Branch `bridge/server-modules`, worktree `<bridge-modules>`, on the split (`457a86b`, M-001):
