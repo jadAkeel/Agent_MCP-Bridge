@@ -79,6 +79,9 @@ const ISSUE_EVENTS = new Set([
   "queue.job_retried",
   "queue.auto_integration_failed",
   "provider.rate_limit_detected",
+  // B-075: an unattended worker's start and stop frame the failures of its run.
+  "queue_worker.started",
+  "queue_worker.stopped",
 ]);
 
 function issueLogPath(stateDir, env = process.env) {
@@ -293,9 +296,11 @@ function readOpsLog(stateDir, { days = 7, now = Date.now() } = {}) {
 }
 
 // Groups by event and errorType. A group is "recurring" at 3 or more lines, or at any error.
+// Info lines (B-075: the queue worker's start, summaries and stop) are progress, not incidents.
 function summarizeIncidents(lines) {
   const groups = new Map();
   for (const line of lines) {
+    if (line?.level === "info") continue;
     const errorType = String(line.errorType || "");
     const key = `${line.event || "unknown"}|${errorType}`;
     const group = groups.get(key) || { event: line.event || "unknown", errorType, level: line.level || "warn", count: 0, firstAt: line.ts, lastAt: line.ts, samples: [], summary: "" };
@@ -467,7 +472,8 @@ function main() {
     process.stdout.write(issueLinesFromRecords(read.lines).join(""));
     return;
   }
-  const read = readOpsLog(stateDir, { days: options.days });
+  const all = readOpsLog(stateDir, { days: options.days });
+  const read = { ...all, lines: all.lines.filter((line) => line?.level !== "info") };
   const groups = summarizeIncidents(read.lines);
   const opencode = opencodeDatabaseHealth();
   const report = { stateDir, days: options.days, read: { files: read.files, lines: read.lines.length, unreadable: read.unreadable }, groups, opencode };
