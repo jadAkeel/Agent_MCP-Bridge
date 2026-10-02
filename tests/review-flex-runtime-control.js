@@ -209,6 +209,102 @@ test("Q-005: get_opencode_bridge_status shows the global cap and every pause wit
   }
 });
 
+// Q-014b: per-provider slot limits at runtime (set_opencode_concurrency providerLimits), persisted
+// as provider_limit:<provider> rows, read by a second bridge process through its refresh.
+const { execFile: execFileCallback } = await import("node:child_process");
+const { promisify } = await import("node:util");
+const { fileURLToPath, pathToFileURL } = await import("node:url");
+const execFileAsync = promisify(execFileCallback);
+const serverUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "server.js")).href;
+const secondProcessScript = path.join(fixtureRoot, "second-process.mjs");
+await writeFile(secondProcessScript, [
+  "process.argv.push('--self-test');",
+  "process.env.CODEX_OPENCODE_LOG_LEVEL = 'off';",
+  "process.env.CODEX_OPENCODE_OPS_LOG = 'off';",
+  `const { __selfTest } = await import(${JSON.stringify(serverUrl)});`,
+  "__selfTest.hooks.stateDirectoryOverride = process.argv[2];",
+  "const { internals } = __selfTest;",
+  "await internals.refreshRuntimeConcurrency({ force: true });",
+  "const base = internals.CONFIG.providerConcurrencyKey;",
+  "process.stdout.write(JSON.stringify({ codex: internals.providerLimitForKey(`${base}:codex`), agy: internals.providerLimitForKey(`${base}:agy`), google: internals.providerLimitForKey(`${base}:google`), perProvider: internals.describeConcurrencyLimits().perProvider }));",
+  "process.exit(0);",
+].join("\n"), "utf8");
+const secondProcess = async () => {
+  const { stdout } = await execFileAsync(process.execPath, [secondProcessScript, stateDir], { env: process.env, timeout: 120_000, windowsHide: true });
+  return JSON.parse(stdout.trim().split(/\r?\n/).pop());
+};
+
+test("Q-014b: providerLimits sets one provider's slots at runtime; a second process reads it; reset clears it", async () => {
+  const { providerLimitForKey } = internals;
+  const globalLimit = CONFIG.providerConcurrencyLimit;
+  assert.equal(describeConcurrencyLimits().perProvider, "", "none configured");
+  const changed = await callTool("set_opencode_concurrency", { providerLimits: { codex: 5, Agy: 1 } });
+  assert.notEqual(changed.isError, true, textOf(changed));
+  assert.match(textOf(changed), /Per-provider slot limits: agy=1 \(runtime\), codex=5 \(runtime\)/);
+  assert.equal(providerLimitForKey(`${base}:codex`), 5);
+  assert.equal(providerLimitForKey(`${base}:agy`), 1, "the provider name is lower-cased like the env list");
+  assert.equal(providerLimitForKey(`${base}:google`), globalLimit, "other providers keep the global limit");
+  // The slot request applies it: one agy slot, the second waits.
+  const first = await slot(`${base}:agy`);
+  assert.equal(first.ok, true, first.error);
+  const second = await slot(`${base}:agy`, [], 500);
+  assert.equal(second.errorType, "provider_slot_wait_timeout");
+  assert.match(second.error, /0 of 1|1 of 1/);
+  await releaseProviderLease(first.lease);
+  // Another bridge process (the queue worker, the other client) picks it up from the database.
+  const other = await secondProcess();
+  assert.deepEqual(other, { codex: 5, agy: 1, google: globalLimit, perProvider: "agy=1 (runtime), codex=5 (runtime)" });
+  // A restart of this process keeps it.
+  RUNTIME_CONCURRENCY.providerLimits = new Map();
+  assert.equal(providerLimitForKey(`${base}:codex`), globalLimit);
+  await refreshRuntimeConcurrency({ force: true });
+  assert.equal(providerLimitForKey(`${base}:codex`), 5, "persisted");
+  // L3: a providerLimit change names the providers that keep their own limit.
+  const global = await callTool("set_opencode_concurrency", { providerLimit: 3 });
+  assert.match(textOf(global), /providerLimit does not apply to agy=1 \(runtime\), codex=5 \(runtime\): they keep their own limit/);
+  assert.equal(providerLimitForKey(`${base}:codex`), 5);
+  assert.equal(providerLimitForKey(`${base}:google`), 3);
+  // null clears one provider; the status shows the rest.
+  const cleared = await setRuntimeConcurrency({ providerLimits: { agy: null } });
+  assert.equal(cleared.ok, true, cleared.error);
+  assert.deepEqual(cleared.current.providerLimits, { codex: 5 });
+  assert.deepEqual(cleared.previousProviderLimits, { agy: 1, codex: 5 });
+  assert.equal(providerLimitForKey(`${base}:agy`), 3, "back to providerLimit");
+  const status = textOf(await callTool("get_opencode_bridge_status", { cwd: repo }));
+  assert.match(status, /Per-provider slot limits: codex=5 \(runtime\)/);
+  // reset clears the per-provider rows too, in this process and the other one.
+  const reset = await callTool("set_opencode_concurrency", { reset: true });
+  assert.notEqual(reset.isError, true, textOf(reset));
+  assert.equal(providerLimitForKey(`${base}:codex`), CONFIG.providerConcurrencyLimit);
+  assert.equal(describeConcurrencyLimits().perProvider, "");
+  assert.equal((await secondProcess()).perProvider, "");
+});
+
+test("Q-014b: invalid providerLimits are refused and change nothing", async () => {
+  const cases = [
+    [{ codex: 0 }, /providerLimits\.codex must be an integer from 1 to 32; got 0 \(or null to clear it\)/],
+    [{ codex: 33 }, /from 1 to 32/],
+    [{ codex: 2.5 }, /from 1 to 32/],
+    [{ codex: "4" }, /from 1 to 32/],
+    [{ "bad name": 2 }, /is not a provider name/],
+    [{ "-x": 2 }, /is not a provider name/],
+    [[2], /must be an object of provider: slots/],
+    ["codex=2", /must be an object of provider: slots/],
+  ];
+  for (const [value, pattern] of cases) {
+    const refused = await setRuntimeConcurrency({ providerLimits: value });
+    assert.equal(refused.ok, false, JSON.stringify(value));
+    assert.equal(refused.errorType, "concurrency_invalid");
+    assert.match(refused.error, pattern, JSON.stringify(value));
+  }
+  assert.match((await setRuntimeConcurrency({ providerLimits: { codex: 2 }, reset: true })).error, /do not combine it with .*providerLimits/);
+  assert.match((await setRuntimeConcurrency({ providerLimits: {} })).error, /reset: true/, "an empty object changes nothing");
+  const tool = await callTool("set_opencode_concurrency", { providerLimits: { codex: 0 } });
+  assert.equal(tool.isError, true);
+  assert.match(textOf(tool), /providerLimits as \{ "<provider>": 1 to 32 or null \}/);
+  assert.equal(describeConcurrencyLimits().perProvider, "");
+});
+
 let failed = 0;
 try {
   for (const { name, fn } of tests) {
