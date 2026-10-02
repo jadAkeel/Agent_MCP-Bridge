@@ -214,6 +214,7 @@ Orchestrator profiles (advanced):
 - When an allowlisted override is used, the result says `Model selection: operator_allowlist_override` and names the model it replaced.
 - A model that is **not** allowlisted is rejected before anything runs (`configured_model_requirement_mismatch`). There is no silent fallback.
 - **To allow a new model:** add it to `CODEX_OPENCODE_MODEL_ALLOWLIST` in `~/.codex/config.toml` under `[mcp_servers.opencode.env]`, restart Codex, then run `npm run smoke:live`.
+- **codex and agy as runners (optional):** with `CODEX_OPENCODE_EXTERNAL_RUNNERS=codex,agy`, allowlist entries such as `codex/gpt-6.1-sol@high` or `agy/default` run the Codex CLI or the Antigravity CLI instead of OpenCode, in the same worktree and with the same checks. The result says `Role enforcement: none (runner codex)`: the CLI does not follow the OpenCode role's permissions. agy runs only worktree writers. Details: `docs/REFERENCE.md`, "External runners".
 
 > **Model identity note.** OpenCode (observed on 1.17.13) does not report in every stream which model actually answered. The bridge therefore reports the *configured* model and never claims runtime proof it does not have. Keep `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=false`, because `true` rejects every real run whose stream lacks that proof.
 

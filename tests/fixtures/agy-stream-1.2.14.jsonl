@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"00000000-0000-0000-0000-000000000000","init":{"cwd":"C:\\scratch","tools":["list_dir","view_file","grep_search","replace_file_content","write_to_file","run_command"],"permission_mode":"request-review"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-0000-0000-000000000000","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\n","duration_seconds":2.95,"usage":{"input_tokens":12121,"output_tokens":61,"thinking_tokens":60,"cache_read_tokens":0,"total_tokens":12182}}}
+{"event":"result","result":{"conversation_id":"00000000-0000-0000-0000-000000000000","status":"SUCCESS","response":"OK\n","duration_seconds":3.04,"num_turns":1,"usage":{"input_tokens":12121,"output_tokens":61,"thinking_tokens":60,"cache_read_tokens":0,"total_tokens":12182}}}
