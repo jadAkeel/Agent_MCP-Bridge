@@ -12,7 +12,7 @@ import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck
 import { inventory as gcInventory } from "./bridge-gc.js";
 import { libPinError } from "./lib-digest.js";
 import { isMainModule } from "./main-module.js";
-import { opencodeDatabaseHealth, readOpsLog, recordCliFailure, summarizeIncidents } from "./ops-log.js";
+import { opencodeDatabaseHealth, readOpsLog, recordCliFailure, summarizeFaults, summarizeIncidents } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER_NAME = "opencode";
@@ -245,9 +245,15 @@ async function runDailyDoctor({ configPath, cwd, claudeConfigPath = defaultClaud
   // OpenCode's own database runs every worker; grown too large it failed every run (2026-09-30).
   for (const warning of opencodeDatabaseHealth(entry?.env || process.env).warnings) warnings.push(warning);
   // Recurring problems from the operations log (bin/ops-log.js), last 7 days.
-  const recurringIncidents = summarizeIncidents(readOpsLog(stateDir, { days: 7 }).lines).filter((group) => group.recurring);
+  const opsLines = readOpsLog(stateDir, { days: 7 }).lines;
+  const recurringIncidents = summarizeIncidents(opsLines).filter((group) => group.recurring);
   if (recurringIncidents.length) {
     warnings.push(`Operations log: ${recurringIncidents.length} recurring problem(s) in the last 7 days (${recurringIncidents.slice(0, 3).map((group) => `${group.event}${group.errorType ? ` [${group.errorType}]` : ""} ${group.count}x`).join("; ")}). Run npm run incidents for details and draft log.md rows.`);
+  }
+  // Q-013: faults of the bridge itself go to the owner's coding assistant, not to a human reader.
+  const faults = summarizeFaults(opsLines);
+  if (faults.length) {
+    warnings.push(`Fault log: ${faults.length} distinct fault(s) of the bridge itself in the last 7 days (${faults.slice(0, 3).map((group) => `${group.event}${group.errorType ? ` [${group.errorType}]` : ""} ${group.count}x`).join("; ")}). Run npm run faults -- --prompt and give the output to your coding assistant.`);
   }
   const retainedForReview = housekeeping.worktrees.filter((item) => item.classification === "retained_for_review").length;
   if (retainedForReview) {

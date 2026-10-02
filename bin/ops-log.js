@@ -8,14 +8,18 @@
 // OpenCode's own database has grown large enough to fail every run (2026-09-30: 5 GB with a
 // 4 GB WAL, every OpenCode start failed on its first insert).
 //   node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json]
+//   node bin/ops-log.js --issues [--days 7] [--state-dir <absolute>]
+//   node bin/ops-log.js --faults [--days 30] [--state-dir <absolute>] [--json | --prompt]
 //   node bin/ops-log.js --self-test
 // The bin/ commands record their own top-level failure here too (recordCliFailure), so a
 // failed setup, doctor or release step is in the same file as the bridge's own errors.
 
+import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isMainModule } from "./main-module.js";
 
 const LOG_FILE_PATTERN = /^bridge-(\d{4}-\d{2}-\d{2})\.jsonl$/;
@@ -143,14 +147,265 @@ function appendIssueLogLine(stateDir, record) {
   }
 }
 
+// Q-013: the fault log. The issue log (above) holds what went wrong with a job: the agent, the
+// provider, a timeout, a refused call. This file holds what went wrong with the BRIDGE ITSELF: a
+// crash, a tool handler or queue runner that threw, state that could not be written or recovered,
+// a JavaScript error surfacing in a job's failure text. The owner's coding assistant reads it
+// (`npm run faults -- --prompt` prints a ready task) and fixes the bridge; nobody writes these by
+// hand in production. Same source of truth as the issue log: the JSONL record that was just
+// written, and `node bin/ops-log.js --faults` rebuilds the grouped view from the JSONL files.
+const FAULT_EXCLUDED_EVENTS = new Set([
+  // The companion of a crash line, not a fault of its own.
+  "process.exited",
+  // The external runner (agy) misbehaved, not the bridge.
+  "external_runner.wrote_outside_worktree",
+]);
+// Warn-level events that mean the bridge's own state went wrong (lost ownership, a record it
+// could not persist, a recovery or quarantine step that did not run to its result).
+// A transient refresh failure (a busy database) is not among them.
+const FAULT_WARN_EVENT_PATTERN = /quarantin|reconcil|ownership_lost|persistence|recovery_failed|recovery_blocked|resume_failed|record_failed|release_failed|cleanup_failed|handler_failed|unhandled|internal/i;
+// The text of a JavaScript or storage error inside any record's summary, stack or errorType.
+const JS_FAULT_SIGNATURE = /\b(?:TypeError|ReferenceError|RangeError|SyntaxError|AssertionError|ERR_[A-Z_]{3,}|SQLITE_(?:CORRUPT|MISUSE|IOERR|CANTOPEN|READONLY|FULL|NOTADB|CONSTRAINT))\b|is not a function|Cannot read propert|Cannot set propert|is not defined|is not iterable|Maximum call stack|database disk image is malformed|Unexpected token|Unexpected end of JSON/;
+const NODE_ERROR_CODE = /^E[A-Z]{3,}$/;
+const JSON_RPC_INTERNAL_ERROR = -32603;
+
+function faultText(record) {
+  return [record.summary, record.lastLine, record.stack, record.errorType, record.error].filter((item) => typeof item === "string").join("\n");
+}
+
+// Whether a record of the operations log is a fault of the bridge itself.
+function isBridgeFault(record) {
+  if (!record || typeof record !== "object") return false;
+  const event = String(record.event || "");
+  if (!event || FAULT_EXCLUDED_EVENTS.has(event)) return false;
+  const text = faultText(record);
+  // An MCP request the SDK rejected is the client's mistake (unknown method or tool, invalid
+  // arguments) unless the server itself failed (-32603) or a JavaScript error is in the text.
+  if (event === "mcp.request_failed") return Number(record.code) === JSON_RPC_INTERNAL_ERROR || JS_FAULT_SIGNATURE.test(text);
+  // A bin/ command failing on purpose (a refused preflight, "attention required", a failed gate)
+  // is a report for the operator; a Node error or a JavaScript error inside one is a fault.
+  if (event.startsWith("cli.")) return JS_FAULT_SIGNATURE.test(text) || NODE_ERROR_CODE.test(String(record.errorType || ""));
+  if (record.level === "error") return true;
+  if (FAULT_WARN_EVENT_PATTERN.test(event)) return true;
+  return JS_FAULT_SIGNATURE.test(text);
+}
+
+// The first stack frame that names a bridge file: "<function> (<file basename>)", without line
+// numbers, so a fault keeps its identity across deploys.
+function faultLocation(stack) {
+  for (const line of String(stack || "").split(/\r?\n/)) {
+    const match = /^\s*at\s+(?:(.+?)\s+\()?(?:file:\/\/\/?|)(.+?\.(?:m?js|cjs)):\d+:\d+\)?\s*$/.exec(line);
+    if (!match) continue;
+    const file = match[2].replace(/\\/g, "/").split("/").pop();
+    return match[1] ? `${match[1].replace(/^async\s+/, "")} (${file})` : file;
+  }
+  return "";
+}
+
+// Paths, hashes, ids and numbers vary between occurrences of the same fault; the fingerprint
+// hashes the record with those removed, so repeats of one fault group together.
+function faultFingerprint(record) {
+  const normalize = (value) => String(value || "")
+    .replace(/[A-Za-z]:\\[^\s"'`)]+|(?:file:\/\/)?\/[^\s"'`):]+/g, "<path>")
+    .replace(/\b[0-9a-f]{12,}\b/gi, "<hex>")
+    .replace(/\d+/g, "#")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  const text = `${record.event || ""}|${record.errorType || ""}|${normalize(record.summary || record.error || "")}|${faultLocation(record.stack)}`;
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 12);
+}
+
+function faultLogPath(stateDir, env = process.env) {
+  const raw = String(env.CODEX_OPENCODE_FAULT_LOG || "").trim();
+  if (raw.toLowerCase() === "off") return "";
+  if (!raw) return path.join(logDirectory(stateDir), "faults.md");
+  return path.isAbsolute(raw) ? path.resolve(raw) : "";
+}
+
+const FAULT_LOG_HEADER = [
+  "# Bridge fault log",
+  "",
+  "Faults of the bridge itself: crashes, tool handlers and queue runners that threw, state it",
+  "could not write or recover, JavaScript errors inside a job's failure. One entry per fault the",
+  "first time a bridge process sees it, then one `repeat` line; derived from the operations log",
+  "(`bridge-<day>.jsonl` next to this file). Agent failures, rate limits, timeouts and refused",
+  "calls are not faults; they are in `issues.md`.",
+  "",
+  "To fix them: in the bridge directory run `npm run faults -- --prompt` and give the output to",
+  "your coding assistant. When one is fixed, change its `status: open` line to",
+  "`status: fixed <commit>`; `npm run faults` always rebuilds the grouped view from the JSONL files.",
+  "",
+].join("\n");
+
+function faultContext(record) {
+  const clean = (value, max = 120) => String(value ?? "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+  const parts = [];
+  if (record.tool) parts.push(`tool ${clean(record.tool, 80)}`);
+  if (record.method && !record.tool) parts.push(`method ${clean(record.method, 80)}`);
+  if (record.jobId) parts.push(`job ${clean(record.jobId)}`);
+  if (record.runId) parts.push(`run ${clean(record.runId)}`);
+  if (record.operationId) parts.push(`operation ${clean(record.operationId)}`);
+  if (record.pipelineId) parts.push(`pipeline ${clean(record.pipelineId)}`);
+  if (record.providerKey) parts.push(`provider ${clean(record.providerKey)}`);
+  if (record.runner) parts.push(`runner ${clean(record.runner, 40)}`);
+  if (record.code !== undefined && record.code !== null) parts.push(`code ${clean(record.code, 20)}`);
+  if (record.exitCode !== undefined && record.exitCode !== null) parts.push(`exit ${clean(record.exitCode, 20)}`);
+  if (record.origin) parts.push(`origin ${clean(record.origin, 40)}`);
+  if (record.pid) parts.push(`pid ${clean(record.pid, 20)}`);
+  if (record.build) parts.push(`build ${clean(record.build, 80)}`);
+  return parts.join(", ");
+}
+
+// The markdown entry of one fault record (a repeat is one line). Multi-line by design: the
+// stack is what the fixing session needs; the summary alone rarely names the file.
+function faultMarkdownEntry(record, { fingerprint = faultFingerprint(record), repeat = false } = {}) {
+  if (!isBridgeFault(record)) return "";
+  const clean = (value, max) => String(value ?? "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+  const when = `${String(record.ts || "").replace("T", " ").slice(0, 16)} UTC`;
+  if (repeat) return `- repeat: fault ${fingerprint} at ${when}${record.jobId ? ` (job ${clean(record.jobId, 120)})` : ""}\n`;
+  const lines = [
+    `### ${when} | ${clean(record.event, 80)} | fault ${fingerprint}`,
+    "- status: open",
+  ];
+  if (record.errorType) lines.push(`- errorType: ${clean(record.errorType, 80)}`);
+  const location = faultLocation(record.stack);
+  if (location) lines.push(`- where: ${clean(location, 160)}`);
+  const context = faultContext(record);
+  if (context) lines.push(`- context: ${context}`);
+  lines.push(`- summary: ${clean(record.summary || record.error || record.note || "", 600) || "-"}`);
+  if (record.lastLine && !String(record.summary || "").includes(record.lastLine)) lines.push(`- last line: ${clean(record.lastLine, 200)}`);
+  if (typeof record.stack === "string" && record.stack.trim()) {
+    lines.push("- stack:", "  ```");
+    for (const frame of record.stack.split(/\r?\n/).slice(0, 8)) lines.push(`  ${frame.replace(/[\r\n]+/g, " ").slice(0, 300)}`);
+    lines.push("  ```");
+  }
+  return `${lines.join("\n")}\n\n`;
+}
+
+// Fingerprints this process has already written in full; a repeat gets one line. A file under
+// this size is also read once per fault, so a second process does not repeat the full entry.
+const faultsWritten = new Set();
+const FAULT_LOG_MAX_BYTES = 20 * 1024 * 1024;
+const FAULT_LOG_SCAN_BYTES = 2 * 1024 * 1024;
+
+function appendFaultLogEntry(stateDir, record) {
+  try {
+    if (!isBridgeFault(record)) return false;
+    const file = faultLogPath(stateDir);
+    if (!file) return false;
+    const directory = path.dirname(file);
+    if (entryKind(directory) !== "directory") return false;
+    const fileKind = entryKind(file);
+    if (fileKind !== "missing" && fileKind !== "file") return false;
+    const size = fileKind === "file" ? lstatSync(file).size : 0;
+    if (size >= FAULT_LOG_MAX_BYTES) return false;
+    const fingerprint = faultFingerprint(record);
+    let repeat = faultsWritten.has(fingerprint);
+    if (!repeat && fileKind === "file" && size > 0 && size <= FAULT_LOG_SCAN_BYTES) {
+      try { repeat = readFileSync(file, "utf8").includes(`fault ${fingerprint}`); } catch { /* Unreadable: write the full entry. */ }
+    }
+    const entry = faultMarkdownEntry(record, { fingerprint, repeat });
+    if (!entry) return false;
+    const descriptor = openSync(file, APPEND_FLAGS, 0o600);
+    try {
+      if (!fstatSync(descriptor).isFile()) return false;
+      writeSync(descriptor, `${fileKind === "missing" || size === 0 ? FAULT_LOG_HEADER : ""}${entry}`, null, "utf8");
+    } finally {
+      closeSync(descriptor);
+    }
+    faultsWritten.add(fingerprint);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Groups the fault records by fingerprint, newest group first.
+function summarizeFaults(lines) {
+  const groups = new Map();
+  for (const line of lines) {
+    if (!isBridgeFault(line)) continue;
+    const fingerprint = faultFingerprint(line);
+    const group = groups.get(fingerprint) || { fingerprint, event: line.event || "unknown", errorType: String(line.errorType || ""), level: line.level || "warn", count: 0, firstAt: line.ts || "", lastAt: line.ts || "", summary: "", location: "", stack: "", context: "", samples: [], builds: [] };
+    group.count += 1;
+    const ts = String(line.ts || "");
+    if (ts < group.firstAt || !group.firstAt) group.firstAt = ts;
+    if (ts >= group.lastAt) {
+      group.lastAt = ts;
+      group.summary = String(line.summary || line.error || line.note || "").replace(/\s+/g, " ").trim().slice(0, 600) || group.summary;
+      group.location = faultLocation(line.stack) || group.location;
+      if (typeof line.stack === "string" && line.stack.trim()) group.stack = line.stack.split(/\r?\n/).slice(0, 8).join("\n");
+      group.context = faultContext({ ...line, pid: undefined, build: undefined }) || group.context;
+    }
+    const sample = line.operationId || line.jobId || line.runId || line.pipelineId || line.tool || line.method || "";
+    if (sample && group.samples.length < 3 && !group.samples.includes(sample)) group.samples.push(sample);
+    if (line.build && group.builds.length < 3 && !group.builds.includes(line.build)) group.builds.push(line.build);
+    groups.set(fingerprint, group);
+  }
+  return [...groups.values()].sort((left, right) => right.lastAt.localeCompare(left.lastAt));
+}
+
+function formatFaults({ days, read, groups, faultLog = "" }) {
+  const out = [`Bridge faults, last ${days} day(s): ${groups.length} distinct fault(s), ${groups.reduce((sum, group) => sum + group.count, 0)} record(s), from ${read.lines.length} log line(s) in ${read.files} file(s)${read.unreadable ? `, ${read.unreadable} unreadable` : ""}.`];
+  if (faultLog) out.push(`Fault log: ${faultLog}`);
+  if (!groups.length) out.push("No fault of the bridge itself was logged.");
+  for (const group of groups) {
+    out.push("", `FAULT ${group.fingerprint}  ${group.count}x  ${group.event}${group.errorType ? ` [${group.errorType}]` : ""}  first ${group.firstAt}  last ${group.lastAt}${group.builds.length ? `  build ${group.builds.join(" / ")}` : ""}`);
+    if (group.location) out.push(`  where:   ${group.location}`);
+    if (group.context) out.push(`  context: ${group.context}`);
+    if (group.summary) out.push(`  summary: ${group.summary}`);
+    if (group.samples.length) out.push(`  samples: ${group.samples.join(", ")}`);
+    if (group.stack) for (const frame of group.stack.split("\n")) out.push(`    ${frame}`);
+  }
+  if (groups.length) out.push("", "A task for your coding assistant: node bin/ops-log.js --faults --prompt");
+  return `${out.join("\n")}\n`;
+}
+
+// A self-contained task for the owner's coding assistant (Claude Code, Codex or another): the
+// faults with their locations and stacks, the bridge directory, and the rules a fix session
+// of this repository follows.
+function faultFixPrompt({ groups, bridgeRoot, faultLog = "", days }) {
+  if (!groups.length) return `The bridge at ${bridgeRoot} logged no fault of its own in the last ${days} day(s). Nothing to fix.\n`;
+  const lines = [
+    `You are fixing the Agent MCP Bridge, the MCP server in ${bridgeRoot} (Node.js, ES modules; server.js plus lib/**/*.js and bin/*.js).`,
+    `Its operations log recorded ${groups.length} fault(s) the bridge caused itself in the last ${days} day(s); they are listed below with the first stack frame that names a bridge file. A fault here is a defect or a broken state of the bridge, not an agent, provider or rate-limit failure.`,
+    "",
+    "For each fault:",
+    "1. Read the named file and function and the code around it; find the root cause, not just the throwing line.",
+    "2. Fix it in a git worktree of the bridge repository (never edit the live checkout directly) and keep the change to what the fault requires.",
+    "3. Add a regression test under tests/ in the style of its neighbours, run `node --check` on every touched file and the related tests (not the full `npm test` unless asked).",
+    "4. Add a row to log.md under today's date with the next free B-xxx id (problem, cause, fix, status), and change the fault's `status: open` line in the fault log to `status: fixed <commit>`.",
+    "5. Never touch ~/.codex/config.toml, ~/.claude.json, the bridge state directory or its SQLite files; a fix is deployed afterwards with `npm run release:activate -- --sync-clients` and a client restart.",
+    "If a fault is a configuration problem (for example a stale integrity pin after an update, or a missing executable), say so and name the command that fixes it instead of changing code.",
+    "",
+  ];
+  if (faultLog) lines.push(`Fault log file: ${faultLog}`, "");
+  groups.forEach((group, index) => {
+    lines.push(`## Fault ${index + 1} of ${groups.length}: ${group.fingerprint}, ${group.count}x, last ${group.lastAt}`);
+    lines.push(`- event: ${group.event}${group.errorType ? `, errorType: ${group.errorType}` : ""}${group.builds.length ? `, build: ${group.builds.join(" / ")}` : ""}`);
+    if (group.location) lines.push(`- where: ${group.location}`);
+    if (group.context) lines.push(`- context: ${group.context}`);
+    if (group.samples.length) lines.push(`- samples: ${group.samples.join(", ")}`);
+    lines.push(`- summary: ${group.summary || "-"}`);
+    if (group.stack) lines.push("- stack:", "```", ...group.stack.split("\n"), "```");
+    lines.push("");
+  });
+  lines.push("Reference: docs/REFERENCE.md (configuration, errorType catalogue), docs/USER_GUIDE.md section 11 (troubleshooting), log.md (every past problem and its fix).");
+  return `${lines.join("\n")}\n`;
+}
+
 // Never throws: the operations log must not turn a logged failure into a second one.
 // It never follows a link: if <state-dir>/logs or today's file is a junction or symlink, the
 // line is dropped (false) instead of being written, or pruning deleting, outside the state dir.
 function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
   const written = appendJsonlLine(stateDir, record, { now });
   // Q-006: only a record the JSONL file holds may appear in the issue log (not one the daily cap
-  // replaced by its cap line).
-  if (written === "record") appendIssueLogLine(stateDir, record);
+  // replaced by its cap line). Q-013: the same for the fault log.
+  if (written === "record") {
+    appendIssueLogLine(stateDir, record);
+    appendFaultLogEntry(stateDir, record);
+  }
   return Boolean(written);
 }
 
@@ -372,11 +627,13 @@ function formatIncidents({ days, read, groups, opencode }) {
 }
 
 function parseArguments(argv) {
-  const options = { incidents: false, issues: false, selfTest: false, days: 7, json: false, stateDir: "" };
+  const options = { incidents: false, issues: false, faults: false, prompt: false, selfTest: false, days: 0, json: false, stateDir: "" };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--incidents") options.incidents = true;
     else if (argument === "--issues") options.issues = true;
+    else if (argument === "--faults") options.faults = true;
+    else if (argument === "--prompt") options.prompt = true;
     else if (argument === "--self-test") options.selfTest = true;
     else if (argument === "--json") options.json = true;
     else if (argument === "--days") {
@@ -393,6 +650,10 @@ function parseArguments(argv) {
       throw new Error(`Unknown argument: ${argument}`);
     }
   }
+  if (Number(options.incidents) + Number(options.issues) + Number(options.faults) > 1) throw new Error("Use one of --incidents, --issues or --faults.");
+  if (options.prompt && !options.faults) throw new Error("--prompt belongs to --faults.");
+  // Faults are rare and worth a longer look back than the incident summary.
+  if (!options.days) options.days = options.faults ? 30 : 7;
   return options;
 }
 
@@ -412,7 +673,7 @@ function selfTest() {
     }
     appendOpsLogLine(root, { ts: now.toISOString(), level: "error", event: "integration.journal_quarantined", operationId: "op-1" }, { now });
     appendOpsLogLine(root, { ts: now.toISOString(), level: "warn", event: "once" }, { now });
-    const files = readdirSync(logDirectory(root));
+    const files = readdirSync(logDirectory(root)).filter((name) => LOG_FILE_PATTERN.test(name));
     if (files.length !== 1 || files[0] !== `bridge-${dayOf(now)}.jsonl`) throw new Error(`retention: ${files.join(",")}`);
     const read = readOpsLog(root, { days: 7 });
     const groups = summarizeIncidents(read.lines);
@@ -456,22 +717,57 @@ function selfTest() {
     if (JSON.stringify(readOpsLog(cliState, { days: 1 }).lines).includes("ghp_FAKE")) throw new Error("the CLI message must be redacted");
     if (recordCliFailure("x", new Error("y"), { argv: ["node", "x.js", "--self-test"] }) !== false) throw new Error("a self-test without a state dir writes nothing");
     if (recordCliFailure("x", null, { stateDir: path.join(root, "\0bad") }) !== false) throw new Error("recordCliFailure never throws");
+
+    // Q-013: a crash is a fault and gets a full entry once, then a repeat line; a rate-limited
+    // run and a client's unknown method are not faults; the grouped view finds the same fault.
+    const faultState = path.join(root, "fault-state");
+    const crash = { ts: now.toISOString(), level: "error", event: "process.uncaught_exception", errorType: "TypeError", summary: "Cannot read properties of undefined (reading 'jobId') in C:\\x\\lib\\queue\\start.js", stack: "TypeError: Cannot read properties of undefined (reading 'jobId')\n    at startQueueRecord (file:///C:/x/lib/queue/start.js:240:11)\n    at async run (file:///C:/x/server.js:10:3)" };
+    if (!isBridgeFault(crash) || isBridgeFault({ ...crash, level: "warn", event: "agent.run_failed", errorType: "opencode_rate_limited", summary: "rate limit", stack: "" })) throw new Error("fault classification");
+    if (isBridgeFault({ ts: now.toISOString(), level: "error", event: "mcp.request_failed", method: "resources/templates/list", code: -32601, summary: "Method not found" })) throw new Error("a client's unknown method is not a fault");
+    if (!isBridgeFault({ ts: now.toISOString(), level: "warn", event: "tool.refused", tool: "get_opencode_job", errorType: "", summary: "TypeError: x is not a function" })) throw new Error("a JavaScript error inside a refusal is a fault");
+    if (faultFingerprint(crash) !== faultFingerprint({ ...crash, summary: crash.summary.replace("C:\\x", "D:\\y"), stack: crash.stack.replace(":240:11", ":512:3") })) throw new Error("a fingerprint ignores paths and line numbers");
+    if (faultLocation(crash.stack) !== "startQueueRecord (start.js)") throw new Error(`location: ${faultLocation(crash.stack)}`);
+    faultsWritten.clear();
+    if (!appendOpsLogLine(faultState, crash, { now }) || !appendOpsLogLine(faultState, crash, { now })) throw new Error("fault lines must be written");
+    const faultsText = readFileSync(faultLogPath(faultState), "utf8");
+    if (!faultsText.startsWith("# Bridge fault log") || (faultsText.match(/^### /gm) || []).length !== 1 || !/^- repeat: fault [0-9a-f]{12} at /m.test(faultsText) || !/- where: startQueueRecord \(start\.js\)/.test(faultsText) || !/- status: open/.test(faultsText)) throw new Error(`fault log: ${faultsText}`);
+    // A second process (empty memory) reads the file and writes a repeat line, not a second entry.
+    faultsWritten.clear();
+    appendOpsLogLine(faultState, crash, { now });
+    if ((readFileSync(faultLogPath(faultState), "utf8").match(/^### /gm) || []).length !== 1) throw new Error("a second process must not repeat the full entry");
+    const faultGroups = summarizeFaults(readOpsLog(faultState, { days: 1 }).lines);
+    if (faultGroups.length !== 1 || faultGroups[0].count !== 3 || faultGroups[0].location !== "startQueueRecord (start.js)") throw new Error(`fault groups: ${JSON.stringify(faultGroups)}`);
+    const prompt = faultFixPrompt({ groups: faultGroups, bridgeRoot: "C:\\bridge", faultLog: faultLogPath(faultState), days: 30 });
+    if (!/Fault 1 of 1/.test(prompt) || !/start\.js/.test(prompt) || !/log\.md/.test(prompt)) throw new Error("fix prompt");
+    if (faultLogPath("/state", { CODEX_OPENCODE_FAULT_LOG: "off" }) !== "" || faultLogPath("/state", { CODEX_OPENCODE_FAULT_LOG: "relative.md" }) !== "") throw new Error("fault log path");
     process.stdout.write("ops-log self-test passed.\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
     Object.assign(writerState, { day: "", file: "", bytes: 0, capped: false, pruned: "" });
+    faultsWritten.clear();
   }
 }
 
 function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.selfTest) return selfTest();
-  if (!options.incidents && !options.issues) throw new Error("Usage: node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json] | --issues [--days 7] [--state-dir <absolute>] | --self-test");
+  if (!options.incidents && !options.issues && !options.faults) throw new Error("Usage: node bin/ops-log.js --incidents [--days 7] [--state-dir <absolute>] [--json] | --issues [--days 7] [--state-dir <absolute>] | --faults [--days 30] [--state-dir <absolute>] [--json | --prompt] | --self-test");
   const stateDir = options.stateDir || defaultStateDirectory();
   // Q-006: the issue lines rebuilt from the JSONL file (the source of truth), oldest first.
   if (options.issues) {
     const read = readOpsLog(stateDir, { days: options.days });
     process.stdout.write(issueLinesFromRecords(read.lines).join(""));
+    return;
+  }
+  // Q-013: the bridge's own faults, grouped by fingerprint, or the fix task for an assistant.
+  if (options.faults) {
+    const read = readOpsLog(stateDir, { days: options.days });
+    const groups = summarizeFaults(read.lines);
+    const faultLog = faultLogPath(stateDir);
+    const bridgeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    if (options.prompt) process.stdout.write(faultFixPrompt({ groups, bridgeRoot, faultLog, days: options.days }));
+    else if (options.json) process.stdout.write(`${JSON.stringify({ stateDir, days: options.days, faultLog, read: { files: read.files, lines: read.lines.length, unreadable: read.unreadable }, groups }, null, 2)}\n`);
+    else process.stdout.write(formatFaults({ days: options.days, read, groups, faultLog }));
     return;
   }
   const all = readOpsLog(stateDir, { days: options.days });
@@ -491,4 +787,4 @@ if (isMainModule(import.meta.url)) {
   }
 }
 
-export { appendOpsLogLine, draftLogRow, issueLinesFromRecords, issueLogPath, issueMarkdownLine, formatIncidents, opencodeDatabaseHealth, readOpsLog, recordCliFailure, redactCliText, summarizeIncidents };
+export { appendOpsLogLine, draftLogRow, faultFingerprint, faultFixPrompt, faultLocation, faultLogPath, faultMarkdownEntry, formatFaults, isBridgeFault, issueLinesFromRecords, issueLogPath, issueMarkdownLine, formatIncidents, opencodeDatabaseHealth, readOpsLog, recordCliFailure, redactCliText, summarizeFaults, summarizeIncidents };
