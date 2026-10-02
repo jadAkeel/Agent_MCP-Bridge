@@ -61,12 +61,17 @@ Run these from `<bridge-dir>`.
 | `npm run tui` | Terminal dashboard for pipelines and jobs |
 | `npm run incidents` | Summarize recurring warnings and errors from the operations log |
 | `npm run issues` | Print the issue log: one line per job failure, rebuilt from the operations log |
+| `npm run worker -- --repo <project> --status` | Show the unattended queue worker of a repository and its queue counts |
 | `npm run release:activate -- --sync-clients` | Re-pin the `server.js` and plugin-manifest hashes and copy the Codex entry to Claude Code |
 | `npm run release:activate` | Run the release gate, build, activate, and verify a new release in one step |
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
 Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them, and every job failure is also one line of `<state-dir>/logs/issues.md`.
+
+## Unattended runs
+
+A bridge lives only as long as its MCP client, so a batch of hundreds of queued jobs used to need a client open for hours. `npm run worker -- --repo <project> --enqueue jobs.jsonl --env-from codex` runs the bridge's own queue for one repository without a client: write one `enqueue_opencode_job` input per line (each with an `idempotencyKey`), start the worker, watch it with `list_opencode_jobs` or `--status`, and stop it with `--stop` (`--now` cancels the running jobs) or Ctrl+C; jobs a stopped worker leaves behind stay parked for the next worker until `--release` hands them to the clients; `--until-empty` exits when the queue is done. Retries, fallback models, pauses and auto-integration work as in a client ([USER_GUIDE section 8](docs/USER_GUIDE.md#unattended-runs-queue-worker), [REFERENCE](docs/REFERENCE.md#queue-worker-binqueue-workerjs)).
 
 ## Status
 

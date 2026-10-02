@@ -9,12 +9,12 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { strict as assert } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createDirectRunAudit, directRunMetrics, ensureDirectRunAuditSchema } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { detachWorktreeLinks } from "./bin/worktree-links.js";
@@ -2039,11 +2039,16 @@ function sanitizeLogValue(value, depth = 0) {
   return String(value);
 }
 
+// B-075: info events that still belong in the operations log. An unattended worker has no client
+// that shows its stderr, so its start, its 10-minute summaries and its stop are only visible there;
+// a client bridge's "worker present, adoption skipped" line explains jobs it leaves alone.
+const OPS_LOG_INFO_EVENTS = new Set(["queue_worker.started", "queue_worker.summary", "queue_worker.stopped", "queue.worker_present"]);
+
 function logEvent(level, event, data = {}) {
   const configuredLevel = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.warn;
   const eventLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
   const toStderr = configuredLevel >= eventLevel;
-  const toOpsLog = eventLevel <= LOG_LEVELS.warn && opsLogEnabled();
+  const toOpsLog = (eventLevel <= LOG_LEVELS.warn || OPS_LOG_INFO_EVENTS.has(event)) && opsLogEnabled();
   if (!toStderr && !toOpsLog) {
     return;
   }
@@ -2192,23 +2197,33 @@ function recordProcessFailure(kind, error, { origin = "" } = {}) {
 
 // Only the real start path installs these (never an import or --self-test): the bridge still
 // prints the error and exits 1, as Node does without a handler.
+let processFailureHandlersInstalled = false;
+
 function installProcessFailureHandlers() {
+  // Once per process: the queue worker installs them too (B-075), and a test may start it twice.
+  if (processFailureHandlersInstalled) return;
+  processFailureHandlersInstalled = true;
   process.on("uncaughtException", (error, origin) => crashAndExit("uncaught_exception", error, origin || "uncaughtException"));
   // The second argument of unhandledRejection is the promise, not an origin string.
   process.on("unhandledRejection", (reason) => crashAndExit("unhandled_rejection", reason, "unhandledRejection"));
   process.on("exit", (code) => {
     try {
-      if (code) logEvent("error", "process.exited", { code });
+      if (code && code !== processExitLogSuppressedCode) logEvent("error", "process.exited", { code });
     } catch { /* The process is ending; nothing else can be done. */ }
   });
 }
+
+// B-075: the queue worker documents exit code 2 for "stopped by an error" (1 is "refused to start").
+let processCrashExitCode = 1;
+// B-086: the exit code a queue worker's refusal already logged (queue_worker.refused) as itself.
+let processExitLogSuppressedCode = null;
 
 function crashAndExit(kind, error, origin) {
   recordProcessFailure(kind, error, { origin });
   try {
     process.stderr.write(`${error?.stack || error}\n`);
   } catch { /* stderr may already be closed. */ }
-  process.exit(1);
+  process.exit(processCrashExitCode);
 }
 
 // encoding: "buffer" returns stdout as the exact bytes (patches, blobs); stderr is always text.
@@ -21687,9 +21702,16 @@ function queueRecordSnapshot(record, includeResult = true) {
     // Q-007: the retry policy's counters, the attempts so far and a retry's start time.
     retryAttempt: record.retryAttempt || 0,
     maxAttempts: record.maxAttempts || 0,
-    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS)) : [],
+    attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_HISTORY_MAX) : [],
     startAfter: record.startAfter || "",
+    // B-080: "provider_pause" when startAfter waits for provider/model pauses to end; any bridge
+    // process releases such a wait as soon as none of the job's models is paused any more.
+    startAfterReason: record.startAfter ? record.startAfterReason || "" : "",
     slotWaitRequeues: record.slotWaitRequeues || 0,
+    // B-078: requeues after a slot refusal for a paused provider/model (not attempts), and the
+    // pause end such a refusal reported (set only when the agent never started).
+    pauseWaitRequeues: record.pauseWaitRequeues || 0,
+    providerRefusedUntil: record.providerRefusedUntil || "",
     // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
     // (a restart reschedules completed jobs that asked and are not integrated yet).
     autoIntegration: record.autoIntegration || null,
@@ -22962,7 +22984,17 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
-  if (!record.startAfter) delete record.startAfter;
+  // B-078: a new job whose every model is paused waits for the first pause to end instead of
+  // failing its first attempt at the slot. The request keeps its first model (the idempotency
+  // fingerprint must not depend on the pauses of the moment); a requeue chose its own start.
+  if (!recordFields && retryPolicy.policy?.models?.length && !normalizedJob.dryRun) {
+    const first = await chooseRetryModel(retryPolicy.policy, 0).catch(() => ({ startAfter: "" }));
+    if (first.startAfter) Object.assign(record, { startAfter: first.startAfter, startAfterReason: "provider_pause" });
+  }
+  if (!record.startAfter) {
+    delete record.startAfter;
+    delete record.startAfterReason;
+  }
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -23065,6 +23097,10 @@ async function markQueueJobRequeued(projectRoot, jobId, newJobId) {
 const RETRY_POLICY_DEFAULT_ATTEMPTS = 4;
 const RETRY_POLICY_MAX_ATTEMPTS = 10;
 const RETRY_POLICY_MAX_SLOT_WAITS = 12;
+// B-078: a slot request refused because the provider or model was paused (by the operator, a rate
+// limit or a quota) never started the agent either; such refusals are not attempts, up to this many.
+const RETRY_POLICY_MAX_PAUSE_WAITS = 24;
+const RETRY_POLICY_HISTORY_MAX = RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS + RETRY_POLICY_MAX_PAUSE_WAITS;
 
 // B-072: removes the worktree of a failed write attempt only when it holds nothing: no changed
 // file in the record, and git sees no change, untracked file or commit in it.
@@ -23251,7 +23287,14 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
   // RETRY_POLICY_MAX_SLOT_WAITS times (a cap held for hours must not loop forever).
   const slotWaits = Number(summary.slotWaitRequeues || 0);
   const uncountedSlotWait = errorType === "provider_slot_wait_timeout" && slotWaits < RETRY_POLICY_MAX_SLOT_WAITS;
-  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedSlotWait ? " (not counted: the agent never started)" : ""}`].slice(-(RETRY_POLICY_MAX_ATTEMPTS + RETRY_POLICY_MAX_SLOT_WAITS));
+  // B-078: the slot request was refused because the provider or model is paused (providerRefusedUntil
+  // is set only when the agent never started). Counting it let a job whose next model got paused,
+  // or whose models were all paused at enqueue, give up without one real run; it now waits instead.
+  const pauseWaits = Number(summary.pauseWaitRequeues || 0);
+  const uncountedPauseWait = !uncountedSlotWait && Boolean(summary.providerRefusedUntil) && pauseWaits < RETRY_POLICY_MAX_PAUSE_WAITS;
+  const uncounted = uncountedSlotWait || uncountedPauseWait;
+  const uncountedNote = uncountedSlotWait ? " (not counted: the agent never started)" : uncountedPauseWait ? " (not counted: the model was paused, the agent never started)" : "";
+  const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}${uncountedNote}`].slice(-RETRY_POLICY_HISTORY_MAX);
   const giveUp = async (why) => {
     await patchTerminalQueueSummary(projectRoot, jobId, { completionOutcome: "gave_up", attemptHistory: history });
     logEvent("warn", "queue.job_gave_up", {
@@ -23263,16 +23306,17 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     });
     return { action: "gave_up", attempts: attempt, history };
   };
-  if (!uncountedSlotWait && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
-  const nextAttempt = uncountedSlotWait ? attempt : attempt + 1;
-  // The model order follows the counted attempts; a slot wait tries the next model all the same
-  // (another provider may have a free slot), without spending an attempt.
-  const next = await chooseRetryModel(checked.policy, uncountedSlotWait ? attempt + slotWaits : attempt, summary);
+  if (!uncounted && attempt >= maxAttempts) return await giveUp(`Gave up after ${attempt} of ${maxAttempts} attempt(s).`);
+  const nextAttempt = uncounted ? attempt : attempt + 1;
+  // The model order follows the counted attempts; a slot wait or a paused-model refusal tries the
+  // next model all the same (another provider may have a free slot or no pause), without spending
+  // an attempt; when every model is paused, chooseRetryModel makes the retry wait (startAfter).
+  const next = await chooseRetryModel(checked.policy, uncounted ? attempt + slotWaits + pauseWaits : attempt, summary);
   const requeued = await requeueQueueJob({
     cwd: projectRoot,
     jobId,
     model: next.spec || "",
-    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits },
+    recordFields: { retryAttempt: nextAttempt, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "", startAfterReason: next.startAfter ? "provider_pause" : "", slotWaitRequeues: uncountedSlotWait ? slotWaits + 1 : slotWaits, pauseWaitRequeues: uncountedPauseWait ? pauseWaits + 1 : pauseWaits },
   });
   // Q-008: a previous child that is still alive may still write its worktree; the job stays
   // interrupted (not gave_up) so the operator can stop the child and requeue it.
@@ -23286,23 +23330,30 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     agent: summary.agent || "",
     model: next.spec || retryPolicyModelLabel(summary),
     errorType,
-    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
+    summary: failureSummary(`Attempt ${nextAttempt} of ${maxAttempts} after ${errorType} on ${retryPolicyModelLabel(summary)} (requeued from ${jobId})${uncountedSlotWait ? `; the slot wait was not counted (${slotWaits + 1} of ${RETRY_POLICY_MAX_SLOT_WAITS})` : ""}${uncountedPauseWait ? `; the paused-model refusal was not counted (${pauseWaits + 1} of ${RETRY_POLICY_MAX_PAUSE_WAITS})` : ""}${next.startAfter ? `; every candidate model is paused, so it waits until ${next.startAfter}` : ""}.`),
   });
   // B-072: a failed write attempt that changed nothing leaves an empty worktree; the retry gets
   // its own, so the empty one is removed (a worktree with any change is kept for review).
   const emptyWorktree = row.status === "failed" ? await removeEmptyRetryWorktree(projectRoot, summary) : null;
-  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, emptyWorktree };
+  return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: nextAttempt, uncountedSlotWait, uncountedPauseWait, emptyWorktree };
 }
 
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
 let autoResumeInterruptedOverride = null;
 
 // Never blocks or fails the caller (a terminal commit, a recovery pass): the policy runs after it.
+// B-075: retries being decided right now. Between a failed attempt and its requeue the queue looks
+// empty, so the worker's --until-empty must not exit while one is in flight.
+let queueRetryPoliciesInFlight = 0;
+
 function scheduleQueueRetryPolicy(cwd, jobId) {
   if (!jobId || effectiveQueueMode() !== "sqlite") return;
+  queueRetryPoliciesInFlight += 1;
   setImmediate(() => {
     applyQueueRetryPolicy({ cwd, jobId }).catch((error) => {
       logEvent("warn", "queue.retry_policy_failed", { jobId, errorType: error?.errorType || "retry_policy_failed", summary: failureSummary(error?.message || String(error)) });
+    }).finally(() => {
+      queueRetryPoliciesInFlight = Math.max(0, queueRetryPoliciesInFlight - 1);
     });
   });
 }
@@ -23329,6 +23380,8 @@ function autoIntegrateJobError(job, lockPlan, parentJobId = "") {
 }
 
 const AUTO_INTEGRATION_CHAINS = new Map();
+// Jobs whose auto-integration waits for a lock and will be tried again by a timer of this process.
+const AUTO_INTEGRATION_WAITING = new Set();
 const AUTO_INTEGRATION_RETRYABLE_ERRORS = new Set(["integration_lock_conflict", "integration_preview_stale", "integration_recovery_pending"]);
 // A few quick rounds for a receipt that went stale between the two calls; a lock held by another
 // writer on the same paths (a builder still running on the folder) can last as long as that
@@ -23591,7 +23644,12 @@ function scheduleAutoIntegration(details) {
   run.finally(() => { if (AUTO_INTEGRATION_CHAINS.get(key) === run) AUTO_INTEGRATION_CHAINS.delete(key); });
   run.then((outcome) => {
     if (!outcome?.retryLater) return;
-    const timer = setTimeout(() => scheduleAutoIntegration({ ...details, laterAttempt: Number(details.laterAttempt || 0) + 1 }), autoIntegrationLaterDelayMs());
+    // B-075: a worker that drains or runs --until-empty waits for these too.
+    AUTO_INTEGRATION_WAITING.add(details.jobId);
+    const timer = setTimeout(() => {
+      AUTO_INTEGRATION_WAITING.delete(details.jobId);
+      scheduleAutoIntegration({ ...details, laterAttempt: Number(details.laterAttempt || 0) + 1 });
+    }, autoIntegrationLaterDelayMs());
     timer.unref?.();
   });
   return run;
@@ -24526,6 +24584,8 @@ async function startQueueRecord(record) {
         dependencyRequest: execution.result?.dependencyRequest || null,
         ...queueResultFields(execution),
         providerWaitMs: execution.result?.providerConcurrencyWaitMs || 0,
+        // B-078: the slot request was refused for a paused provider/model; the agent never ran.
+        providerRefusedUntil: execution.result?.exitCode === "provider_capacity_unavailable" ? String(execution.result?.providerCooldownUntil || "") : "",
         providerRetryWarningCount: execution.result?.providerRetryWarningCount || 0,
         usage: execution.result?.usage || null,
         heavyToolCalls: execution.result?.heavyToolCalls?.length ? execution.result.heavyToolCalls : null,
@@ -24618,6 +24678,47 @@ function nextQueueScheduleDelay(records, hasCapacity, progressed = true, now = D
   return Math.max(CONFIG.queueBlockedPollMs, nextRetryMs);
 }
 
+// B-080: a pending job waiting (startAfter, reason provider_pause) for the pauses of its models is
+// released as soon as none of them is paused any more, whoever ended the pause: resumeProvider
+// clears the waits of its own process only, so a resume from Claude Code left a worker's jobs idle
+// until the original pause end. One read of the provider database per scheduler poll interval, and
+// only while such a job exists.
+let pauseWaitCheckedAt = 0;
+
+function pauseWaitCandidates(record) {
+  const request = record.request || {};
+  const models = Array.isArray(request.models) ? request.models.map((entry) => parseModelAllowlistEntry(entry)).filter(Boolean) : [];
+  if (models.length) return models.map((item) => ({ provider: item.provider, model: item.model }));
+  const requirement = request.scopeContract?.modelRequirement || record.scopeContract?.modelRequirement;
+  return requirement?.provider ? [{ provider: requirement.provider, model: requirement.model || "" }] : [];
+}
+
+async function releaseResumedPauseWaits(now = Date.now()) {
+  const waiting = [...QUEUE_JOBS.values()].filter((record) => ["pending", "planned"].includes(record.status)
+    && record.startAfterReason === "provider_pause" && queueStartAfterPending(record, now));
+  if (!waiting.length || now - pauseWaitCheckedAt < Math.max(250, CONFIG.queueBlockedPollMs)) return 0;
+  pauseWaitCheckedAt = now;
+  let pauses;
+  try {
+    pauses = await activeProviderPauses();
+  } catch {
+    return 0;
+  }
+  const pausedUntil = (provider, model) => Math.max(
+    pauses.get(providerKeyForMetadata({ provider })) || 0,
+    model ? pauses.get(modelPauseKeyForMetadata({ provider, model })) || 0 : 0,
+  );
+  let released = 0;
+  for (const record of waiting) {
+    const candidates = pauseWaitCandidates(record);
+    if (!candidates.length || candidates.some((item) => pausedUntil(item.provider, item.model) > now)) continue;
+    delete record.startAfter;
+    delete record.startAfterReason;
+    released += 1;
+  }
+  return released;
+}
+
 let queueWakeAt = 0;
 let queueSchedulerRunning = false;
 let queueScheduleRequested = false;
@@ -24661,6 +24762,8 @@ function scheduleQueue(delayMs = 0) {
       // below, so an operator cancelling queued jobs to free memory sees it happen). A pass that
       // starts nothing makes no progress, so the scheduler polls again
       // (CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS) and starts the jobs once memory recovers.
+      // B-080: a pause-wait released by a resume in any process (resumeProvider frees only its own).
+      await releaseResumedPauseWaits();
       const memoryGate = queueMemoryGate();
       const startableRecords = [...QUEUE_JOBS.values()].filter((record) => ["pending", "planned", "blocked"].includes(record.status));
       const holdStarts = memoryGate.blocked && startableRecords.length > 0;
@@ -24703,6 +24806,10 @@ function scheduleQueue(delayMs = 0) {
           if (holdStarts) continue;
           // Q-007: a retry whose every model is paused waits for the first pause to end.
           if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) continue;
+          // B-075: a queue worker that is draining (a stop was requested) or has not finished taking
+          // in its --enqueue file starts nothing new; the job stays pending for the next owner.
+          // Checked before planning, so a held job costs no durable write per pass.
+          if (queueDrainRequested()) continue;
 
           if (record.status === "blocked" && Number(record.queueBlockedRetryAt || 0) > Date.now()) continue;
           if (record.status === "blocked") {
@@ -24743,6 +24850,8 @@ function scheduleQueue(delayMs = 0) {
             continue;
           }
 
+          // The stop may have arrived while this pass awaited the plan and the conflict check.
+          if (queueDrainRequested()) continue;
           const started = await startQueueRecord(record);
           if (started) capacity -= 1;
         } finally {
@@ -28434,6 +28543,618 @@ function scheduleDeferredRecovery(delayMs) {
   deferredRecoveryTimer.unref?.();
 }
 
+// Feature 10 (log.md B-075..B-077): the unattended queue worker, bin/queue-worker.js. A bridge runs
+// only while an MCP client keeps it alive, so a batch of hundreds of jobs could not run for hours
+// without one. The worker is this module imported by a plain Node process: it runs the same
+// startup checks and recovery, then the same queue runner (leases, bridge_instances, provider
+// leases, pauses, integration journal, operations log) for ONE repository, without a transport.
+// Nothing new is stored in the database; small files sit beside it in <state-dir>/workers/:
+// <projectKey>.json (presence: pid, instance, heartbeat, counts), <projectKey>.stop (a stop
+// request, the primary stop signal because Windows has no SIGTERM) and <projectKey>.parked (B-079:
+// a stopped worker left jobs behind for the next worker).
+const QUEUE_WORKER_PRESENCE_FRESH_MS = 2 * 60 * 1000;
+// B-082: a heartbeat this old is stale even when the recorded pid is alive: a live worker refreshes
+// it every 15 s, so after 10 minutes the pid belongs to another process (a reused pid would
+// otherwise block every restart for good) or the worker hung; in both cases it is taken over.
+const QUEUE_WORKER_PRESENCE_ABANDONED_MS = 10 * 60 * 1000;
+// B-087: a heartbeat in the future (a clock that moved back) counts only within this skew.
+const QUEUE_WORKER_CLOCK_SKEW_MS = 60 * 1000;
+// { repo, dbPath, projectKey, startedAt } while this process is a queue worker.
+let queueWorkerMode = null;
+// The worker holds every start until its --enqueue file is in (all lines valid and enqueued).
+let queueStartsHeld = false;
+// A stop was requested: nothing new starts, running jobs finish.
+let queueDrainFlag = false;
+// dbPath of a repository whose live or parked worker this client bridge already logged (once per episode).
+const QUEUE_WORKER_PRESENT_LOGGED = new Set();
+const QUEUE_WORKER_NON_TERMINAL_STATUSES = ["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"];
+// Every line of an --enqueue file: the enqueue_opencode_job input, with a required idempotency key
+// (re-running the same file must deduplicate instead of doubling a 220-job batch) and no unknown
+// field (a misspelt option would otherwise be dropped silently). parentJobId is not offered: a
+// pipeline drives its own children.
+const QUEUE_WORKER_JOB_SCHEMA = z.object({
+  idempotencyKey: z.string().min(1).max(200),
+  ...jobInputShape,
+}).strict();
+
+function queueDrainRequested() {
+  return queueStartsHeld || queueDrainFlag;
+}
+
+function sameStateDbPath(left, right) {
+  return normalizeFilesystemCase(path.resolve(String(left || ""))) === normalizeFilesystemCase(path.resolve(String(right || "")));
+}
+
+// <projectKey>.parked (B-079): a worker that stopped with jobs left behind keeps the repository's
+// queue for the next worker; client bridges do not adopt it until --release removes the file.
+function queueWorkerFiles(projectRoot) {
+  const projectKey = projectStateKey(projectRoot);
+  const directory = path.join(effectiveBridgeStateDirectory(), "workers");
+  return {
+    projectKey,
+    directory,
+    presence: path.join(directory, `${projectKey}.json`),
+    stop: path.join(directory, `${projectKey}.stop`),
+    parked: path.join(directory, `${projectKey}.parked`),
+  };
+}
+
+// A regular file's text, or null (missing, a link or unreadable).
+function readQueueWorkerText(file) {
+  try {
+    if (!lstatSync(file).isFile()) return null;
+    return readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// A regular file's JSON object, or null (missing, a link, unreadable or not an object).
+function readQueueWorkerFile(file) {
+  const text = readQueueWorkerText(file);
+  if (text === null) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function queueWorkerHeartbeatAgeMs(presence, now = Date.now()) {
+  const at = Date.parse(presence?.heartbeatAt || "");
+  return Number.isFinite(at) ? now - at : Number.POSITIVE_INFINITY;
+}
+
+// Fresh: written less than 2 minutes ago, and not more than the clock skew in the future (B-087).
+function queueWorkerPresenceFresh(presence, now = Date.now()) {
+  const age = queueWorkerHeartbeatAgeMs(presence, now);
+  return age >= -QUEUE_WORKER_CLOCK_SKEW_MS && age < QUEUE_WORKER_PRESENCE_FRESH_MS;
+}
+
+// EPERM means the process exists but belongs to someone else: alive, unlike processIsAlive.
+function queueWorkerPidAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// The one rule for "a worker runs here" (start refusal, --stop, --status, --release): a fresh
+// heartbeat, or a live pid whose heartbeat is younger than 10 minutes (B-082).
+function queueWorkerPresenceLive(presence, now = Date.now()) {
+  if (!presence) return false;
+  if (queueWorkerPresenceFresh(presence, now)) return true;
+  const age = queueWorkerHeartbeatAgeMs(presence, now);
+  return age >= -QUEUE_WORKER_CLOCK_SKEW_MS && age < QUEUE_WORKER_PRESENCE_ABANDONED_MS && queueWorkerPidAlive(presence.pid);
+}
+
+function assertQueueWorkerDirectory(directory) {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const details = lstatSync(directory);
+  if (details.isSymbolicLink() || !details.isDirectory()) throw new Error(`${directory} must be a plain directory, not a link.`);
+}
+
+// Written through a temporary file and a rename, so a reader never sees half a file. The rename
+// is retried: on Windows a client bridge reading the file at that moment makes it fail with EPERM.
+function writeQueueWorkerFileAtomically(file, value) {
+  const temporary = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  let lastError = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      renameSync(temporary, file);
+      return true;
+    } catch (error) {
+      lastError = error;
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) break;
+      // A short synchronous pause (the callers are synchronous; the tick runs every 15 s).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
+    }
+  }
+  try { rmSync(temporary, { force: true }); } catch { /* Best effort. */ }
+  throw lastError;
+}
+
+function queueWorkerPresenceRecord(files, fields = {}) {
+  const now = new Date().toISOString();
+  return {
+    version: 1,
+    pid: process.pid,
+    instanceId: BRIDGE_INSTANCE_ID,
+    projectKey: files.projectKey,
+    repo: queueWorkerMode?.repo || fields.repo || "",
+    startedAt: queueWorkerMode?.startedAt || now,
+    heartbeatAt: now,
+    draining: queueDrainFlag,
+    ...fields,
+  };
+}
+
+// B-081: a stale presence file is taken over by renaming it to a name only this process uses and
+// checking that the renamed file is still the stale content that was judged. A plain remove could
+// delete a fresh file another worker created between the judgement and the remove; a rename of a
+// file that changed meanwhile is put back (linkSync refuses to replace one that exists again).
+function takeOverStalePresence(files, staleText) {
+  const aside = `${files.presence}.stale-${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    renameSync(files.presence, aside);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { ok: true };
+    return { ok: false, error: `could not move the stale presence file aside (${error?.code || error?.message || error})` };
+  }
+  const moved = readQueueWorkerText(aside);
+  if (moved === staleText) {
+    try { rmSync(aside, { force: true }); } catch { /* A leftover .stale file is inert. */ }
+    return { ok: true };
+  }
+  try {
+    linkSync(aside, files.presence);
+    rmSync(aside, { force: true });
+  } catch { /* Another worker's file is in place again; the moved one stays aside for inspection. */ }
+  return { ok: false, error: "the presence file changed while it was being taken over" };
+}
+
+// B-076: one worker per repository. The presence file is created exclusively; an existing one
+// blocks the start while queueWorkerPresenceLive says a worker runs. A stale one is taken over.
+function claimQueueWorkerPresence(projectRoot, { now = Date.now() } = {}) {
+  const files = queueWorkerFiles(projectRoot);
+  assertQueueWorkerDirectory(files.directory);
+  let takenOver = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const descriptor = openSync(files.presence, "wx", 0o600);
+      try {
+        writeSync(descriptor, `${JSON.stringify(queueWorkerPresenceRecord(files, { repo: projectRoot }), null, 2)}\n`, null, "utf8");
+      } finally {
+        closeSync(descriptor);
+      }
+      return { ok: true, files, takenOver };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const existingText = readQueueWorkerText(files.presence);
+    if (existingText === null) continue;
+    let existing = null;
+    try { existing = JSON.parse(existingText); } catch { existing = null; }
+    if (existing && (typeof existing !== "object" || Array.isArray(existing))) existing = null;
+    let modifiedMs = 0;
+    try { modifiedMs = lstatSync(files.presence).mtimeMs; } catch { /* Gone meanwhile: try the create again. */ }
+    // An unreadable file is judged by its age alone.
+    const live = existing ? queueWorkerPresenceLive(existing, now) : (modifiedMs && now - modifiedMs < QUEUE_WORKER_PRESENCE_FRESH_MS);
+    if (live) {
+      const alive = existing ? queueWorkerPidAlive(existing.pid) : false;
+      return {
+        ok: false,
+        errorType: "queue_worker_already_running",
+        existing,
+        error: existing
+          ? `A queue worker already runs for this repository: pid ${existing.pid} (${alive ? "alive" : "not alive"}), last heartbeat ${existing.heartbeatAt || "unknown"}, presence file ${files.presence}. Stop it with --stop, or wait until its heartbeat is older than 2 minutes (its process gone) or 10 minutes.`
+          : `The presence file ${files.presence} is unreadable and younger than 2 minutes; another worker may be starting. Try again in 2 minutes.`,
+      };
+    }
+    const taken = takeOverStalePresence(files, existingText);
+    if (!taken.ok) return { ok: false, errorType: "queue_worker_presence_race", error: `Another worker took ${files.presence} at the same moment: ${taken.error}.` };
+    takenOver = existing || { unreadable: true };
+  }
+  return { ok: false, errorType: "queue_worker_presence_race", error: `Another worker took ${files.presence} at the same moment.` };
+}
+
+// false when the file now belongs to another worker (taken over after this one stalled for 10
+// minutes, or created by another worker after someone removed this one's): never overwritten.
+function refreshQueueWorkerPresence(files, fields = {}) {
+  const current = readQueueWorkerFile(files.presence);
+  if (current && current.instanceId !== BRIDGE_INSTANCE_ID) return { ok: false, owner: current };
+  writeQueueWorkerFileAtomically(files.presence, queueWorkerPresenceRecord(files, fields));
+  return { ok: true };
+}
+
+// B-083: the stop file belongs to the worker whose presence file this is; a worker that lost its
+// presence file leaves the new owner's stop request alone.
+function releaseQueueWorkerPresence(files) {
+  const current = readQueueWorkerFile(files.presence);
+  if (!current || current.instanceId !== BRIDGE_INSTANCE_ID) return { released: false };
+  try { rmSync(files.stop, { force: true }); } catch { /* The next worker removes it at its start. */ }
+  try { rmSync(files.presence, { force: true }); } catch { /* A stale file is taken over after 2 minutes. */ }
+  return { released: true };
+}
+
+// B-079: written by a worker that stops (drain or --now) with non-terminal jobs left.
+function writeQueueWorkerParked(files, fields = {}) {
+  assertQueueWorkerDirectory(files.directory);
+  writeQueueWorkerFileAtomically(files.parked, {
+    version: 1,
+    parkedAt: new Date().toISOString(),
+    pid: process.pid,
+    instanceId: BRIDGE_INSTANCE_ID,
+    projectKey: files.projectKey,
+    repo: queueWorkerMode?.repo || "",
+    ...fields,
+  });
+  return true;
+}
+
+function removeQueueWorkerParked(files) {
+  const parked = readQueueWorkerFile(files.parked);
+  if (!parked && !existsSync(files.parked)) return { removed: false, parked: null };
+  rmSync(files.parked, { force: true });
+  return { removed: true, parked };
+}
+
+// --stop (now: false) drains, --stop --now aborts the running jobs too. A later "now" upgrades.
+function writeQueueWorkerStop(projectRoot, { now = false } = {}) {
+  const files = queueWorkerFiles(projectRoot);
+  assertQueueWorkerDirectory(files.directory);
+  const previous = readQueueWorkerFile(files.stop);
+  writeQueueWorkerFileAtomically(files.stop, { requestedAt: new Date().toISOString(), now: Boolean(now || previous?.now), byPid: process.pid });
+  return files;
+}
+
+function readQueueWorkerStop(files) {
+  const stop = readQueueWorkerFile(files.stop);
+  return stop ? { now: stop.now === true, requestedAt: String(stop.requestedAt || "") } : null;
+}
+
+// B-077 / B-079: a client bridge leaves a repository alone while another process's worker is alive
+// there, or while a stopped worker parked its queue. The parked file has no age: it stays until a
+// worker starts or the operator runs --release.
+function foreignQueueWorkerPresence(dbPath) {
+  const stateRoot = effectiveBridgeStateDirectory();
+  if (!sameStateDbPath(path.dirname(dbPath), path.join(stateRoot, "projects"))) return null;
+  const projectKey = path.basename(dbPath, ".sqlite");
+  const presence = readQueueWorkerFile(path.join(stateRoot, "workers", `${projectKey}.json`));
+  if (presence && presence.instanceId !== BRIDGE_INSTANCE_ID && queueWorkerPresenceFresh(presence)) return { ...presence, parked: false };
+  if (presence && presence.instanceId === BRIDGE_INSTANCE_ID) return null;
+  const parkedPath = path.join(stateRoot, "workers", `${projectKey}.parked`);
+  const parked = readQueueWorkerFile(parkedPath) || (existsSync(parkedPath) ? {} : null);
+  if (parked) return { ...parked, parked: true };
+  return null;
+}
+
+function forgetQueueWorkerPresent(dbPath) {
+  for (const logged of [...QUEUE_WORKER_PRESENT_LOGGED]) if (logged.startsWith(`${dbPath}\0`)) QUEUE_WORKER_PRESENT_LOGGED.delete(logged);
+}
+
+function noteQueueWorkerPresent(dbPath, presence) {
+  const key = `${dbPath}\0${presence.parked ? "parked" : "live"}`;
+  if (QUEUE_WORKER_PRESENT_LOGGED.has(key)) return;
+  forgetQueueWorkerPresent(dbPath);
+  QUEUE_WORKER_PRESENT_LOGGED.add(key);
+  logEvent("info", "queue.worker_present", {
+    projectKey: path.basename(dbPath, ".sqlite"),
+    workerPid: Number(presence.pid) || 0,
+    workerInstanceId: String(presence.instanceId || ""),
+    parked: Boolean(presence.parked),
+    summary: presence.parked
+      ? `A stopped queue worker (pid ${Number(presence.pid) || "?"}) parked this repository's queue; this bridge does not adopt its pending or interrupted jobs until a worker starts there or the operator runs queue-worker.js --release.`
+      : `A queue worker (pid ${Number(presence.pid) || "?"}) owns this repository's queue; this bridge does not adopt its pending or interrupted jobs while the worker's heartbeat is under 2 minutes old.`,
+  });
+}
+
+async function startWorkerMode({ repo } = {}) {
+  if (queueWorkerMode) throw Object.assign(new Error("This process is already a queue worker."), { errorType: "queue_worker_already_started" });
+  if (!repo || !path.isAbsolute(String(repo))) throw Object.assign(new Error("--repo must be an absolute path."), { errorType: "queue_worker_invalid_repo" });
+  if (effectiveQueueMode() !== "sqlite") {
+    throw Object.assign(new Error(`The queue worker needs CODEX_OPENCODE_QUEUE_MODE=sqlite (it is ${effectiveQueueMode()}): it runs durable jobs only.`), { errorType: "queue_worker_needs_sqlite" });
+  }
+  const top = await runCommand("git", ["rev-parse", "--show-toplevel"], path.resolve(String(repo)), 15_000);
+  if (top.exitCode !== 0 || !top.stdout.trim()) {
+    throw Object.assign(new Error(`${repo} is not inside a Git repository.`), { errorType: "queue_worker_invalid_repo" });
+  }
+  const projectRoot = await resolveProjectStateRoot(repo);
+  // The main start sequence, without a transport. Failures here mean "refused to start" (exit 1);
+  // a crash after the start is "stopped by an error" (exit 2).
+  installProcessFailureHandlers();
+  await verifyReleaseIntegrity();
+  await syncManagedRuntimeAtStartup();
+  const pluginPolicy = await verifyExternalPluginPolicy(projectRoot);
+  if (!pluginPolicy.ok) {
+    throw Object.assign(new Error(`OpenCode external plugin policy rejected startup: ${pluginPolicy.error}`), { errorType: "plugin_policy_rejected" });
+  }
+  queueStartsHeld = true;
+  queueDrainFlag = false;
+  queueWorkerMode = { repo: projectRoot, dbPath: stateDbPath(projectRoot), projectKey: projectStateKey(projectRoot), startedAt: new Date().toISOString() };
+  try {
+    // Recovery adopts this repository's lapsed jobs; they wait (queueStartsHeld) until the
+    // worker's own file is in.
+    await beginBridgeStartupRecovery();
+  } catch (error) {
+    stopWorkerMode();
+    throw Object.assign(new Error(`Startup recovery failed: ${redactSensitiveText(error?.message || String(error))}`), { errorType: "startup_recovery_failed" });
+  }
+  processCrashExitCode = 2;
+  ensureQueueHeartbeatTimer();
+  void reclaimProvenGoneProviderQuarantines({ force: true });
+  void sweepStaleIndexScratchDirs();
+  return { repo: projectRoot, projectKey: queueWorkerMode.projectKey, instanceId: BRIDGE_INSTANCE_ID, adopted: [...QUEUE_JOBS.values()].filter((record) => recordMatchesProject(record, projectRoot)).length };
+}
+
+// Ends worker mode in this process (the CLI exits next; a test starts the next worker). The
+// repository's jobs this process holds but does not run are forgotten, as an exit would forget
+// them: this process's heartbeat stops covering them, and the next owner adopts them once their
+// leases lapse. Only an exit with nothing running gets here, apart from a refused start.
+function stopWorkerMode() {
+  if (queueWorkerMode) {
+    for (const [jobId, record] of QUEUE_JOBS) {
+      if (record.ownerInstanceId === BRIDGE_INSTANCE_ID && recordMatchesProject(record, queueWorkerMode.repo)
+        && !QUEUE_ACTIVE_STATUSES.includes(record.status) && !record.executionPromise) QUEUE_JOBS.delete(jobId);
+    }
+  }
+  queueWorkerMode = null;
+  queueStartsHeld = false;
+  queueDrainFlag = false;
+  processCrashExitCode = 1;
+}
+
+function releaseQueueStarts() {
+  queueStartsHeld = false;
+  scheduleQueue();
+}
+
+function requestQueueDrain() {
+  queueDrainFlag = true;
+}
+
+// --stop --now: the running jobs of this process are cancelled like cancel_opencode_job does
+// (cancellation persisted, then the exact process tree terminated); they end `cancelled`, which
+// requeue_opencode_job accepts. Pending jobs stay pending.
+async function abortRunningQueueJobs(reason = "The queue worker was stopped with --now.") {
+  const aborted = [];
+  for (const record of runningQueueRecords()) {
+    if (record.ownerInstanceId !== BRIDGE_INSTANCE_ID) continue;
+    Object.assign(record, {
+      cancellationRequested: true,
+      cancellationRequestedAt: new Date().toISOString(),
+      errorReason: reason,
+    });
+    try {
+      await persistQueueRecord(record);
+    } catch (error) {
+      logEvent("warn", "queue_worker.abort_persist_failed", { jobId: record.jobId, summary: failureSummary(error?.message || String(error)) });
+    }
+    record.abortController?.abort();
+    aborted.push(record.jobId);
+  }
+  return aborted;
+}
+
+function parseQueueWorkerJobLine(text) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, error: `not valid JSON (${error.message})` };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "a line must be one JSON object (an enqueue_opencode_job input)" };
+  const parsed = QUEUE_WORKER_JOB_SCHEMA.safeParse(value);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues.slice(0, 5).map((issue) => `${issue.path.join(".") || "(object)"}: ${issue.message}${issue.keys?.length ? ` (${issue.keys.join(", ")})` : ""}`).join("; ") };
+  }
+  return { ok: true, job: parsed.data };
+}
+
+// The full enqueue validation without a durable write (lock plan, Scope Contract, retry policy,
+// autoIntegrate, worktree requirement), plus the idempotency check against the database: an
+// existing key with other content refuses the file instead of half-enqueueing it.
+async function checkQueueWorkerJob(job) {
+  if (!queueWorkerMode) return { ok: false, errorType: "queue_worker_not_started", error: "The queue worker is not started." };
+  if (!path.isAbsolute(String(job?.cwd || ""))) return { ok: false, errorType: "queue_worker_invalid_job", error: "cwd must be an absolute path." };
+  const normalized = await normalizeJobCwd(job);
+  if (RepositoryRootSet.key(normalized.cwd) !== RepositoryRootSet.key(queueWorkerMode.repo)) {
+    return { ok: false, errorType: "queue_worker_wrong_repository", error: `cwd ${job.cwd} is not in the worker's repository ${queueWorkerMode.repo}; start a worker per repository.` };
+  }
+  const prepared = await enqueueQueueJob(job, "", { persist: false, schedule: false });
+  if (!prepared.ok) return { ok: false, errorType: prepared.errorType || "queue_rejected", error: prepared.error || "The job was refused.", suggestedFix: prepared.suggestedFix || "" };
+  const db = await openLockDb(queueWorkerMode.repo);
+  try {
+    const existing = db.prepare("SELECT job_id, status, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(prepared.record.idempotencyKey);
+    if (!existing) return { ok: true, fingerprint: prepared.record.requestFingerprint };
+    let summary = {};
+    try { summary = JSON.parse(existing.record_json || "{}"); } catch { /* Unreadable evidence is a mismatch. */ }
+    if (!summary.requestFingerprint || summary.requestFingerprint !== prepared.record.requestFingerprint) {
+      return { ok: false, errorType: "queue_idempotency_conflict", error: `idempotencyKey ${prepared.record.idempotencyKey} already belongs to job ${existing.job_id} with different request content.` };
+    }
+    return { ok: true, fingerprint: prepared.record.requestFingerprint, deduplicates: existing.job_id, existingStatus: existing.status };
+  } finally {
+    closeDb(db);
+  }
+}
+
+async function enqueueFromToolInput(job) {
+  const checked = await checkQueueWorkerJob(job);
+  if (!checked.ok) return checked;
+  // schedule: false: the worker releases all starts at once after the last line.
+  return await enqueueQueueJob(job, "", { schedule: false });
+}
+
+// Jobs this worker enqueued from a file it then refused: cancelled before anything started, so the
+// refusal leaves no half batch behind (requeue_opencode_job can still run them).
+async function cancelUnstartedQueueJobs(jobIds, reason) {
+  const cancelled = [];
+  for (const jobId of jobIds) {
+    const record = QUEUE_JOBS.get(jobId);
+    if (!record || !["pending", "planned", "blocked", "held"].includes(record.status)) continue;
+    Object.assign(record, {
+      status: "cancelled",
+      finishedAt: new Date().toISOString(),
+      cancellationRequested: true,
+      cancellationRequestedAt: new Date().toISOString(),
+      errorType: "agent_cancelled",
+      errorReason: reason,
+      heartbeatAt: "",
+      leaseExpiresAt: "",
+    });
+    const persisted = await persistQueueRecord(record);
+    if (persisted?.persisted) cancelled.push(jobId);
+  }
+  return cancelled;
+}
+
+// B-091: --status must not create or migrate anything. A database with a -wal and -shm file has
+// (or had) a writer; a read-only connection reads it through them without writing. Without them
+// every page is in the main file, but even a read-only connection would create -wal and -shm, so
+// the file is opened immutable, or, where node:sqlite takes no URL (Node before 22.15), read from
+// a temporary copy. null when the file does not exist.
+function openStateDbForStatus(dbPath) {
+  let details = null;
+  try { details = lstatSync(dbPath); } catch { return null; }
+  if (!details.isFile()) return null;
+  if (existsSync(`${dbPath}-wal`) && existsSync(`${dbPath}-shm`)) {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 2000;");
+    return { db, cleanup: () => {} };
+  }
+  try {
+    const url = pathToFileURL(dbPath);
+    url.searchParams.set("immutable", "1");
+    return { db: new DatabaseSync(url, { readOnly: true }), cleanup: () => {} };
+  } catch {
+    const scratch = mkdtempSync(path.join(tmpdir(), "codex-queue-status-"));
+    const copy = path.join(scratch, "state.sqlite");
+    try {
+      copyFileSync(dbPath, copy);
+      return { db: new DatabaseSync(copy, { readOnly: true }), cleanup: () => rmSync(scratch, { recursive: true, force: true }) };
+    } catch (error) {
+      rmSync(scratch, { recursive: true, force: true });
+      throw error;
+    }
+  }
+}
+
+function emptyQueueWorkerCounts() {
+  return { pending: 0, running: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0, interrupted: 0, notResumable: 0, waitingForPause: 0, gaveUp: 0, autoIntegrated: 0, open: 0 };
+}
+
+function countQueueWorkerJobs(db, counts) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get()) return counts;
+  for (const row of db.prepare("SELECT status, COUNT(*) AS count FROM opencode_jobs GROUP BY status").all()) {
+    const count = Number(row.count || 0);
+    if (QUEUE_WORKER_NON_TERMINAL_STATUSES.includes(row.status)) counts.open += count;
+    if (["held", "pending", "planned"].includes(row.status)) counts.pending += count;
+    else if (QUEUE_ACTIVE_STATUSES.includes(row.status)) counts.running += count;
+    else if (row.status === "blocked") counts.blocked += count;
+    else if (row.status === "not_resumable") counts.notResumable += count;
+    else if (Object.prototype.hasOwnProperty.call(counts, row.status)) counts[row.status] += count;
+  }
+  const nowIso = new Date().toISOString();
+  counts.waitingForPause = Number(db.prepare(`
+    SELECT COUNT(*) AS count FROM opencode_jobs
+    WHERE status IN ('pending', 'planned') AND json_valid(record_json)
+      AND COALESCE(json_extract(record_json, '$.startAfter'), '') > ?
+  `).get(nowIso)?.count || 0);
+  counts.gaveUp = Number(db.prepare("SELECT COUNT(*) AS count FROM opencode_jobs WHERE json_valid(record_json) AND json_extract(record_json, '$.completionOutcome') = 'gave_up'").get()?.count || 0);
+  counts.autoIntegrated = Number(db.prepare("SELECT COUNT(*) AS count FROM opencode_jobs WHERE json_valid(record_json) AND json_extract(record_json, '$.autoIntegration.status') = 'committed'").get()?.count || 0);
+  return counts;
+}
+
+function readOnlyProviderPauses() {
+  const opened = openStateDbForStatus(path.join(effectiveBridgeStateDirectory(), "provider-concurrency.sqlite"));
+  if (!opened) return [];
+  try {
+    const now = Date.now();
+    return opened.db.prepare("SELECT provider_key, until_at FROM provider_cooldowns WHERE until_at > ? ORDER BY provider_key").all(now)
+      .map((row) => ({ key: row.provider_key, until: new Date(Number(row.until_at)).toISOString() }));
+  } catch {
+    return [];
+  } finally {
+    try { opened.db.close(); } catch { /* Read-only: nothing to flush. */ }
+    opened.cleanup();
+  }
+}
+
+// Counts of one repository's queue from its database (nothing is created when it has none yet),
+// the paused provider/model keys and free memory. `open` is every job that is not terminal.
+// readOnly (--status, B-091) writes nothing at all, not even a schema migration or lease cleanup.
+async function queueWorkerSnapshot({ repo = queueWorkerMode?.repo || "", readOnly = false } = {}) {
+  const projectRoot = await resolveProjectStateRoot(repo);
+  const dbPath = stateDbPath(projectRoot);
+  const counts = emptyQueueWorkerCounts();
+  let pausedKeys = [];
+  if (readOnly) {
+    const opened = openStateDbForStatus(dbPath);
+    if (opened) {
+      try {
+        countQueueWorkerJobs(opened.db, counts);
+      } finally {
+        try { opened.db.close(); } catch { /* Read-only. */ }
+        opened.cleanup();
+      }
+    }
+    pausedKeys = readOnlyProviderPauses();
+  } else {
+    if (existsSync(dbPath)) {
+      const db = await openLockDb(projectRoot);
+      try {
+        countQueueWorkerJobs(db, counts);
+      } finally {
+        closeDb(db);
+      }
+    }
+    try {
+      pausedKeys = [...(await activeProviderPauses()).entries()].map(([key, until]) => ({ key, until: new Date(until).toISOString() }));
+    } catch {
+      // The provider database being busy must not stop a status line.
+    }
+  }
+  return { repo: projectRoot, dbPath, counts, pausedKeys, freeMemoryMb: Math.round(currentFreeMemoryBytes() / 1024 / 1024) };
+}
+
+// What this process still has in hand: running jobs, auto-integrations (running, or waiting for a
+// lock) and retry decisions. --until-empty waits for all of them. A stop (B-084) does not wait for
+// an auto-integration that only waits for a lock: its job is completed and marked
+// waiting_for_lock, and the recovery pass of the next worker (or of a bridge after --release)
+// schedules it again (rescheduleOpenAutoIntegrations).
+function queueWorkerActivity() {
+  const running = runningQueueRecords().filter((record) => record.ownerInstanceId === BRIDGE_INSTANCE_ID).length;
+  const integrating = AUTO_INTEGRATION_CHAINS.size;
+  const waitingIntegrations = AUTO_INTEGRATION_WAITING.size;
+  const retries = queueRetryPoliciesInFlight;
+  return {
+    running,
+    autoIntegrations: integrating + waitingIntegrations,
+    integrating,
+    waitingIntegrations,
+    retries,
+    quiet: !running && !integrating && !waitingIntegrations && !retries,
+    quietForStop: !running && !integrating && !retries,
+  };
+}
+
+// B-086: a refused start logs one warn line with its reason; the exit handler's process.exited
+// error (an incident) is for real failures.
+function recordQueueWorkerRefusal(reason, fields = {}) {
+  processExitLogSuppressedCode = 1;
+  logEvent("warn", "queue_worker.refused", {
+    projectKey: queueWorkerMode?.projectKey || fields.projectKey || "",
+    errorType: String(fields.errorType || "queue_worker_refused"),
+    summary: failureSummary(reason),
+  });
+}
+
 // dbPath -> repository root keys with non-terminal integration operations at its last
 // successful scan, so a failed scan keeps its roots blocked.
 const INTEGRATION_RECOVERY_ROOTS_BY_DB = new Map();
@@ -28474,6 +29195,9 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   }
   for (const dbPath of candidates) {
     if (!existsSync(dbPath)) continue;
+    // B-075: a queue worker recovers, adopts and schedules only its own repository's database;
+    // the other repositories belong to the client bridges (or their own workers).
+    if (queueWorkerMode && !sameStateDbPath(dbPath, queueWorkerMode.dbPath)) continue;
     const fingerprint = await stateDbFingerprint(dbPath);
     const memo = DEFERRED_RECOVERY_DB_MEMO.get(dbPath);
     if (memo && !memo.pending && memo.fingerprint === fingerprint) continue;
@@ -28604,6 +29328,17 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       }
       KNOWN_STATE_DB_PATHS.add(dbPath);
       if (!queuePersistenceEnabled) continue;
+      // B-075: a live queue worker owns this repository's unattended jobs. Adopting its lapsed
+      // pending jobs (or resuming its interrupted ones) here would make them die with this
+      // client, so the queue rows are left alone while its presence file is fresh. The database
+      // stays pending: the presence file going stale does not change the database file.
+      const worker = foreignQueueWorkerPresence(dbPath);
+      if (worker) {
+        dbPending = true;
+        noteQueueWorkerPresent(dbPath, worker);
+        continue;
+      }
+      forgetQueueWorkerPresent(dbPath);
       reconcileStaleQueueRecords(db);
       await rescheduleOpenAutoIntegrations(db);
       if (db.prepare(`
@@ -29293,6 +30028,41 @@ export const __selfTest = {
     set autoResumeInterruptedOverride(value) { autoResumeInterruptedOverride = process.argv.includes("--self-test") ? value : null; },
   },
 };
+
+// B-075: the surface bin/queue-worker.js drives. Importing this module starts nothing
+// (bridgeLaunchedAsMain is false for the worker), so the worker decides the order.
+export const queueWorkerApi = Object.freeze({
+  PRESENCE_FRESH_MS: QUEUE_WORKER_PRESENCE_FRESH_MS,
+  get instanceId() { return BRIDGE_INSTANCE_ID; },
+  get stateDirectory() { return effectiveBridgeStateDirectory(); },
+  get mode() { return queueWorkerMode ? { ...queueWorkerMode } : null; },
+  startWorkerMode,
+  stopWorkerMode,
+  releaseQueueStarts,
+  requestQueueDrain,
+  abortRunningQueueJobs,
+  parseJobLine: parseQueueWorkerJobLine,
+  checkJob: checkQueueWorkerJob,
+  enqueueFromToolInput,
+  cancelUnstartedJobs: cancelUnstartedQueueJobs,
+  queueWorkerSnapshot,
+  activity: queueWorkerActivity,
+  resolveRepository: resolveProjectStateRoot,
+  files: queueWorkerFiles,
+  readFile: readQueueWorkerFile,
+  presenceFresh: queueWorkerPresenceFresh,
+  presenceLive: queueWorkerPresenceLive,
+  pidAlive: queueWorkerPidAlive,
+  writeParked: writeQueueWorkerParked,
+  removeParked: removeQueueWorkerParked,
+  recordRefusal: recordQueueWorkerRefusal,
+  claimPresence: claimQueueWorkerPresence,
+  refreshPresence: refreshQueueWorkerPresence,
+  releasePresence: releaseQueueWorkerPresence,
+  writeStop: writeQueueWorkerStop,
+  readStop: readQueueWorkerStop,
+  logEvent: (level, event, data) => logEvent(level, event, data),
+});
 
 // Imported by the self-test suite: register tools only, never connect or recover.
 // argv[1] is compared by real path: a launch through a junction or symlink, or as
