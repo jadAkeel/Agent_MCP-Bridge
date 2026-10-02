@@ -74,7 +74,7 @@ async function runAutoJob(file, edits, extra = {}) {
   const enqueued = await enqueueQueueJob(request);
   assert.equal(enqueued.ok, true, `${enqueued.errorType}: ${enqueued.error}`);
   const jobId = enqueued.record.jobId;
-  const settled = (status) => Boolean(status) && status !== "waiting_for_lock";
+  const settled = (status) => Boolean(status) && !["waiting_for_lock", "integrating"].includes(status);
   const finished = await waitFor(async () => settled((await durable(jobId))?.autoIntegration?.status), 120_000);
   if (!finished) {
     const record = await durable(jobId);
@@ -201,6 +201,73 @@ test("Q-010: an in-place writer or another integration on the files makes the in
   const landed = await autoIntegrateQueueJob({ ...details, laterAttempt: 1 });
   assert.equal(landed.status, "committed", JSON.stringify(landed));
   assert.equal((await git(["show", "--name-only", "--format=", "HEAD"])).trim(), "out/batch-008.json");
+});
+
+test("B-069: the commit keeps the owner's staged work out, handles a name git would quote, and stores no email", async () => {
+  await writeFile(path.join(repo, "src", "a.txt"), "staged by the owner\n", "utf8");
+  await git(["add", "src/a.txt"]);
+  const name = "out/bätch 009.json";
+  try {
+    const before = await head();
+    const { record } = await runAutoJob(name, { [name]: "[9]\n" }, { lockedPaths: [name] });
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.deepEqual(record.autoIntegration.files, [name], "the engine's -z path, not a quoted header");
+    assert.equal((await git(["log", "-1", "--format=%P"])).trim(), before);
+    assert.equal((await git(["-c", "core.quotePath=false", "show", "--name-only", "--format=", "HEAD"])).trim(), name, "only the new file is in the commit");
+    assert.match(await git(["status", "--porcelain"]), /^M  src\/a\.txt/m, "the owner's staged change is still staged and not committed");
+    assert.doesNotMatch(await git(["-c", "core.quotePath=false", "status", "--porcelain"]), /bätch/, "the new file is clean in the index");
+    assert.equal(record.autoIntegration.author, "Batch Owner");
+    const view = textOf(await callTool("get_opencode_job", { cwd: repo, jobId: record.jobId, detail: true }));
+    assert.doesNotMatch(view, /owner@example\.invalid/, "the author's email is not stored in the queue record");
+  } finally {
+    await git(["reset", "-q", "--", "src/a.txt"]);
+    await git(["checkout", "--", "src/a.txt"]);
+  }
+});
+
+test("B-069: the commit step refuses content that is not the reviewed content and leaves HEAD alone", async () => {
+  const { autoIntegrationCommitHooks } = internals;
+  await writeFile(path.join(repo, "out", "batch-010.json"), "[10]\n", "utf8");
+  const before = await head();
+  const hooks = autoIntegrationCommitHooks({ jobId: "manual-test", agent: "builder", worktreePath: path.join(root, "no-such-worktree") });
+  const wrong = await hooks.commit({ changedFiles: ["out/batch-010.json"] }, { targetCwd: repo, prepared: { ok: true, files: [{ path: "out/batch-010.json", blob: "0".repeat(40), mode: "100644" }] } });
+  assert.equal(wrong.ok, false);
+  assert.equal(wrong.errorType, "auto_integration_content_mismatch");
+  assert.equal(await head(), before, "nothing was committed");
+  const unprepared = await hooks.commit({ changedFiles: [] }, { targetCwd: repo, prepared: null });
+  assert.equal(unprepared.ok, false);
+  const { rm: remove } = await import("node:fs/promises");
+  await remove(path.join(repo, "out", "batch-010.json"), { force: true });
+});
+
+test("B-069: after a restart an open auto-integration is scheduled again, once, and a claim stops a second run", async () => {
+  const { AUTO_INTEGRATION_RESCHEDULED, closeDb, decryptQueueRequest, encryptQueueRequest, openLockDb, rescheduleOpenAutoIntegrations } = internals;
+  // A finished writer whose bridge died before it integrated: run it without the option, then
+  // give its stored request and record the option, as an enqueue with autoIntegrate would have.
+  const dir = await builderWorktree({ "out/batch-011.json": "[11]\n" });
+  const request = job("out/batch-011.json", { lockedPaths: ["out/batch-011.json"], autoIntegrate: undefined });
+  worktreeOf.set(request.task, { dir, changed: ["out/batch-011.json"] });
+  const enqueued = await enqueueQueueJob(request);
+  const jobId = enqueued.record.jobId;
+  assert.ok(await waitFor(async () => (await durable(jobId))?.status === "completed", 15_000));
+  const db = await openLockDb(repo);
+  try {
+    const row = db.prepare("SELECT request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+    const stored = await decryptQueueRequest(row.request_encrypted, jobId);
+    stored.autoIntegrate = true;
+    db.prepare("UPDATE opencode_jobs SET request_encrypted = ?, record_json = ? WHERE job_id = ?").run(
+      await encryptQueueRequest(stored, jobId), JSON.stringify({ ...JSON.parse(row.record_json), autoIntegrateRequested: true }), jobId);
+    AUTO_INTEGRATION_RESCHEDULED.delete(jobId);
+    assert.equal(await rescheduleOpenAutoIntegrations(db), 1, "the open integration is scheduled");
+    assert.equal(await rescheduleOpenAutoIntegrations(db), 0, "once per process");
+  } finally {
+    closeDb(db);
+  }
+  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 30_000), JSON.stringify((await durable(jobId))?.autoIntegration));
+  // A second run (another bridge that found the same job) is refused by the claim.
+  const again = await autoIntegrateQueueJob({ cwd: repo, jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-011.json"], validationCommand: VALIDATION });
+  assert.equal(again.status, "not_claimed");
+  assert.equal(again.current, "committed");
 });
 
 test("Q-010: without autoIntegrate a finished writer is not touched", async () => {

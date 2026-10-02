@@ -13239,6 +13239,16 @@ async function integratePatchSerially(options) {
         error: stopIntegrationHeartbeat.signal.reason?.message || "The serial integration lease was lost before completion could be accepted.",
       };
     }
+    // B-069: an auto-integration's commit hooks, inside this lock, after the journal operation
+    // committed and validation passed: prepare before the cleanup (it reads the source worktree),
+    // commit after it (the cleanup checks that the target is still exactly as integrated).
+    const afterApplyEligible = Boolean(options.afterApply) && result.ok && result.status === "applied"
+      && result.journalStatus === "committed" && result.validationGate?.status === "passed" && !options.batch;
+    let afterApplyPrepared = null;
+    if (afterApplyEligible) {
+      afterApplyPrepared = await options.afterApply.prepare(result, { targetCwd })
+        .catch((error) => ({ ok: false, errorType: "auto_integration_prepare_failed", error: redactSensitiveText(error?.message || String(error)) }));
+    }
     if (result.ok && options.cleanupAfterSuccess && options.worktreePath) {
       await cleanupIntegratedWorktreeWhileLocked({
         result,
@@ -13247,6 +13257,10 @@ async function integratePatchSerially(options) {
         deferCleanup: Boolean(options.deferCleanup),
         beforeCleanupHook: options.beforeCleanupHook,
       });
+    }
+    if (afterApplyEligible) {
+      result.afterApply = await options.afterApply.commit(result, { targetCwd, prepared: afterApplyPrepared })
+        .catch((error) => ({ ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(error?.message || String(error)) }));
     }
     if (result.ok && result.status === "applied" && options.batch) {
       await cleanupIntegratedBatchWorktreesWhileLocked({
@@ -21663,8 +21677,10 @@ function queueRecordSnapshot(record, includeResult = true) {
     maxAttempts: record.maxAttempts || 0,
     attemptHistory: Array.isArray(record.attemptHistory) ? record.attemptHistory.map(String).slice(-RETRY_POLICY_MAX_ATTEMPTS) : [],
     startAfter: record.startAfter || "",
-    // Q-010: what the bridge did with an autoIntegrate job's patch.
+    // Q-010: what the bridge did with an autoIntegrate job's patch; B-069: whether it asked for it
+    // (a restart reschedules completed jobs that asked and are not integrated yet).
     autoIntegration: record.autoIntegration || null,
+    autoIntegrateRequested: Boolean(record.autoIntegrateRequested),
     agent: record.agent,
     taskSha256: createHash("sha256").update(String(record.task || "")).digest("hex"),
     taskChars: String(record.task || "").length,
@@ -22929,6 +22945,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     revision: 0,
     // Q-007: attempt counters of a retry policy (a requeue by the policy passes the next ones).
     ...(retryPolicy.policy ? { retryAttempt: 1, maxAttempts: retryPolicy.policy.maxAttempts } : {}),
+    ...(normalizedJob.autoIntegrate === true ? { autoIntegrateRequested: true } : {}),
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
@@ -23139,7 +23156,7 @@ async function chooseRetryModel(policy, attempt, failed = {}) {
 
 // A guarded update of a terminal row's summary (as markQueueJobRequeued does): the owner never
 // rewrites a terminal row, so this only races another such update and retries on the revision.
-async function patchTerminalQueueSummary(projectRoot, jobId, fields) {
+async function patchTerminalQueueSummary(projectRoot, jobId, fields, { onlyIf = null } = {}) {
   const db = await openLockDb(projectRoot);
   try {
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -23147,6 +23164,8 @@ async function patchTerminalQueueSummary(projectRoot, jobId, fields) {
       if (!row || !QUEUE_TERMINAL_STATUSES.includes(row.status)) return { patched: false, reason: "the job is not terminal" };
       let summary = {};
       try { summary = JSON.parse(row.record_json || "{}"); } catch { return { patched: false, reason: "the record is unreadable" }; }
+      // B-069: a claim (auto-integration) is decided on the revision it is written on.
+      if (typeof onlyIf === "function" && !onlyIf(summary, row)) return { patched: false, reason: "condition", summary };
       const updatedAt = new Date().toISOString();
       const changed = db.prepare(`
         UPDATE opencode_jobs SET record_json = ?, updated_at = ?, revision = revision + 1
@@ -23282,33 +23301,109 @@ function autoIntegrationLaterDelayMs() {
   return process.argv.includes("--self-test") ? 150 : 60_000;
 }
 
-// Commits exactly the integrated files, by pathspec (other changes of the checkout, staged or not,
-// stay as they are), as the author of the target's last commit. Unsigned: the bridge's git runs no
-// gpg program. A concurrent git (index.lock) is retried.
-async function commitAutoIntegratedFiles(root, files, message) {
-  const identity = await runCommand("git", ["log", "-1", "--format=%an%x00%ae"], root, 15_000);
-  const [name = "", email = ""] = String(identity.stdout || "").trim().split("\0");
-  if (identity.exitCode !== 0 || !name.trim() || !email.trim()) {
-    return { ok: false, errorType: "auto_integration_identity_missing", error: "The target repository's last commit has no author name and email to commit with." };
-  }
-  let last = null;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    if (attempt) await delayWithSignal(process.argv.includes("--self-test") ? 50 : 3000);
-    const add = await runCommand("git", ["add", "--", ...files], root, 60_000);
-    last = add.exitCode === 0
-      ? await runCommand("git", ["-c", `user.name=${name.trim()}`, "-c", `user.email=${email.trim()}`, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message, "--", ...files], root, 60_000)
-      : add;
-    if (last.exitCode === 0) {
-      const head = await runCommand("git", ["rev-parse", "HEAD"], root, 15_000);
-      return { ok: true, commit: String(head.stdout || "").trim(), author: `${name.trim()} <${email.trim()}>` };
-    }
-    if (!/index\.lock|unable to lock|cannot lock|File exists/i.test(`${last.stderr}`)) break;
-  }
-  return { ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(String(last?.stderr || "git commit failed")).slice(0, 500) };
+// B-069: the commit of an auto-integration, made INSIDE the integration's serial lock (the
+// engine calls these hooks after its journal operation committed and validation passed): `prepare`
+// runs before the worktree cleanup and hashes each applied file of the reviewed source worktree
+// (the engine just re-verified it against the receipt) with the target's attributes; `commit`
+// runs after the cleanup, hashes the same paths in the target (git hash-object -w --path), refuses
+// any difference, builds the tree in a temporary index (GIT_INDEX_FILE: the owner's index is not
+// used for it), creates the commit with commit-tree as the author of the target's last commit and
+// moves HEAD with update-ref against the expected old HEAD. Only then are exactly these paths set
+// in the owner's index to the committed blobs (git update-index --cacheinfo), so `git status`
+// agrees with HEAD; nothing else in the index or the working tree is touched. The paths are the
+// engine's changedFiles (read with -z), never re-parsed patch headers.
+const AUTO_INTEGRATION_EMPTY_INDEX_RETRIES = 5;
+
+function autoIntegrationCommitHooks({ jobId, agent = "", model = "", worktreePath }) {
+  const git = (args, cwd, env = null) => runCommand("git", args, cwd, 60_000, env);
+  return {
+    async prepare(result, { targetCwd }) {
+      const files = [];
+      for (const relative of result.changedFiles || []) {
+        const sourceFile = path.join(worktreePath, ...String(relative).split("/"));
+        const details = await lstat(sourceFile).catch(() => null);
+        if (!details?.isFile()) return { ok: false, errorType: "auto_integration_source_unreadable", error: `The source file ${relative} is not a regular file.` };
+        const hashed = await git(["hash-object", "--path", relative, sourceFile], targetCwd);
+        if (hashed.exitCode !== 0) return { ok: false, errorType: "auto_integration_hash_failed", error: redactSensitiveText(hashed.stderr).slice(0, 300) };
+        const executable = process.platform !== "win32" && (details.mode & 0o111) !== 0;
+        files.push({ path: relative, blob: hashed.stdout.trim(), mode: executable ? "100755" : "100644" });
+      }
+      return files.length ? { ok: true, files } : { ok: false, errorType: "auto_integration_no_files", error: "The integration reported no changed files." };
+    },
+    async commit(result, { targetCwd, prepared }) {
+      if (!prepared?.ok) return prepared || { ok: false, errorType: "auto_integration_not_prepared", error: "The source files were not hashed before cleanup." };
+      for (const file of prepared.files) {
+        const targetFile = path.join(targetCwd, ...file.path.split("/"));
+        const written = await git(["hash-object", "-w", "--path", file.path, targetFile], targetCwd);
+        if (written.exitCode !== 0) return { ok: false, errorType: "auto_integration_hash_failed", error: redactSensitiveText(written.stderr).slice(0, 300) };
+        if (written.stdout.trim() !== file.blob) {
+          return { ok: false, errorType: "auto_integration_content_mismatch", error: `${file.path} in the checkout is not the reviewed content (blob ${written.stdout.trim().slice(0, 12)}, expected ${file.blob.slice(0, 12)}); nothing was committed.` };
+        }
+      }
+      const identity = await git(["log", "-1", "--format=%an%x00%ae"], targetCwd);
+      const [name = "", email = ""] = String(identity.stdout || "").trim().split("\0");
+      if (identity.exitCode !== 0 || !name.trim() || !email.trim()) {
+        return { ok: false, errorType: "auto_integration_identity_missing", error: "The target repository's last commit has no author name and email to commit with." };
+      }
+      const oldHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"], targetCwd)).stdout.trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(oldHead)) return { ok: false, errorType: "auto_integration_head_unreadable", error: "The target HEAD could not be read." };
+      const scratch = await mkdtemp(path.join(tmpdir(), "codex-auto-integrate-index-"));
+      try {
+        const indexEnv = { GIT_INDEX_FILE: path.join(scratch, "index") };
+        const steps = [["read-tree", oldHead], ...prepared.files.map((file) => ["update-index", "--add", "--cacheinfo", `${file.mode},${file.blob},${file.path}`])];
+        for (const step of steps) {
+          const done = await git(step, targetCwd, indexEnv);
+          if (done.exitCode !== 0) return { ok: false, errorType: "auto_integration_index_failed", error: redactSensitiveText(done.stderr).slice(0, 300) };
+        }
+        const tree = (await git(["write-tree"], targetCwd, indexEnv)).stdout.trim();
+        if (!/^[0-9a-f]{40,64}$/i.test(tree)) return { ok: false, errorType: "auto_integration_index_failed", error: "git write-tree returned no tree." };
+        const message = `Auto-integrate ${jobId}: ${prepared.files.length} new file(s) by ${agent || "agent"}${model ? ` on ${model}` : ""}`;
+        const created = await git(["-c", `user.name=${name.trim()}`, "-c", `user.email=${email.trim()}`, "commit-tree", tree, "-p", oldHead, "-m", message], targetCwd);
+        const commit = created.stdout.trim();
+        if (created.exitCode !== 0 || !/^[0-9a-f]{40,64}$/i.test(commit)) return { ok: false, errorType: "auto_integration_commit_failed", error: redactSensitiveText(created.stderr).slice(0, 300) };
+        const moved = await git(["update-ref", "-m", `auto-integrate ${jobId}`, "HEAD", commit, oldHead], targetCwd);
+        if (moved.exitCode !== 0) return { ok: false, errorType: "auto_integration_head_moved", error: `HEAD moved while committing; nothing was committed (${redactSensitiveText(moved.stderr).slice(0, 200)}).` };
+        // The owner's index: exactly these paths, to the committed blobs (a concurrent git is retried).
+        let indexed = null;
+        for (let attempt = 0; attempt < AUTO_INTEGRATION_EMPTY_INDEX_RETRIES; attempt += 1) {
+          if (attempt) await delayWithSignal(process.argv.includes("--self-test") ? 50 : 3000);
+          indexed = await git(["update-index", "--add", ...prepared.files.flatMap((file) => ["--cacheinfo", `${file.mode},${file.blob},${file.path}`])], targetCwd);
+          if (indexed.exitCode === 0 || !/index\.lock|unable to lock|cannot lock|File exists/i.test(indexed.stderr)) break;
+        }
+        return {
+          ok: true,
+          commit,
+          parent: oldHead,
+          files: prepared.files.map((file) => file.path),
+          // Only the name is kept in the queue record (get_opencode_job returns it); never the email.
+          authorName: name.trim(),
+          indexUpdated: indexed?.exitCode === 0,
+          ...(indexed?.exitCode === 0 ? {} : { indexWarning: `The commit is in place, but the index entries of these paths could not be updated (${redactSensitiveText(indexed?.stderr || "").slice(0, 200)}); run git status and git reset -- <paths> if they show as staged deletions.` }),
+        };
+      } finally {
+        await rm(scratch, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+  };
 }
+
+const AUTO_INTEGRATION_FINAL_STATUSES = new Set(["committed", "skipped_not_new_files", "failed", "applied_not_committed"]);
+const AUTO_INTEGRATION_CLAIM_STALE_MS = 30 * 60_000;
 
 async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", worktreePath, allowedEdits = [], forbiddenEdits = [], sharedFiles = [], serialOnly = [], validationCommand = "", laterAttempt = 0 }) {
   const projectRoot = await resolveProjectStateRoot(cwd);
+  // B-069: one bridge process integrates a job: a claim on the terminal row (a restart, or two
+  // processes finding the same waiting job, must not integrate it twice).
+  const claimedAt = new Date().toISOString();
+  const claim = await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration: { status: "integrating", claimedBy: BRIDGE_INSTANCE_ID, at: claimedAt } }, {
+    onlyIf: (summary) => {
+      const current = summary.autoIntegration;
+      if (!current?.status || current.status === "waiting_for_lock") return true;
+      if (AUTO_INTEGRATION_FINAL_STATUSES.has(current.status)) return false;
+      return current.claimedBy === BRIDGE_INSTANCE_ID || Date.now() - (Date.parse(current.at || "") || 0) > AUTO_INTEGRATION_CLAIM_STALE_MS;
+    },
+  });
+  if (!claim.patched) return { status: "not_claimed", reason: claim.reason, current: claim.summary?.autoIntegration?.status || "" };
   const recordOutcome = async (fields) => {
     const autoIntegration = { at: new Date().toISOString(), ...fields };
     await patchTerminalQueueSummary(projectRoot, jobId, { autoIntegration });
@@ -23335,7 +23430,6 @@ async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", workt
     return { retryLater: true };
   };
   let applied = null;
-  let files = [];
   for (let round = 0; round < AUTO_INTEGRATION_ROUNDS; round += 1) {
     if (round) await delayWithSignal(autoIntegrationRetryDelayMs(round - 1));
     const preview = await integratePatchSerially({ ...options, dryRun: true });
@@ -23343,32 +23437,83 @@ async function autoIntegrateQueueJob({ cwd, jobId, agent = "", model = "", workt
       if (AUTO_INTEGRATION_RETRYABLE_ERRORS.has(preview.errorType) && round < AUTO_INTEGRATION_ROUNDS - 1) continue;
       return (await waitLater(preview)) || await failed("dry run", preview);
     }
-    files = Array.isArray(preview.patchFiles) ? preview.patchFiles : [];
+    const files = Array.isArray(preview.patchFiles) ? preview.patchFiles : [];
     const newFilesOnly = files.length > 0 && files.every((file) => file.created && !file.deleted);
     if (!newFilesOnly) {
       const outcome = await recordOutcome({ status: "skipped_not_new_files", files: files.map((file) => file.path), reason: "The patch changes or deletes a file that already exists; integrate it after review with integrate_opencode_worktree." });
       logEvent("info", "queue.auto_integration_skipped", { jobId, files: outcome.files.length });
       return outcome;
     }
-    applied = await integratePatchSerially({ ...options, dryRun: false, reviewed: true, previewReceipt: preview.previewReceipt });
+    applied = await integratePatchSerially({ ...options, dryRun: false, reviewed: true, previewReceipt: preview.previewReceipt, afterApply: autoIntegrationCommitHooks({ jobId, agent, model, worktreePath }) });
     if (applied.ok) break;
     if (!AUTO_INTEGRATION_RETRYABLE_ERRORS.has(applied.errorType) || round === AUTO_INTEGRATION_ROUNDS - 1) return (await waitLater(applied)) || await failed("apply", applied);
   }
   if (!applied?.ok || applied.validationGate?.status !== "passed") {
     return await failed("apply", applied || { errorType: "auto_integration_failed", error: "The apply did not report a passing validation." });
   }
-  const paths = files.map((file) => file.path);
-  const committed = await commitAutoIntegratedFiles(projectRoot, paths, `Auto-integrate ${jobId}: ${paths.length} new file(s) by ${agent || "agent"}${model ? ` on ${model}` : ""}`);
+  const committed = applied.afterApply || { ok: false, errorType: "auto_integration_commit_missing", error: "The integration ran no commit step." };
   if (!committed.ok) return await failed("commit", committed);
   const cleanup = applied.sourceCleanup ? `${applied.sourceCleanup.cleanup}${applied.sourceCleanup.reason ? ` (${applied.sourceCleanup.reason})` : ""}` : "";
-  const outcome = await recordOutcome({ status: "committed", commit: committed.commit, files: paths, author: committed.author, worktreeCleanup: cleanup });
-  logEvent("info", "queue.auto_integrated", { jobId, files: paths.length, commit: committed.commit });
+  const outcome = await recordOutcome({ status: "committed", commit: committed.commit, files: committed.files, author: committed.authorName, worktreeCleanup: cleanup, ...(committed.indexWarning ? { indexWarning: committed.indexWarning } : {}) });
+  logEvent("info", "queue.auto_integrated", { jobId, files: committed.files.length, commit: committed.commit });
   return outcome;
+}
+
+// B-069: after a restart, a completed autoIntegrate job whose integration never finished (it was
+// waiting for a lock, or the bridge died first) is scheduled again. Each job once per process; the
+// claim in autoIntegrateQueueJob keeps two processes from integrating it twice.
+const AUTO_INTEGRATION_RESCHEDULED = new Set();
+
+async function rescheduleOpenAutoIntegrations(db) {
+  if (!CONFIG.autoIntegrateAllowed) return 0;
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT job_id, cwd, request_encrypted, record_json FROM opencode_jobs
+      WHERE status = 'completed' AND json_valid(record_json)
+        AND json_extract(record_json, '$.autoIntegrateRequested') = 1
+        AND (json_extract(record_json, '$.autoIntegration.status') IS NULL
+          OR json_extract(record_json, '$.autoIntegration.status') IN ('waiting_for_lock', 'integrating'))
+    `).all();
+  } catch {
+    return 0;
+  }
+  let scheduled = 0;
+  for (const row of rows) {
+    if (AUTO_INTEGRATION_RESCHEDULED.has(row.job_id) || !row.request_encrypted) continue;
+    AUTO_INTEGRATION_RESCHEDULED.add(row.job_id);
+    let summary = {};
+    let request = null;
+    try {
+      summary = JSON.parse(row.record_json || "{}");
+      request = await decryptQueueRequest(row.request_encrypted, row.job_id);
+    } catch {
+      continue;
+    }
+    if (request?.autoIntegrate !== true || !summary.worktreePath || !(summary.changedFiles || []).length || !existsSync(summary.worktreePath)) continue;
+    scheduleAutoIntegration({
+      cwd: row.cwd || summary.cwd,
+      jobId: row.job_id,
+      agent: summary.agent || "",
+      model: summary.configuredModel ? `${summary.configuredProvider || "?"}/${summary.configuredModel}` : "",
+      worktreePath: summary.worktreePath,
+      allowedEdits: summary.allowedEdits || [],
+      forbiddenEdits: request.forbiddenEdits || [],
+      sharedFiles: request.sharedFiles || [],
+      serialOnly: request.serialOnly || [],
+      validationCommand: String(request.validationCommand || request.scopeContract?.validationCommand || "").trim(),
+    });
+    scheduled += 1;
+  }
+  if (scheduled) logEvent("info", "queue.auto_integration_rescheduled", { count: scheduled });
+  return scheduled;
 }
 
 // One repository's auto-integrations run one after another, each with its commit, so the next
 // dry run sees a clean target and a committed HEAD.
 function scheduleAutoIntegration(details) {
+  // This process handles the job now; the restart scan (rescheduleOpenAutoIntegrations) skips it.
+  AUTO_INTEGRATION_RESCHEDULED.add(details.jobId);
   const key = RepositoryRootSet.key(details.cwd);
   const run = (AUTO_INTEGRATION_CHAINS.get(key) || Promise.resolve())
     .then(() => autoIntegrateQueueJob(details))
@@ -28394,6 +28539,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       KNOWN_STATE_DB_PATHS.add(dbPath);
       if (!queuePersistenceEnabled) continue;
       reconcileStaleQueueRecords(db);
+      await rescheduleOpenAutoIntegrations(db);
       if (db.prepare(`
         SELECT 1 FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
@@ -29034,6 +29180,9 @@ export const __selfTest = {
     AUTO_INTEGRATION_CHAINS,
     autoIntegrateJobError,
     autoIntegrateQueueJob,
+    autoIntegrationCommitHooks,
+    rescheduleOpenAutoIntegrations,
+    AUTO_INTEGRATION_RESCHEDULED,
     patchFileEntries,
     SELF_TEST_TEMP_STATE_DIR,
     effectiveBridgeStateDirectory,

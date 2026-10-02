@@ -326,8 +326,10 @@ Safety checks during integration:
 - **Auto-integration (opt-in per job).** A queued writer enqueued with `autoIntegrate: true` (and a
   `validationCommand`) whose patch only **adds new files** is integrated by the bridge as soon as it
   finishes: the same dry run, receipt, validation in your checkout and rollback as above, then one
-  commit of exactly those files with the author of your last commit (`Auto-integrate <job>: ...`;
-  unrelated uncommitted work stays uncommitted). A patch that changes or deletes an existing file
+  commit of exactly those files with the author of your last commit (`Auto-integrate <job>: ...`),
+  made from a temporary index after checking that the files are the reviewed content; your own
+  staged and unstaged work stays as it was. An integration that was waiting when the bridge
+  stopped is resumed after the restart. A patch that changes or deletes an existing file
   is left for the normal review (`autoIntegration=skipped_not_new_files` on the job). Set
   `CODEX_OPENCODE_AUTO_INTEGRATE=false` to refuse the option.
 - If an agent needs a new package, it stops and returns `DEPENDENCY_REQUIRED {...}`. Codex then:
