@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createDirectRunAudit, directRunMetrics } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
 import { resolvePluginManifestEntryPath } from "./bin/plugin-manifest-paths.js";
-import { libPinError } from "./bin/lib-digest.js";
+import { libDigest, libPinError } from "./bin/lib-digest.js";
 import { LIKELY_SECRET_PATTERNS, redactLikelySecrets, redactSensitiveText, patchLikelySecretLines, sanitizePersistedValue, sanitizeLogValue, failureSummary } from "./lib/redaction.js";
 import { binaryTextFilesInPatch, patchFileEntries, diffStatFromPatch } from "./lib/git-patch.js";
 import { createBridgeConfig } from "./lib/config.js";
@@ -191,6 +191,10 @@ const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_SERVER_PATH = fileURLToPath(import.meta.url);
 const BRIDGE_SOURCE_SHA256 = createHash("sha256").update(await readFile(fileURLToPath(import.meta.url))).digest("hex");
+// B-103: the lib/ digest at startup (bin/lib-digest.js), so a status call can tell when a
+// deploy changed lib/ (most deploys since the split) under a process Codex kept alive. "" when
+// lib/ cannot be digested here (a link under it in a development tree; the pin check decides).
+const BRIDGE_LIB_SHA256_AT_STARTUP = await libDigest(BRIDGE_RUNTIME_DIR).then((digest) => digest?.sha256 || "", () => "");
 const PROCESS_SUPERVISOR_PATH = path.join(BRIDGE_RUNTIME_DIR, "bin", "process-supervisor.js");
 const {
   USER_HOME_DIR,
@@ -2674,21 +2678,37 @@ async function staleBridgeProcessHint(currentSha256) {
 // idle bridges, does not end it), so a restart that did not happen looked exactly like one that
 // did: status printed the startup hash and "healthy" while the process ran the old code, and the
 // synced runtime profiles no longer matched that code's rules. Compare against the file on disk.
-async function bridgeSourceFreshness(serverPath = BRIDGE_SERVER_PATH, startupSha256 = BRIDGE_SOURCE_SHA256) {
+// B-103: server.js and the lib/ digest are both compared with their startup values; since the
+// split most deploys change lib/ only, so the server hash alone said "same as at startup".
+async function bridgeSourceFreshness(serverPath = BRIDGE_SERVER_PATH, startupSha256 = BRIDGE_SOURCE_SHA256, { runtimeDir = BRIDGE_RUNTIME_DIR, startupLibSha256 = BRIDGE_LIB_SHA256_AT_STARTUP } = {}) {
+  const base = { startedAt: BRIDGE_PROCESS_STARTED_AT, startupSha256, startupLibSha256 };
   try {
     const onDiskSha256 = createHash("sha256").update(await readFile(serverPath)).digest("hex");
-    return { startedAt: BRIDGE_PROCESS_STARTED_AT, startupSha256, onDiskSha256, stale: onDiskSha256 !== startupSha256, error: "" };
+    let onDiskLibSha256 = "";
+    let libError = "";
+    try {
+      onDiskLibSha256 = (await libDigest(runtimeDir))?.sha256 || "";
+    } catch (error) {
+      libError = error?.message || String(error);
+    }
+    const libStale = Boolean(startupLibSha256 || onDiskLibSha256) && onDiskLibSha256 !== startupLibSha256;
+    return { ...base, onDiskSha256, onDiskLibSha256, libError, serverStale: onDiskSha256 !== startupSha256, libStale, stale: onDiskSha256 !== startupSha256 || libStale, error: "" };
   } catch (error) {
-    return { startedAt: BRIDGE_PROCESS_STARTED_AT, startupSha256, onDiskSha256: "", stale: false, error: error?.message || String(error) };
+    return { ...base, onDiskSha256: "", onDiskLibSha256: "", libError: "", serverStale: false, libStale: false, stale: false, error: error?.message || String(error) };
   }
 }
 
 function bridgeSourceFreshnessLines(freshness) {
   if (freshness.error) return [`Bridge source on disk: unreadable (${freshness.error})`];
-  if (!freshness.stale) return ["Bridge source on disk: same as at startup"];
+  const libLine = freshness.libError
+    ? `Bridge lib/ digest on disk: unreadable (${freshness.libError})`
+    : `Bridge lib/ digest at startup: ${freshness.startupLibSha256 || "none"}${freshness.libStale ? `; on disk ${freshness.onDiskLibSha256 || "none"} (differs from startup)` : ""}`;
+  if (!freshness.stale) return ["Bridge source on disk: same as at startup", libLine];
+  const changed = [freshness.serverStale ? "server.js" : "", freshness.libStale ? "lib/" : ""].filter(Boolean).join(" and ");
   return [
-    `Bridge source on disk: ${freshness.onDiskSha256} (differs from startup)`,
-    `Warning: server.js changed after this bridge process started (${freshness.startedAt}); this process still runs the old code. Restart the client that launched it (quit Claude fully, not just the window, or start a new Claude Code session; restart Codex) so it launches the current bridge.`,
+    freshness.serverStale ? `Bridge source on disk: ${freshness.onDiskSha256} (differs from startup)` : "Bridge source on disk: same as at startup",
+    libLine,
+    `Warning: ${changed} changed after this bridge process started (${freshness.startedAt}); this process still runs the old code. Restart the client that launched it (quit Claude fully, not just the window, or start a new Claude Code session; restart Codex) so it launches the current bridge.`,
   ];
 }
 

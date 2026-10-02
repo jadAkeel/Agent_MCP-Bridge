@@ -3616,7 +3616,20 @@ async function runSelfTests() {
     assert.match(bridgeSourceFreshnessLines(changedOnDisk).join(" "), /still runs the old code. Restart the client/, "Status tells the operator the restart did not take effect.");
     const unchangedOnDisk = await bridgeSourceFreshness(freshnessFile, changedOnDisk.onDiskSha256);
     assert.equal(unchangedOnDisk.stale, false);
-    assert.deepEqual(bridgeSourceFreshnessLines(unchangedOnDisk), ["Bridge source on disk: same as at startup"]);
+    const unchangedLines = bridgeSourceFreshnessLines(unchangedOnDisk);
+    assert.equal(unchangedLines[0], "Bridge source on disk: same as at startup");
+    assert.match(unchangedLines[1], /^Bridge lib\/ digest at startup: [a-f0-9]{64}$/, "B-103: the lib/ digest is reported next to the server hash.");
+    // B-103: a lib/ that changed under a running process (most deploys since the split) marks
+    // it stale although server.js did not change.
+    await mkdir(path.join(freshnessDir, "lib"), { recursive: true });
+    await writeFile(path.join(freshnessDir, "lib", "changed.js"), "// new lib code\n");
+    const libChanged = await bridgeSourceFreshness(freshnessFile, changedOnDisk.onDiskSha256, { runtimeDir: freshnessDir, startupLibSha256: "0".repeat(64) });
+    assert.equal(libChanged.stale, true, "A lib/ digest that differs from startup marks the process stale.");
+    assert.equal(libChanged.serverStale, false);
+    assert.equal(libChanged.libStale, true);
+    assert.match(bridgeSourceFreshnessLines(libChanged).join(" "), /Warning: lib\/ changed after this bridge process started/);
+    const libSame = await bridgeSourceFreshness(freshnessFile, changedOnDisk.onDiskSha256, { runtimeDir: freshnessDir, startupLibSha256: libChanged.onDiskLibSha256 });
+    assert.equal(libSame.stale, false);
     const unreadable = await bridgeSourceFreshness(path.join(freshnessDir, "missing.js"), "0".repeat(64));
     assert.equal(unreadable.stale, false, "An unreadable file is reported, not treated as a stale process.");
     assert.match(bridgeSourceFreshnessLines(unreadable)[0], /unreadable/);

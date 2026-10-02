@@ -15,7 +15,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { LIB_PIN_ENV, libDigest, libDigestOf, libPinError, listLibFiles } from "../bin/lib-digest.js";
+import { LIB_PIN_ENV, RUNTIME_BIN_FILES, isLibDigestPath, libDigest, libDigestOf, libPinError, listLibFiles } from "../bin/lib-digest.js";
 import { SkipTest, finishSkips } from "./skip-gate.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -160,10 +160,54 @@ try {
       writeFileSync(path.join(tree, "lib", "a2.js"), readFileSync(path.join(tree, "lib", "a.js")));
       rmSync(path.join(tree, "lib", "a.js"));
     });
-    // Changes outside lib/ are not part of it.
+    // Changes outside lib/ and the runtime bin/ files are not part of it.
     const before = (await libDigest(tree)).sha256;
     writeTree(tree, { "server.js": "// other\n", "bin/tool.js": "tool\n" });
     assert.equal((await libDigest(tree)).sha256, before);
+  });
+
+  // B-102: the bin/ files the bridge runs are entries of the same digest.
+  await check("the runtime bin/ files are part of the digest, other bin/ files and missing ones are not", async () => {
+    const tree = path.join(scratch, "bin-files");
+    writeTree(tree, { "lib/a.js": "a\n", "bin/ops-log.js": "ops\n", "bin/process-supervisor.js": "supervisor\n", "bin/setup.js": "setup\n" });
+    const digest = await libDigest(tree);
+    assert.deepEqual(digest.files.map((file) => file.path), ["bin/ops-log.js", "bin/process-supervisor.js", "lib/a.js"], "bin entries sort before lib/, setup.js is not an entry");
+    assert.equal(digest.fileCount, 3);
+    const withoutBin = await libDigest(path.join(scratch, "format"));
+    assert.ok(!withoutBin.files.some((file) => file.path.startsWith("bin/")), "a tree without the bin files has no bin entries");
+    writeFileSync(path.join(tree, "bin", "ops-log.js"), "ops, edited\n");
+    const edited = await libDigest(tree);
+    assert.notEqual(edited.sha256, digest.sha256, "editing a runtime bin file changes the digest");
+    writeFileSync(path.join(tree, "bin", "setup.js"), "setup, edited\n");
+    assert.equal((await libDigest(tree)).sha256, edited.sha256, "editing another bin file does not");
+    assert.ok(RUNTIME_BIN_FILES.includes("bin/lib-digest.js") && RUNTIME_BIN_FILES.includes("bin/process-supervisor.js"));
+    assert.equal(isLibDigestPath("lib/queue/store.js"), true);
+    assert.equal(isLibDigestPath("bin/ops-log.js"), true);
+    assert.equal(isLibDigestPath("bin/setup.js"), false);
+    assert.equal(isLibDigestPath("server.js"), false);
+    // This checkout: every runtime bin file exists and is an entry.
+    const real = await libDigest(ROOT);
+    for (const relative of RUNTIME_BIN_FILES) assert.ok(real.files.some((file) => file.path === relative), `${relative} is an entry of the real digest`);
+  });
+
+  await check("the import closure of server.js stays inside server.js, lib/** and RUNTIME_BIN_FILES", async () => {
+    const seen = new Set();
+    const queue = ["server.js"];
+    while (queue.length) {
+      const relative = queue.shift();
+      const source = readFileSync(path.join(ROOT, ...relative.split("/")), "utf8");
+      for (const match of source.matchAll(/(?:^|\n)\s*(?:import|export)\s[^;]*?\sfrom\s+["'](\.{1,2}\/[^"']+)["']|(?:^|\n)\s*import\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+        const target = path.posix.normalize(path.posix.join(path.posix.dirname(relative), match[1] || match[2]));
+        if (!seen.has(target)) {
+          seen.add(target);
+          queue.push(target);
+        }
+      }
+    }
+    assert.ok(seen.size >= 50, `the closure found only ${seen.size} files`);
+    const outside = [...seen].filter((relative) => !(relative.startsWith("lib/") || RUNTIME_BIN_FILES.includes(relative)));
+    assert.deepEqual(outside, [], `files the bridge imports but no pin covers: ${outside.join(", ")}; add them to RUNTIME_BIN_FILES in bin/lib-digest.js`);
+    assert.ok(seen.has("bin/ops-log.js") && seen.has("bin/lib-digest.js"), "the closure reaches the bin files");
   });
 
   await check("a link under lib/, or lib/ itself as a link, is refused", async () => {
@@ -250,6 +294,9 @@ try {
   await check("the server pin is still checked first: a wrong server pin is refused as before", async () => {
     const stderr = startRefused(scratchEnv("wrong-server", { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "0".repeat(64), [LIB_PIN_ENV]: libPin }));
     assert.match(stderr, /Bridge release integrity check failed\. Expected 0{64}, got [a-f0-9]{64}\./);
+    // B-104: the refusal names the file and the remedy.
+    assert.match(stderr, /server\.js \(.*server\.js\) does not match CODEX_OPENCODE_EXPECTED_SERVER_SHA256/);
+    assert.match(stderr, SYNC_HINT);
   });
 } finally {
   rmSync(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
