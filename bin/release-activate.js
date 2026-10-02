@@ -1658,8 +1658,11 @@ export {
   assertRewritePreservesConfig,
   claudeCodeCommand,
   clientToolTimeoutSeconds,
+  defaultClaudeConfigPath,
   cleanupUnactivatedRelease,
   listReleases,
+  // B-075: bin/queue-worker.js --env-from claude reads the entry, never writes it.
+  readClaudeUserEntry,
   repinnableServerSha256,
   resolveReleasesRoot,
   rewriteConfig,
