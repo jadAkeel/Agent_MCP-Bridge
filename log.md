@@ -16,6 +16,15 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-02
 
+### server.js split: integrity of lib/ (Claude, 2026-10-02)
+
+Branch `bridge/server-modules`, worktree `<bridge-modules>`, on the split (`457a86b`, M-001):
+`server.js` is 22,115 lines and imports 25 modules under `lib/` statically.
+
+| ID | Problem | Cause | Fix | Commit | Status |
+|---|---|---|---|---|---|
+| B-093 | `node bin/release-gate.js --self-test` failed with `ENOENT ... lstat '...\release-gate-self-test-XXXX\source\lib'`. | The split made `lib` a publish entry (`LEGACY_PUBLISH_ENTRIES`), and the source-tree digest refuses a missing entry, but the self-test's source fixture had no `lib/`. The fixtures of `bin/build-release.js` and `bin/release-activate.js` (checked build) passed their own entry lists, which lacked `tests`. | `writeSourceFixture` writes `lib/module.js`, and the self-test proves a missing `lib/` is not digested as absent. Both other fixtures now build from `LEGACY_PUBLISH_ENTRIES` itself (plus a `tests/` file and a nested `lib/queue/store.js`), so they cannot drift from what a release copies. `tests/review-b037-portable-release.js` checks out the committed tree, which holds `lib/`, so it already matched. | (this commit) | fixed |
+
 ### Unattended queue worker (Claude, 2026-10-02)
 
 Branch `bridge/queue-worker`, isolated worktree `<bridge-worker>` from `bridge/flex-scheduling`

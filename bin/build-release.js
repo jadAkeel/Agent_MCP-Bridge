@@ -327,7 +327,9 @@ async function runSelfTest() {
   const source = path.join(fixture, "source");
   const releases = path.join(fixture, "releases");
   const outside = path.join(fixture, "outside");
-  const publishEntries = ["server.js", "package.json", "package-lock.json", "bin", "lib", "opencode/agents", "opencode/skills", "opencode/.gitignore", "opencode/plugin-integrity-manifest.json", "node_modules"];
+  // The real publish entries, so the fixture tree cannot drift from what a release copies
+  // (it lacked tests/; release-gate's lacked lib/ after the split and failed with ENOENT).
+  const publishEntries = [...LEGACY_PUBLISH_ENTRIES];
   try {
     const files = [
       "server.js",
@@ -342,6 +344,8 @@ async function runSelfTest() {
       "bin/fresh-healthcheck.js",
       "lib/redaction.js",
       "lib/git-patch.js",
+      "lib/queue/store.js",
+      "tests/case.js",
       "opencode/agents/builder.md",
       "opencode/agents/reviewer.md",
       "opencode/skills/agent-suitability-check/SKILL.md",
