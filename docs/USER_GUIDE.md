@@ -267,7 +267,8 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
 - **Fallback models.** Give `enqueue_opencode_job` a `models` list (allowlisted
   `provider/model[@variant]`, tried in order) and optionally `maxAttempts` (default 4). A job that
   fails for a provider reason (rate limit, pause, quota, 5xx), stops as idle, times out, ends with
-  no answer, changes no file or fails its validation is requeued by the bridge on the next model
+  no answer, changes no file, fails its validation or is stopped by a sleep or stall (lease fence,
+  supervisor watchdog) is requeued by the bridge on the next model
   that is not paused. `list_opencode_jobs` shows `attempt=2/4 model=...`; after the last attempt
   the job shows `outcome=gave_up`. Jobs with such a policy that a client restart interrupted are
   resumed by the next bridge as their next attempt.
@@ -336,7 +337,9 @@ retries, fallback models, pauses, auto-integration and logs.
 4. **Stop it**: `--repo C:\path\to\repo --stop`, or Ctrl+C in its window. Nothing new starts and
    the worker exits when its running jobs end. `--stop --now` (or a second Ctrl+C) cancels the
    running jobs; they end `cancelled` and `requeue_opencode_job` can run them again. A third Ctrl+C
-   exits at once (exit code 2). Jobs the worker leaves behind are **parked**: the next worker you
+   exits at once (exit code 2, logged as `queue_worker.stopped` with `forced_exit`). A Ctrl+C while
+   the worker is still starting (checking or enqueueing the file) stops it before any job starts:
+   the jobs it had already enqueued are cancelled and it exits with code 1. Jobs the worker leaves behind are **parked**: the next worker you
    start for the repository runs them, and Codex or Claude Code do not take them over, so the rest
    of the batch does not end up running in a client window. To hand them to the clients instead,
    run `node bin\queue-worker.js --repo C:\path\to\repo --release`.
@@ -359,6 +362,8 @@ Good to know:
   client after `--release`) finishes it.
 - The global worker cap (`set_opencode_concurrency({ globalWorkerLimit })`) counts the worker's
   agents together with the clients'.
+- A check that cannot read the queue (a busy or full disk) is one `queue_worker.tick_failed`
+  warning per streak; the worker keeps its presence file fresh and still obeys `--stop` meanwhile.
 - Exit codes: 0 clean stop, 1 refused to start, 2 stopped by an error. Details in
   [REFERENCE](REFERENCE.md#queue-worker-binqueue-workerjs).
 
@@ -387,7 +392,8 @@ Safety checks during integration:
 - **Auto-integration (opt-in per job).** A queued writer enqueued with `autoIntegrate: true` (and a
   `validationCommand`) whose patch only **adds new files** is integrated by the bridge as soon as it
   finishes: the same dry run, receipt, validation in your checkout and rollback as above, then one
-  commit of exactly those files with the author of your last commit (`Auto-integrate <job>: ...`),
+  commit of exactly those files as your configured Git user (`user.name` / `user.email`; the author
+  of your last commit only when none is configured) (`Auto-integrate <job>: ...`),
   made from a temporary index after checking that the files are the reviewed content; your own
   staged and unstaged work stays as it was. An integration that was waiting when the bridge
   stopped is resumed after the restart. A patch that changes or deletes an existing file

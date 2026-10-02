@@ -106,4 +106,66 @@ test("Q-008: the resume counts against maxAttempts, so a job that keeps being in
   assert.equal((await durable(jobId)).requeuedAs || "", "");
 });
 
+// B-123: a lease fence after a sleep or stall (queue_ownership_lost) and a supervisor watchdog
+// (process_supervisor_watchdog_expired) end a policy job as failed; the policy retries them. The
+// failed row is written by its owner generation only, so the retry duplicates nothing.
+for (const errorType of ["queue_ownership_lost", "process_supervisor_watchdog_expired"]) {
+  test(`B-123: a failed attempt with ${errorType} is requeued by the retry policy`, async () => {
+    const enqueued = await enqueueQueueJob(readJob({ task: `retry after ${errorType}`, models: [MUSE, GEMINI] }), "", { schedule: false });
+    assert.equal(enqueued.ok, true, enqueued.error);
+    const jobId = enqueued.record.jobId;
+    QUEUE_JOBS.delete(jobId);
+    const now = new Date().toISOString();
+    const db = await openLockDb(repo);
+    try {
+      db.prepare(`UPDATE opencode_jobs SET status = 'failed', finished_at = ?, heartbeat_at = '', lease_expires_at = '',
+        record_json = json_set(record_json, '$.status', 'failed', '$.errorType', ?), revision = revision + 1 WHERE job_id = ?`).run(now, errorType, jobId);
+    } finally {
+      closeDb(db);
+    }
+    const decided = await internals.applyQueueRetryPolicy({ cwd: repo, jobId });
+    assert.equal(decided.action, "requeued", JSON.stringify(decided));
+    const original = await durable(jobId);
+    assert.equal(original.requeuedAs, decided.newJobId);
+    assert.ok(await waitFor(async () => (await durable(decided.newJobId))?.status === "completed"), "the retry ran");
+  });
+}
+
+// B-127: a retry the policy deferred because the interrupted run's child was still alive
+// (requeue_orphan_child_alive) is tried again by the recovery pass once that child is gone.
+test("B-127: a retry deferred by a live orphan child runs once the child has exited", async () => {
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  const exited = new Promise((resolve) => child.on("exit", resolve));
+  try {
+    const enqueued = await enqueueQueueJob(readJob({ task: "deferred by an orphan", models: [MUSE, GEMINI] }), "", { schedule: false });
+    assert.equal(enqueued.ok, true, enqueued.error);
+    const jobId = enqueued.record.jobId;
+    QUEUE_JOBS.delete(jobId);
+    const past = new Date(Date.now() - 10 * 60_000).toISOString();
+    const db = await openLockDb(repo);
+    try {
+      db.prepare(`UPDATE opencode_jobs SET status = 'running', owner_instance_id = 'dead-bridge-instance', owner_process_id = 999999,
+        owner_generation = 'dead-generation', started_at = ?, heartbeat_at = ?, lease_expires_at = ?, child_process_id = ?, child_process_started_at = ?,
+        revision = revision + 1 WHERE job_id = ?`).run(past, past, past, child.pid, past, jobId);
+      assert.ok(reconcileStaleQueueRecords(db, Date.now()).includes(jobId));
+    } finally {
+      closeDb(db);
+    }
+    assert.ok(await waitFor(async () => Boolean((await durable(jobId))?.retryDeferredAt)), "the retry is deferred and marked");
+    assert.equal((await durable(jobId)).requeuedAs || "", "", "not requeued while the child lives");
+    child.kill();
+    await exited;
+    assert.ok(await waitFor(async () => {
+      await internals.reconcileQueueStateAtStartup();
+      return Boolean((await durable(jobId))?.requeuedAs);
+    }, 15_000, 100), "the recovery pass requeues it once the child is gone");
+    const original = await durable(jobId);
+    assert.equal(original.status, "interrupted");
+    assert.ok(await waitFor(async () => (await durable(original.requeuedAs))?.status === "completed"), "the retry ran");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+});
+
 await runFlexTests({ isolatedStateDir, file: "tests/review-flex-resume.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "restart resume" });
