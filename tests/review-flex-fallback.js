@@ -251,28 +251,40 @@ test("B-072: models, maxAttempts and autoIntegrate are refused in the memory que
   }
 });
 
-test("B-072: a requeued write attempt that changed nothing has its empty worktree removed; one with a change keeps it", async () => {
-  const { existsSync, writeFileSync } = await import("node:fs");
-  const emptyDir = path.join(fixture.root, "wt-empty");
-  const dirtyDir = path.join(fixture.root, "wt-dirty");
-  await fixture.git(["worktree", "add", "-q", "-b", "agent/builder/empty-attempt", emptyDir, "HEAD"]);
-  await fixture.git(["worktree", "add", "-q", "-b", "agent/builder/dirty-attempt", dirtyDir, "HEAD"]);
-  writeFileSync(path.join(dirtyDir, "src", "notes.txt"), "half done\n");
-  const plans = { "empty attempt": emptyDir, "dirty attempt": dirtyDir };
+test("B-072/B-074: only a provably empty worktree of a failed attempt is removed (base commit known, no change, untracked or ignored file)", async () => {
+  const { existsSync, writeFileSync, appendFileSync, mkdirSync } = await import("node:fs");
+  const base = (await fixture.git(["rev-parse", "HEAD"])).trim();
+  // Ignored files: worktree remove --force would delete them, so they keep the worktree.
+  mkdirSync(path.join(fixture.repoInput, ".git", "info"), { recursive: true });
+  appendFileSync(path.join(fixture.repoInput, ".git", "info", "exclude"), "\n*.log\n");
+  const cases = {
+    "empty attempt": { keep: false, baseCommit: base },
+    "dirty attempt": { keep: true, baseCommit: base, file: ["src", "notes.txt"] },
+    "ignored attempt": { keep: true, baseCommit: base, file: ["debug.log"] },
+    "unknown base attempt": { keep: true, baseCommit: "" },
+  };
+  for (const [task, plan] of Object.entries(cases)) {
+    plan.dir = path.join(fixture.root, `wt-${task.split(" ")[0]}`);
+    plan.branch = `agent/builder/${task.split(" ")[0]}-attempt`;
+    await fixture.git(["worktree", "add", "-q", "-b", plan.branch, plan.dir, "HEAD"]);
+    if (plan.file) writeFileSync(path.join(plan.dir, ...plan.file), "half done\n");
+  }
   const counts = {};
   hooks.queueJobExecutorTestHook = async (request) => {
     counts[request.task] = (counts[request.task] || 0) + 1;
+    const plan = cases[request.task];
     return counts[request.task] === 1
-      ? { response: { content: [{ type: "text", text: "Job failed.\nerrorType: agent_idle_timeout" }] }, result: { errorType: "agent_idle_timeout", changedFiles: [] }, validation: null, worktree: { path: plans[request.task], branch: request.task === "empty attempt" ? "agent/builder/empty-attempt" : "agent/builder/dirty-attempt", baseCommit: "", baseTree: "" } }
+      ? { response: { content: [{ type: "text", text: "Job failed.\nerrorType: agent_idle_timeout" }] }, result: { errorType: "agent_idle_timeout", changedFiles: [] }, validation: null, worktree: { path: plan.dir, branch: plan.branch, baseCommit: plan.baseCommit, baseTree: "" } }
       : execution({ changedFiles: ["src/a.txt"] });
   };
-  for (const task of Object.keys(plans)) {
+  for (const task of Object.keys(cases)) {
     const first = await enqueueQueueJob(writeJob("src/a.txt", { task, models: [MUSE] }));
     assert.equal(first.ok, true, first.error);
     await chain(first.record.jobId);
   }
-  assert.equal(existsSync(emptyDir), false, "the empty worktree of the failed attempt was removed");
-  assert.equal(existsSync(dirtyDir), true, "a worktree with an untracked file is kept for review");
+  for (const [task, plan] of Object.entries(cases)) {
+    assert.equal(existsSync(plan.dir), plan.keep, `${task}: ${plan.keep ? "kept" : "removed"}`);
+  }
 });
 
 await runFlexTests({ isolatedStateDir, file: "tests/review-flex-fallback.js", tests, cleanup: async () => { hooks.selfTestModelOverrideAllowlist = null; await fixture.cleanup(); }, finishSkips, label: "model fallback" });

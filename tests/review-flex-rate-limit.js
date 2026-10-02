@@ -159,6 +159,14 @@ test("B-070: a burst delivered at once is one observation; the default needs hit
   watcher.stop();
 });
 
+test("B-074: CODEX_OPENCODE_RATE_LIMIT_HITS=1 stops at the first line (there is no spread to wait for)", () => {
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch({ hits: 1, minSpreadMs: undefined }), onTrip: () => { trips += 1; } });
+  watcher.stderrLine(logLine());
+  assert.equal(trips, 1);
+  watcher.stop();
+});
+
 test("B-061: once the run's session is known only that session's lines count", async () => {
   await writeFile(logPath, "", "utf8");
   const running = spawnChild("session", 8000, { rateLimitWatch: watch({ logPath }) });

@@ -270,6 +270,53 @@ test("B-069: after a restart an open auto-integration is scheduled again, once, 
   assert.equal(again.current, "committed");
 });
 
+test("B-074: a claim of a dead bridge process is taken over at startup; a live process's claim is not", async () => {
+  const { AUTO_INTEGRATION_RESCHEDULED, autoIntegrationClaimerGone, closeDb, decryptQueueRequest, encryptQueueRequest, openLockDb, rescheduleOpenAutoIntegrations } = internals;
+  const dir = await builderWorktree({ "out/batch-012.json": "[12]\n" });
+  const request = job("out/batch-012.json", { lockedPaths: ["out/batch-012.json"], autoIntegrate: undefined });
+  worktreeOf.set(request.task, { dir, changed: ["out/batch-012.json"] });
+  const enqueued = await enqueueQueueJob(request);
+  const jobId = enqueued.record.jobId;
+  assert.ok(await waitFor(async () => (await durable(jobId))?.status === "completed", 15_000));
+  const setClaim = async (claimedBy) => {
+    const db = await openLockDb(repo);
+    try {
+      const row = db.prepare("SELECT request_encrypted, record_json FROM opencode_jobs WHERE job_id = ?").get(jobId);
+      const stored = await decryptQueueRequest(row.request_encrypted, jobId);
+      stored.autoIntegrate = true;
+      db.prepare("UPDATE opencode_jobs SET request_encrypted = ?, record_json = ? WHERE job_id = ?").run(
+        await encryptQueueRequest(stored, jobId),
+        JSON.stringify({ ...JSON.parse(row.record_json), autoIntegrateRequested: true, autoIntegration: { status: "integrating", claimedBy, at: new Date().toISOString() } }),
+        jobId);
+      return db;
+    } catch (error) {
+      closeDb(db);
+      throw error;
+    }
+  };
+  // A live process (this test's own pid under another instance id): its fresh claim stands.
+  const liveClaimer = `${process.pid}-1-livelivelive`;
+  let db = await setClaim(liveClaimer);
+  try {
+    assert.equal(autoIntegrationClaimerGone(db, liveClaimer), false);
+  } finally {
+    closeDb(db);
+  }
+  const refused = await autoIntegrateQueueJob({ cwd: repo, jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-012.json"], validationCommand: VALIDATION });
+  assert.equal(refused.status, "not_claimed", "a fresh claim of a live process is not taken over");
+  // A crashed bridge: no live bridge_instances lease and no live process. The restart scan takes it over at once.
+  const deadClaimer = "999999-1-deaddeaddead";
+  db = await setClaim(deadClaimer);
+  try {
+    assert.equal(autoIntegrationClaimerGone(db, deadClaimer), true);
+    AUTO_INTEGRATION_RESCHEDULED.delete(jobId);
+    assert.equal(await rescheduleOpenAutoIntegrations(db), 1);
+  } finally {
+    closeDb(db);
+  }
+  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 30_000), JSON.stringify((await durable(jobId))?.autoIntegration));
+});
+
 test("Q-010: without autoIntegrate a finished writer is not touched", async () => {
   const before = await head();
   const dir = await builderWorktree({ "out/batch-007.json": "[7]\n" });
