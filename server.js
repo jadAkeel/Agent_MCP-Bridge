@@ -22986,7 +22986,7 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
   if (!checked.ok || !checked.policy) return { action: "none" };
   const errorType = row.status === "interrupted" ? "queue_job_interrupted" : String(summary.errorType || "");
   if (!RETRY_POLICY_ERROR_TYPES.has(errorType)) return { action: "not_eligible", errorType };
-  if (errorType === "queue_job_interrupted" && !CONFIG.autoResumeInterrupted) return { action: "resume_disabled" };
+  if (errorType === "queue_job_interrupted" && !(autoResumeInterruptedOverride ?? CONFIG.autoResumeInterrupted)) return { action: "resume_disabled" };
   const attempt = Math.max(1, Number(summary.retryAttempt || 1));
   const maxAttempts = checked.policy.maxAttempts;
   const history = [...(Array.isArray(summary.attemptHistory) ? summary.attemptHistory : []), `${jobId} ${retryPolicyModelLabel(summary)} ${errorType}`].slice(-RETRY_POLICY_MAX_ATTEMPTS);
@@ -23009,6 +23009,12 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
     model: next.spec || "",
     recordFields: { retryAttempt: attempt + 1, maxAttempts, attemptHistory: history, startAfter: next.startAfter || "" },
   });
+  // B-065: a previous child that is still alive may still write its worktree; the job stays
+  // interrupted (not gave_up) so the operator can stop the child and requeue it.
+  if (!requeued.ok && requeued.errorType === "requeue_orphan_child_alive") {
+    logEvent("warn", "queue.retry_deferred", { jobId, agent: summary.agent || "", errorType: requeued.errorType, summary: failureSummary(requeued.error) });
+    return { action: "deferred", errorType: requeued.errorType };
+  }
   if (!requeued.ok) return await giveUp(`The retry could not be enqueued (${requeued.errorType}: ${requeued.error}).`);
   logEvent("warn", "queue.job_retried", {
     jobId: requeued.record.jobId,
@@ -23019,6 +23025,9 @@ async function applyQueueRetryPolicy({ cwd, jobId }) {
   });
   return { action: "requeued", newJobId: requeued.record.jobId, model: next.spec, startAfter: next.startAfter, attempt: attempt + 1 };
 }
+
+// Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
+let autoResumeInterruptedOverride = null;
 
 // Never blocks or fails the caller (a terminal commit, a recovery pass): the policy runs after it.
 function scheduleQueueRetryPolicy(cwd, jobId) {
@@ -28691,6 +28700,8 @@ export const __selfTest = {
     set freeMemoryBytesTestHook(value) { freeMemoryBytesTestHook = value; },
     get minFreeMemoryMbOverride() { return minFreeMemoryMbOverride; },
     set minFreeMemoryMbOverride(value) { minFreeMemoryMbOverride = value; },
+    get autoResumeInterruptedOverride() { return autoResumeInterruptedOverride; },
+    set autoResumeInterruptedOverride(value) { autoResumeInterruptedOverride = process.argv.includes("--self-test") ? value : null; },
   },
 };
 
