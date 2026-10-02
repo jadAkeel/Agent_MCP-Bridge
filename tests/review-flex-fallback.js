@@ -263,9 +263,10 @@ test("B-078: a new job whose every model is paused waits (startAfter) instead of
     assert.equal(record.scopeContract.modelRequirement.model, "muse-spark-1.3-contributor-free", "the request keeps its first model, so the idempotency fingerprint does not depend on the pauses");
     assert.match(textOf(await callTool("list_opencode_jobs", { cwd: repo, limit: 50 })), new RegExp(`${job.record.jobId} .*stage=waiting_for_provider_pause`));
     assert.equal((await enqueueQueueJob(input)).deduplicated, true, "the same input again deduplicates");
+    assert.equal(record.startAfterReason, "provider_pause");
+    // The resume releases the wait (B-080); nothing clears startAfter by hand.
     await resumeProvider({ provider: "google" });
-    QUEUE_JOBS.get(job.record.jobId).startAfter = "";
-    scheduleQueue();
+    await resumeProvider({ provider: "opencode" });
     assert.equal((await terminalOf(job.record.jobId)).status, "completed");
   } finally {
     await resumeProvider({ provider: "opencode" });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Feature 10 (log.md B-075..B-077, 2026-10-02): the unattended queue worker, bin/queue-worker.js,
+// Feature 10 (log.md Q-011, B-075..B-077 and the review fixes B-079..B-091, 2026-10-02): the unattended queue worker, bin/queue-worker.js,
 // and the claims it relies on. The worker runs the bridge's own queue for one repository without an
 // MCP client. In this process the worker runs in-process (runQueueWorker with a short tick); the
 // tests that need two processes (a second worker, a hand-off after a crash, the global worker cap,
@@ -73,7 +73,7 @@ async function runParent() {
   const { hooks, internals } = __selfTest;
   const { QUEUE_JOBS, BRIDGE_INSTANCE_ID, assert, enqueueQueueJob, mkdir, path, runCommand, writeFile } = internals;
   const { spawn } = await import("node:child_process");
-  const { existsSync, readFileSync, readdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } = await import("node:fs");
   const { DatabaseSync } = await import("node:sqlite");
   const { fileURLToPath } = await import("node:url");
 
@@ -116,8 +116,13 @@ async function runParent() {
     if (!existsSync(dbPath)) return [];
     const db = new DatabaseSync(dbPath);
     try {
+      // A database another process is creating may not have its tables (or columns) yet.
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get()) return [];
       return db.prepare("SELECT job_id, status, owner_instance_id, idempotency_key, record_json FROM opencode_jobs ORDER BY created_at").all()
         .map((row) => ({ ...row, record: JSON.parse(row.record_json || "{}") }));
+    } catch (error) {
+      if (/no such (table|column)/.test(String(error?.message || ""))) return [];
+      throw error;
     } finally {
       db.close();
     }
@@ -145,10 +150,10 @@ async function runParent() {
   };
 
   // runQueueWorker in this process; the result promise and the captured output.
-  function startWorker(args, { tickMs = 40 } = {}) {
+  function startWorker(args, { tickMs = 40, api = queueWorkerApi } = {}) {
     const out = { text: "", write(chunk) { this.text += chunk; return true; } };
     const err = { text: "", write(chunk) { this.text += chunk; return true; } };
-    const done = runQueueWorker(args, { out, err, tickMs, summaryMs: 150, signals: false, importServer: async () => ({ queueWorkerApi }) });
+    const done = runQueueWorker(args, { out, err, tickMs, summaryMs: 150, signals: false, importServer: async () => ({ queueWorkerApi: api }) });
     return { done, out, err };
   }
 
@@ -165,6 +170,7 @@ async function runParent() {
       CODEX_OPENCODE_OPENCODE_LOG_PATH: "off",
       CODEX_OPENCODE_MIN_FREE_MEMORY_MB: "0",
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
+      CODEX_OPENCODE_SYNC_MANAGED_RUNTIME: "false",
       ...extra,
     };
   }
@@ -189,6 +195,10 @@ async function runParent() {
     const code = await spawned.exited;
     return { code, ...spawned.output };
   };
+  // Size and mtime of every file whose name starts with one of the given paths (a database and its
+  // -wal/-shm), plus the file names of the folders: --status must leave all of them alone.
+  const fileStates = (paths) => paths.flatMap((file) => [file, `${file}-wal`, `${file}-shm`])
+    .map((file) => `${file}=${existsSync(file) ? `${statSync(file).size}/${statSync(file).mtimeMs}` : "missing"}`);
   const withTimeout = (promise, ms, label) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} did not finish in ${ms} ms`)), ms))]);
   // A pending row whose owner is gone (a crashed bridge or worker): no live lease, an unknown owner.
   function orphanRow(repo, jobId) {
@@ -396,7 +406,7 @@ async function runParent() {
     assert.match(issues(), /\| queue_worker\.stopped \| - \| - \| Queue worker stopped \(queue_empty, exit 0\)/);
   });
 
-  test("B-075: a stop request drains: the running job finishes, nothing new starts, the worker exits 0 and its pending jobs stay pending", async () => {
+  test("B-075/B-079: a stop request drains; the jobs left are parked: a client bridge does not adopt them until --release", async () => {
     const { repo } = await makeRepo("drain");
     calls.length = 0;
     behaviours = { "Review for drain-1.": "hold" };
@@ -420,8 +430,31 @@ async function runParent() {
       const rows = rowsOf(repo);
       assert.deepEqual(rows.map((row) => row.status).sort(), ["completed", "pending", "pending"]);
       assert.equal(calls.length, 1, "the pending jobs did not start after the exit either");
-      // Clean up the leftovers so no later recovery pass in this process adopts them.
-      for (const row of rows.filter((item) => item.status === "pending")) await callTool("cancel_opencode_job", { cwd: repo, jobId: row.job_id });
+      assert.match(run.out.text, /The 2 job\(s\) left are parked: the next worker for this repository runs them; client bridges do not adopt them until you run: .* --release/);
+      const parked = queueWorkerApi.readFile(files.parked);
+      assert.equal(parked?.stopReason, "stop_requested");
+      assert.equal(parked.counts.pending, 2);
+      // A client bridge after the leases lapsed: it leaves the parked queue alone.
+      for (const row of rows.filter((item) => item.status === "pending")) orphanRow(repo, row.job_id);
+      await internals.reconcileQueueStateAtStartup();
+      await internals.reconcileQueueStateAtStartup();
+      assert.deepEqual(rowsOf(repo).map((row) => row.status).sort(), ["completed", "pending", "pending"], "not adopted while parked");
+      assert.ok(rowsOf(repo).filter((row) => row.status === "pending").every((row) => row.owner_instance_id === "dead-owner-1"));
+      const present = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue.worker_present" && line.projectKey === files.projectKey);
+      assert.equal(present.length, 1, "one info line");
+      assert.equal(present[0].parked, true);
+      assert.match(present[0].summary, /parked this repository's queue/);
+      const status = await runCli(["--repo", repo, "--status"]);
+      assert.match(status.stdout, /Parked: yes, since .*client bridges do not adopt this queue; the next worker takes it, or run --release/);
+      const releasedRun = startWorker(["--repo", repo, "--release"]);
+      assert.equal(await releasedRun.done, 0, releasedRun.err.text);
+      assert.match(releasedRun.out.text, /Released the parked queue/);
+      assert.equal(existsSync(files.parked), false);
+      const again = startWorker(["--repo", repo, "--release"]);
+      assert.equal(await again.done, 0);
+      assert.match(again.out.text, /Nothing is parked/);
+      await internals.reconcileQueueStateAtStartup();
+      assert.ok(await waitFor(() => rowsOf(repo).every((row) => row.status === "completed"), 10_000), "adopted and run after --release");
     } finally {
       behaviours = {};
       released.add("Review for drain-1.");
@@ -432,7 +465,8 @@ async function runParent() {
     const { repo } = await makeRepo("stop-now");
     calls.length = 0;
     behaviours = { "Review for now-1.": "hold" };
-    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("now", [readJob(repo, "now-1")])]);
+    const nowFile = jobsFile("now", [readJob(repo, "now-1")]);
+    const run = startWorker(["--repo", repo, "--enqueue", nowFile]);
     try {
       assert.ok(await waitFor(() => calls.includes("Review for now-1.")));
       queueWorkerApi.writeStop(repo, { now: true });
@@ -440,7 +474,17 @@ async function runParent() {
       assert.match(run.out.text, /Stop now: cancelled 1 running job\(s\)/);
       const [row] = rowsOf(repo);
       assert.equal(row.status, "cancelled");
+      assert.equal(existsSync(queueWorkerApi.files(repo).parked), false, "nothing left behind, nothing parked");
       behaviours = {};
+      // B-088: running the file again deduplicates into the cancelled job; the worker says so.
+      const rerun = startWorker(["--repo", repo, "--enqueue", nowFile, "--until-empty"]);
+      assert.equal(await withTimeout(rerun.done, 20_000, "the re-run"), 0, rerun.err.text);
+      assert.match(rerun.out.text, new RegExp(`line 1: now-1 is already queued as ${row.job_id} \\(cancelled\\)`));
+      assert.match(rerun.err.text, /Warning: 1 line\(s\) of .* match jobs that ended cancelled and will not run again: line 1 now-1 .*Requeue them \(requeue_opencode_job\) or give those lines new idempotency keys/);
+      const startedLine = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.started").pop();
+      assert.equal(startedLine.level, "warn");
+      assert.equal(startedLine.deduplicatedEnded, 1);
+      assert.deepEqual(startedLine.deduplicatedEndedKeys, ["now-1=cancelled"]);
       const requeued = await callTool("requeue_opencode_job", { cwd: repo, jobId: row.job_id });
       assert.notEqual(requeued.isError, true, textOf(requeued));
       assert.match(textOf(requeued), /requeued/i);
@@ -600,6 +644,153 @@ async function runParent() {
     } finally {
       if (second.child.exitCode === null) second.child.kill();
     }
+  });
+
+  test("B-081/B-082/B-083/B-087: presence rules: rename takeover, 10-minute rule for a live pid, a future heartbeat, the stop file of another owner", async () => {
+    const { repo } = await makeRepo("presence-rules");
+    const files = queueWorkerApi.files(repo);
+    await mkdir(files.directory, { recursive: true });
+    const now = Date.now();
+    const at = (ms) => new Date(now + ms).toISOString();
+    // B-087: within the skew a future heartbeat is fresh, beyond it not.
+    assert.equal(queueWorkerApi.presenceFresh({ heartbeatAt: at(30_000) }, now), true);
+    assert.equal(queueWorkerApi.presenceFresh({ heartbeatAt: at(5 * 60_000) }, now), false);
+    assert.equal(queueWorkerApi.presenceFresh({ heartbeatAt: at(-60_000) }, now), true);
+    assert.equal(queueWorkerApi.presenceFresh({ heartbeatAt: at(-3 * 60_000) }, now), false);
+    // B-082: a live pid keeps a 5-minute-old heartbeat live, not an 11-minute-old one.
+    const other = { version: 1, pid: process.pid, instanceId: "some-other-worker", projectKey: files.projectKey, repo };
+    writeFileSync(files.presence, JSON.stringify({ ...other, heartbeatAt: at(-5 * 60_000) }), "utf8");
+    const refused = queueWorkerApi.claimPresence(repo);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.errorType, "queue_worker_already_running");
+    assert.match(refused.error, /\(alive\)/);
+    // B-083: the stop file belongs to that worker: releasing a presence that is not ours keeps it.
+    queueWorkerApi.writeStop(repo);
+    assert.equal(queueWorkerApi.releasePresence(files).released, false);
+    assert.equal(existsSync(files.stop), true, "another worker's stop request is kept");
+    assert.equal(existsSync(files.presence), true);
+    rmSync(files.stop, { force: true });
+    writeFileSync(files.presence, JSON.stringify({ ...other, heartbeatAt: at(-11 * 60_000) }), "utf8");
+    const taken = queueWorkerApi.claimPresence(repo);
+    assert.equal(taken.ok, true, taken.error);
+    assert.equal(taken.takenOver.instanceId, "some-other-worker", "an 11-minute-old heartbeat is stale even with a live (possibly reused) pid");
+    assert.equal(queueWorkerApi.readFile(files.presence).instanceId, BRIDGE_INSTANCE_ID);
+    // B-081: taken over by a rename and a content check: no aside copy is left.
+    assert.deepEqual(readdirSync(files.directory).filter((name) => name.includes(".stale-")), []);
+    queueWorkerApi.writeStop(repo);
+    assert.equal(queueWorkerApi.releasePresence(files).released, true);
+    assert.equal(existsSync(files.presence), false);
+    assert.equal(existsSync(files.stop), false, "its own stop file goes with it");
+  });
+
+  test("B-081: a worker that loses its presence file before its first refresh refuses to start (exit 1) and logs queue_worker.refused", async () => {
+    const { repo } = await makeRepo("first-refresh");
+    calls.length = 0;
+    let refreshes = 0;
+    const api = Object.create(queueWorkerApi, {
+      refreshPresence: { value: (files, fields) => (++refreshes === 1 ? { ok: false, owner: { pid: 4242 } } : queueWorkerApi.refreshPresence(files, fields)) },
+    });
+    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("first-refresh", [readJob(repo, "fr-1")])], { api });
+    assert.equal(await withTimeout(run.done, 20_000, "the worker"), 1);
+    assert.match(run.err.text, /Refused to start: the presence file .* now belongs to another worker \(pid 4242\)/);
+    assert.equal(calls.length, 0, "nothing ran");
+    assert.equal(rowsOf(repo).length, 0, "nothing was enqueued");
+    const refusedLine = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.refused").pop();
+    assert.equal(refusedLine?.level, "warn");
+    assert.equal(refusedLine.errorType, "queue_worker_presence_race");
+  });
+
+  test("B-085: an exception while enqueueing cancels what the file already added; nothing starts", async () => {
+    const { repo } = await makeRepo("enqueue-throw");
+    calls.length = 0;
+    let enqueues = 0;
+    const api = Object.create(queueWorkerApi, {
+      enqueueFromToolInput: { value: async (job) => { if (++enqueues === 2) throw new Error("disk full"); return queueWorkerApi.enqueueFromToolInput(job); } },
+    });
+    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("enqueue-throw", [readJob(repo, "et-1"), readJob(repo, "et-2")])], { api });
+    assert.equal(await withTimeout(run.done, 20_000, "the worker"), 1);
+    assert.match(run.err.text, /the 1 job\(s\) this file had added are cancelled/);
+    assert.match(run.err.text, /line 2: enqueue_failed: disk full/);
+    await sleep(200);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(rowsOf(repo).map((row) => row.status), ["cancelled"]);
+  });
+
+  test("B-080: a resume from another process releases the worker's job waiting for paused models within a tick", async () => {
+    const { repo } = await makeRepo("resume");
+    const MUSE = "opencode/muse-spark-1.3-contributor-free@high";
+    const GEMINI = "google/antigravity-gemini-3.8-flash@high";
+    assert.equal((await internals.pauseProvider({ provider: "opencode/muse-spark-1.3-contributor-free", minutes: 30 })).ok, true);
+    assert.equal((await internals.pauseProvider({ provider: "google", minutes: 20 })).ok, true);
+    const worker = spawnWorkerChild({
+      name: "resume",
+      env: { CODEX_OPENCODE_MODEL_ALLOWLIST: `${MUSE},${GEMINI}` },
+      args: ["--repo", repo, "--until-empty", "--enqueue", jobsFile("resume", [readJob(repo, "resume-1", { models: [MUSE, GEMINI], maxAttempts: 1 })])],
+    });
+    try {
+      assert.ok(await waitFor(() => rowsOf(repo).some((row) => row.status === "pending" && row.record.startAfter && row.record.startAfterReason === "provider_pause"), 30_000), `the job waits for the pauses: ${worker.output.stderr}`);
+      await sleep(500);
+      assert.equal(worker.childCalls().length, 0, "nothing runs while every model is paused");
+      // This process is another bridge instance: its resume clears no wait of the worker directly.
+      assert.equal((await internals.resumeProvider({ provider: "opencode" })).ok, true);
+      assert.equal((await internals.resumeProvider({ provider: "google" })).ok, true);
+      const resumedAt = Date.now();
+      assert.ok(await waitFor(() => worker.childCalls().length === 1, 15_000), "the worker starts the job after the resume");
+      assert.ok(Date.now() - resumedAt < 10_000, `within a scheduler poll, not at the pause end: ${Date.now() - resumedAt} ms`);
+      assert.equal(await withTimeout(worker.exited, 30_000, "the worker"), 0, worker.output.stderr);
+    } finally {
+      await internals.resumeProvider({ provider: "opencode" });
+      await internals.resumeProvider({ provider: "google" });
+      if (worker.child.exitCode === null) worker.child.kill();
+    }
+  });
+
+  test("B-086: a refused --enqueue after the start logs one queue_worker.refused warn, not process.exited", async () => {
+    const { repo } = await makeRepo("refused-log");
+    const { repo: other } = await makeRepo("refused-log-other");
+    const result = await runCli(["--repo", repo, "--enqueue", jobsFile("refused-log", [readJob(other, "rl-1")])]);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /line 1: queue_worker_wrong_repository/);
+    const lines = readOpsLogLines(path.join(stateDir, "logs"));
+    const refused = lines.filter((line) => line.event === "queue_worker.refused" && /line 1: queue_worker_wrong_repository/.test(line.summary || ""));
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].level, "warn");
+    assert.equal(lines.some((line) => line.event === "process.exited" && line.pid === refused[0].pid), false, "no process.exited error for a refusal");
+  });
+
+  test("B-091: --status opens the repository and provider databases read-only and changes no file", async () => {
+    const { repo } = await makeRepo("status-readonly");
+    const run = startWorker(["--repo", repo, "--enqueue", jobsFile("status-readonly", [readJob(repo, "sr-1")]), "--until-empty"]);
+    assert.equal(await withTimeout(run.done, 20_000, "the worker"), 0, run.err.text);
+    const dbPath = internals.stateDbPath(repo);
+    const providerDb = path.join(stateDir, "provider-concurrency.sqlite");
+    assert.equal(existsSync(dbPath) && existsSync(providerDb), true);
+    const listing = () => [...readdirSync(stateDir), ...readdirSync(path.join(stateDir, "projects")), ...(existsSync(path.join(stateDir, "workers")) ? readdirSync(path.join(stateDir, "workers")) : [])].sort();
+    const before = { files: fileStates([dbPath, providerDb]), listing: listing() };
+    await sleep(50);
+    const status = await runCli(["--repo", repo, "--status", "--json"]);
+    assert.equal(status.code, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).counts.completed, 1, "it still reads the counts");
+    assert.deepEqual({ files: fileStates([dbPath, providerDb]), listing: listing() }, before, "no file was created, written or migrated");
+    // With a writer holding the database open (a -wal and -shm exist), it reads through them.
+    const writer = new DatabaseSync(dbPath);
+    try {
+      writer.exec("PRAGMA busy_timeout = 5000;");
+      writer.prepare("SELECT COUNT(*) AS count FROM opencode_jobs").get();
+      const live = fileStates([dbPath]);
+      const second = await runCli(["--repo", repo, "--status", "--json"]);
+      assert.equal(second.code, 0, second.stderr);
+      assert.equal(JSON.parse(second.stdout).counts.completed, 1);
+      assert.deepEqual(fileStates([dbPath]), live);
+    } finally {
+      writer.close();
+    }
+    // A repository with no database: zeros, and none is created.
+    const { repo: empty } = await makeRepo("status-empty");
+    const third = await runCli(["--repo", empty, "--status", "--json"]);
+    assert.equal(third.code, 0, third.stderr);
+    assert.equal(JSON.parse(third.stdout).counts.open, 0);
+    assert.equal(existsSync(internals.stateDbPath(empty)), false);
   });
 
   test("Item 9: the global worker cap counts the worker's running jobs like a bridge's", async () => {
