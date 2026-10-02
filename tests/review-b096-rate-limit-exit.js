@@ -42,7 +42,7 @@ const isolatedStateDir = isolateBridgeStateDir("review-b096-rate-limit-exit");
 const { __selfTest } = await import("../server.js");
 const { SkipTest, finishSkips } = await import("./skip-gate.js");
 const { hooks, internals } = __selfTest;
-const { CONFIG, createRateLimitWatcher, modelPauseKeyForMetadata, openCodeRateLimitHit, openProviderLeaseDb, rateLimitPauseReason, runOpenCode, runSpawnCommand } = internals;
+const { CONFIG, applyRateLimitOutcome, classifyResultError, createRateLimitWatcher, modelPauseKeyForMetadata, openCodeRateLimitHit, openProviderLeaseDb, providerErrorTypeFromStructuredEvent, providerErrorTypeFromText, rateLimitPauseReason, runOpenCode, runSpawnCommand } = internals;
 
 const stateDir = path.join(scratch, "state");
 await mkdir(stateDir, { recursive: true });
@@ -158,6 +158,17 @@ const [mode] = process.argv.slice(2);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const lines = ${JSON.stringify({ final: logLine(), retried: logLine({ error: RETRIED_ERROR }), info: logLine({ level: "INFO" }), other: logLine({ model: "antigravity-gemini-3.8-flash" }) })};
 const report = ${JSON.stringify(JSON.stringify({ type: "text", sessionID: "ses_b096", part: { type: "text", text: "The provider said: Rate limit exceeded. Please try again later. (HTTP 429)" } }))};
+const usage = (at) => ${JSON.stringify(logLine({ error: "AI_APICallError: The usage limit has been reached", at: "AT" }))}.replace("AT", at);
+const usageReport = ${JSON.stringify(JSON.stringify({ type: "text", sessionID: "ses_b096", part: { type: "text", text: "Note: the provider said The usage limit has been reached (429); I will retry later." } }))};
+if (mode === "usage-twice") { process.stderr.write(usage(new Date().toISOString()) + "\\n"); await sleep(300); process.stderr.write(usage(new Date().toISOString()) + "\\n"); await sleep(20000); }
+if (mode === "usage-report") {
+  process.stdout.write(${JSON.stringify(stepStart)} + "\\n" + usageReport + "\\n");
+  process.stderr.write("The usage limit has been reached\\n");
+  await sleep(400);
+  process.stdout.write(usageReport + "\\n");
+  process.stderr.write("usage limit reached, see report\\n");
+  await sleep(1500);
+}
 if (mode === "final-then-exit") { process.stderr.write(lines.final + "\\n"); await sleep(300); process.exit(1); }
 if (mode === "retried") { process.stderr.write(lines.retried + "\\n"); await sleep(4500); }
 if (mode === "no-trip") {
@@ -252,6 +263,45 @@ test("B-096: free text, an INFO line and another model's final line never stop t
   assert.equal(result.exitCode, 0);
   assert.equal(result.rateLimitHits, 1, "the INFO line counts toward the streak as before (B-061), but is not final");
   assert.equal(result.rateLimitEvidence.final, false);
+});
+
+const USAGE_ERROR = "AI_APICallError: The usage limit has been reached";
+test("B-097: a usage-limit line is a quota hit, never final, and maps to opencode_quota_exhausted", () => {
+  const hit = openCodeRateLimitHit(logLine({ error: USAGE_ERROR, model: "gpt-6.1-sol" }));
+  assert.equal(hit.kind, "quota");
+  assert.equal(hit.final, false, "OpenCode retries it");
+  assert.equal(openCodeRateLimitHit("The usage limit has been reached"), null, "not a log line");
+  assert.equal(providerErrorTypeFromText(USAGE_ERROR), "opencode_quota_exhausted");
+  assert.equal(providerErrorTypeFromText("429 Too Many Requests: The usage limit has been reached"), "opencode_quota_exhausted");
+  assert.equal(providerErrorTypeFromStructuredEvent({ type: "error", error: { name: "APIError", data: { message: "The usage limit has been reached", statusCode: 429, isRetryable: true } } }), "opencode_quota_exhausted");
+  assert.equal(providerErrorTypeFromStructuredEvent({ type: "error", error: { name: "UnknownError", data: { message: "the report mentions a usage limit reached" } } }), "", "free message text without provider context");
+});
+
+test("B-097: one usage-limit line does not trip (streak rule); a second, spaced line trips with kind quota", async () => {
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch({ minSpreadMs: 100 }), finalGraceMs: 0, onTrip: () => { trips += 1; } });
+  watcher.stderrLine(logLine({ error: USAGE_ERROR, at: "2026-10-02T02:41:07.424Z" }));
+  await sleep(150);
+  assert.equal(trips, 0, "a single line waits for the streak");
+  watcher.stderrLine(logLine({ error: USAGE_ERROR, at: "2026-10-02T02:41:10.629Z" }));
+  assert.equal(trips, 1);
+  assert.equal(watcher.state.evidence.kind, "quota");
+  assert.equal(watcher.state.evidence.final, false);
+  watcher.stop();
+  const result = await spawnChild("usage-twice", { rateLimitWatch: watch({ minSpreadMs: 100 }) });
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.rateLimitHits, 2);
+  assert.equal(result.rateLimitEvidence.kind, "quota");
+  const runResult = applyRateLimitOutcome({ exitCode: 1, configuredProvider: "opencode", configuredModel: MUSE }, result);
+  assert.equal(classifyResultError(runResult), "provider_rate_limited", "the watcher's model-pause outcome");
+  assert.match(rateLimitPauseReason(runResult), /^quota: 2 line\(s\) for opencode\/muse-spark-1\.3-contributor-free with no agent output in between \(stderr: stream error AI_APICallError: The usage limit has been reached\)/);
+});
+
+test("B-097: a model report that mentions the usage limit never trips", async () => {
+  const result = await spawnChild("usage-report", { rateLimitWatch: watch({ minSpreadMs: 100 }) });
+  assert.equal(result.rateLimited, false);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.rateLimitHits, 0);
 });
 
 test("B-096: end to end, the real stderr line ends a silent run in seconds as provider_rate_limited and pauses the model", async () => {
