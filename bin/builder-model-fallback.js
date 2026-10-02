@@ -27,7 +27,9 @@ export function builderFallbackEligible(agent, result, { enabled, modelRequireme
     && result?.configuredModel === "muse-spark-1.3-contributor-free"
     && ["opencode_auth_error", "opencode_quota_exhausted", "opencode_billing_error",
       "opencode_model_error", "opencode_rate_limited", "opencode_transient_provider_error",
-      "opencode_provider_unavailable", "opencode_transport_error"].includes(result.errorType)
+      "opencode_provider_unavailable", "opencode_transport_error",
+      // B-061: a run stopped by the bridge's rate-limit watcher, before any tool ran.
+      "provider_rate_limited"].includes(result.errorType)
     && result.streamIntegrity === "valid" && terminationContained(result)
     && !result.cancelled && !result.timedOut && !result.rawOutputTruncated
     && !result.assistantResponseTruncated && !result.assistantFinalResponseDetected

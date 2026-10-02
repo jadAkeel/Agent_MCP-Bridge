@@ -209,6 +209,18 @@ const CONFIG = Object.freeze({
   // limits for models that write a whole file in one long silent step.
   agentIdleTimeoutMs: readNonNegativeIntEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS", 1000 * 60 * 10),
   agentIdleTimeoutByModel: readModelDurationMapEnv("CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL"),
+  // B-061: OpenCode retries "Rate limit exceeded" by itself, silently on stdout, for as long as the
+  // run timeout allows. This many rate-limit lines for the job's model with no stdout output in
+  // between end the run as provider_rate_limited (0 turns the detection off).
+  rateLimitHits: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_HITS", 2),
+  // The pause a detected rate limit puts on that provider/model; it doubles on the next one up to
+  // the maximum (30, then 60 minutes, as the round-6 orchestrator did). 0 records no pause.
+  rateLimitPauseMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS", 1000 * 60 * 30),
+  rateLimitPauseMaxMs: readNonNegativeIntEnv("CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS", 1000 * 60 * 60),
+  // The OpenCode log file scanned for those lines in addition to the job's own stderr ("off" stops
+  // the scan). Tests point it at a scratch fixture.
+  openCodeLogPath: readOpenCodeLogPathEnv(),
+  openCodeLogScanMs: readPositiveIntEnv("CODEX_OPENCODE_OPENCODE_LOG_SCAN_MS", 1000 * 15),
   queueWriteConflictPolicy: readChoiceEnv("CODEX_OPENCODE_QUEUE_WRITE_CONFLICT_POLICY", ["reject", "wait"], "wait"),
   queueBlockedPollMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_BLOCKED_POLL_MS", 2000),
   queueStaleAfterMs: readPositiveIntEnv("CODEX_OPENCODE_QUEUE_STALE_AFTER_MS", 1000 * 60 * 60 * 2),
@@ -857,6 +869,17 @@ function readModelDurationMapEnv(name) {
     map.set(`${match[1].toLowerCase()}/${match[2].toLowerCase()}`, value);
   }
   return map;
+}
+
+// B-061: CODEX_OPENCODE_OPENCODE_LOG_PATH, default <OpenCode data dir>/log/opencode.log (bridge
+// children write there too: they run with --print-logs, which writes the file and stderr). "off"
+// disables the file scan; anything else must be an absolute path.
+function readOpenCodeLogPathEnv() {
+  const raw = String(process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH || "").trim();
+  if (!raw) return path.join(DEFAULT_OPENCODE_DATA_DIR, "log", "opencode.log");
+  if (raw.toLowerCase() === "off") return "";
+  if (!path.isAbsolute(raw)) throw new Error(`CODEX_OPENCODE_OPENCODE_LOG_PATH must be an absolute path or off; got ${JSON.stringify(raw)}.`);
+  return path.resolve(raw);
 }
 
 function readCsvEnv(name, fallback = []) {
@@ -2213,6 +2236,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
   // it has written nothing for that long.
   onActivity = null,
   idleTimeoutMs = 0,
+  // B-061: { hits, provider, model, agent, logPath, scanMs }: stop the payload as rate_limited once
+  // that many rate-limit lines of its model arrive with no stdout output in between.
+  rateLimitWatch = null,
   supervisorScriptForTest = "",
 } = {}) {
   return new Promise((resolve) => {
@@ -2245,6 +2271,10 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     let cancellationErrorType = "";
     let providerTerminated = false;
     let idleTimedOut = false;
+    let rateLimited = false;
+    const rateWatcher = rateLimitWatch && Number(rateLimitWatch.hits) > 0
+      ? createRateLimitWatcher({ ...rateLimitWatch, startedAtMs: Date.now(), onTrip: () => requestTermination("rate_limited") })
+      : null;
     let lastActivityMs = 0;
     let idleTimer = null;
     let startupTimer = null;
@@ -2279,6 +2309,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
     });
 
     const clearTimers = () => {
+      rateWatcher?.stop();
       if (startupTimer) clearTimeout(startupTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (idleTimer) clearTimeout(idleTimer);
@@ -2303,6 +2334,9 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       if (stderrTruncated) {
         result.stderr = `${result.stderr.slice(0, Math.floor(CONFIG.maxProcessOutputChars / 2))}\n... [stderr truncated by bridge; terminal tail preserved] ...\n${stderrTail}`;
       }
+      result.rateLimited = rateLimited;
+      result.rateLimitHits = rateWatcher?.state.hits || 0;
+      result.rateLimitEvidence = rateWatcher?.state.evidence || null;
       result.stdoutChars = stdoutChars;
       result.stderrChars = stderrChars;
       result.stdoutSha256 = stdoutHash.digest("hex");
@@ -2352,6 +2386,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       terminationReason = reason;
       if (reason === "timeout") timedOut = true;
       if (reason === "provider_error") providerTerminated = true;
+      if (reason === "rate_limited") rateLimited = true;
       // An idle stop is a timeout for everything downstream (exit 124, retry rules); idleTimedOut tells which.
       if (reason === "idle_timeout") { idleTimedOut = true; timedOut = true; }
       if (!launchSent) {
@@ -2427,6 +2462,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
       noteActivity();
       armIdleTimer();
+      rateWatcher?.start();
       heartbeatTimer = setInterval(() => {
         if (heartbeatInFlight || settled || terminationRequested) return;
         heartbeatInFlight = true;
@@ -2481,7 +2517,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
         ? 130
         : timedOut
           ? 124
-          : providerTerminated
+          : providerTerminated || rateLimited
             ? 1
             : Number.isInteger(event.payloadExitCode)
               ? event.payloadExitCode
@@ -2592,6 +2628,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       }
       const lines = stdoutLineBuffer.split(/\r?\n/);
       stdoutLineBuffer = lines.pop() || "";
+      rateWatcher?.stdoutText(text);
       if (terminateOnProviderError && !providerTerminated) {
         for (const line of lines) {
           try {
@@ -2621,6 +2658,7 @@ async function runSpawnCommand(command, args, cwd, timeoutMs = 1000 * 90, env = 
       stderrLineBuffer += text;
       const lines = stderrLineBuffer.split(/\r?\n/);
       stderrLineBuffer = (lines.pop() || "").slice(-64 * 1024);
+      if (rateWatcher) for (const line of lines) rateWatcher.stderrLine(line);
       const recentErrorLines = lines
         .filter((line) => !/"(?:messages|system|prompt|input)"\s*:/i.test(line))
         .filter((line) => /level\s*=\s*ERROR|\berror\b\s*[:=.]|APIError|CreditsError|HTTP\s+[45]\d\d/i.test(line))
@@ -3326,6 +3364,11 @@ async function openProviderLeaseDb({ deadlineAt = Date.now() + 1000 * 30, signal
           value INTEGER NOT NULL,
           updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_pause_strikes (
+          pause_key TEXT PRIMARY KEY,
+          strikes INTEGER NOT NULL,
+          last_strike_at INTEGER NOT NULL
+        );
       `);
       ensureTableColumn(db, "provider_leases", "heartbeat_at", "INTEGER");
       ensureTableColumn(db, "provider_leases", "containment", "TEXT NOT NULL DEFAULT ''");
@@ -3499,7 +3542,9 @@ async function setRuntimeConcurrency({ providerLimit, queueParallelLimit, reset 
   }
 }
 
-async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
+async function acquireProviderLease({ providerKey, pauseKeys = [], timeoutMs, signal = null }) {
+  // B-061: a pause can sit on the provider key itself or on a provider/model key under it.
+  const cooldownKeys = [...new Set([providerKey, ...(Array.isArray(pauseKeys) ? pauseKeys : [])].filter(Boolean))];
   const started = Date.now();
   const waitBudgetMs = Math.max(1, timeoutMs);
   const deadlineAt = started + waitBudgetMs;
@@ -3524,14 +3569,15 @@ async function acquireProviderLease({ providerKey, timeoutMs, signal = null }) {
       runtimeConcurrencyRefreshedAt = Date.now();
       // A provider whose quota ran out fails new jobs at once instead of starting agents that
       // can only burn their wait budget (or the quota of the next account) until the reset.
-      const cooldown = db.prepare("SELECT until_at, error_type, reason FROM provider_cooldowns WHERE provider_key = ?").get(providerKey);
+      const cooldown = db.prepare(`SELECT provider_key, until_at, error_type, reason FROM provider_cooldowns WHERE provider_key IN (${cooldownKeys.map(() => "?").join(", ")}) ORDER BY until_at DESC LIMIT 1`).get(...cooldownKeys);
       if (cooldown) {
         db.exec("ROLLBACK");
         const untilAt = Number(cooldown.until_at);
         return {
           ok: false,
           errorType: String(cooldown.error_type || "opencode_quota_exhausted"),
-          error: `Provider ${providerKey} is paused until ${new Date(untilAt).toISOString()} (${cooldown.error_type}${cooldown.reason ? `: ${cooldown.reason}` : ""}). The agent was not started; enqueue the job again after that time.`,
+          error: `Provider ${cooldown.provider_key || providerKey} is paused until ${new Date(untilAt).toISOString()} (${cooldown.error_type}${cooldown.reason ? `: ${cooldown.reason}` : ""}). The agent was not started; enqueue the job again after that time.`,
+          pausedKey: String(cooldown.provider_key || providerKey),
           waitedMs: Date.now() - started,
           holders: observedHolders,
           capacity: observedCapacity,
@@ -3634,6 +3680,59 @@ async function recordProviderCooldown({ providerKey, durationMs, errorType, reas
     return { ok: true, recorded: true, untilAt };
   } catch (error) {
     logEvent("error", "provider.cooldown_record_failed", { providerKey, error: error.message || String(error) });
+    return { ok: false, recorded: false, error: error.message || String(error) };
+  } finally {
+    if (db) closeDb(db);
+  }
+}
+
+// B-061: the pause a detected rate limit puts on one provider/model. A pause still running is kept
+// as it is (the parallel jobs that trip on the same rate limit add no strike); otherwise the strike
+// count grows and the pause doubles from CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS up to
+// CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS. A strike older than twice the maximum is forgotten, so a
+// model that behaved for hours starts again at the first step.
+async function recordRateLimitPause({ pauseKey, reason = "", now = Date.now() }) {
+  if (!pauseKey || !(CONFIG.rateLimitPauseMs > 0)) return { ok: true, recorded: false };
+  const baseMs = CONFIG.rateLimitPauseMs;
+  const maxMs = Math.max(baseMs, CONFIG.rateLimitPauseMaxMs);
+  let db = null;
+  let transactionOpen = false;
+  try {
+    db = await openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const active = db.prepare("SELECT until_at FROM provider_cooldowns WHERE provider_key = ? AND until_at > ?").get(pauseKey, now);
+    const strikeRow = db.prepare("SELECT strikes, last_strike_at FROM provider_pause_strikes WHERE pause_key = ?").get(pauseKey);
+    if (active) {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      return { ok: true, recorded: true, reused: true, untilAt: Number(active.until_at), strikes: Number(strikeRow?.strikes || 1) };
+    }
+    const recent = strikeRow && now - Number(strikeRow.last_strike_at || 0) < 2 * maxMs;
+    const strikes = recent ? Number(strikeRow.strikes || 0) + 1 : 1;
+    const durationMs = Math.min(maxMs, PROVIDER_COOLDOWN_MAX_MS, baseMs * 2 ** Math.min(20, strikes - 1));
+    const untilAt = now + durationMs;
+    db.prepare(`
+      INSERT INTO provider_pause_strikes (pause_key, strikes, last_strike_at) VALUES (?, ?, ?)
+      ON CONFLICT(pause_key) DO UPDATE SET strikes = excluded.strikes, last_strike_at = excluded.last_strike_at
+    `).run(pauseKey, strikes, now);
+    db.prepare(`
+      INSERT INTO provider_cooldowns (provider_key, until_at, error_type, reason, set_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider_key) DO UPDATE SET
+        until_at = MAX(provider_cooldowns.until_at, excluded.until_at),
+        error_type = excluded.error_type,
+        reason = excluded.reason,
+        set_at = excluded.set_at
+    `).run(pauseKey, untilAt, "provider_rate_limited", redactSensitiveText(String(reason || "")).slice(0, 300), now);
+    db.exec("COMMIT");
+    transactionOpen = false;
+    logEvent("warn", "provider.cooldown_recorded", { providerKey: pauseKey, untilAt: new Date(untilAt).toISOString(), errorType: "provider_rate_limited", strikes });
+    return { ok: true, recorded: true, reused: false, untilAt, strikes, durationMs };
+  } catch (error) {
+    if (transactionOpen) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    }
+    logEvent("error", "provider.cooldown_record_failed", { providerKey: pauseKey, error: error.message || String(error) });
     return { ok: false, recorded: false, error: error.message || String(error) };
   } finally {
     if (db) closeDb(db);
@@ -4035,6 +4134,15 @@ function providerKeyForMetadata(metadata = null) {
   return CONFIG.providerConcurrencyKeyExplicit || !provider
     ? CONFIG.providerConcurrencyKey
     : `${CONFIG.providerConcurrencyKey}:${provider}`;
+}
+
+// B-061: the pause key of one provider/model, "<account key>:<provider>/<model>". It lives under the
+// same "<key>:" prefix as the per-provider slot keys, so status and diagnose list it with them.
+function modelPauseKeyForMetadata(metadata = null) {
+  const provider = String(metadata?.provider || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  const model = String(metadata?.model || "").trim();
+  if (!provider || !model || !MODEL_NAME_PATTERN.test(model)) return "";
+  return `${CONFIG.providerConcurrencyKey}:${provider}/${model}`;
 }
 
 // LIKE pattern for "<key>:<provider>" rows; "_" and "%" in the operator key are literals.
@@ -5541,6 +5649,150 @@ function syntheticProviderQuotaNotice(finalText) {
 const GATEWAY_TIMEOUT_TEXT_PATTERN = /\b504\b|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 const GATEWAY_DIAGNOSTIC_LINE_PATTERN = /\[50[0234]\]|\bupstream[\s-]+idle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
 const GATEWAY_FAILURE_MESSAGE_PATTERN =/\[50[0234]\]|\bgateway[\s-]+time[\s-]?(?:d[\s-]?)?out\b|\bupstream[\s-]+(?:idle[\s-]+|request[\s-]+|response[\s-]+)?time[\s-]?(?:d[\s-]?)?out\b|\bidle[\s-]+time[\s-]?(?:d[\s-]?)?out[\s-]+exceeded\b/i;
+
+// B-061: OpenCode's log lines are logfmt: `timestamp=2026-10-01T08:25:56.490Z level=ERROR run=...
+// message="stream error" providerID=opencode modelID=muse-spark-1.3-contributor-free
+// session.id=ses_... small=false agent=builder mode=all error.error="AI_APICallError: Rate limit
+// exceeded. Please retry after a brief wait."`. The same line reaches the job's stderr (the bridge
+// runs OpenCode with --print-logs) and ~/.local/share/opencode/log/opencode.log.
+function parseOpenCodeLogLine(line) {
+  const text = String(line || "");
+  if (!/\btimestamp=\S/.test(text) && !/\bmodelID=\S/.test(text)) return null;
+  const fields = {};
+  for (const match of text.matchAll(/([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|[^\s"]*)/g)) {
+    const raw = match[2];
+    let value = raw;
+    if (raw.startsWith("\"")) {
+      try { value = JSON.parse(raw); } catch { value = raw.slice(1, -1); }
+    }
+    if (!(match[1] in fields)) fields[match[1]] = String(value);
+  }
+  const timestamp = fields.timestamp || "";
+  const detail = Object.entries(fields)
+    .filter(([key]) => key === "message" || key === "error" || key.startsWith("error."))
+    .map(([, value]) => value)
+    .join(" ")
+    .slice(0, 2000);
+  return {
+    timestamp,
+    timestampMs: Date.parse(timestamp) || 0,
+    level: fields.level || "",
+    providerID: fields.providerID || "",
+    modelID: fields.modelID || "",
+    sessionID: fields["session.id"] || fields.sessionID || "",
+    agent: fields.agent || "",
+    small: fields.small === "true",
+    detail,
+  };
+}
+
+const RATE_LIMIT_LOG_PATTERN = /rate.?limit|too many requests|\b429\b|quota|insufficient account funds|RESOURCE_EXHAUSTED/i;
+
+// A rate-limit, quota or no-funds line of the main model. The title agent's small model fails on
+// its own account ("small=true agent=title ... Insufficient account funds") and says nothing about
+// the job's model, so those lines are ignored.
+function openCodeRateLimitHit(line) {
+  if (!RATE_LIMIT_LOG_PATTERN.test(String(line || ""))) return null;
+  const entry = parseOpenCodeLogLine(line);
+  if (!entry || entry.small || entry.agent.toLowerCase() === "title") return null;
+  if (!RATE_LIMIT_LOG_PATTERN.test(entry.detail)) return null;
+  const kind = /insufficient account funds/i.test(entry.detail) ? "funds" : /quota|RESOURCE_EXHAUSTED/i.test(entry.detail) ? "quota" : "rate_limit";
+  return { ...entry, kind, detail: redactSensitiveText(entry.detail).slice(0, 300) };
+}
+
+// Watches one agent run for silent rate limiting: rate-limit lines of the run's model on its own
+// stderr, and (when a log path is set) in OpenCode's log file. A file line names its session; once
+// the run's own session id is known (the first stdout event carries it) only that session counts,
+// before that the provider, model and agent must match and the line must be newer than the run.
+// Any stdout output means the agent is making progress and resets the count, so a run that
+// recovers between retries is never stopped.
+function createRateLimitWatcher({ hits = 0, provider = "", model = "", agent = "", logPath = "", scanMs = 15000, startedAtMs = Date.now(), onTrip = () => {} } = {}) {
+  const state = { hits: 0, consecutive: 0, sessionId: "", evidence: null, tripped: false, offset: -1, remainder: "", timer: null, scanning: false };
+  const seen = new Set();
+  const wantedProvider = String(provider || "").toLowerCase();
+  const wantedModel = String(model || "").toLowerCase();
+  const wantedAgent = String(agent || "").toLowerCase();
+  const modelMatches = (entry) => (!entry.modelID || entry.modelID.toLowerCase() === wantedModel)
+    && (!entry.providerID || !wantedProvider || entry.providerID.toLowerCase() === wantedProvider);
+  const consider = (entry, source) => {
+    if (!entry || state.tripped || !(hits > 0)) return;
+    if (source === "file") {
+      if (entry.timestampMs && entry.timestampMs < startedAtMs - 1000) return;
+      if (state.sessionId && entry.sessionID) {
+        if (entry.sessionID !== state.sessionId) return;
+      } else {
+        if (!entry.modelID || !modelMatches(entry)) return;
+        if (wantedAgent && entry.agent && entry.agent.toLowerCase() !== wantedAgent) return;
+      }
+    } else if (!modelMatches(entry)) {
+      return;
+    }
+    // The same line arrives on stderr and in the file; count it once.
+    const key = `${entry.timestamp}|${entry.sessionID}|${entry.detail}`;
+    if (seen.has(key)) return;
+    if (seen.size > 500) seen.clear();
+    seen.add(key);
+    state.hits += 1;
+    state.consecutive += 1;
+    state.evidence = { source, kind: entry.kind, at: entry.timestamp, sessionId: entry.sessionID, providerID: entry.providerID, modelID: entry.modelID, detail: entry.detail };
+    if (state.consecutive >= hits) {
+      state.tripped = true;
+      try { onTrip(state.evidence); } catch { /* The trip only asks for termination. */ }
+    }
+  };
+  const scanFile = async () => {
+    if (!logPath || state.scanning || state.tripped) return;
+    state.scanning = true;
+    let handle = null;
+    try {
+      const details = await stat(logPath);
+      if (state.offset < 0 || details.size < state.offset) {
+        // First look (only lines written from now on count), or the file was rotated/truncated.
+        state.offset = state.offset < 0 ? details.size : 0;
+        state.remainder = "";
+        if (state.offset === details.size) return;
+      }
+      const length = Math.min(details.size - state.offset, 1024 * 1024);
+      if (length <= 0) return;
+      handle = await open(logPath, "r");
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, state.offset);
+      state.offset += bytesRead;
+      const lines = `${state.remainder}${buffer.subarray(0, bytesRead).toString("utf8")}`.split(/\r?\n/);
+      state.remainder = (lines.pop() || "").slice(-64 * 1024);
+      for (const text of lines) consider(openCodeRateLimitHit(text), "file");
+    } catch {
+      // A missing or unreadable log file only means there is nothing to scan.
+    } finally {
+      state.scanning = false;
+      if (handle) await handle.close().catch(() => {});
+    }
+  };
+  return {
+    state,
+    start() {
+      if (!logPath || !(hits > 0) || state.timer) return;
+      void scanFile();
+      state.timer = setInterval(() => { void scanFile(); }, Math.max(50, scanMs));
+      state.timer.unref?.();
+    },
+    stop() {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = null;
+    },
+    scanNow: scanFile,
+    stderrLine(line) {
+      consider(openCodeRateLimitHit(line), "stderr");
+    },
+    stdoutText(text) {
+      if (!state.sessionId) {
+        const match = /"sessionID"\s*:\s*"([^"]{1,200})"/.exec(String(text || ""));
+        if (match) state.sessionId = match[1];
+      }
+      if (String(text || "").trim()) state.consecutive = 0;
+    },
+  };
+}
 
 function providerErrorTypeFromText(value) {
   const text = String(value || "");
@@ -7316,6 +7568,24 @@ function isTimeoutResult(result) {
   return result?.timedOut || result?.exitCode === 124 || result?.exitCode === "timeout";
 }
 
+// B-061: a run the rate-limit watcher stopped is provider_rate_limited, whatever OpenCode's own exit
+// looked like (it was killed while retrying). The evidence line is kept for the result and the log.
+function applyRateLimitOutcome(runResult, spawnResult) {
+  if (!spawnResult?.rateLimited) return runResult;
+  runResult.rateLimited = true;
+  runResult.rateLimitHits = Number(spawnResult.rateLimitHits || 0);
+  runResult.rateLimitEvidence = spawnResult.rateLimitEvidence || null;
+  runResult.providerErrorType = "provider_rate_limited";
+  runResult.openCodeApiErrorDetected = true;
+  return runResult;
+}
+
+function rateLimitPauseReason(runResult) {
+  const evidence = runResult?.rateLimitEvidence || {};
+  const kind = evidence.kind === "funds" ? "no account funds" : evidence.kind === "quota" ? "quota" : "rate limit";
+  return `${kind}: ${Number(runResult?.rateLimitHits || 0)} line(s) for ${evidence.providerID || runResult?.configuredProvider || "?"}/${evidence.modelID || runResult?.configuredModel || "?"} with no agent output in between (${evidence.source || "stderr"}${evidence.detail ? `: ${evidence.detail}` : ""})`;
+}
+
 function classifyResultError(result) {
   if (!result) {
     return null;
@@ -7548,6 +7818,8 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   // builder's Gemini fallback) the managed profile's provider is not the one spawned, and
   // counting the run against it over-subscribed the real provider.
   const providerKey = providerKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
+  // B-061: a rate-limit pause is recorded per provider/model; a slot request checks both keys.
+  const modelPauseKey = modelPauseKeyForMetadata(applyModelOverrideToMetadata(configuredMetadata, modelOverride));
   // The slot wait has its own budget. It used to come out of the run timeout, so a builder
   // that waited 25 of its 30 minutes was killed after 5 minutes of work as agent_timeout.
   const preSlotMs = Math.round(nowMs() - started);
@@ -7555,7 +7827,7 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   if (slotWaitJobId) providerSlotWaitingJobs.set(slotWaitJobId, { providerKey, since: new Date().toISOString() });
   let providerLease;
   try {
-    providerLease = await acquireProviderLease({ providerKey, timeoutMs: CONFIG.providerWaitMaxMs, signal });
+    providerLease = await acquireProviderLease({ providerKey, pauseKeys: modelPauseKey ? [modelPauseKey] : [], timeoutMs: CONFIG.providerWaitMaxMs, signal });
   } finally {
     if (slotWaitJobId) providerSlotWaitingJobs.delete(slotWaitJobId);
   }
@@ -7796,6 +8068,14 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
         // B-046: queue jobs show their last output; the idle watchdog is off unless configured.
         onActivity: slotWaitJobId ? (atMs) => noteAgentActivity(slotWaitJobId, atMs) : null,
         idleTimeoutMs: runIdleTimeoutMs,
+        rateLimitWatch: CONFIG.rateLimitHits > 0 && configuredMetadata?.model ? {
+          hits: CONFIG.rateLimitHits,
+          provider: configuredMetadata.provider || "",
+          model: configuredMetadata.model,
+          agent,
+          logPath: CONFIG.openCodeLogPath,
+          scanMs: CONFIG.openCodeLogScanMs,
+        } : null,
       }
     );
     containmentUnconfirmed = result?.terminationErrorType === "process_tree_termination_unconfirmed";
@@ -7920,9 +8200,29 @@ async function runOpenCode(agent, prompt, cwd, dryRun = false, timeoutMs = defau
   const dependencyRequest = parseDependencyRequest(runResult.stdout);
   runResult.dependencyRequest = dependencyRequest.request;
   runResult.dependencyRequestError = dependencyRequest.error;
+  // B-061: stopped by the rate-limit watcher. A cancellation or a containment failure still wins
+  // (classifyResultError checks those first).
+  applyRateLimitOutcome(runResult, result);
   runResult.errorType = classifyResultError(runResult);
   if (!runResult.errorType && runtimeModelEvidencePresent && !runResult.modelAttested) {
     runResult.errorType = "opencode_model_mismatch";
+  }
+  if (runResult.errorType === "provider_rate_limited") {
+    const pause = await recordRateLimitPause({
+      pauseKey: modelPauseKey,
+      reason: rateLimitPauseReason(runResult),
+    });
+    if (pause.recorded) runResult.providerCooldownUntil = new Date(pause.untilAt).toISOString();
+    runResult.rateLimitPause = pause.recorded ? { until: runResult.providerCooldownUntil, strikes: pause.strikes, pauseKey: modelPauseKey, reused: Boolean(pause.reused) } : null;
+    logEvent("warn", "provider.rate_limit_detected", {
+      jobId: slotWaitJobId,
+      agent,
+      model: `${configuredMetadata?.provider || ""}/${configuredMetadata?.model || ""}`,
+      errorType: "provider_rate_limited",
+      hits: runResult.rateLimitHits,
+      pausedUntil: runResult.providerCooldownUntil || "",
+      summary: failureSummary(rateLimitPauseReason(runResult)),
+    });
   }
   if (runResult.errorType === "opencode_quota_exhausted" && runResult.retryAfterMs > 0) {
     const cooldown = await recordProviderCooldown({
@@ -8152,6 +8452,7 @@ function formatSingleResultParts({ resolution, result, cwd, lockPlan = null }) {
     `Timeout ms: ${result?.timeoutMs ?? "not specified"}`,
     `Timed out: ${result?.timedOut ? "yes" : "no"}`,
     result?.idleTimedOut ? `Agent idle timeout: the agent wrote no output for ${result.idleTimeoutMs} ms (CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS) and was stopped` : null,
+    result?.rateLimited ? `Rate limit detected: ${rateLimitPauseReason(result)}; the agent was stopped (CODEX_OPENCODE_RATE_LIMIT_HITS)${result.rateLimitPause ? `, ${result.rateLimitPause.pauseKey} paused until ${result.rateLimitPause.until} (pause ${result.rateLimitPause.strikes})` : ""}` : null,
     timedOutWriterLine(result),
     `Read-only unavailable: ${result?.readOnlyUnavailable ? "yes" : "no"}`,
     `Retry attempts used: ${result?.retryAttempt ?? 0}`,
@@ -8277,6 +8578,7 @@ function compactJobLines({ resolution, result, unsafeFiles = [] }) {
     result?.rawOutputTruncated ? "Raw process output truncated: yes" : null,
     result?.timedOut ? `Timed out: yes (timeout ms ${result.timeoutMs ?? "not specified"})` : null,
     result?.idleTimedOut ? `Idle timeout: yes (no output for ${result.idleTimeoutMs} ms)` : null,
+    result?.rateLimited ? `Rate limit detected: yes (${Number(result.rateLimitHits || 0)} line(s)${result.rateLimitPause ? `; paused until ${result.rateLimitPause.until}` : ""})` : null,
     timedOutWriterLine(result),
     result?.readOnlyUnavailable ? "Read-only unavailable: yes" : null,
     result?.retryAttempt ? `Retry attempts used: ${result.retryAttempt} of ${result.maxRetries ?? 0}` : null,
@@ -27832,6 +28134,14 @@ export const __selfTest = {
     agentIdleTimeoutStatusLine,
     effectiveMinFreeMemoryMb,
     readModelDurationMapEnv,
+    applyRateLimitOutcome,
+    createRateLimitWatcher,
+    modelPauseKeyForMetadata,
+    openCodeRateLimitHit,
+    parseOpenCodeLogLine,
+    rateLimitPauseReason,
+    readOpenCodeLogPathEnv,
+    recordRateLimitPause,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
