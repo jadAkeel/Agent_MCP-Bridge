@@ -265,8 +265,14 @@ test("Q-012: a model requirement selects a runner only when enabled and allowlis
 });
 
 test("Q-012: argv: fixed flags, the variant and the read-only sandbox; env keeps the real profile and strips secrets", () => {
-  const codex = runners.buildCodexArgs({ model: "gpt-test", variant: "high", cwd: "W", lastMessagePath: "L", prompt: "P" });
+  const codex = runners.buildCodexArgs({ model: "gpt-test", variant: "high", cwd: "W", lastMessagePath: "L", prompt: "P", windowsSandbox: "" });
   assert.deepEqual(codex, ["exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "-s", "workspace-write", "-C", "W", "-m", "gpt-test", "-c", "model_reasoning_effort=high", "-o", "L", "--", "P"]);
+  // Without a Windows sandbox codex refuses every write; --ignore-user-config drops the user's one.
+  const winArgs = runners.buildCodexArgs({ model: "m", cwd: "W", lastMessagePath: "L", prompt: "P", windowsSandbox: "elevated" });
+  assert.deepEqual(winArgs.slice(winArgs.indexOf("-c"), winArgs.indexOf("-c") + 2), ["-c", "windows.sandbox=elevated"]);
+  assert.equal(runners.defaultCodexWindowsSandbox({}, "win32"), "elevated");
+  assert.equal(runners.defaultCodexWindowsSandbox({ CODEX_OPENCODE_CODEX_WINDOWS_SANDBOX: "unelevated" }, "win32"), "unelevated");
+  assert.equal(runners.defaultCodexWindowsSandbox({}, "linux"), "");
   assert.equal(runners.buildCodexArgs({ model: "m", readOnly: true, cwd: "W", lastMessagePath: "L", prompt: "P" })[6], "read-only");
   const agy = runners.buildAgyArgs({ model: "claude-test", variant: "high", timeoutMs: 600_000, logPath: "G", prompt: "P" });
   assert.deepEqual(agy, ["-p", "P", "--dangerously-skip-permissions", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json", "--print-timeout", "540s", "--log-file", "G", "--model", "claude-test", "--effort", "high"]);
@@ -341,7 +347,7 @@ test("Q-012: a codex reader runs in the checkout with the read-only sandbox", as
   assert.equal(errorTypeOf(text), "none", text);
   const [record] = records("codex");
   assert.equal(record.args[record.args.indexOf("-s") + 1], "read-only");
-  assert.equal(record.args.includes("-c"), false, "no variant, no effort override");
+  assert.equal(record.args.some((arg) => arg.startsWith("model_reasoning_effort=")), false, "no variant, no effort override");
   assert.equal(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase());
 });
 
