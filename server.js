@@ -3270,7 +3270,18 @@ async function assessQueuePlan(lockPlans = []) {
   };
 }
 
-async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true, recordFields = null } = {}) {
+// Q-015: `unowned: true` (queue-worker.js --add) persists the row with no owner and no lease and
+// keeps it out of this process: the running queue worker of the repository adopts it in its next
+// recovery pass (an empty lease and owner are adoptable at once). Durable (sqlite) queue only.
+async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true, recordFields = null, unowned = false } = {}) {
+  if (unowned && effectiveQueueMode() !== "sqlite") {
+    return {
+      ok: false,
+      errorType: "queue_worker_needs_sqlite",
+      error: `A job for a running queue worker needs CODEX_OPENCODE_QUEUE_MODE=sqlite (it is ${effectiveQueueMode()}).`,
+      suggestedFix: "Run queue-worker.js --add with the environment of the worker (--env-from codex or claude).",
+    };
+  }
   if (effectiveQueueMode() === "off") {
     return {
       ok: false,
@@ -3410,6 +3421,9 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     delete record.startAfter;
     delete record.startAfterReason;
   }
+  if (unowned) {
+    Object.assign(record, { ownerInstanceId: "", ownerProcessId: 0, ownerGeneration: "", heartbeatAt: "", leaseExpiresAt: "" });
+  }
 
   if (!persist) return { ok: true, record, prepared: true };
 
@@ -3433,6 +3447,8 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
       error: persistence.error || "The queue request was not durably accepted.",
     };
   }
+  // Q-015: the running worker adopts an unowned row; this process neither tracks nor starts it.
+  if (unowned) return { ok: true, record, unowned: true };
   QUEUE_JOBS.set(jobId, record);
   if (schedule) {
     scheduleQueue();
@@ -4468,16 +4484,21 @@ function parseQueueWorkerJobLine(text) {
 // The full enqueue validation without a durable write (lock plan, Scope Contract, retry policy,
 // autoIntegrate, worktree requirement), plus the idempotency check against the database: an
 // existing key with other content refuses the file instead of half-enqueueing it.
-async function checkQueueWorkerJob(job) {
-  if (!queueWorkerMode) return { ok: false, errorType: "queue_worker_not_started", error: "The queue worker is not started." };
+// Q-015: `repo` names the worker's repository explicitly (queue-worker.js --add runs in a short
+// process that is no worker itself); it defaults to this process's own worker repository.
+async function checkQueueWorkerJob(job, { repo = queueWorkerMode?.repo } = {}) {
+  if (!repo) return { ok: false, errorType: "queue_worker_not_started", error: "The queue worker is not started." };
+  if (effectiveQueueMode() !== "sqlite") {
+    return { ok: false, errorType: "queue_worker_needs_sqlite", error: `The queue worker runs durable jobs only: CODEX_OPENCODE_QUEUE_MODE must be sqlite (it is ${effectiveQueueMode()}).` };
+  }
   if (!path.isAbsolute(String(job?.cwd || ""))) return { ok: false, errorType: "queue_worker_invalid_job", error: "cwd must be an absolute path." };
   const normalized = await normalizeJobCwd(job);
-  if (RepositoryRootSet.key(normalized.cwd) !== RepositoryRootSet.key(queueWorkerMode.repo)) {
-    return { ok: false, errorType: "queue_worker_wrong_repository", error: `cwd ${job.cwd} is not in the worker's repository ${queueWorkerMode.repo}; start a worker per repository.` };
+  if (RepositoryRootSet.key(normalized.cwd) !== RepositoryRootSet.key(repo)) {
+    return { ok: false, errorType: "queue_worker_wrong_repository", error: `cwd ${job.cwd} is not in the worker's repository ${repo}; start a worker per repository.` };
   }
   const prepared = await enqueueQueueJob(job, "", { persist: false, schedule: false });
   if (!prepared.ok) return { ok: false, errorType: prepared.errorType || "queue_rejected", error: prepared.error || "The job was refused.", suggestedFix: prepared.suggestedFix || "" };
-  const db = await openLockDb(queueWorkerMode.repo);
+  const db = await openLockDb(repo);
   try {
     const existing = db.prepare("SELECT job_id, status, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(prepared.record.idempotencyKey);
     if (!existing) return { ok: true, fingerprint: prepared.record.requestFingerprint };
@@ -4492,19 +4513,25 @@ async function checkQueueWorkerJob(job) {
   }
 }
 
-async function enqueueFromToolInput(job) {
-  const checked = await checkQueueWorkerJob(job);
+// Q-015: `unowned` (with `repo`) enqueues for the worker running in another process (--add).
+async function enqueueFromToolInput(job, { repo, unowned = false } = {}) {
+  const checked = await checkQueueWorkerJob(job, { repo });
   if (!checked.ok) return checked;
   // schedule: false: the worker releases all starts at once after the last line.
-  return await enqueueQueueJob(job, "", { schedule: false });
+  return await enqueueQueueJob(job, "", { schedule: false, unowned });
 }
 
 // Jobs this worker enqueued from a file it then refused: cancelled before anything started, so the
 // refusal leaves no half batch behind (requeue_opencode_job can still run them).
-async function cancelUnstartedQueueJobs(jobIds, reason) {
+// Q-015: with `repo`, a job this process does not hold (an unowned row --add wrote for the running
+// worker) is cancelled in the database: a pending row at once, one the worker already started
+// gets a cancellation request (cancel_opencode_job's durable path).
+async function cancelUnstartedQueueJobs(jobIds, reason, { repo = "" } = {}) {
   const cancelled = [];
+  const durable = [];
   for (const jobId of jobIds) {
     const record = QUEUE_JOBS.get(jobId);
+    if (!record && repo) durable.push(jobId);
     if (!record || !["pending", "planned", "blocked", "held"].includes(record.status)) continue;
     Object.assign(record, {
       status: "cancelled",
@@ -4518,6 +4545,17 @@ async function cancelUnstartedQueueJobs(jobIds, reason) {
     });
     const persisted = await persistQueueRecord(record);
     if (persisted?.persisted) cancelled.push(jobId);
+  }
+  if (durable.length) {
+    const db = await openLockDb(repo);
+    try {
+      for (const jobId of durable) {
+        const outcome = await cancelPersistedQueueJob(db, jobId);
+        if (outcome?.ok && ["cancelled", "cancellation_requested"].includes(outcome.outcome)) cancelled.push(jobId);
+      }
+    } finally {
+      closeDb(db);
+    }
   }
   return cancelled;
 }

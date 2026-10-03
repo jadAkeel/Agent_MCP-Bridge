@@ -111,6 +111,8 @@ async function runParent() {
     return file;
   };
   const durableIn = (repo, jobId) => internals.readPersistedQueueRecord(jobId, repo);
+  // B-155: a pid no process has (checked with pidAlive where it is used).
+  const DEAD_PID = 999999;
   const rowsOf = (repo) => {
     const dbPath = internals.stateDbPath(repo);
     if (!existsSync(dbPath)) return [];
@@ -626,7 +628,7 @@ async function runParent() {
     }
   });
 
-  test("B-076: after a crash the presence file blocks a restart until its heartbeat is stale; the next worker then adopts the lapsed pending job", async () => {
+  test("B-076/B-155: after a crash the presence file of the dead process is taken over at once (fresh heartbeat or not); the next worker adopts the lapsed pending job", async () => {
     const { repo } = await makeRepo("handoff");
     const leases = { CODEX_OPENCODE_QUEUE_LEASE_MS: "1500", CODEX_OPENCODE_QUEUE_HEARTBEAT_MS: "300" };
     const first = spawnWorkerChild({ name: "handoff-a", env: leases, args: ["--repo", repo, "--enqueue", jobsFile("handoff", [readJob(repo, "handoff-1"), readJob(repo, "handoff-2")])], behaviour: { "Review for handoff-1.": "hold", "Review for handoff-2.": "hold" } });
@@ -636,10 +638,23 @@ async function runParent() {
     const files = queueWorkerApi.files(repo);
     const leftover = queueWorkerApi.readFile(files.presence);
     assert.equal(leftover?.pid, first.child.pid, "a killed process leaves its presence file");
-    const tooEarly = await runCli(["--repo", repo, "--until-empty"]);
-    assert.equal(tooEarly.code, 1, "a dead pid with a fresh heartbeat is still refused");
-    assert.match(tooEarly.stderr, /\(not alive\)/);
-    writeFileSync(files.presence, JSON.stringify({ ...leftover, heartbeatAt: new Date(Date.now() - 5 * 60_000).toISOString() }), "utf8");
+    assert.equal(queueWorkerApi.presenceFresh(leftover), true, "its heartbeat is still fresh");
+    assert.equal(queueWorkerApi.presenceLive(leftover), false, "B-155: a dead pid is never live, whatever its heartbeat");
+    // B-155: --status calls it stale and --stop refuses: no worker runs.
+    const status = await runCli(["--repo", repo, "--status", "--json"]);
+    assert.equal(status.code, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).worker.state, "stale");
+    assert.equal(JSON.parse(status.stdout).worker.alive, false);
+    const stop = await runCli(["--repo", repo, "--stop"]);
+    assert.equal(stop.code, 1, stop.stdout);
+    assert.match(stop.stderr, /No queue worker is running/);
+    assert.equal(existsSync(files.stop), false, "a refused --stop writes no stop file");
+    // B-155: taken over at once, without waiting for the heartbeat to age 2 minutes.
+    const claim = queueWorkerApi.claimPresence(repo);
+    assert.equal(claim.ok, true, claim.error);
+    assert.equal(claim.takenOver.pid, first.child.pid);
+    assert.equal(queueWorkerApi.releasePresence(claim.files).released, true);
+    // The job leases (1500 ms here) of the killed worker must lapse before the next worker adopts.
     await sleep(1800);
     const second = spawnWorkerChild({ name: "handoff-b", env: leases, args: ["--repo", repo, "--until-empty"] });
     try {
@@ -692,6 +707,96 @@ async function runParent() {
     assert.equal(queueWorkerApi.releasePresence(files).released, true);
     assert.equal(existsSync(files.presence), false);
     assert.equal(existsSync(files.stop), false, "its own stop file goes with it");
+    // B-155: a pid that is no process is not live even with a 5-second-old heartbeat: taken over.
+    assert.equal(queueWorkerApi.pidAlive(DEAD_PID), false, `pid ${DEAD_PID} must not exist for this test`);
+    const dead = { ...other, pid: DEAD_PID, instanceId: "dead-worker", heartbeatAt: at(-5_000) };
+    assert.equal(queueWorkerApi.presenceFresh(dead, now), true);
+    assert.equal(queueWorkerApi.presenceLive(dead, now), false);
+    writeFileSync(files.presence, JSON.stringify(dead), "utf8");
+    const takenDead = queueWorkerApi.claimPresence(repo);
+    assert.equal(takenDead.ok, true, takenDead.error);
+    assert.equal(takenDead.takenOver.pid, DEAD_PID);
+    assert.equal(takenDead.takenOver.instanceId, "dead-worker");
+    assert.equal(queueWorkerApi.readFile(files.presence).instanceId, BRIDGE_INSTANCE_ID);
+    assert.equal(queueWorkerApi.releasePresence(takenDead.files).released, true);
+    assert.equal(existsSync(files.presence), false);
+  });
+
+  test("B-155: a client bridge adopts the pending jobs of a repository whose worker's process is gone, even with a fresh heartbeat", async () => {
+    const { repo } = await makeRepo("client-dead-worker");
+    calls.length = 0;
+    const job = await enqueueQueueJob(readJob(repo, "dead-worker-1"), "", { schedule: false });
+    assert.equal(job.ok, true, job.error);
+    orphanRow(repo, job.record.jobId);
+    const files = queueWorkerApi.files(repo);
+    await mkdir(files.directory, { recursive: true });
+    assert.equal(queueWorkerApi.pidAlive(DEAD_PID), false);
+    writeFileSync(files.presence, JSON.stringify({ version: 1, pid: DEAD_PID, instanceId: "dead-worker-instance", projectKey: files.projectKey, repo, startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString() }), "utf8");
+    try {
+      await internals.reconcileQueueStateAtStartup();
+      assert.ok(await waitFor(async () => (await durableIn(repo, job.record.jobId))?.status === "completed"), "adopted and run: the dead worker does not hold the queue");
+      assert.equal(rowsOf(repo)[0].owner_instance_id, BRIDGE_INSTANCE_ID);
+    } finally {
+      rmSync(files.presence, { force: true });
+    }
+  });
+
+  test("Q-015: --add enqueues into a running worker, which runs the jobs; --add without a worker is refused", async () => {
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add", "x.jsonl", "--enqueue", "y.jsonl"]), /--add adds jobs to the worker already running/);
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add", "x.jsonl", "--until-empty"]), /--add adds jobs/);
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add", "x.jsonl", "--stop"]), /--add adds jobs/);
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add", "x.jsonl", "--status"]), /--add adds jobs/);
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add", "x.jsonl", "--release"]), /--add adds jobs/);
+    assert.throws(() => parseWorkerArguments(["--repo", root, "--add"]), /--add needs a value/);
+    assert.equal(parseWorkerArguments(["--repo", root, "--add", path.join(root, "x.jsonl")]).add, path.join(root, "x.jsonl"));
+    const { repo } = await makeRepo("add");
+    const { repo: other } = await makeRepo("add-other");
+    const addFile = jobsFile("add", [readJob(repo, "add-1"), readJob(repo, "add-2")]);
+    // No worker: refused, nothing added.
+    const refused = await runCli(["--repo", repo, "--add", addFile]);
+    assert.equal(refused.code, 1, refused.stdout);
+    assert.match(refused.stderr, /No queue worker runs for .*; start one with --enqueue <file> \(it takes the file at its start\), or use enqueue_opencode_job from a client\./);
+    assert.equal(rowsOf(repo).length, 0, "nothing was added without a worker");
+    const worker = spawnWorkerChild({ name: "add-worker", args: ["--repo", repo], behaviour: { "Review for add-1.": "quick", "Review for add-2.": "quick" } });
+    try {
+      const files = queueWorkerApi.files(repo);
+      assert.ok(await waitFor(() => /Queue worker for /.test(worker.output.stdout), 30_000), `the worker runs on an empty queue: ${worker.output.stderr}`);
+      const presence = queueWorkerApi.readFile(files.presence);
+      assert.equal(presence.pid, worker.child.pid);
+      // A bad line refuses the whole file; nothing is added.
+      const bad = await runCli(["--repo", repo, "--add", jobsFile("add-bad", [readJob(repo, "add-3"), readJob(other, "add-4")])]);
+      assert.equal(bad.code, 1, bad.stdout);
+      assert.match(bad.stderr, /nothing was added/);
+      assert.match(bad.stderr, /line 2: queue_worker_wrong_repository/);
+      assert.equal(rowsOf(repo).length, 0, "a refused file adds nothing");
+      const added = await runCli(["--repo", repo, "--add", addFile]);
+      assert.equal(added.code, 0, added.stderr);
+      assert.match(added.stdout, new RegExp(`Added 2 job\\(s\\) to the queue of .*; the running worker \\(pid ${worker.child.pid}\\) picks them up at its next check\\.`));
+      assert.ok(await waitFor(() => worker.childCalls().length === 2, 60_000), `the running worker ran both jobs: ${worker.output.stderr}`);
+      assert.deepEqual(worker.childCalls().map((call) => call.task).sort(), ["Review for add-1.", "Review for add-2."]);
+      assert.ok(worker.childCalls().every((call) => call.pid === worker.child.pid), "run in the worker's process");
+      assert.ok(await waitFor(() => { const rows = rowsOf(repo); return rows.length === 2 && rows.every((row) => row.status === "completed"); }, 30_000), "both rows completed");
+      for (const row of rowsOf(repo)) assert.equal(row.owner_instance_id, presence.instanceId, "owned by the running worker, not by the --add process");
+      // The same file again deduplicates; nothing runs twice.
+      const again = await runCli(["--repo", repo, "--add", addFile]);
+      assert.equal(again.code, 0, again.stderr);
+      assert.match(again.stdout, /line 1: add-1 is already queued as \S+ \(completed\)/);
+      assert.match(again.stdout, /Added 0 job\(s\)/);
+      await sleep(300);
+      assert.equal(worker.childCalls().length, 2);
+      const jobsAdded = readOpsLogLines(path.join(stateDir, "logs")).filter((line) => line.event === "queue_worker.jobs_added" && line.projectKey === files.projectKey);
+      assert.equal(jobsAdded.length, 2, "one queue_worker.jobs_added line per --add");
+      assert.equal(jobsAdded[0].level, "info");
+      assert.equal(jobsAdded[0].added, 2);
+      assert.equal(jobsAdded[0].workerPid, worker.child.pid);
+      assert.equal(jobsAdded[1].deduplicated, 2);
+      const stop = await runCli(["--repo", repo, "--stop"]);
+      assert.equal(stop.code, 0, stop.stderr);
+      assert.equal(await withTimeout(worker.exited, 30_000, "the worker"), 0, worker.output.stderr);
+      assert.equal(existsSync(files.parked), false, "nothing left behind");
+    } finally {
+      if (worker.child.exitCode === null) worker.child.kill();
+    }
   });
 
   test("B-081: a worker that loses its presence file before its first refresh refuses to start (exit 1) and logs queue_worker.refused", async () => {

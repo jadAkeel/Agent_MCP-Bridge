@@ -339,7 +339,19 @@ retries, fallback models, pauses, auto-integration and logs.
    Every 10 minutes the worker writes a `queue_worker.summary` line to the operations log. A
    `resume_opencode_provider` from a client reaches the worker's jobs that wait for a pause within
    a few seconds.
-4. **Stop it**: `--repo C:\path\to\repo --stop`, or Ctrl+C in its window. Nothing new starts and
+4. **Add jobs to a running worker** (log.md Q-015): the worker reads `--enqueue` only at its
+   start, and a second worker is refused, so put more jobs in a new file (same format) and run:
+
+   ```powershell
+   node <bridge-dir>\bin\queue-worker.js --repo C:\path\to\repo --add C:\path\to\more-jobs.jsonl --env-from codex
+   ```
+
+   Every line is checked as at a start (one bad line adds nothing), lines already queued are
+   reported instead of added, and it prints `Added N job(s) to the queue of ...; the running
+   worker (pid X) picks them up at its next check.` The running worker starts them within about
+   15 seconds. Without a running worker for the repository `--add` is refused: start one with
+   `--enqueue` instead.
+5. **Stop it**: `--repo C:\path\to\repo --stop`, or Ctrl+C in its window. Nothing new starts and
    the worker exits when its running jobs end. `--stop --now` (or a second Ctrl+C) cancels the
    running jobs; they end `cancelled` and `requeue_opencode_job` can run them again. A third Ctrl+C
    exits at once (exit code 2, logged as `queue_worker.stopped` with `forced_exit`). A Ctrl+C while
@@ -348,7 +360,7 @@ retries, fallback models, pauses, auto-integration and logs.
    start for the repository runs them, and Codex or Claude Code do not take them over, so the rest
    of the batch does not end up running in a client window. To hand them to the clients instead,
    run `node bin\queue-worker.js --repo C:\path\to\repo --release`.
-5. **Afterwards**: `npm run issues` lists one line per failure (rate limit, idle stop, timeout,
+6. **Afterwards**: `npm run issues` lists one line per failure (rate limit, idle stop, timeout,
    failed validation, no output, retry, gave up, failed auto-integration) between the worker's
    `queue_worker.started` and `queue_worker.stopped` lines; `npm run incidents` groups the
    recurring warnings and errors (the worker's progress lines are not incidents; a refused start
@@ -357,12 +369,13 @@ retries, fallback models, pauses, auto-integration and logs.
 Good to know:
 
 - One worker per repository. A second one exits with code 1 while the first is alive. After a
-  crash a normal restart works at once; after a killed process, wait until its heartbeat in
-  `<state-dir>\workers\<projectKey>.json` is 2 minutes old (10 minutes when another process now
-  has the same pid).
+  crash or a killed process a restart works as soon as the old process is gone (B-155: a
+  presence file whose process no longer exists counts as stale, whatever its heartbeat). Only
+  when another process now has the same pid, wait until the heartbeat in
+  `<state-dir>\workers\<projectKey>.json` is 10 minutes old.
 - While a worker runs, and while its queue is parked, client bridges leave that repository's
   waiting jobs to it. Jobs you enqueue through MCP still run in the client that enqueued them and
-  end with it: put unattended work in the worker's file.
+  end with it: put unattended work in the worker's file, or add it with `--add` while it runs.
 - A stop does not wait for an auto-integration that only waits for a lock; the next worker (or a
   client after `--release`) finishes it.
 - The global worker cap (`set_opencode_concurrency({ globalWorkerLimit })`) counts the worker's
