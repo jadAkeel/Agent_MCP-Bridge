@@ -171,7 +171,7 @@ Talk to Codex like you would talk to a senior engineer. You do not need to name 
 ### Tips
 
 - **Keep tiny edits in Codex itself.** Delegation has overhead, roughly a minute even for trivial work.
-- **Uncommitted files are fine**, as long as they are not the files the job needs to edit. See `dirty_worktree_requires_checkpoint` in [section 11](#11-troubleshooting).
+- **Uncommitted files are fine**, as long as they are not the files the job may change (files it only reads do not block it). A queued job that does hit your uncommitted files waits and runs by itself once you commit. See `dirty_worktree_requires_checkpoint` in [section 11](#11-troubleshooting).
 - **Do not ask for the OpenCode Orchestrator** unless you specifically want OpenCode to coordinate its own sub-agents. Codex is already the orchestrator.
 
 ---
@@ -403,8 +403,12 @@ Safety checks during integration:
   staged and unstaged work stays as it was. An integration that was waiting when the bridge
   stopped is resumed after the restart. A patch that changes or deletes an existing file
   is left for the normal review (`autoIntegration=skipped_not_new_files` on the job). A worktree
-  that changed after the job finished is not integrated (`autoIntegration=failed`). Set
-  `CODEX_OPENCODE_AUTO_INTEGRATE=false` to refuse the option.
+  that changed after the job finished is not integrated (`autoIntegration=failed`). On a busy
+  repository (many writers, your own commits) the integration waits for another integration that
+  is still validating, rebases its commit when yours landed first, and reports files you landed
+  by hand as `already_committed`; once committed, its worktree is removed even when the target
+  changed meanwhile, so worktrees no longer pile up. Set `CODEX_OPENCODE_AUTO_INTEGRATE=false` to
+  refuse the option.
 - If an agent needs a new package, it stops and returns `DEPENDENCY_REQUIRED {...}`. Codex then:
   1. adds the dependency itself, after your review;
   2. commits;
@@ -467,7 +471,7 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 
 | Error / symptom | Meaning | What to do |
 | --- | --- | --- |
-| `dirty_worktree_requires_checkpoint` | You have uncommitted changes in the files the job needs. | Commit or revert those files, then retry. |
+| `dirty_worktree_requires_checkpoint` | You have uncommitted changes in the files the job may change (uncommitted files it only reads do not block it). | Commit or revert those files. A direct run needs a retry; a queued job waits (`blocked`, up to an hour) and runs by itself once you have committed. |
 | `configured_model_requirement_mismatch` | A model was requested that is not in the allowlist. | Use an allowlisted model, or add it to `CODEX_OPENCODE_MODEL_ALLOWLIST`. |
 | `opencode_model_evidence_required` | Runtime model proof was required, but OpenCode does not emit it. | Keep `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=false`, and do not set `requireRuntimeEvidence: true` on the job. |
 | `missing_scope_contract` / `empty_allowed_edits` | A write job was submitted without a proper contract. | Ask Codex to validate the plan with explicit allowed edits. |

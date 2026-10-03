@@ -2802,7 +2802,7 @@ const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTable
 
 const statePruneTimes = new Map();
 
-const { reconcileStaleQueueRecords, processIsAlive, renewPersistedQueueRecordLease, QUEUE_PRE_EXECUTION_STATUSES, reacquirePersistedQueueRecordLease, queueOwnershipLossError, clearQueueLeaseFence, loseQueueOwnership, resetQueueLeaseFence, noteQueueLeaseRenewalFailure, assertQueueRecordDurableOwnership, renewQueueRecordDurableOwnership, heartbeatKnownQueueState, ensureQueueHeartbeatTimer, pruneInMemoryState, sqliteUsedBytes, stateCapacityError, prunePersistedState, maintainKnownStateDatabases, ensureStateMaintenanceTimer } = createQueueLeaseRuntime({ BRIDGE_INSTANCE_ID, CONFIG, KNOWN_STATE_DB_PATHS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, effectiveQueueMode, expireLocksFromDb, foreignQueueWorkerPresence: (dbPath) => foreignQueueWorkerPresence(dbPath), logEvent, openLockDb, propagatePipelineTerminalInTransaction, scheduleQueueRetryPolicy: (...args) => scheduleQueueRetryPolicy(...args), stateDbPath, statePruneTimes });
+const { reconcileStaleQueueRecords, releaseQueueJobLocks, processIsAlive, renewPersistedQueueRecordLease, QUEUE_PRE_EXECUTION_STATUSES, reacquirePersistedQueueRecordLease, queueOwnershipLossError, clearQueueLeaseFence, loseQueueOwnership, resetQueueLeaseFence, noteQueueLeaseRenewalFailure, assertQueueRecordDurableOwnership, renewQueueRecordDurableOwnership, heartbeatKnownQueueState, ensureQueueHeartbeatTimer, pruneInMemoryState, sqliteUsedBytes, stateCapacityError, prunePersistedState, maintainKnownStateDatabases, ensureStateMaintenanceTimer } = createQueueLeaseRuntime({ BRIDGE_INSTANCE_ID, CONFIG, KNOWN_STATE_DB_PATHS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, effectiveQueueMode, expireLocksFromDb, foreignQueueWorkerPresence: (dbPath) => foreignQueueWorkerPresence(dbPath), logEvent, openLockDb, propagatePipelineTerminalInTransaction, scheduleQueueRetryPolicy: (...args) => scheduleQueueRetryPolicy(...args), stateDbPath, statePruneTimes });
 
 
 async function normalizeJobCwd(job) {
@@ -3471,7 +3471,7 @@ async function activeProviderPauses() {
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
 let autoResumeInterruptedOverride = null;
 
-const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, RepositoryRootSet, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
+const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_LATER_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, AUTO_INTEGRATION_HEAD_RETRIES, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration, sweepCommittedWorktrees, autoIntegrationTestHooks } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, RepositoryRootSet, cleanupWorktree, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
 
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
@@ -5232,6 +5232,9 @@ export const __selfTest = {
     createIsolatedOpenCodeRuntime,
     createPipelinePlan,
     createWorktreeForJob,
+    formatWorktreeSummary,
+    releaseQueueJobLocks,
+    sweepCommittedWorktrees,
     decryptQueueRequest,
     defaultBuilderTimeoutMs,
     defaultOrchestratorTimeoutMs,
@@ -5572,6 +5575,9 @@ export const __selfTest = {
     set stateDirectoryOverride(value) { stateDirectoryOverride = value; },
     get worktreeCleanupTestHook() { return worktreeTestHooks.cleanup; },
     set worktreeCleanupTestHook(value) { worktreeTestHooks.cleanup = value; },
+    get worktreeCreateTestHook() { return worktreeTestHooks.create; },
+    set worktreeCreateTestHook(value) { worktreeTestHooks.create = value; },
+    get autoIntegrationTestHooks() { return autoIntegrationTestHooks; },
     get integrationScratchCleanupTestHook() { return getIntegrationScratchCleanupTestHook(); },
     set integrationScratchCleanupTestHook(value) { setIntegrationScratchCleanupTestHook(value); },
     get pipelineGateExecutorTestHook() { return getPipelineGateExecutorTestHook(); },
