@@ -27,10 +27,10 @@ const { finishSkips } = await import("./skip-gate.js");
 const { makeFlexFixture, runFlexTests } = await import("./flex-fixture.js");
 const { hooks, internals } = __selfTest;
 const {
-  QUEUE_JOBS, acquireHardLock, assert, autoIntegrateQueueJob, cleanupWorktree, closeDb, createWorktreeForJob, enqueueQueueJob,
+  QUEUE_JOBS, acquireHardLock, assert, autoIntegrateQueueJob, cleanupWorktree, closeDb, createWorktreeForJob, enqueueQueueJob, heartbeatKnownQueueState,
   inspectSourceCheckpointState, mkdir, openLockDb, path, reconcileStaleQueueRecords, releaseHardLock, sweepCommittedWorktrees, writeFile,
 } = internals;
-const { existsSync, readFileSync, rmSync } = await import("node:fs");
+const { existsSync, readFileSync, readdirSync, rmSync } = await import("node:fs");
 
 const fixture = await makeFlexFixture(__selfTest, "review-batch-race");
 const { root, repo, git, identity, waitFor, durable, writeScope, execution, writeJob } = fixture;
@@ -385,6 +385,62 @@ test("B-154: the recovery pass sweeps the worktree of a committed job that a cra
   }
   assert.equal(existsSync(dir), false);
   assert.match((await durable(jobId)).autoIntegration.worktreeCleanup, /after commit \(recovery pass\): success/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// B-158: a job another process cancelled is handed over, not "lost".
+
+const opsLogRecords = () => {
+  const dir = path.join(fixture.stateDir, "logs");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".jsonl")).flatMap((name) => readFileSync(path.join(dir, name), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+};
+
+test("B-158: a pending job cancelled by another process is released at info level (queue.ownership_released), not logged as an ownership-loss fault", async () => {
+  const request = writeJob("src/b.txt", { task: "Cancelled from the other client." });
+  const enqueued = await enqueueQueueJob(request, "", { schedule: false });
+  assert.equal(enqueued.ok, true, enqueued.error);
+  const jobId = enqueued.record.jobId;
+  const record = QUEUE_JOBS.get(jobId);
+  assert.ok(record, "held by this process");
+  // What cancel_opencode_job's durable path does to a pending row from another process.
+  const db = await openLockDb(repo);
+  try {
+    const at = new Date().toISOString();
+    db.prepare("UPDATE opencode_jobs SET status = 'cancelled', cancellation_requested_at = ?, finished_at = ?, heartbeat_at = '', lease_expires_at = '', revision = revision + 1 WHERE job_id = ?").run(at, at, jobId);
+  } finally {
+    closeDb(db);
+  }
+  heartbeatKnownQueueState();
+  assert.equal(record.queueOwnershipLost, true, "the local record stops renewing");
+  assert.equal(record.cancellationRequested, true);
+  const released = opsLogRecords().filter((item) => item.event === "queue.ownership_released" && item.jobId === jobId);
+  assert.equal(released.length, 1, "one handover line");
+  assert.equal(released[0].level, "info");
+  assert.equal(released[0].handover, "cancelled", "the field is not one the log sanitizer hashes");
+  assert.deepEqual(opsLogRecords().filter((item) => item.event === "queue.ownership_lost" && item.jobId === jobId), [], "no fault for an operator's cancellation");
+  QUEUE_JOBS.delete(jobId);
+});
+
+test("B-158: a row taken by another owner while still active is a real ownership loss (error)", async () => {
+  const request = writeJob("src/b.txt", { task: "Taken over elsewhere." });
+  const enqueued = await enqueueQueueJob(request, "", { schedule: false });
+  assert.equal(enqueued.ok, true, enqueued.error);
+  const jobId = enqueued.record.jobId;
+  const record = QUEUE_JOBS.get(jobId);
+  const db = await openLockDb(repo);
+  try {
+    db.prepare("UPDATE opencode_jobs SET owner_instance_id = 'another-bridge', owner_generation = 'other-generation', revision = revision + 1 WHERE job_id = ?").run(jobId);
+  } finally {
+    closeDb(db);
+  }
+  heartbeatKnownQueueState();
+  assert.equal(record.queueOwnershipLost, true);
+  const lost = opsLogRecords().filter((item) => item.event === "queue.ownership_lost" && item.jobId === jobId);
+  assert.equal(lost.length, 1, "a foreign owner on an active row is still a loss");
+  assert.equal(lost[0].level, "error");
+  assert.deepEqual(opsLogRecords().filter((item) => item.event === "queue.ownership_released" && item.jobId === jobId), []);
+  QUEUE_JOBS.delete(jobId);
 });
 
 await runFlexTests({ isolatedStateDir, file: "tests/review-batch-race.js", tests, cleanup: fixture.cleanup, finishSkips, label: "batch-race" });

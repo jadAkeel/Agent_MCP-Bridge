@@ -344,7 +344,15 @@ async function inventory(stateDir, options) {
     const projectHash = projectDir.name;
     const projectPath = path.join(worktreeRoot, projectHash);
     const info = databaseInfo.get(projectHash) || null;
-    const entries = (await readdir(projectPath, { withFileTypes: true })).filter((entry) => !entry.isSymbolicLink());
+    // B-159: a bridge removes worktrees while the doctor walks them (an integration's cleanup, a
+    // sweep); one that vanished between the listing and its stat is simply gone, not a failure.
+    let entries;
+    try {
+      entries = (await readdir(projectPath, { withFileTypes: true })).filter((entry) => !entry.isSymbolicLink());
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
     if (entries.length === 0) {
       report.emptyProjectDirectories.push(projectPath);
       continue;
@@ -352,7 +360,13 @@ async function inventory(stateDir, options) {
     for (const entry of entries) {
       const worktreePath = path.join(projectPath, entry.name);
       if (!isPathInside(worktreeRoot, worktreePath)) continue;
-      const details = await stat(worktreePath);
+      let details;
+      try {
+        details = await stat(worktreePath);
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
+      }
       // Windows clock ticks can trail filesystem timestamps by a few milliseconds, which
       // made a brand-new directory -1 days old; an age is never negative.
       const ageDays = Math.max(0, Math.floor((now - details.mtimeMs) / DAY_MS));
