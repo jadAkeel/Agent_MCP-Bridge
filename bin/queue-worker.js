@@ -11,6 +11,7 @@
 //   node bin/queue-worker.js --repo <abs> [--enqueue jobs.jsonl] [--until-empty] [--env-from claude|codex]
 //   node bin/queue-worker.js --repo <abs> --stop [--now]
 //   node bin/queue-worker.js --repo <abs> --status [--json]
+//   node bin/queue-worker.js --repo <abs> --add more-jobs.jsonl   (Q-015: into the running worker)
 //
 // Exit codes: 0 clean stop (drained, stopped, or --until-empty found the queue empty), 1 refused
 // to start (bad arguments or file, another worker, a failed startup check, a Ctrl+C during the start:
@@ -45,8 +46,10 @@ const USAGE = [
   "  node bin/queue-worker.js --repo <absolute repository> --stop [--now]",
   "  node bin/queue-worker.js --repo <absolute repository> --status [--json]",
   "  node bin/queue-worker.js --repo <absolute repository> --release",
+  "  node bin/queue-worker.js --repo <absolute repository> --add <jobs.jsonl> [--env-from claude|codex]",
   "Options:",
   "  --enqueue <file>      One enqueue_opencode_job input per line, each with an idempotencyKey; every line is checked before anything starts.",
+  "  --add <file>          Add the jobs of a file (same format as --enqueue) to the worker already running for the repository; it picks them up at its next check. Refused when no worker runs there.",
   "  --until-empty         Exit once the repository's queue is empty and nothing runs.",
   "  --env-from <client>   Copy the environment of the registered client entry (codex: CODEX_HOME/config.toml, claude: ~/.claude.json); variables already set win.",
   "  --codex-config <abs>  Codex config.toml to read with --env-from codex.",
@@ -54,14 +57,14 @@ const USAGE = [
   "  --stop [--now]        Ask the running worker to stop starting jobs and exit when its running jobs end; --now cancels them too. Jobs left behind stay parked for the next worker.",
   "  --status [--json]     Print the worker's presence, a parked queue, the queue counts and the paused providers; reads only.",
   "  --release             Remove the parked mark a stopped worker left, so client bridges may adopt the repository's pending jobs again.",
-  "Exit codes: 0 clean stop, 1 refused to start, 2 stopped by an error (also a third Ctrl+C).",
+  "Exit codes: 0 clean stop (--add: the jobs were added), 1 refused to start (--add: refused, nothing added), 2 stopped by an error (also a third Ctrl+C).",
   "",
 ].join("\n");
 
 class WorkerRefusal extends Error {}
 
 function parseWorkerArguments(argv) {
-  const options = { repo: "", enqueue: "", untilEmpty: false, envFrom: "", codexConfig: "", claudeConfig: "", stop: false, now: false, status: false, json: false, release: false, help: false };
+  const options = { repo: "", enqueue: "", add: "", untilEmpty: false, envFrom: "", codexConfig: "", claudeConfig: "", stop: false, now: false, status: false, json: false, release: false, help: false };
   const valueOf = (index, name) => {
     const value = argv[index + 1];
     if (value === undefined || String(value).startsWith("--")) throw new WorkerRefusal(`${name} needs a value.`);
@@ -76,6 +79,7 @@ function parseWorkerArguments(argv) {
     if (argument === "--help" || argument === "-h") options.help = true;
     else if (argument === "--repo") { options.repo = absolute(valueOf(index, "--repo"), "--repo"); index += 1; }
     else if (argument === "--enqueue") { options.enqueue = path.resolve(valueOf(index, "--enqueue")); index += 1; }
+    else if (argument === "--add") { options.add = path.resolve(valueOf(index, "--add")); index += 1; }
     else if (argument === "--env-from") {
       const value = valueOf(index, "--env-from");
       if (!["claude", "codex"].includes(value)) throw new WorkerRefusal(`--env-from must be claude or codex; got ${JSON.stringify(value)}.`);
@@ -95,6 +99,9 @@ function parseWorkerArguments(argv) {
   if (!options.repo) throw new WorkerRefusal("--repo <absolute repository> is required.");
   if (options.now && !options.stop) throw new WorkerRefusal("--now goes with --stop.");
   if (options.json && !options.status) throw new WorkerRefusal("--json goes with --status.");
+  if (options.add && (options.enqueue || options.untilEmpty || options.stop || options.status || options.release)) {
+    throw new WorkerRefusal("--add adds jobs to the worker already running and starts none; drop --enqueue, --until-empty, --stop, --status and --release.");
+  }
   if ([options.stop, options.status, options.release].filter(Boolean).length > 1) throw new WorkerRefusal("Use one of --stop, --status and --release.");
   if ((options.stop || options.status || options.release) && (options.enqueue || options.untilEmpty)) throw new WorkerRefusal("--stop, --status and --release start no worker; drop --enqueue and --until-empty.");
   return options;
@@ -232,14 +239,54 @@ function releaseParked(api, repo, out, err) {
   return EXIT_CLEAN;
 }
 
+// Q-015: --add puts the jobs of a file into the queue of the worker already running for the
+// repository (--enqueue is read only at a worker's start, and a second worker is refused). Every
+// line is checked first, as at a start; the rows are written without an owner, so this short
+// process runs none of them and the running worker adopts them in its next recovery pass (within
+// about 15 s). A refused line cancels what this file had added. Nothing else is touched.
+async function addJobsToRunningWorker(api, repo, options, out, err) {
+  const files = api.files(repo);
+  const presence = api.readFile(files.presence);
+  if (!api.presenceLive(presence)) {
+    throw new WorkerRefusal(`No queue worker runs for ${repo}; start one with --enqueue <file> (it takes the file at its start), or use enqueue_opencode_job from a client.`);
+  }
+  const lines = readJobFile(api, options.add, "--add");
+  const enqueued = await enqueueLines(api, lines, { add: { repo } });
+  if (!enqueued.ok) {
+    throw new WorkerRefusal(`Refused ${options.add}; nothing was added${enqueued.cancelled?.length ? ` (the ${enqueued.cancelled.length} job(s) this file had added are cancelled)` : ""}:\n  ${enqueued.errors.join("\n  ")}`);
+  }
+  const dead = enqueued.deduplicated.filter((item) => DEAD_DEDUPLICATED_STATUSES.has(item.status));
+  for (const item of enqueued.deduplicated) out.write(`line ${item.line}: ${item.key} is already queued as ${item.jobId} (${item.status}).\n`);
+  if (dead.length) {
+    err.write(`Warning: ${dead.length} line(s) of ${options.add} match jobs that ended ${[...new Set(dead.map((item) => item.status))].join("/")} and will not run again: ${dead.map((item) => `line ${item.line} ${item.key} (${item.jobId}, ${item.status})`).join("; ")}. Requeue them (requeue_opencode_job) or give those lines new idempotency keys.\n`);
+  }
+  const workerPid = Number(presence.pid) || 0;
+  const summary = `Added ${enqueued.created.length} job(s) to the queue of ${repo}; the running worker (pid ${workerPid || "?"}) picks them up at its next check.`;
+  api.logEvent("info", "queue_worker.jobs_added", {
+    projectKey: files.projectKey,
+    repoName: path.basename(repo),
+    workerPid,
+    added: enqueued.created.length,
+    deduplicated: enqueued.deduplicated.length,
+    summary: `Added ${enqueued.created.length} job(s) to the queue of ${path.basename(repo)} for the running worker (pid ${workerPid || "?"}); ${enqueued.deduplicated.length} line(s) already queued.`,
+  });
+  out.write(`${summary}\n`);
+  // The worker may have stopped meanwhile: the rows stay pending for the next worker (a stopped
+  // worker parks them) or, without a parked mark, a client bridge.
+  if (enqueued.created.length && !api.presenceLive(api.readFile(files.presence))) {
+    err.write(`Warning: the queue worker for ${repo} is no longer running; the added jobs wait for the next worker (or a client bridge, when the queue is not parked).\n`);
+  }
+  return EXIT_CLEAN;
+}
+
 // Every line must parse before the worker claims anything; a repeated key in the file is refused
 // (two lines with one key are either a duplicate or a conflict, both mistakes in a batch file).
-function readJobFile(api, file) {
+function readJobFile(api, file, flag = "--enqueue") {
   let text;
   try {
     text = readFileSync(file, "utf8");
   } catch (error) {
-    throw new WorkerRefusal(`Cannot read --enqueue file ${file}: ${error?.message || error}`);
+    throw new WorkerRefusal(`Cannot read ${flag} file ${file}: ${error?.message || error}`);
   }
   const lines = [];
   const errors = [];
@@ -273,12 +320,18 @@ const DEAD_DEDUPLICATED_STATUSES = new Set(["cancelled", "failed", "interrupted"
 // added, before anything started.
 // B-121: `interrupted` (a Ctrl+C during the start) is checked before every line; the jobs this
 // file added are then cancelled as for a refused line.
-async function enqueueLines(api, lines, { interrupted = () => false } = {}) {
+// Q-015: `add` ({ repo }) enqueues for the worker running in another process: the rows are
+// written unowned (that worker adopts them) and a rollback cancels them in the database.
+async function enqueueLines(api, lines, { interrupted = () => false, add = null } = {}) {
   const stoppedAt = (line) => `line ${line}: queue_worker_interrupted: the worker was stopped (Ctrl+C) before this line was enqueued`;
+  const fileName = add ? "an --add file" : "its --enqueue file";
+  const checkOptions = add ? [{ repo: add.repo }] : [];
+  const enqueueOptions = add ? [{ repo: add.repo, unowned: true }] : [];
+  const cancelOptions = add ? [{ repo: add.repo }] : [];
   const errors = [];
   for (const { line, job } of lines) {
     if (interrupted()) return { ok: false, interrupted: true, errors: [stoppedAt(line)], created: [], deduplicated: [] };
-    const checked = await api.checkJob(job);
+    const checked = await api.checkJob(job, ...checkOptions);
     if (!checked.ok) errors.push(`line ${line}: ${checked.errorType}: ${checked.error}${checked.suggestedFix ? ` (${checked.suggestedFix})` : ""}`);
   }
   if (errors.length) return { ok: false, errors, created: [], deduplicated: [] };
@@ -289,19 +342,19 @@ async function enqueueLines(api, lines, { interrupted = () => false } = {}) {
     for (const { line, job } of lines) {
       current = line;
       if (interrupted()) {
-        const cancelled = await api.cancelUnstartedJobs(created, `The queue worker was stopped (Ctrl+C) while enqueueing its --enqueue file, before line ${line}; nothing of the file was started.`);
+        const cancelled = await api.cancelUnstartedJobs(created, `The queue worker was stopped (Ctrl+C) while enqueueing ${fileName}, before line ${line}; nothing of the file was started.`, ...cancelOptions);
         return { ok: false, interrupted: true, errors: [stoppedAt(line)], created, deduplicated, cancelled };
       }
-      const result = await api.enqueueFromToolInput(job);
+      const result = await api.enqueueFromToolInput(job, ...enqueueOptions);
       if (!result.ok) {
-        const cancelled = await api.cancelUnstartedJobs(created, `The queue worker refused its --enqueue file at line ${line} (${result.errorType}); nothing of the file was started.`);
+        const cancelled = await api.cancelUnstartedJobs(created, `The queue worker refused ${fileName} at line ${line} (${result.errorType}); nothing of the file was started.`, ...cancelOptions);
         return { ok: false, errors: [`line ${line}: ${result.errorType}: ${result.error}`], created, deduplicated, cancelled };
       }
       if (result.deduplicated) deduplicated.push({ line, key: job.idempotencyKey, jobId: result.record?.jobId || "", status: result.record?.status || "unknown" });
       else created.push(result.record.jobId);
     }
   } catch (error) {
-    const cancelled = await api.cancelUnstartedJobs(created, `The queue worker stopped enqueueing its --enqueue file at line ${current} after an error; nothing of the file was started.`).catch(() => []);
+    const cancelled = await api.cancelUnstartedJobs(created, `The queue worker stopped enqueueing ${fileName} at line ${current} after an error; nothing of the file was started.`, ...cancelOptions).catch(() => []);
     return { ok: false, errors: [`line ${current}: ${error?.errorType || error?.code || "enqueue_failed"}: ${error?.message || error}`], created, deduplicated, cancelled };
   }
   return { ok: true, errors: [], created, deduplicated };
@@ -629,6 +682,7 @@ async function runQueueWorker(argv, { out = process.stdout, err = process.stderr
     if (options.status) return await printStatus(api, repo, options, out);
     if (options.stop) return requestStop(api, repo, options, out, err);
     if (options.release) return releaseParked(api, repo, out, err);
+    if (options.add) return await addJobsToRunningWorker(api, repo, options, out, err);
     const code = await runWorker(api, repo, options, io);
     // B-086: one warn line with the reason, instead of the exit handler's process.exited error.
     if (code === EXIT_REFUSED && io.refusal) api.recordRefusal(io.refusal.reason, { errorType: io.refusal.errorType });
@@ -636,7 +690,8 @@ async function runQueueWorker(argv, { out = process.stdout, err = process.stderr
   } catch (error) {
     if (error instanceof WorkerRefusal) {
       err.write(`${error.message}\n`);
-      if (api && !options.status && !options.stop && !options.release) api.recordRefusal(error.message, { errorType: "queue_worker_refused" });
+      // --add starts no worker: its refusal is no refused start (queue_worker.refused).
+      if (api && !options.status && !options.stop && !options.release && !options.add) api.recordRefusal(error.message, { errorType: "queue_worker_refused" });
       return EXIT_REFUSED;
     }
     throw error;
