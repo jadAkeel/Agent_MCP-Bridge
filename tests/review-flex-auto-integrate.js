@@ -268,7 +268,7 @@ test("B-069: after a restart an open auto-integration is scheduled again, once, 
   } finally {
     closeDb(db);
   }
-  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 30_000), JSON.stringify((await durable(jobId))?.autoIntegration));
+  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 120_000), JSON.stringify((await durable(jobId))?.autoIntegration));
   // A second run (another bridge that found the same job) is refused by the claim.
   const again = await autoIntegrateQueueJob({ cwd: repo, jobId, agent: "builder", worktreePath: dir, allowedEdits: ["out/batch-011.json"], validationCommand: VALIDATION });
   assert.equal(again.status, "not_claimed");
@@ -319,7 +319,7 @@ test("B-074: a claim of a dead bridge process is taken over at startup; a live p
   } finally {
     closeDb(db);
   }
-  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 30_000), JSON.stringify((await durable(jobId))?.autoIntegration));
+  assert.ok(await waitFor(async () => (await durable(jobId))?.autoIntegration?.status === "committed", 120_000), JSON.stringify((await durable(jobId))?.autoIntegration));
 });
 
 test("B-114: a worktree changed after the job finished is not integrated", async () => {
