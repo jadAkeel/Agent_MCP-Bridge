@@ -1790,7 +1790,7 @@ async function listAvailableAgents(cwd, { forcePure = false } = {}) {
 }
 
 async function listAvailableAgentsUncached(cwd, { forcePure = false } = {}) {
-  const result = await safeOpenCodeCommand(["agent", "list"], cwd, 1000 * 30, { forcePure });
+  const result = await safeOpenCodeCommand(["agent", "list"], cwd, CONFIG.attestationCommandTimeoutMs, { forcePure });
   return {
     result,
     agents: parseAgentList(result.stdout || result.stderr),
@@ -1807,7 +1807,7 @@ async function debugAgentExists(agent, cwd, { forcePure = false } = {}) {
 }
 
 async function debugAgentExistsUncached(agent, cwd, { forcePure = false } = {}) {
-  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, 1000 * 20, { forcePure });
+  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, CONFIG.attestationCommandTimeoutMs, { forcePure });
   if (result.exitCode !== 0) {
     return null;
   }
@@ -2016,7 +2016,7 @@ async function managedSkillSourceEvidence(sourceRoot = OPENCODE_SKILL_DIR) {
 const managedSkillDebugFlights = new Map();
 
 async function readManagedSkillDebugMetadata(cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
-  const read = () => safeOpenCodeCommand(["debug", "skill"], cwd, 1000 * 30, { forcePure, runtimeContext, verifiedPluginPolicy });
+  const read = () => safeOpenCodeCommand(["debug", "skill"], cwd, CONFIG.attestationCommandTimeoutMs, { forcePure, runtimeContext, verifiedPluginPolicy });
   if (forcePure || runtimeContext) return read();
   const key = normalizePathForCompare(path.resolve(cwd || process.cwd()));
   return runSingleFlight(managedSkillDebugFlights, key, read);
@@ -2024,22 +2024,64 @@ async function readManagedSkillDebugMetadata(cwd, { forcePure = false, runtimeCo
 
 // Speed-up option 3 (user decision, 2026-09-29): a freshly created, proven-clean worktree holds
 // exactly its base tree, and OpenCode's project directory there is the worktree root, so every
-// such worktree of one repository and base tree attests the same (global inputs are in the cache
-// fingerprint). Keyed that way instead of by the new worktree path, which never repeated. The
-// final uncached pre-spawn attestation in runOpenCode still runs in each worktree.
+// such worktree of one repository attests the same as long as the repository-local OpenCode
+// inputs agree (global inputs are in the cache fingerprint). B-164: the key is the repository
+// plus a hash of the base tree's entries for those inputs (WORKTREE_OPENCODE_CONFIG_PATHS), not
+// the base tree itself: the base tree changed with every auto-integration commit, so the cached
+// worktree read missed on almost every job (39 s p50). A failed `git ls-tree` falls back to the
+// base-tree key; without a worktree identity the key is the cwd. The final uncached pre-spawn
+// attestation in lib/opencode-run.js still runs for every job (before the provider slot request).
 function agentMetadataCacheKey(agent, cwd, worktreeIdentity = null) {
-  const place = worktreeIdentity?.repoRoot && /^[0-9a-f]{40,64}$/i.test(String(worktreeIdentity.baseTree || ""))
-    ? `worktree\0${attestationCwdKey(worktreeIdentity.repoRoot)}\0${String(worktreeIdentity.baseTree).toLowerCase()}`
+  const repoKey = worktreeIdentity?.repoRoot ? attestationCwdKey(worktreeIdentity.repoRoot) : "";
+  const place = repoKey && /^[0-9a-f]{64}$/i.test(String(worktreeIdentity.configTreeHash || ""))
+    ? `worktree\0${repoKey}\0cfg:${String(worktreeIdentity.configTreeHash).toLowerCase()}`
+    : repoKey && /^[0-9a-f]{40,64}$/i.test(String(worktreeIdentity.baseTree || ""))
+    ? `worktree\0${repoKey}\0${String(worktreeIdentity.baseTree).toLowerCase()}`
     : attestationCwdKey(cwd);
   return `agent-metadata\0${String(agent)}\0${place}`;
+}
+
+// The repository-local files `opencode debug agent` / `debug skill` (and the plugin policy's
+// project checks) can read at the worktree root. Bridge children run with
+// OPENCODE_DISABLE_PROJECT_CONFIG=true, so most of these are ignored anyway; the list is kept
+// conservative. An empty listing (no such files) is a valid, shared key.
+const WORKTREE_OPENCODE_CONFIG_PATHS = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md"];
+
+// sha256 of `git ls-tree -r -z <baseTree> -- <config paths>` (modes, blob ids and paths), or ""
+// when the tree id is malformed or git fails; the caller then keeps the base-tree key.
+async function worktreeConfigTreeHash(repoRoot, baseTree) {
+  if (!repoRoot || !/^[0-9a-f]{40,64}$/i.test(String(baseTree || ""))) return "";
+  try {
+    const listed = await runCommand(
+      "git",
+      ["ls-tree", "-r", "-z", String(baseTree), "--", ...WORKTREE_OPENCODE_CONFIG_PATHS],
+      repoRoot,
+      1000 * 15,
+      buildValidationEnv({ GIT_OPTIONAL_LOCKS: "0" }),
+    );
+    if (listed.exitCode !== 0) return "";
+    return createHash("sha256").update(String(listed.stdout || "")).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
+async function withWorktreeConfigTreeHash(worktreeIdentity) {
+  if (!worktreeIdentity?.repoRoot || worktreeIdentity.configTreeHash) return worktreeIdentity;
+  const configTreeHash = await worktreeConfigTreeHash(worktreeIdentity.repoRoot, worktreeIdentity.baseTree);
+  return configTreeHash ? { ...worktreeIdentity, configTreeHash } : worktreeIdentity;
 }
 
 async function readAgentDebugMetadata(agent, cwd, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null, worktreeIdentity = null } = {}) {
   if (forcePure || runtimeContext) {
     return readAgentDebugMetadataUncached(agent, cwd, { forcePure, runtimeContext, verifiedPluginPolicy });
   }
+  // The key costs a git call; skip it when the cache is off (cachedAttestation would ignore it).
+  const identity = worktreeIdentity && attestationCacheTtlMs() > 0
+    ? await withWorktreeConfigTreeHash(worktreeIdentity)
+    : worktreeIdentity;
   return cachedAttestation(
-    agentMetadataCacheKey(agent, cwd, worktreeIdentity),
+    agentMetadataCacheKey(agent, cwd, identity),
     () => readAgentDebugMetadataUncached(agent, cwd, { verifiedPluginPolicy }),
     (value) => Boolean(value?.ok),
   );
@@ -2052,7 +2094,7 @@ async function readAgentDebugMetadataUncached(agent, cwd, { forcePure = false, r
   if (!pluginPolicy.ok) {
     return { ok: false, errorType: pluginPolicy.errorType, error: pluginPolicy.error, metadata: null, pluginPolicy };
   }
-  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, 1000 * 30, { forcePure, runtimeContext, verifiedPluginPolicy: pluginPolicy });
+  const result = await safeOpenCodeCommand(["debug", "agent", agent], cwd, CONFIG.attestationCommandTimeoutMs, { forcePure, runtimeContext, verifiedPluginPolicy: pluginPolicy });
   if (result.exitCode !== 0) {
     return { ok: false, errorType: "agent_metadata_unavailable", error: summarizeStderr(result.stderr), metadata: null };
   }
@@ -5152,6 +5194,8 @@ export const __selfTest = {
     integrationQuarantineStatusLine,
     resolveIntegrationQuarantine,
     agentMetadataCacheKey,
+    worktreeConfigTreeHash,
+    withWorktreeConfigTreeHash,
     seedIndexFromRealIndex,
     createPhaseClock,
     directRunAuditStore,
