@@ -17,7 +17,7 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 - Node.js 22.12 or newer
 - Git
-- OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The default pure profile needs 1.18.32 or newer and was tested on 1.18.32 and 1.18.34; setup refuses an older version and notes a newer untested one. The optional Gemini profile needs exactly 1.18.32, the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`).
+- OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The default pure profile needs 1.18.32 or newer; 1.18.32 is the tested version, setup refuses an older one and accepts a newer one with a note (`npm run smoke:live` then proves it). The optional Gemini profile needs exactly 1.18.32, the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`).
 - One MCP client: Codex CLI or Claude Code. Both work side by side, but one is enough; setup registers whichever is installed.
 
 Python is no longer needed: the bridge reads its TOML entry itself (log.md B-176).

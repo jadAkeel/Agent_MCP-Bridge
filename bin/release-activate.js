@@ -305,7 +305,9 @@ function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifes
 function parseTomlDocuments(texts) {
   return texts.map((text) => {
     try {
-      return JSON.parse(JSON.stringify(parseToml(text)));
+      // Integers beyond 2^53 (tomllib accepted them) compare as strings instead of failing the parse.
+      return JSON.parse(JSON.stringify(parseToml(text, { integersAsBigInt: "asNeeded" }),
+        (_key, value) => (typeof value === "bigint" ? value.toString() : value)));
     } catch (error) {
       throw new Error(`Could not parse the config as TOML: ${error?.message || String(error)}`);
     }

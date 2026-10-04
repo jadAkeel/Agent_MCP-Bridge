@@ -523,7 +523,7 @@ const BRIDGE_MCP_INSTRUCTIONS = [
   "- One bounded fix: a builder or debugger via run_opencode_agent with write:true, lockedPaths, allowedEdits, validationCommand \"git diff --check\" and a write scopeContract (read, write, allowedEdits, forbidden). Writers run in their own git worktree with no installed dependencies.",
   "- Independent scopes: validate_delegation_plan, then run_opencode_parallel (scopes must not overlap); long or many jobs: enqueue_opencode_job and poll list_opencode_jobs / get_opencode_job. Package manifests, lockfiles, schemas, migrations and shared config are serial.",
   "- Integrate: read the report and diff, preview with integrate_opencode_worktree dryRun:true, show the patch, then apply with the same arguments plus reviewed:true and the exact previewReceipt. Run the project's real checks afterwards. Never report success from an agent's own claim.",
-  "- Locks are managed by the bridge: do not call acquire_agent_lock / release_agent_lock. Something stuck: get_opencode_bridge_status, then diagnose_opencode_bridge. Every refusal names its errorType and the next step.",
+  "- Locks are managed by the bridge: do not call acquire_agent_lock / release_agent_lock. Something stuck: get_opencode_bridge_status, then diagnose_opencode_bridge. A refusal names its errorType and the next step.",
 ].join("\n");
 
 const server = new McpServer({
@@ -617,7 +617,7 @@ function startupRecoveryPendingResult() {
       text: [
         "Bridge startup recovery still running.",
         "errorType: startup_recovery_pending",
-        `The bridge is still recovering durable queue, pipeline and integration state (waited ${Math.round(STARTUP_RECOVERY_TOOL_WAIT_MS / 1000)} s). Retry the call shortly; get_opencode_bridge_status reports the bridge once recovery finishes.`,
+        `The bridge is still attesting the OpenCode plugin policy or recovering durable queue, pipeline and integration state (waited ${Math.round(STARTUP_RECOVERY_TOOL_WAIT_MS / 1000)} s). Retry the call shortly; get_opencode_bridge_status reports the bridge once recovery finishes.`,
       ].join("\n"),
     }],
   };
@@ -5909,7 +5909,9 @@ if (!BRIDGE_RUN_AS_MAIN) {
   startupPluginPolicy.catch(() => {});
   // Connect first so the client's MCP startup timeout never waits on recovery or the plugin
   // policy; tool calls wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
-  beginBridgeStartupRecovery(() => Promise.all([startupPluginPolicy, reconcileQueueStateAtStartup()]));
+  // Recovery still runs only after the policy passed, as before: it adopts lapsed queue jobs,
+  // recovers integrations and schedules the queue, none of which a rejected bridge may do.
+  beginBridgeStartupRecovery(() => startupPluginPolicy.then(() => reconcileQueueStateAtStartup()));
   const transport = new StdioServerTransport();
   // Protocol.onerror: unparseable frames, failed sends, handler errors the SDK cannot answer.
   server.server.onerror = (error) => {

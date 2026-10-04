@@ -14,10 +14,9 @@ import { recordCliFailure } from "./ops-log.js";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--provider-limit N] [--self-test]";
 requireSelfTestRun(import.meta.url);
-// The OpenCode version the managed profiles were reviewed on (the Gemini profile's plugin
-// manifest pins exactly this one), and the newest version the pure profile was tested with.
+// The OpenCode version the managed profiles were reviewed and tested on (the Gemini
+// profile's plugin manifest pins exactly this one).
 const OPENCODE_PINNED_VERSION = "1.18.32";
-const OPENCODE_NEWEST_TESTED_VERSION = "1.18.34";
 
 function parseArguments(argv, env = process.env) {
   const options = { yes: false, dryRun: false, skipClaudeCode: false, client: "auto", profile: "pure", providerLimit: 2, selfTest: false };
@@ -127,14 +126,17 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
     // it); the pure profile accepts the pinned version or newer and refuses older ones, which
     // were never run with these agent profiles.
     const openCodeNotPinned = name === "opencode" && version !== OPENCODE_PINNED_VERSION;
-    const openCodeTooOld = name === "opencode" && (!version || !versionAtLeast(version, OPENCODE_PINNED_VERSION.split(".").map(Number)));
+    // A version that does not parse, or a 0.0.0 development build, is not judged old.
+    const openCodeTooOld = name === "opencode" && Boolean(version) && !version.startsWith("0.0.0")
+      && !versionAtLeast(version, OPENCODE_PINNED_VERSION.split(".").map(Number));
     const wrong = !missing && name === "opencode" && (options.profile === "gemini" ? openCodeNotPinned : openCodeTooOld);
     log(`${name}: ${missing ? "missing" : wrong ? "wrong version" : "ok"}${version ? ` (${version})` : ""}${missing || wrong ? `; install: ${hints[name]}` : ""}`);
     if (missing) found[name] = null;
     if ((missing && !["codex", "claude"].includes(name)) || wrong) ok = false;
-    if (name === "opencode" && !missing && !wrong && openCodeNotPinned) {
-      const beyondTested = !versionAtLeast(OPENCODE_NEWEST_TESTED_VERSION, version.split(".").map(Number));
-      log(`Note: OpenCode ${version} is newer than the pinned ${OPENCODE_PINNED_VERSION}${beyondTested ? ` and than the newest tested ${OPENCODE_NEWEST_TESTED_VERSION}` : ` (tested up to ${OPENCODE_NEWEST_TESTED_VERSION})`}; the pure profile accepts it. npm run smoke:live proves it after setup.`);
+    if (name === "opencode" && !missing && !wrong && openCodeNotPinned && (!version || version.startsWith("0.0.0"))) {
+      log(`Note: OpenCode reported ${version ? `development build ${version}` : "no readable version"}; the pure profile accepts it untested. npm run smoke:live proves it after setup.`);
+    } else if (name === "opencode" && !missing && !wrong && openCodeNotPinned) {
+      log(`Note: OpenCode ${version} is newer than the tested ${OPENCODE_PINNED_VERSION}; the pure profile accepts it. npm run smoke:live proves it after setup.`);
     }
   }
   const clients = selectClients(options.client, found);
@@ -366,7 +368,10 @@ if (isMainModule(import.meta.url)) {
       if (/: (?:missing|wrong version)\b/.test(String(line))) problems.push(String(line));
     };
     const code = await runSetup(options, { log });
-    if (code === 1) recordSetupFailure(options, { name: "setup_preflight_failed", message: `Setup preflight failed: ${problems.join("; ") || "a prerequisite check failed"}` }, 1);
+    // A missing Codex or Claude Code is a problem only when no usable client was found.
+    const clientsMissing = problems.some((line) => line.startsWith("clients: missing"));
+    const reported = problems.filter((line) => clientsMissing || !/^(?:codex|claude): missing\b/.test(line));
+    if (code === 1) recordSetupFailure(options, { name: "setup_preflight_failed", message: `Setup preflight failed: ${reported.join("; ") || "a prerequisite check failed"}` }, 1);
     if (code === 2) recordSetupFailure(options, { name: "setup_write_refused", message: "Setup write refused: the displayed changes were not accepted. Re-run with --yes to accept them." }, 2);
     process.exitCode = code;
   })().catch((error) => {

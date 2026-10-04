@@ -80,7 +80,9 @@ async function loadMcpEntry(configPath, serverName = "opencode") {
   let config;
   try {
     // JSON round trip: plain objects (smol-toml tables have a null prototype) and dates as strings.
-    config = JSON.parse(JSON.stringify(parseToml(await readFile(resolvedConfig, "utf8"))));
+    // Integers beyond 2^53 (tomllib accepted them) become strings instead of failing the parse.
+    config = JSON.parse(JSON.stringify(parseToml(await readFile(resolvedConfig, "utf8"), { integersAsBigInt: "asNeeded" }),
+      (_key, value) => (typeof value === "bigint" ? value.toString() : value)));
   } catch (error) {
     throw new Error(`Could not read ${resolvedConfig} as TOML: ${error?.message || String(error)}`);
   }

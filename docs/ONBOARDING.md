@@ -25,7 +25,7 @@ instead of `&&` there.
 | --- | --- | --- |
 | Node.js | 22.12 or newer | `node --version` |
 | Git | Any current version (the scratch run used 2.39) | `git --version` |
-| OpenCode | 1.18.32 or newer for the default pure profile (tested on 1.18.32 and 1.18.34); exactly 1.18.32 for the Gemini profile, whose plugin manifest pins it | `opencode --version` |
+| OpenCode | 1.18.32 or newer for the default pure profile (1.18.32 is tested; a newer one gets a note and `npm run smoke:live` proves it); exactly 1.18.32 for the Gemini profile, whose plugin manifest pins it | `opencode --version` |
 | Codex CLI **or** Claude Code | One MCP client is enough; setup registers whichever is installed (`--client` chooses) | `codex --version` / `claude --version` |
 
 Python is not needed (log.md B-176).

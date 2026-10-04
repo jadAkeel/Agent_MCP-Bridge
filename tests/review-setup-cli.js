@@ -29,7 +29,7 @@ async function check(name, action) { await action(); checks += 1; process.stdout
 
 try {
   // All clients, XDG state/cache/data and bridge state are scratch, even when the
-  // real Python/Git run. No installed client or provider credentials are needed.
+  // real Git runs. No installed client or provider credentials are needed.
   for (const key of Object.keys(process.env)) if (/^(CODEX_HOME|CLAUDE_CONFIG_DIR|CODEX_OPENCODE_|OPENCODE_|XDG_|HOME$|USERPROFILE$)/i.test(key)) delete process.env[key];
   const fakeDir = path.join(scratch, "fake-bin");
   await mkdir(fakeDir);
@@ -279,16 +279,26 @@ try {
     assert.doesNotMatch(probe("1.18.32").text, /Note: OpenCode/);
     const newest = probe("1.18.34");
     assert.equal(newest.ok, true);
-    assert.match(newest.text, /Note: OpenCode 1\.18\.34 is newer than the pinned 1\.18\.32 \(tested up to 1\.18\.34\); the pure profile accepts it/);
+    assert.match(newest.text, /Note: OpenCode 1\.18\.34 is newer than the tested 1\.18\.32; the pure profile accepts it\. npm run smoke:live proves it after setup\./);
     const beyond = probe("1.19.0");
     assert.equal(beyond.ok, true);
-    assert.match(beyond.text, /newer than the pinned 1\.18\.32 and than the newest tested 1\.18\.34/);
+    assert.match(beyond.text, /Note: OpenCode 1\.19\.0 is newer than the tested 1\.18\.32/);
     const older = probe("1.18.31");
     assert.equal(older.ok, false);
     assert.match(older.text, /opencode: wrong version \(1\.18\.31\); install: OpenCode 1\.18\.32 or newer/);
     assert.equal(probe("1.18.34", "gemini").ok, false);
     assert.match(probe("1.18.34", "gemini").text, /install: exactly OpenCode 1\.18\.32/);
     assert.equal(probe("1.18.32", "gemini").ok, true);
+    const dev = probe("0.0.0-dev-202610030456");
+    assert.equal(dev.ok, true, "a development build is not judged old");
+    assert.match(dev.text, /Note: OpenCode reported development build 0\.0\.0; the pure profile accepts it untested/);
+  });
+
+  await check("B-176: the in-process TOML reader accepts integers beyond 2^53 elsewhere in config.toml", async () => {
+    const file = path.join(scratch, "bigint-config.toml");
+    await writeFile(file, (await readFile(fresh.configPath, "utf8")) + "\n[other]\nhuge = 18446744073709551615\n");
+    const entry = await loadMcpEntry(file);
+    assert.deepEqual(entry, await loadMcpEntry(fresh.configPath));
   });
 
   await check("Windows npm shims resolve native package bins without Node or a shell", async () => {
