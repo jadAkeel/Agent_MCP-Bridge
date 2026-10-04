@@ -9,6 +9,7 @@
 // supervisor, provider slots and pauses are real; only agent discovery and attestation are the
 // agentRuntimeTestHook. The state directory, CODEX_HOME and the OpenCode config folder are scratch.
 //   node tests/review-flex-runners.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync } = await import("node:fs");
 const { createHash } = await import("node:crypto");

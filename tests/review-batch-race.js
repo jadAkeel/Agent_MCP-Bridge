@@ -10,6 +10,7 @@
 // B-154: a committed auto-integration removes its worktree, and the recovery pass sweeps the ones
 // left behind. B-156: the recovery pass releases the hard lock of a job whose owner died.
 //   node tests/review-batch-race.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_SOURCE_DIRT_POLICY = "unrelated_ok";

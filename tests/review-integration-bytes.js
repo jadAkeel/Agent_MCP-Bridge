@@ -6,6 +6,7 @@
 // "--self-test" is added to process.argv before the import because server.js keys
 // its test-mode guards (background timers, attestation cache TTL) on that flag.
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";

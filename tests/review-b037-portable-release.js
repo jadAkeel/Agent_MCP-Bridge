@@ -15,6 +15,7 @@
 // install does, and builds a release from it with the committed manifest. Stage your changes
 // before running it on an uncommitted tree.
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -277,7 +278,11 @@ int main(int argc, char **argv) {
     snprintf(origin, sizeof origin, "%s/opencode", home);
     fputs("{\"plugin\":[\"SPEC\"],\"plugin_origins\":[{\"spec\":\"SPEC\",\"source\":", stdout);
     put_json_string(origin);
-    fputs(",\"scope\":\"global\"}]}", stdout);
+    fputs(",\"scope\":\"global\"}]", stdout);
+    snprintf(origin, sizeof origin, "%s/fake-effective-mcp", home);
+    FILE *marker = fopen(origin, "r");
+    if (marker) { fclose(marker); fputs(",\"mcp\":{\"x\":{\"type\":\"local\",\"command\":[\"npx\",\"@playwright/mcp\"]}}", stdout); }
+    fputs("}", stdout);
     return 0;
   }
   fputs("unexpected fake OpenCode arguments", stderr);
@@ -301,7 +306,7 @@ int main(int argc, char **argv) {
     await writeFile(script, [
       "const args = process.argv.slice(2);",
       `if (args.includes("--version")) { process.stdout.write(${JSON.stringify(`${OPENCODE_VERSION}\n`)}); process.exit(0); }`,
-      `if (args.join(" ") === "debug config") { process.stdout.write(JSON.stringify({ plugin: [${JSON.stringify(FIXTURE_SPEC)}], plugin_origins: [{ spec: ${JSON.stringify(FIXTURE_SPEC)}, source: process.env.XDG_CONFIG_HOME + "/opencode", scope: "global" }] })); process.exit(0); }`,
+      `if (args.join(" ") === "debug config") { const mcp = require("fs").existsSync(process.env.XDG_CONFIG_HOME + "/fake-effective-mcp") ? { mcp: { x: { type: "local", command: ["npx", "@playwright/mcp"] } } } : {}; process.stdout.write(JSON.stringify({ plugin: [${JSON.stringify(FIXTURE_SPEC)}], plugin_origins: [{ spec: ${JSON.stringify(FIXTURE_SPEC)}, source: process.env.XDG_CONFIG_HOME + "/opencode", scope: "global" }], ...mcp })); process.exit(0); }`,
       "process.stderr.write('unexpected fake OpenCode arguments'); process.exit(2);",
       "",
     ].join("\n"), "utf8");
@@ -329,8 +334,8 @@ int main(int argc, char **argv) {
 
   const probeCwd = path.join(scratch, "probe-cwd");
   await mkdir(probeCwd, { recursive: true });
-  function verifyPluginPolicy({ configHome, manifestPath, manifestSha256 }) {
-    if (fakeError) throw new SkipTest(fakeError);
+  function verifyPluginPolicy({ configHome, manifestPath, manifestSha256, pure = false }) {
+    if (fakeError && !pure) throw new SkipTest(fakeError);
     const env = {};
     for (const [key, value] of Object.entries(process.env)) {
       if (!/^(?:CODEX_OPENCODE_|XDG_|OPENCODE_)/i.test(key)) env[key] = value;
@@ -350,6 +355,10 @@ int main(int argc, char **argv) {
       CODEX_OPENCODE_PLUGIN_MANIFEST_PATH: manifestPath,
       CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256: manifestSha256,
     });
+    if (pure) {
+      env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "false";
+      for (const key of ["CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST", "CODEX_OPENCODE_PLUGIN_MANIFEST_PATH", "CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256"]) delete env[key];
+    }
     const run = spawnSync(process.execPath, [SERVER_PATH, "--verify-plugin-policy", probeCwd], {
       cwd: probeCwd,
       env,
@@ -424,6 +433,33 @@ int main(int argc, char **argv) {
     }
     const tree = await writeTree(rootA, { settings: "opencode/../../antigravity.json" });
     rejected(verifyPluginPolicy({ configHome: rootA, ...tree }), /incomplete security-settings entry/);
+  });
+
+  await check("(e) an enabled MCP server in a config OpenCode loads is refused, pure and allowlisted (B-179)", async () => {
+    const mcpConfig = `${JSON.stringify({ mcp: { x: { type: "local", command: ["npx", "@playwright/mcp"] } } }, null, 2)}\n`;
+    const pureHome = path.join(scratch, "trees", "pure-home");
+    await mkdir(path.join(pureHome, "opencode"), { recursive: true });
+    const pureConfig = path.join(pureHome, "opencode", "opencode.jsonc");
+    await writeFile(pureConfig, `${JSON.stringify({ snapshot: false, lsp: false, formatter: false }, null, 2)}\n`, "utf8");
+    accepted(verifyPluginPolicy({ configHome: pureHome, pure: true }));
+    await writeFile(pureConfig, mcpConfig, "utf8");
+    rejected(verifyPluginPolicy({ configHome: pureHome, pure: true }), /enables MCP server\(s\) x; bridge agents must not inherit MCP servers/);
+    // `enabled: false` turns an entry off; that config is accepted.
+    await writeFile(pureConfig, `${JSON.stringify({ mcp: { x: { type: "local", command: ["npx", "@playwright/mcp"], enabled: false } } })}\n`, "utf8");
+    accepted(verifyPluginPolicy({ configHome: pureHome, pure: true }));
+    // Allowlisted: a sibling config without plugins passes the plugin checks but not this one.
+    const tree = await writeTree(rootA);
+    accepted(verifyPluginPolicy({ configHome: rootA, ...tree }));
+    const sibling = path.join(rootA, "opencode", "config.json");
+    await writeFile(sibling, mcpConfig, "utf8");
+    rejected(verifyPluginPolicy({ configHome: rootA, ...tree }), /config\.json enables MCP server\(s\) x/);
+    await rm(sibling, { force: true });
+    // And the effective config OpenCode reports, wherever it came from.
+    const marker = path.join(rootA, "fake-effective-mcp");
+    await writeFile(marker, "", "utf8");
+    rejected(verifyPluginPolicy({ configHome: rootA, ...tree }), /Effective OpenCode config enables MCP server\(s\) x/);
+    await rm(marker, { force: true });
+    accepted(verifyPluginPolicy({ configHome: rootA, ...tree }));
   });
 } finally {
   await rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 }).catch(() => {});

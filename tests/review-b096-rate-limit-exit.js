@@ -14,6 +14,7 @@ if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPS_LOG = "off";
 
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";

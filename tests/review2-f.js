@@ -9,6 +9,7 @@
 //   node tests/review2-f.js
 // The state and cache directories are set before server.js is imported, and "--self-test" is
 // added to process.argv because server.js keys its test-mode guards on that flag.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";

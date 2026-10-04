@@ -6,6 +6,7 @@
 // The real scheduler, SQLite queue, encrypted requests and requeue run in a scratch state
 // directory; only the agent execution is the queue executor test hook.
 //   node tests/review-flex-fallback.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

@@ -13,7 +13,7 @@
   "configs": [
     {
       "path": "opencode/opencode.jsonc",
-      "sha256": "e1f9ab495e1616ef5d7decff50cf9d353c08e82fdadae6d14e7f9c375b1cf766",
+      "sha256": "02398ffa7f858b4e1bb7b58d25186ebe57c3c5c11705a11a5db1cee2a8610969",
       "scope": "global",
       "plugins": ["@cortexkit/opencode-antigravity-auth@2.2.1"]
     }

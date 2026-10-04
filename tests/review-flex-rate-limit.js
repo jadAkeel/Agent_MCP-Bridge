@@ -7,6 +7,7 @@
 // provider/model with a growing pause. Real child processes run through the process supervisor;
 // the log file is a scratch fixture and the state directory is a scratch directory.
 //   node tests/review-flex-rate-limit.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPS_LOG = "off";

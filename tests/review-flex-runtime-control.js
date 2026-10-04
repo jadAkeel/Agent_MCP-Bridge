@@ -6,6 +6,7 @@
 // worker cap over all providers (CODEX_OPENCODE_GLOBAL_WORKER_LIMIT). Slots are real SQLite leases
 // in a scratch state directory.
 //   node tests/review-flex-runtime-control.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPS_LOG = "off";

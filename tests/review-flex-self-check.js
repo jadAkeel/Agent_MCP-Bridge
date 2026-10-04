@@ -9,6 +9,7 @@
 // back. Git, the worktree and the validation runs are real; only the agent run is the
 // agentRuntimeTestHook (as in tests/review-queue-features.js, Q-004).
 //   node tests/review-flex-self-check.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node,npm,python";

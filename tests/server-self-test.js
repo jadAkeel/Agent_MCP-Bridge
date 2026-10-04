@@ -6,6 +6,7 @@
 //   node tests/server-self-test.js --self-test-events  event-evidence suite only
 // "--self-test" is added to process.argv before the import because server.js keys
 // its test-mode guards (background timers, attestation cache TTL) on that flag.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const { __selfTest } = await import("../server.js");
 const selfTestHooks = __selfTest.hooks;

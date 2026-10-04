@@ -8,6 +8,7 @@
 // with CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED=false, it stays interrupted for requeue_opencode_job.
 // The dead owner is simulated on the durable row in a scratch state directory.
 //   node tests/review-flex-resume.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

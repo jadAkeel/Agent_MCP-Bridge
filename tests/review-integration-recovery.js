@@ -5,6 +5,7 @@
 // module (tools register; nothing connects) and drives internals directly.
 //   node tests/review-integration-recovery.js
 // Each case is named after the defect it covers (D1..D20) and runs on its own scratch repository.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const { __selfTest } = await import("../server.js");
 const { SkipTest, finishSkips } = await import("./skip-gate.js");

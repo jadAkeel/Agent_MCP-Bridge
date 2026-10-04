@@ -13,6 +13,7 @@ process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT;
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
 import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";

@@ -9,6 +9,7 @@
 // base tree's repository-local OpenCode config entries, not by the base tree, so a commit that did
 // not touch those files keeps the cache entry. A git failure falls back to the base-tree key.
 //   node tests/review-attestation-cache.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPS_LOG = "off";

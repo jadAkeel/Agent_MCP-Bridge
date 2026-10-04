@@ -5,6 +5,7 @@
 // register, nothing connects) and internals are driven directly.
 //   node tests/review2-d.js
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { mkdtempSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as joinPath } from "node:path";

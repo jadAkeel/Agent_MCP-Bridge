@@ -6,6 +6,7 @@
 // self-test hooks (queueJobExecutorTestHook / agentRuntimeTestHook), as in tests/review-queue.js
 // and tests/review-measurement.js.
 //   node tests/review-queue-features.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

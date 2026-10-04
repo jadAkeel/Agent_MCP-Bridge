@@ -6,6 +6,7 @@
 // says. Each case builds its own scratch repository with the operator's plain Git.
 //   node tests/review3-g10.js
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";

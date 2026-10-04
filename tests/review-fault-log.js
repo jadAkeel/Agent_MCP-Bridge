@@ -10,6 +10,7 @@
 // tool handler is logged with its stack, and a client's probe of an unserved method (-32601 on
 // resources/templates/list) is no longer an error line. Everything runs in scratch directories.
 //   node tests/review-fault-log.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 delete process.env.CODEX_OPENCODE_OPS_LOG;

@@ -9,6 +9,7 @@
 // Agent discovery and the OpenCode run are replaced by the self-test agentRuntimeTestHook, as in
 // tests/review-l025.js; Git, locks, the worktree registry, the queue and SQLite state are real.
 //   node tests/review-g05-secrets.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

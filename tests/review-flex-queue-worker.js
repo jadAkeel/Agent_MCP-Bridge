@@ -7,6 +7,7 @@
 // the CLI) start this same file as a child with --queue-worker-child, which installs a fake agent
 // through queueJobExecutorTestHook and runs the worker there. Everything lives in scratch folders.
 //   node tests/review-flex-queue-worker.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 const CHILD_ROLE = process.argv.includes("--queue-worker-child");
 if (!CHILD_ROLE && !process.argv.includes("--self-test")) process.argv.push("--self-test");
 
@@ -66,6 +67,18 @@ async function runParent() {
   // Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
   const { isolateBridgeStateDir } = await import("./flex-fixture.js");
   const isolatedStateDir = isolateBridgeStateDir("review-flex-queue-worker");
+  // B-179: a worker refuses to start when the OpenCode config its agents would load enables an MCP
+  // server; without XDG_CONFIG_HOME that is the operator's own ~/.config/opencode. A scratch config
+  // directory instead (passed to the worker processes), the agent and skill folders unchanged.
+  if (!process.env.XDG_CONFIG_HOME) {
+    const { mkdtempSync } = await import("node:fs");
+    const { homedir, tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const operatorConfig = join(homedir(), ".config", "opencode");
+    process.env.CODEX_OPENCODE_AGENT_DIR ||= join(operatorConfig, "agents");
+    process.env.CODEX_OPENCODE_SKILL_DIR ||= join(operatorConfig, "skills");
+    process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "review-flex-queue-worker-xdg-config-"));
+  }
   const { __selfTest, queueWorkerApi } = await import("../server.js");
   const { finishSkips } = await import("./skip-gate.js");
   const { makeFlexFixture, runFlexTests } = await import("./flex-fixture.js");
@@ -178,6 +191,8 @@ async function runParent() {
       CODEX_OPENCODE_MIN_FREE_MEMORY_MB: "0",
       CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT: "1",
       CODEX_OPENCODE_SYNC_MANAGED_RUNTIME: "false",
+      ...(process.env.CODEX_OPENCODE_AGENT_DIR ? { CODEX_OPENCODE_AGENT_DIR: process.env.CODEX_OPENCODE_AGENT_DIR } : {}),
+      ...(process.env.CODEX_OPENCODE_SKILL_DIR ? { CODEX_OPENCODE_SKILL_DIR: process.env.CODEX_OPENCODE_SKILL_DIR } : {}),
       ...extra,
     };
   }

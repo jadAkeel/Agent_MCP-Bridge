@@ -6,6 +6,7 @@
 // (no --self-test), with a scratch state directory; the parser and the per-model choice are checked
 // in this process.
 //   node tests/review-flex-defaults.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 delete process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS;

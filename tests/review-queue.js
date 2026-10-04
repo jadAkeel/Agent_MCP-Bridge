@@ -6,6 +6,7 @@
 //   node tests/review-queue.js
 // "--self-test" is added to process.argv before the import because server.js keys its
 // test-mode guards (background timers, attestation cache TTL) on that flag.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 // The tool wrapper's startup-recovery wait is read at import; keep it short for the gate test.
 process.env.CODEX_OPENCODE_STARTUP_RECOVERY_WAIT_MS = "200";

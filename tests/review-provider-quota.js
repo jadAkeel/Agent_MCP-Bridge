@@ -6,6 +6,7 @@
 // opencode_quota_exhausted, pauses the provider until the reported reset, and labels a queue job
 // that waits for a provider slot.
 //   node tests/review-provider-quota.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 const { mkdtemp, rm } = await import("node:fs/promises");

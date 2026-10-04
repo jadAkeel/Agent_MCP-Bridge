@@ -6,6 +6,7 @@
 // state and cache directories point at a fresh temporary directory, before server.js is imported:
 // both are read once at import, and the bridge must never touch the operator's own state.
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";

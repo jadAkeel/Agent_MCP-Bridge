@@ -9,6 +9,7 @@
 //   node tests/review-ops-log-coverage.js
 // "--self-test" is added to process.argv before the import because server.js keys its
 // test-mode guards on that flag; the bridge started over stdio below runs without it.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 const { __selfTest } = await import("../server.js");

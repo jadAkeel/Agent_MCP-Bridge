@@ -7,6 +7,7 @@
 // its test-mode guards (background timers, attestation cache TTL) on that flag.
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { execFile as execFileCallback } from "node:child_process";
 import { readBridgeSource } from "./bridge-source.js";
 import { existsSync, realpathSync } from "node:fs";

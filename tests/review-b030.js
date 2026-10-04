@@ -4,6 +4,7 @@
 // node_modules/ was a junction into another checkout deleted that checkout's files, because
 // `git worktree remove` on Windows recurses through a junction. Git and the filesystem are real.
 //   node tests/review-b030.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 const { __selfTest } = await import("../server.js");

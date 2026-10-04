@@ -5,6 +5,7 @@
 //   node tests/review2-a.js
 // "--self-test" is added to process.argv before the import because server.js keys its
 // test-mode guards (background timers, attestation cache TTL) on that flag.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

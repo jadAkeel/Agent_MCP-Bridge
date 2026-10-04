@@ -7,6 +7,7 @@
 // rebuilds the lines from the JSONL file. Queue jobs run through the real scheduler with the
 // executor replaced by a test hook; everything is in a scratch directory.
 //   node tests/review-flex-issue-log.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

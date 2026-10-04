@@ -8,6 +8,7 @@
 // other patch stays for the reviewed flow. The worktrees are real git worktrees in a scratch
 // folder; only the agent run is the queue executor test hook.
 //   node tests/review-flex-auto-integrate.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

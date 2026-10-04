@@ -4,6 +4,7 @@
 // "Measurement follow-up"): 1 target captures start from the target's own index, 2 no
 // back-to-back pre-apply capture without a hook, 3 in-worktree attestation cached by base tree.
 //   node tests/review-speedup.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

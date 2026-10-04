@@ -6,6 +6,7 @@
 // is the executeJobTestHooks wrapper (the supervisor cannot be made to fail on demand). Everything
 // lives in scratch folders, and the bridge state directory is isolated.
 //   node tests/review-prod-core.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";

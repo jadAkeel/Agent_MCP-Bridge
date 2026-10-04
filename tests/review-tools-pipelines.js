@@ -5,6 +5,7 @@
 // tests/server-self-test.js; agent discovery and the OpenCode run are replaced by the
 // self-test agentRuntimeTestHook, everything else (Git, locks, SQLite state) is real.
 //   node tests/review-tools-pipelines.js
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 // Read once at import: writer worktrees on, a small snapshot bound for the group-scope fault
 // test, and node allowlisted so a validation command can write ignored output.

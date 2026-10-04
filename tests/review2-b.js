@@ -3,6 +3,7 @@
 // Regression tests for the second review's security-gate findings R-141, R-142 and R-143.
 //   node tests/review2-b.js
 // PEM markers are assembled from parts so this file never carries a literal key header line.
+import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { generateKeyPairSync, createPrivateKey } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
