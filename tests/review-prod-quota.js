@@ -194,7 +194,7 @@ test("B-131: an OpenCode openai rate limit pauses codex too (end to end)", async
     assert.equal(result.rateLimitPause?.pauseKey, modelPauseKeyForMetadata({ provider: "openai", model: SOL }));
     assert.deepEqual(result.rateLimitPause?.groupKeys, [codexKey, openaiKey]);
     const pauses = await activeProviderPauses();
-    assert.ok(pauses.get(codexKey) > Date.now() + 25 * 60_000, "codex paused for the first-strike 30 minutes");
+    assert.ok(pauses.get(codexKey) > Date.now() + 8 * 60_000, "codex paused for the first-strike 10 minutes (B-162)");
     assert.equal(pauses.get(codexKey), pauses.get(openaiKey));
     const codex = await acquireProviderLease({ providerKey: codexKey, pauseKeys: quotaGroupProviderKeys("codex"), timeoutMs: 2000 });
     assert.equal(codex.ok, false);

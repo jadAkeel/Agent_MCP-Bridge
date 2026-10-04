@@ -216,7 +216,7 @@ test("B-061: the outcome is provider_rate_limited unless a cancellation or conta
   assert.equal(builderFallbackEligible("builder", eligible, { enabled: true }), true, "the opt-in builder fallback treats it like opencode_rate_limited");
 });
 
-test("B-061: a detected rate limit pauses the model for 30 minutes, then 60; a running pause adds no strike", async () => {
+test("B-061: a detected rate limit pauses the model for 10 minutes, then 20, 40, 60 (B-162); a running pause adds no strike", async () => {
   const key = modelPauseKeyForMetadata({ provider: "OpenCode", model: MUSE });
   assert.equal(key, `${CONFIG.providerConcurrencyKey}:opencode/${MUSE}`);
   assert.equal(modelPauseKeyForMetadata({ provider: "opencode", model: "" }), "");
@@ -224,7 +224,7 @@ test("B-061: a detected rate limit pauses the model for 30 minutes, then 60; a r
   const first = await recordRateLimitPause({ pauseKey: key, reason: "rate limit: test", now: t0 });
   assert.equal(first.recorded, true);
   assert.equal(first.strikes, 1);
-  assert.equal(first.untilAt - t0, 30 * 60_000);
+  assert.equal(first.untilAt - t0, 10 * 60_000);
   const again = await recordRateLimitPause({ pauseKey: key, reason: "parallel job", now: t0 + 1000 });
   assert.equal(again.reused, true, "a second job tripping on the same limit keeps the running pause");
   assert.equal(again.untilAt, first.untilAt);
@@ -254,15 +254,22 @@ test("B-061: a detected rate limit pauses the model for 30 minutes, then 60; a r
   await expire();
   const second = await recordRateLimitPause({ pauseKey: key, now: Date.now() });
   assert.equal(second.strikes, 2);
-  assert.equal(second.durationMs, 60 * 60_000);
+  assert.equal(second.durationMs, 20 * 60_000);
   await expire();
   const third = await recordRateLimitPause({ pauseKey: key, now: Date.now() });
   assert.equal(third.strikes, 3);
-  assert.equal(third.durationMs, 60 * 60_000, "capped at CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS");
+  assert.equal(third.durationMs, 40 * 60_000);
+  await expire();
+  const fourth = await recordRateLimitPause({ pauseKey: key, now: Date.now() });
+  assert.equal(fourth.strikes, 4);
+  assert.equal(fourth.durationMs, 60 * 60_000, "capped at CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS");
+  await expire();
+  const fifth = await recordRateLimitPause({ pauseKey: key, now: Date.now() });
+  assert.equal(fifth.durationMs, 60 * 60_000, "stays at the cap");
   await expire(Date.now() - 3 * 60 * 60_000);
   const decayed = await recordRateLimitPause({ pauseKey: key, now: Date.now() });
   assert.equal(decayed.strikes, 1, "a strike older than twice the maximum is forgotten");
-  assert.equal(decayed.durationMs, 30 * 60_000);
+  assert.equal(decayed.durationMs, 10 * 60_000);
   await expire();
 });
 
@@ -280,7 +287,7 @@ test("B-061: the log path setting: default under the OpenCode data dir, off, or 
   }
   assert.equal(CONFIG.openCodeLogPath, logPath, "this run reads the scratch fixture");
   assert.equal(CONFIG.rateLimitHits, 2);
-  assert.equal(CONFIG.rateLimitPauseMs, 30 * 60_000);
+  assert.equal(CONFIG.rateLimitPauseMs, 10 * 60_000, "B-162: the first pause is 10 min");
   assert.equal(CONFIG.rateLimitPauseMaxMs, 60 * 60_000);
 });
 

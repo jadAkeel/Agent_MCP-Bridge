@@ -688,7 +688,8 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_VALIDATION_TIMEOUT_MS` | 5 min |
 | `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` | 20 min (how long a job may wait for a provider slot) |
 | `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS` | 10 min (`0` turns it off). An agent that writes nothing to stdout or stderr for that long is stopped and the job fails as `agent_idle_timeout`; keep it at 10 minutes or more, because a long reasoning step or tool call is silent. `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL=opencode/space-bunny-free=1200000` gives one model a longer limit. |
-| `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS` | 30 min, doubling to `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS` (60 min): the pause after a detected rate limit |
+| `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS` | 10 min, doubling (10, 20, 40) to `CODEX_OPENCODE_RATE_LIMIT_PAUSE_MAX_MS` (60 min): the pause after a detected rate limit |
+| `CODEX_OPENCODE_ATTESTATION_REVALIDATE_AFTER_MS` | 60 s. The pre-spawn attestation (OpenCode cold starts) runs before the provider slot is requested; a slot wait longer than this repeats it with the slot held. On a busy host this attestation is the largest bridge cost per job, so keep the number of agents running at once (`set_opencode_concurrency` with `globalWorkerLimit`) near the machine's core count. |
 
 The Codex `tool_timeout_sec` must cover the longest job the bridge allows. Codex gives up on a tool call after that time, and the job's result is lost even if the job is still running. The bound is:
 

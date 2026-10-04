@@ -403,7 +403,7 @@ test("B-096: end to end, the real stderr line ends a silent run in seconds as pr
   assert.equal(result.idleTimedOut, false);
   assert.equal(result.rateLimitPause?.pauseKey, pauseKey);
   assert.equal(result.rateLimitPause?.strikes, 1);
-  assert.ok(Date.parse(result.providerCooldownUntil) - Date.now() > 25 * 60_000, "paused for the first-strike 30 minutes");
+  assert.ok(Date.parse(result.providerCooldownUntil) - Date.now() > 8 * 60_000, "paused for the first-strike 10 minutes (B-162)");
   assert.match(rateLimitPauseReason(result), /^rate limit: final provider error for opencode\/muse-spark-1\.3-contributor-free, OpenCode did not retry \(stderr: stream error AI_APICallError: Rate limit exceeded\. Please try again later\.\)/);
   // The pause holds: the next run on the model is refused before the agent starts.
   const refusedAt = Date.now();

@@ -114,14 +114,14 @@ test("Q-005: a provider pause covers every model; its resume also clears model p
   assert.match(text, /opencode \(was until .*, provider_paused\)/);
   assert.match(text, /muse-spark-1\.3-contributor-free \(was until .*, provider_rate_limited\)/);
   const again = await recordRateLimitPause({ pauseKey: museKey, reason: "rate limit: again" });
-  assert.equal(again.strikes, 1, "the resume cleared the backoff, so the next pause starts at 30 minutes");
-  assert.equal(again.durationMs, 30 * 60_000);
+  assert.equal(again.strikes, 1, "the resume cleared the backoff, so the next pause starts at the first-strike 10 minutes (B-162)");
+  assert.equal(again.durationMs, 10 * 60_000);
   await callTool("resume_opencode_provider", { provider: "opencode" });
 });
 
 test("Q-005: an operator pause replaces an automatic one, shorter or longer", async () => {
   const automatic = await recordRateLimitPause({ pauseKey: museKey, reason: "rate limit" });
-  assert.equal(automatic.durationMs, 30 * 60_000);
+  assert.equal(automatic.durationMs, 10 * 60_000);
   await callTool("pause_opencode_provider", { provider: `opencode/${MUSE}`, minutes: 5 });
   const snapshot = await providerCapacitySnapshot();
   const pause = snapshot.cooldowns.find((item) => item.providerKey === museKey);
