@@ -157,6 +157,8 @@ Every managed agent profile pins one `provider/model` and variant in its frontma
 CODEX_OPENCODE_MODEL_ALLOWLIST=opencode/muse-spark-1.3-contributor-free@high,opencode/gpt-5.3-codex,opencode/claude-sonnet-5@high
 ```
 
+The allowlist is read from the process environment at start, like every `CODEX_OPENCODE_*` setting: a change in `~/.codex/config.toml` or `~/.claude.json` reaches a client bridge at its next session and a queue worker at its next start (log.md Q-016: a running worker keeps the list it started with; there is no runtime reload, because the environment of a running process cannot change).
+
 An entry without `@variant` accepts any requested variant. When the job names none, the override runs with no variant at all (no `--variant` argument): the profile's variant belongs to the profile's own model and is not carried over to the overriding model. An entry with `@variant` accepts only that variant, and a job that names no variant gets the entry's variant.
 
 ### External runners: codex and agy (log.md Q-012)
