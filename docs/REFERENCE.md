@@ -590,8 +590,9 @@ set and no public npm package is available yet.
 | --- | --- |
 | `--yes` | Approve the displayed file changes without a prompt. Without approval, a non-interactive write exits 2. |
 | `--dry-run` | Print full new content and unified diffs for changed files, including managed profiles. No directories, backups or files are written. Auth checks (which can refresh credentials), doctor and smoke are deferred. |
-| `--skip-claude-code` | Do not register or compare Claude Code, even when an older entry exists. Missing `claude` also disables registration. |
-| `--profile pure\|gemini` | Default `pure` copies `opencode.jsonc` and runs OpenCode with `--pure`. Gemini also copies settings and a runtime-bound reviewed manifest, pins its hash and sets the exact plugin allowlist; OpenCode must be exactly 1.18.32. |
+| `--client auto\|codex\|claude\|both` | Which MCP clients to register (log.md B-175). Default `auto`: every installed one, and at least one must be installed. An explicit choice must be installed. The canonical TOML entry is written in every case, because the doctor, the smoke and `release:activate` read it and build the Claude Code entry from it. |
+| `--skip-claude-code` | Same as `--client codex`: do not register or compare Claude Code, even when an older entry exists. |
+| `--profile pure\|gemini` | Default `pure` copies `opencode.jsonc` and runs OpenCode with `--pure`; OpenCode must be 1.18.32 or newer (tested on 1.18.32 and 1.18.34; a newer version gets a note, an older one is refused). Gemini also copies settings and a runtime-bound reviewed manifest, pins its hash and sets the exact plugin allowlist; OpenCode must be exactly 1.18.32. |
 | `--runtime-dir <dir>` | Dedicated XDG config root; default `<CODEX_HOME>/opencode-bridge-runtime`. Files live in its `opencode/` child. |
 | `--state-dir <dir>` | Bridge state; default `<CODEX_HOME>/codex-opencode-mcp`. |
 | `--codex-home <dir>` | Default `$CODEX_HOME`, else `~/.codex`; setup writes its `config.toml`. |
@@ -600,9 +601,8 @@ set and no public npm package is available yet.
 | `--self-test` | Scratch-only tests with no client installation or provider sign-in needed. |
 | `--help` | Show usage. |
 
-Required preflight: Node >=22.12, Git, OpenCode, Codex, and Python >=3.11 (`tomllib`,
-already used by the release/config/doctor helpers). Version mismatch in pure OpenCode is
-a warning, not a refusal. Client sign-in checks warn without stopping, and do not print
+Required preflight: Node >=22.12, Git, OpenCode, and Codex or Claude Code. Python is not
+needed: the release/config/doctor helpers parse TOML in-process with `smol-toml` (log.md B-176). Client sign-in checks warn without stopping, and do not print
 credential output. First-run values match ONBOARDING §5; timeouts stay built-in, giving
 `tool_timeout_sec = 3000` using the shared §6 formula (5100 applies to raised timeouts).
 The server pin is computed from this checkout's bytes.

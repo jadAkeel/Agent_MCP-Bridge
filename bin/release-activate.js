@@ -64,7 +64,8 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { LEGACY_PUBLISH_ENTRIES, buildRelease } from "./build-release.js";
-import { healthcheckProcessEnvironment, loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
+import { parse as parseToml } from "smol-toml";
+import { loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
 import { LIB_PIN_ENV, isLibDigestPath, libDigest, libDigestOf } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
@@ -299,24 +300,16 @@ function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifes
   return { text: out.join(eol), pluginManifestPinned: manifestDone };
 }
 
-const PYTHON_TOML_DOCUMENTS = [
-  "import json, sys, tomllib",
-  "texts = json.loads(sys.stdin.read())",
-  "print(json.dumps([tomllib.loads(text) for text in texts], default=str))",
-].join("\n");
-
+// B-176: in-process TOML 1.0 (smol-toml) instead of Python's tomllib. The JSON round trip keeps
+// the comparison below on plain values (dates become ISO strings, as both sides parse alike).
 function parseTomlDocuments(texts) {
-  const result = spawnSync(process.env.PYTHON || "python", ["-I", "-c", PYTHON_TOML_DOCUMENTS], {
-    input: JSON.stringify(texts),
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer: 16 * 1024 * 1024,
-    env: healthcheckProcessEnvironment(process.env, { PYTHONIOENCODING: "utf-8" }),
+  return texts.map((text) => {
+    try {
+      return JSON.parse(JSON.stringify(parseToml(text)));
+    } catch (error) {
+      throw new Error(`Could not parse the config as TOML: ${error?.message || String(error)}`);
+    }
   });
-  if (result.error || result.status !== 0) {
-    throw new Error(`Could not parse the config as TOML: ${String(result.error?.message || result.stderr || `exit ${result.status}`).trim()}`);
-  }
-  return JSON.parse(result.stdout);
 }
 
 function withoutRewrittenFields(document) {

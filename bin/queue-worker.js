@@ -139,7 +139,7 @@ function parseWorkerArguments(argv) {
 }
 
 // The registered client entry's env, read only (bin/fresh-healthcheck.js reads the Codex TOML through
-// Python's tomllib, bin/release-activate.js the Claude Code JSON). Nothing is written.
+// smol-toml, bin/release-activate.js the Claude Code JSON). Nothing is written.
 async function clientEntryEnvironment(source, { env = process.env, codexConfig = "", claudeConfig = "" } = {}) {
   if (source === "codex") {
     const { loadMcpEntry } = await import("./fresh-healthcheck.js");

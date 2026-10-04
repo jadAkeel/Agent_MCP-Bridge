@@ -25,12 +25,12 @@ instead of `&&` there.
 | --- | --- | --- |
 | Node.js | 22.12 or newer | `node --version` |
 | Git | Any current version (the scratch run used 2.39) | `git --version` |
-| Python | 3.11 or newer; config validation, doctor and smoke use `tomllib` | `python --version` |
-| OpenCode | The scratch run used 1.18.32; the Gemini profile's plugin manifest requires exactly that version | `opencode --version` |
-| Codex CLI | Any current version | `codex --version` |
-| Claude Code (optional) | Only if Claude Code will use the bridge too | `claude --version` |
+| OpenCode | 1.18.32 or newer for the default pure profile (tested on 1.18.32 and 1.18.34); exactly 1.18.32 for the Gemini profile, whose plugin manifest pins it | `opencode --version` |
+| Codex CLI **or** Claude Code | One MCP client is enough; setup registers whichever is installed (`--client` chooses) | `codex --version` / `claude --version` |
 
-Check that each client is signed in before you connect it to the bridge:
+Python is not needed (log.md B-176).
+
+Check that the client you use, and OpenCode, are signed in before you connect them to the bridge:
 
 ```powershell
 codex login status
@@ -38,7 +38,7 @@ opencode auth list
 claude auth status
 ```
 
-**Checked:** all five version commands and the three sign-in checks.
+**Checked:** the version commands and the sign-in checks of the installed tools.
 
 `opencode auth list` shows the providers OpenCode has credentials for. Most managed agent
 profiles use `opencode/muse-spark-1.3-contributor-free` (in the scratch run it answered with no
@@ -80,17 +80,18 @@ knowingly for one run.
 
 From the installed clone, run `npm run setup` (or `npm run setup -- --yes` to approve
 non-interactively). It checks step 1, previews every change, creates the runtime, writes the
-Codex entry and real server pin, registers Claude Code when installed, syncs agents/skills,
-and runs the doctor and **health-only** smoke. Restart Codex and Claude Code, then run
+bridge's canonical entry (in `<CODEX_HOME>/config.toml`, even without Codex) and real server pin,
+registers each installed client, syncs agents/skills,
+and runs the doctor and **health-only** smoke. Restart the registered client, then run
 `npm run smoke:live` once to prove provider readiness. Setup cannot sign in or restart clients
 for you. It does not run the full `npm test` suite from step 2.
 
 Defaults: `$CODEX_HOME` (or `~/.codex`), runtime `<CODEX_HOME>/opencode-bridge-runtime`,
 state `<CODEX_HOME>/codex-opencode-mcp`. Use `--codex-home`, `--runtime-dir`, `--state-dir`
-and `--claude-config` to isolate another setup, `--skip-claude-code` for Codex only,
+and `--claude-config` to isolate another setup, `--client codex|claude|both` to choose the clients instead of detecting them (`--skip-claude-code` means `--client codex`),
 `--provider-limit N` (default 2), and `--dry-run` to preview without writing anything.
-The default profile is `pure`; `--profile gemini` requires the reviewed plugin cache and
-OpenCode 1.18.32 (see [Reference](REFERENCE.md#managed-gemini-oauth-profile)).
+The default profile is `pure` (OpenCode 1.18.32 or newer); `--profile gemini` requires the reviewed plugin cache and
+exactly OpenCode 1.18.32 (see [Reference](REFERENCE.md#managed-gemini-oauth-profile)).
 Existing Codex configs are backed up as `config.toml.setup-backup-<time>`; only the
 `opencode` tables are replaced. Other TOML bytes stay identical. A second completed run
 is a no-op. The manual steps below explain what setup writes.

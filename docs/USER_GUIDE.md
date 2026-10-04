@@ -55,7 +55,7 @@ In one sentence: **Codex decides, the bridge enforces, and OpenCode agents execu
 | **Codex** | The AI you talk to. It is the orchestrator and the only one allowed to integrate changes. | The Codex app/CLI |
 | **Codex orchestrator profile** | The Codex agent you select for work, `principal-engineer-orchestrator`. | `codex/agents/*.toml`, installed into `~/.codex` |
 | **MCP bridge** | A Node.js MCP server (`server.js`) that exposes 28 tools to its MCP clients, Codex and Claude Code. | This checkout, pinned by hash, or an immutable release folder (see [section 12](#12-updating-and-rolling-back)) |
-| **OpenCode** | The agent runtime that actually runs the helper agents. Version `1.18.32`: the plugin manifest (`openCodeVersion` in `opencode/plugin-integrity-manifest.json`) requires exactly that version for the Gemini profile. | Installed on `PATH` |
+| **OpenCode** | The agent runtime that actually runs the helper agents. The default pure profile needs `1.18.32` or newer (tested on 1.18.32 and 1.18.34); the plugin manifest (`openCodeVersion` in `opencode/plugin-integrity-manifest.json`) requires exactly `1.18.32` for the Gemini profile. | Installed on `PATH` |
 | **OpenCode agents** | Role profiles such as `builder`, `reviewer` and `debugger`. Each has fixed permissions and a pinned model. | `opencode/agents/*.md`, copied to the runtime folder automatically when a release starts |
 | **Skills** | Reusable instruction packs the agents load, such as `code-review-checklist` and `debugging-investigation`. | `opencode/skills/` |
 | **State store** | SQLite databases (one per project) holding jobs, locks, queues and audit records, plus retained worktrees. | `~/.codex/codex-opencode-mcp` |

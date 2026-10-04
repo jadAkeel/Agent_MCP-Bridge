@@ -1,22 +1,20 @@
 #!/usr/bin/env node
 
 import { strict as assert } from "node:assert";
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { parse as parseToml } from "smol-toml";
 import { libDigest, libPinError } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { recordCliFailure } from "./ops-log.js";
 
-const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 requireSelfTestRun(import.meta.url);
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -35,13 +33,6 @@ const HEALTHCHECK_INHERITED_ENV_KEYS = new Set([
   "TZ",
   "WINDIR",
 ]);
-const PYTHON_TOML_READER = [
-  "import json, sys, tomllib",
-  "with open(sys.argv[1], 'rb') as handle:",
-  "    config = tomllib.load(handle)",
-  "server = config['mcp_servers'][sys.argv[2]]",
-  "print(json.dumps({'command': server['command'], 'args': server.get('args', []), 'env': server.get('env', {})}))",
-].join("\n");
 
 function normalizedPath(value) {
   const resolved = path.resolve(value || "");
@@ -79,21 +70,25 @@ function validateMcpEntry(parsed, serverName) {
   };
 }
 
-async function loadMcpEntry(configPath, serverName = "opencode", python = process.env.PYTHON || "python") {
+// B-176: parsed in-process (smol-toml, TOML 1.0 like Python's tomllib), so neither setup, the
+// doctor, the smoke nor release:activate needs Python on the machine any more.
+async function loadMcpEntry(configPath, serverName = "opencode") {
   const resolvedConfig = path.resolve(configPath || "");
   if (!path.isAbsolute(String(configPath || ""))) {
     throw new Error("Codex config path must be absolute.");
   }
-  const { stdout } = await execFileAsync(
-    python,
-    ["-I", "-c", PYTHON_TOML_READER, resolvedConfig, serverName],
-    {
-      windowsHide: true,
-      maxBuffer: 1024 * 1024,
-      env: healthcheckProcessEnvironment(process.env, { PYTHONIOENCODING: "utf-8" }),
-    }
-  );
-  return validateMcpEntry(JSON.parse(stdout), serverName);
+  let config;
+  try {
+    // JSON round trip: plain objects (smol-toml tables have a null prototype) and dates as strings.
+    config = JSON.parse(JSON.stringify(parseToml(await readFile(resolvedConfig, "utf8"))));
+  } catch (error) {
+    throw new Error(`Could not read ${resolvedConfig} as TOML: ${error?.message || String(error)}`);
+  }
+  const server = config?.mcp_servers?.[serverName];
+  if (!server || typeof server !== "object" || Array.isArray(server)) {
+    throw new Error(`${resolvedConfig} has no [mcp_servers.${serverName}] table.`);
+  }
+  return validateMcpEntry({ command: server.command, args: server.args ?? [], env: server.env ?? {} }, serverName);
 }
 
 async function sha256File(filePath) {

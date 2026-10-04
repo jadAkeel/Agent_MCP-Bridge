@@ -17,10 +17,10 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 - Node.js 22.12 or newer
 - Git
-- Python 3.11 or newer (`tomllib` is used by the config validator, doctor and health smoke)
-- OpenCode 1.18.32 on `PATH`: the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`). The Gemini profile refuses any other version; the default pure profile does not check it, but 1.18.32 is the tested version.
-- Codex CLI, with an MCP entry in `~/.codex/config.toml`; see [codex/config.example.toml](codex/config.example.toml)
-- Claude Code (optional), registered with the same entry; see [docs/ONBOARDING.md](docs/ONBOARDING.md) step 7
+- OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The default pure profile needs 1.18.32 or newer and was tested on 1.18.32 and 1.18.34; setup refuses an older version and notes a newer untested one. The optional Gemini profile needs exactly 1.18.32, the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`).
+- One MCP client: Codex CLI or Claude Code. Both work side by side, but one is enough; setup registers whichever is installed.
+
+Python is no longer needed: the bridge reads its TOML entry itself (log.md B-176).
 
 The setup is tested on Windows 11 only; macOS and Linux are not verified yet.
 
@@ -31,13 +31,14 @@ git clone https://github.com/jadAkeel/Agent_MCP-Bridge.git && cd Agent_MCP-Bridg
 ```
 
 In Windows PowerShell 5.1, run those four commands on separate lines (`&&` requires PowerShell 7 or a POSIX shell).
-Then restart Codex and Claude Code, and run `npm run smoke:live` once.
+Then restart the client setup registered (Codex, Claude Code, or both), and run `npm run smoke:live` once.
 
 Setup checks prerequisites and sign-in, previews its changes for approval, creates the isolated
-runtime, registers both clients with the real server hash, copies managed agents/skills, and runs
+runtime, registers the installed client (Codex, Claude Code, or both) with the real server hash, copies managed agents/skills, and runs
 the doctor and health smoke. Re-running a completed setup changes nothing. Use
 `npm run setup -- --yes` for non-interactive approval, `--dry-run` for a write-free preview, or
-`--skip-claude-code` for Codex only. Defaults and the optional Gemini profile are in
+`--client codex|claude|both` to choose the clients instead of detecting them (`--skip-claude-code` still means Codex only).
+The bridge's canonical MCP entry always lives in `~/.codex/config.toml`, even on a machine without Codex: the doctor, the smoke and `release:activate` read it, and the Claude Code entry is built from it. Defaults and the optional Gemini profile are in
 [docs/REFERENCE.md](docs/REFERENCE.md#one-command-setup). The manual explanation of steps 3–8
 remains in [docs/ONBOARDING.md](docs/ONBOARDING.md). Run `npm test` to verify the clone separately.
 The `agent-mcp-bridge` bin entry is ready for a future `npx` release; this package is still private and unpublished.
@@ -45,7 +46,7 @@ The `agent-mcp-bridge` bin entry is ready for a future `npx` release; this packa
 ## Quick start
 
 1. Open Codex (or Claude Code) in your project, which must be a Git repository with at least one commit.
-2. In Codex, select the `principal-engineer-orchestrator` agent. Claude Code follows the delegation rules in `~/.claude/CLAUDE.md` (a copy is in [claude/CLAUDE.md](claude/CLAUDE.md)).
+2. Nothing to copy: the bridge sends its delegation workflow to the client in the MCP handshake (log.md B-177). Optional, for more detail: the Codex agent `principal-engineer-orchestrator` (`codex/agents/`), or the owner's fuller Claude Code rules in [claude/CLAUDE.md](claude/CLAUDE.md), which you can add to `~/.claude/CLAUDE.md`.
 3. Ask: *"Run get_opencode_bridge_status for this project, then ask an OpenCode reviewer for a short opinion on the code."*
 
 ## Daily commands

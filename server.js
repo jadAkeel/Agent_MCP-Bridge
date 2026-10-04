@@ -515,10 +515,21 @@ let queueCancellationTestHook = null;
 // Self-test only: stands in for agent discovery, attestation and the OpenCode run so the job
 // and parallel paths can be exercised against a real Git checkout without a provider.
 
+// B-177: the delegation workflow, sent in the MCP handshake so any client (Codex or Claude Code)
+// knows it without a hand-copied CLAUDE.md or Codex agent profile. Generic: no model names.
+const BRIDGE_MCP_INSTRUCTIONS = [
+  "This server hands bounded tasks to OpenCode agents. You stay the planner, reviewer and the only integrator.",
+  "- Tiny or obvious change: do it yourself. Review, exploration or a plan: one read-only agent (reviewer, explore, planner, architect, tester) via run_opencode_agent with write:false, lockMode:\"off\", scopeContract {mode:\"read\", read:[...]}.",
+  "- One bounded fix: a builder or debugger via run_opencode_agent with write:true, lockedPaths, allowedEdits, validationCommand \"git diff --check\" and a write scopeContract (read, write, allowedEdits, forbidden). Writers run in their own git worktree with no installed dependencies.",
+  "- Independent scopes: validate_delegation_plan, then run_opencode_parallel (scopes must not overlap); long or many jobs: enqueue_opencode_job and poll list_opencode_jobs / get_opencode_job. Package manifests, lockfiles, schemas, migrations and shared config are serial.",
+  "- Integrate: read the report and diff, preview with integrate_opencode_worktree dryRun:true, show the patch, then apply with the same arguments plus reviewed:true and the exact previewReceipt. Run the project's real checks afterwards. Never report success from an agent's own claim.",
+  "- Locks are managed by the bridge: do not call acquire_agent_lock / release_agent_lock. Something stuck: get_opencode_bridge_status, then diagnose_opencode_bridge. Every refusal names its errorType and the next step.",
+].join("\n");
+
 const server = new McpServer({
   name: "codex-opencode-bridge",
   version: "1.0.0",
-});
+}, { instructions: BRIDGE_MCP_INSTRUCTIONS });
 
 // Long tool calls (builders can run 45 minutes) look idle to the client while OpenCode
 // works. Claude Code aborts a stdio tool call after 30 idle minutes unless progress
@@ -5883,13 +5894,22 @@ if (!BRIDGE_RUN_AS_MAIN) {
   await verifyReleaseIntegrity();
   await assertExternalRunnerConfig();
   await syncManagedRuntimeAtStartup();
-  const startupPluginPolicy = await verifyExternalPluginPolicy(process.cwd());
-  if (!startupPluginPolicy.ok) {
-    throw new Error(`OpenCode external plugin policy rejected startup: ${startupPluginPolicy.error}`);
-  }
-  // Connect first so the client's MCP startup timeout never waits on recovery; tool calls
-  // wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
-  beginBridgeStartupRecovery();
+  // B-174: with external plugins allowed, the policy check starts OpenCode twice (`--pure
+  // --version`, `debug config`): about 3 s on an idle machine, 30-60 s while a worker runs
+  // many agents. It used to run before the transport connected, so Claude Code's 30 s MCP
+  // startup timeout gave up on the bridge under load. It now runs while the client connects;
+  // every tool call waits for it (with startup recovery, see awaitBridgeStartupRecovery), and
+  // a rejected policy still ends the process, logged, right after connect.
+  const startupPluginPolicy = verifyExternalPluginPolicy(process.cwd()).then((policy) => {
+    if (!policy.ok) {
+      throw Object.assign(new Error(`OpenCode external plugin policy rejected startup: ${policy.error}`), { errorType: "external_plugin_integrity_failed" });
+    }
+    return policy;
+  });
+  startupPluginPolicy.catch(() => {});
+  // Connect first so the client's MCP startup timeout never waits on recovery or the plugin
+  // policy; tool calls wait for bridgeStartupRecovery (see awaitBridgeStartupRecovery).
+  beginBridgeStartupRecovery(() => Promise.all([startupPluginPolicy, reconcileQueueStateAtStartup()]));
   const transport = new StdioServerTransport();
   // Protocol.onerror: unparseable frames, failed sends, handler errors the SDK cannot answer.
   server.server.onerror = (error) => {
@@ -5898,6 +5918,8 @@ if (!BRIDGE_RUN_AS_MAIN) {
   await server.connect(transport);
   // After connect: the SDK sets transport.onmessage during connect (B-056).
   installMcpFailureLogging(transport);
+  // A rejected plugin policy ends the process as before (the failure handlers log it).
+  await startupPluginPolicy;
   // A failed recovery is already logged and answered per tool call; it must not end the process.
   await bridgeStartupRecovery.catch(() => {});
   void reclaimProvenGoneProviderQuarantines({ force: true });

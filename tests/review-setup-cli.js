@@ -241,6 +241,56 @@ try {
     assert.equal(existsSync(concurrent.runtimeDir), false);
   });
 
+  await check("B-175: Claude Code alone installs, registers Claude and keeps the canonical entry; no client at all is refused", async () => {
+    const claudeOnly = optionsFor("claude-only");
+    output.length = 0;
+    assert.equal(await apply(claudeOnly, { commands: { codex: null } }), 0, output.join("\n"));
+    const text = output.join("\n");
+    assert.match(text, /^clients: claude \(detected\)$/m);
+    assert.match(text, /Codex CLI not installed: the bridge keeps its canonical MCP entry/);
+    const entry = await loadMcpEntry(claudeOnly.configPath);
+    assert.deepEqual(JSON.parse(await readFile(claudeOnly.claudeConfigPath, "utf8")).mcpServers.opencode, { type: "stdio", ...entry });
+    assert.ok(output.some((line) => /Bridge daily doctor: healthy/.test(line)), "the doctor still compares the Claude entry with the canonical one");
+    assert.match(text, /Setup verified\.\n1\. Restart Claude Code\.\n2\. Run npm run smoke:live once\./);
+    assert.doesNotMatch(text, /Restart Codex/);
+    const none = optionsFor("no-client");
+    output.length = 0;
+    assert.equal(await apply(none, { commands: { codex: null, claude: null } }), 1);
+    assert.match(output.join("\n"), /clients: missing; install Codex CLI .* or Claude Code .*: the bridge needs one MCP client, not both\./);
+    assert.equal(existsSync(none.configPath), false);
+    output.length = 0;
+    assert.equal(await apply(optionsFor("want-codex", ["--client", "codex"]), { commands: { codex: null } }), 1);
+    assert.match(output.join("\n"), /clients: missing; --client codex needs codex on PATH\./);
+    assert.equal(parseArguments(["--skip-claude-code"]).client, "codex");
+    assert.throws(() => parseArguments(["--client", "other"]), /auto, codex, claude or both/);
+    assert.throws(() => parseArguments(["--client", "claude", "--skip-claude-code"]), /--skip-claude-code means --client codex/);
+  });
+
+  await check("B-175: the pure profile accepts OpenCode 1.18.32 or newer and refuses older; Gemini still needs the exact pin", async () => {
+    const options = optionsFor("versions", ["--dry-run"]);
+    const commands = { git: { command: "git", args: [] }, opencode: { command: "opencode", args: [] }, codex: { command: "codex", args: [] }, claude: null, python: { command: "python", args: [] } };
+    const probe = (opencodeVersion, profile = "pure") => {
+      const lines = [];
+      const run = (command) => ({ status: command ? 0 : 1, stdout: command?.command === "python" ? "Python 3.12.4" : opencodeVersion });
+      const ok = preflight({ ...options, profile }, { commands, run, env: process.env, log: (line) => lines.push(line) }).ok;
+      return { ok, text: lines.join("\n") };
+    };
+    assert.equal(probe("1.18.32").ok, true);
+    assert.doesNotMatch(probe("1.18.32").text, /Note: OpenCode/);
+    const newest = probe("1.18.34");
+    assert.equal(newest.ok, true);
+    assert.match(newest.text, /Note: OpenCode 1\.18\.34 is newer than the pinned 1\.18\.32 \(tested up to 1\.18\.34\); the pure profile accepts it/);
+    const beyond = probe("1.19.0");
+    assert.equal(beyond.ok, true);
+    assert.match(beyond.text, /newer than the pinned 1\.18\.32 and than the newest tested 1\.18\.34/);
+    const older = probe("1.18.31");
+    assert.equal(older.ok, false);
+    assert.match(older.text, /opencode: wrong version \(1\.18\.31\); install: OpenCode 1\.18\.32 or newer/);
+    assert.equal(probe("1.18.34", "gemini").ok, false);
+    assert.match(probe("1.18.34", "gemini").text, /install: exactly OpenCode 1\.18\.32/);
+    assert.equal(probe("1.18.32", "gemini").ok, true);
+  });
+
   await check("Windows npm shims resolve native package bins without Node or a shell", async () => {
     if (process.platform !== "win32") {
       assert.equal(findCommand("codex", process.env).command, path.join(fakeDir, "codex"));

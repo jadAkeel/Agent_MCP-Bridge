@@ -12,12 +12,16 @@ import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.
 import { recordCliFailure } from "./ops-log.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const USAGE = "node bin/setup.js [--yes] [--dry-run] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--provider-limit N] [--self-test]";
+const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--provider-limit N] [--self-test]";
 requireSelfTestRun(import.meta.url);
+// The OpenCode version the managed profiles were reviewed on (the Gemini profile's plugin
+// manifest pins exactly this one), and the newest version the pure profile was tested with.
+const OPENCODE_PINNED_VERSION = "1.18.32";
+const OPENCODE_NEWEST_TESTED_VERSION = "1.18.34";
 
 function parseArguments(argv, env = process.env) {
-  const options = { yes: false, dryRun: false, skipClaudeCode: false, profile: "pure", providerLimit: 2, selfTest: false };
-  const valued = { "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--provider-limit": "providerLimit" };
+  const options = { yes: false, dryRun: false, skipClaudeCode: false, client: "auto", profile: "pure", providerLimit: 2, selfTest: false };
+  const valued = { "--client": "client", "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--provider-limit": "providerLimit" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (valued[arg]) {
@@ -31,6 +35,11 @@ function parseArguments(argv, env = process.env) {
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!["pure", "gemini"].includes(options.profile)) throw new Error("--profile must be pure or gemini.");
+  if (!["auto", "codex", "claude", "both"].includes(options.client)) throw new Error("--client must be auto, codex, claude or both.");
+  if (options.skipClaudeCode) {
+    if (!["auto", "codex"].includes(options.client)) throw new Error("--skip-claude-code means --client codex.");
+    options.client = "codex";
+  }
   options.providerLimit = Number(options.providerLimit);
   if (!Number.isSafeInteger(options.providerLimit) || options.providerLimit < 1 || options.providerLimit > 32) throw new Error("--provider-limit must be an integer from 1 to 32.");
   options.codexHome = path.resolve(options.codexHome || env.CODEX_HOME || path.join(homedir(), ".codex"));
@@ -80,13 +89,32 @@ function versionAtLeast(version, minimum) {
   return true;
 }
 
+// One MCP client is enough: the bridge serves Codex and Claude Code from the same entry.
+// `auto` takes whichever is installed (both when both are); an explicit choice must be present.
+function selectClients(choice, found) {
+  const codex = Boolean(found.codex);
+  const claude = Boolean(found.claude);
+  if (choice === "auto") {
+    if (codex || claude) return { codex, claude };
+    return { codex: false, claude: false, error: "clients: missing; install Codex CLI (npm install -g @openai/codex) or Claude Code (https://code.claude.com/docs/en/setup): the bridge needs one MCP client, not both." };
+  }
+  const wanted = { codex: choice !== "claude", claude: choice !== "codex" };
+  const absent = Object.keys(wanted).filter((name) => wanted[name] && !found[name]);
+  if (absent.length) return { codex: false, claude: false, error: `clients: missing; --client ${choice} needs ${absent.join(" and ")} on PATH.` };
+  return wanted;
+}
+
 function preflight(options, { env, log, commands = {}, run = runCommand, nodeVersion = process.versions.node }) {
   let ok = versionAtLeast(nodeVersion, [22, 12, 0]);
   log(`node: ${ok ? "ok" : "wrong version"} (${nodeVersion}); required >=22.12.0${ok ? "" : "; install: https://nodejs.org/"}`);
   const found = {};
-  const hints = { git: "https://git-scm.com/downloads", opencode: "https://opencode.ai/docs/", codex: "npm install -g @openai/codex", claude: "https://code.claude.com/docs/en/setup", python: "Python >=3.11 (tomllib): https://python.org/downloads/" };
-  for (const name of ["git", "opencode", "codex", "claude", "python"]) {
-    found[name] = Object.hasOwn(commands, name) ? commands[name] : findCommand(name === "python" ? (env.PYTHON || "python") : name, env);
+  const openCodeHint = options.profile === "gemini"
+    ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the Gemini profile's plugin manifest pins it): https://opencode.ai/docs/`
+    : `OpenCode ${OPENCODE_PINNED_VERSION} or newer: https://opencode.ai/docs/`;
+  const hints = { git: "https://git-scm.com/downloads", opencode: openCodeHint, codex: "npm install -g @openai/codex", claude: "https://code.claude.com/docs/en/setup" };
+  // B-176: no Python: the TOML entry is read in-process (bin/fresh-healthcheck.js).
+  for (const name of ["git", "opencode", "codex", "claude"]) {
+    found[name] = Object.hasOwn(commands, name) ? commands[name] : findCommand(name, env);
     // OpenCode eagerly mkdirs <XDG_CONFIG_HOME>/opencode even for --version.
     // In a dry run use the checkout's already-existing opencode directory, so
     // probing its version cannot create the planned runtime as a side effect.
@@ -95,22 +123,37 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
     const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
     const version = /\b(\d+\.\d+\.\d+)\b/.exec(output)?.[1];
     const missing = Boolean(result.error) || result.status !== 0;
-    const wrong = !missing && ((name === "opencode" && version !== "1.18.32") || (name === "python" && (!version || !versionAtLeast(version, [3, 11, 0]))));
+    // OpenCode: the Gemini profile needs the exact pinned version (its plugin manifest binds
+    // it); the pure profile accepts the pinned version or newer and refuses older ones, which
+    // were never run with these agent profiles.
+    const openCodeNotPinned = name === "opencode" && version !== OPENCODE_PINNED_VERSION;
+    const openCodeTooOld = name === "opencode" && (!version || !versionAtLeast(version, OPENCODE_PINNED_VERSION.split(".").map(Number)));
+    const wrong = !missing && name === "opencode" && (options.profile === "gemini" ? openCodeNotPinned : openCodeTooOld);
     log(`${name}: ${missing ? "missing" : wrong ? "wrong version" : "ok"}${version ? ` (${version})` : ""}${missing || wrong ? `; install: ${hints[name]}` : ""}`);
     if (missing) found[name] = null;
-    if ((missing && name !== "claude") || (wrong && (name === "python" || options.profile === "gemini"))) ok = false;
-    if (name === "opencode" && wrong && options.profile === "pure") log("Warning: pure profile does not enforce OpenCode version; 1.18.32 is the tested version.");
+    if ((missing && !["codex", "claude"].includes(name)) || wrong) ok = false;
+    if (name === "opencode" && !missing && !wrong && openCodeNotPinned) {
+      const beyondTested = !versionAtLeast(OPENCODE_NEWEST_TESTED_VERSION, version.split(".").map(Number));
+      log(`Note: OpenCode ${version} is newer than the pinned ${OPENCODE_PINNED_VERSION}${beyondTested ? ` and than the newest tested ${OPENCODE_NEWEST_TESTED_VERSION}` : ` (tested up to ${OPENCODE_NEWEST_TESTED_VERSION})`}; the pure profile accepts it. npm run smoke:live proves it after setup.`);
+    }
+  }
+  const clients = selectClients(options.client, found);
+  if (clients.error) {
+    log(clients.error);
+    ok = false;
+  } else {
+    log(`clients: ${[clients.codex && "codex", clients.claude && "claude"].filter(Boolean).join(" + ")}${options.client === "auto" ? " (detected)" : ""}`);
   }
   // Auth commands may refresh local credentials. A dry run never runs them.
   if (ok) for (const [name, args] of [["codex", ["login", "status"]], ["opencode", ["auth", "list"]], ["claude", ["auth", "status"]]]) {
-    if (!found[name] || (name === "claude" && options.skipClaudeCode)) continue;
+    if (!found[name] || (name !== "opencode" && !clients[name])) continue;
     if (options.dryRun) { log(`Would check sign-in: ${name} ${args.join(" ")} (not run in dry-run)`); continue; }
     const result = run(found[name], args, env);
     const text = `${result.stdout || ""}${result.stderr || ""}`;
     const authMissing = result.error || result.status !== 0 || /not (?:logged|signed) in|0 credentials|no credentials|"loggedIn"\s*:\s*false/i.test(text);
     log(`${name} sign-in: ${authMissing ? "Warning: sign in before a live model smoke" : "check ok (provider readiness still needs smoke:live)"}`);
   }
-  return { ok, commands: found };
+  return { ok, commands: found, clients: { codex: Boolean(clients.codex), claude: Boolean(clients.claude) } };
 }
 
 async function optionalText(file) {
@@ -207,10 +250,15 @@ async function runSetup(options, dependencies = {}) {
   const original = await optionalText(options.configPath);
   const rewritten = rewriteCodexConfig(original || "", entryText);
   await addFile(options.configPath, rewritten.text, "codex");
-  const useClaude = !options.skipClaudeCode && Boolean(checked.commands.claude);
+  const { codex: useCodex, claude: useClaude } = checked.clients;
+  // The TOML entry is the bridge's canonical MCP entry: the doctor, the health smoke and
+  // `release:activate --sync-clients` read it and rebuild the Claude Code entry from it. It is
+  // written even when Codex is not installed; Codex uses it as soon as it is.
+  if (!useCodex) log(`Codex CLI not installed: the bridge keeps its canonical MCP entry in ${options.configPath} anyway (doctor, smoke and release:activate read it; Codex uses it once installed).`);
   const claudeOriginal = useClaude ? await optionalText(options.claudeConfigPath) : null;
   if (useClaude) await addFile(options.claudeConfigPath, rewriteClaudeConfig(claudeOriginal, rewritten.entry), "claude");
-  else log(`Claude Code registration skipped (${options.skipClaudeCode ? "--skip-claude-code" : "claude missing"}).`);
+  else log(`Claude Code registration skipped (${options.client === "codex" ? "--client codex" : "claude missing"}).`);
+  const restartSteps = [...[useCodex && "Restart Codex.", useClaude && "Restart Claude Code."].filter(Boolean), "Run npm run smoke:live once."].map((step, index) => `${index + 1}. ${step}`).join("\n");
   const syncOptions = { source, agentDir: bridgeEnv.CODEX_OPENCODE_AGENT_DIR, skillDir: bridgeEnv.CODEX_OPENCODE_SKILL_DIR, apply: false, removeStale: false };
   const sync = await runSync(syncOptions);
   for (const plan of sync.plans) for (const action of plan.actions.filter((item) => item.action !== "stale")) {
@@ -222,7 +270,7 @@ async function runSetup(options, dependencies = {}) {
   }
   else log("Setup already complete; nothing to change.");
   if (options.dryRun) { log(`Dry-run: ${files.length} file(s) would be written. No files written; doctor and health smoke run only after apply.`); return 0; }
-  if (!files.length) { log("1. Restart Codex.\n2. Restart Claude Code.\n3. Run npm run smoke:live once."); return 0; }
+  if (!files.length) { log(restartSteps); return 0; }
   if (files.length && !options.yes && !await (dependencies.confirm || confirm)()) { log("Setup write refused. Re-run with --yes to accept the displayed changes."); return 2; }
   // Recheck the complete preview before the first write, not only per config.
   for (const file of files) {
@@ -260,7 +308,7 @@ async function runSetup(options, dependencies = {}) {
   const smoke = runCommand({ command: process.execPath, args: [] }, [path.join(ROOT, "bin", "live-smoke.js"), "--health-only", "--config", options.configPath], env);
   log(`${smoke.stdout || ""}${smoke.stderr || ""}`.trim());
   if (!report.ok || smoke.error || smoke.status !== 0) throw new Error("Setup verification failed; inspect the doctor/smoke output and the setup backup before retrying.");
-  log("Setup verified.\n1. Restart Codex.\n2. Restart Claude Code.\n3. Run npm run smoke:live once.");
+  log(`Setup verified.\n${restartSteps}`);
   return 0;
 }
 
@@ -280,9 +328,9 @@ async function selfTest() {
     const rewritten = rewriteCodexConfig(prefix + entry.replace(/\n/g, "\r\n") + suffix, entry);
     assert.equal(rewritten.text, prefix + entry.replace(/\n/g, "\r\n") + suffix);
     const messages = [];
-    const commands = Object.fromEntries(["git", "opencode", "codex", "python"].map((name) => [name, { command: name, args: [] }]));
+    const commands = Object.fromEntries(["git", "opencode", "codex"].map((name) => [name, { command: name, args: [] }]));
     commands.claude = null;
-    const run = (command) => command ? { status: 0, stdout: command.command === "python" ? "3.12.4" : "1.18.32", stderr: "" } : { status: 1 };
+    const run = (command) => command ? { status: 0, stdout: "1.18.32", stderr: "" } : { status: 1 };
     const dry = await runSetup(options, { commands, run, log: (line) => messages.push(line) });
     assert.equal(dry, 0);
     assert.equal(existsSync(options.codexHome), false, "dry-run creates no directories");
