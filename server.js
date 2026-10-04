@@ -752,7 +752,11 @@ async function attestationFingerprint() {
   } catch {
     agentFiles = [];
   }
-  const tracked = [...configFiles, ...agentFiles, CONFIG.externalPluginManifestPath].filter(Boolean);
+  // B-171: the OpenCode executable itself is an input of every attestation (an upgrade changes
+  // the effective configuration without touching any config file); only an absolute path can be
+  // stat'ed, a bare command name resolves through PATH at spawn time.
+  const executable = path.isAbsolute(String(OPENCODE_EXE || "")) ? [OPENCODE_EXE] : [];
+  const tracked = [...configFiles, ...agentFiles, ...executable, CONFIG.externalPluginManifestPath].filter(Boolean);
   const parts = await Promise.all(tracked.map(statFingerprint));
   const skills = await managedSkillSourceEvidence();
   parts.push(`skills\0${skills.ok ? skills.sha256 : "unavailable"}\0${skills.fileCount}`);
@@ -760,21 +764,49 @@ async function attestationFingerprint() {
   return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
 
-async function cachedAttestation(key, operation, cacheable) {
+// A cached value carries the time of the fresh read it came from (`attestedAtMs`) and its key
+// (`attestationKey`), so a later caller can ask for the same attestation with a shorter age limit
+// (`maxAgeMs`, B-171) and gets a fresh read when the entry is older than that.
+function stampAttestation(value, key, at, cacheHit) {
+  const clone = structuredClone(value);
+  if (clone && typeof clone === "object" && !Array.isArray(clone)) {
+    clone.attestedAtMs = at;
+    clone.attestationKey = key;
+    clone.attestationCacheHit = cacheHit;
+  }
+  return clone;
+}
+
+async function cachedAttestation(key, operation, cacheable, { maxAgeMs = null } = {}) {
   const ttl = attestationCacheTtlMs();
   if (ttl <= 0) return operation();
+  const ageLimit = Number.isFinite(maxAgeMs) && maxAgeMs !== null ? Math.min(ttl, Math.max(0, maxAgeMs)) : ttl;
   const fingerprint = await attestationFingerprint();
   const hit = attestationCache.get(key);
-  if (hit && hit.fingerprint === fingerprint && Date.now() - hit.at < ttl) {
-    return structuredClone(hit.value);
+  if (hit && hit.fingerprint === fingerprint && Date.now() - hit.at < ageLimit) {
+    return stampAttestation(hit.value, key, hit.at, true);
   }
   const value = await runSingleFlight(attestationFlights, `${key}\0${fingerprint}`, operation);
+  const at = Date.now();
   if (cacheable(value)) {
-    attestationCache.set(key, { fingerprint, value: structuredClone(value), at: Date.now() });
+    attestationCache.set(key, { fingerprint, value: structuredClone(value), at });
   } else {
     attestationCache.delete(key);
   }
-  return structuredClone(value);
+  return stampAttestation(value, key, at, false);
+}
+
+// B-171: the last attestation before a spawn. It used to be an uncached read for every job (two
+// to three OpenCode cold starts, 30 to 60 s on a loaded host). The inputs it can see are all in the
+// cache fingerprint (config dir, agent and skill files, plugin manifest, the OpenCode executable;
+// project configuration is disabled for OpenCode here), so a result read within
+// CODEX_OPENCODE_ATTESTATION_FINAL_MAX_AGE_MS is reused; older entries and a 0 setting read again.
+async function reattestAgentMetadata(agent, cwd, previous, { maxAgeMs = CONFIG.attestationFinalMaxAgeMs } = {}) {
+  const key = String(previous?.attestationKey || "");
+  if (!(maxAgeMs > 0) || !key || attestationCacheTtlMs() <= 0) {
+    return readAgentDebugMetadataUncached(agent, cwd, {});
+  }
+  return cachedAttestation(key, () => readAgentDebugMetadataUncached(agent, cwd, {}), (value) => Boolean(value?.ok), { maxAgeMs });
 }
 
 function attestationCwdKey(cwd) {
@@ -2499,7 +2531,7 @@ async function loadProjectAgentPolicy(
 
 const { callerPathSpellings, pathSpeller, buildCompactPrompt, dependencyRequestPayloadSchema, DEPENDENCY_ABSENT, parseDependencyRequest, openCodePromptArgument, openCodeRunArgs, OPENCODE_WINDOWS_COMMAND_LINE_LIMIT, OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT, openCodeCommandLineLengthError, commandShape, timeoutForAgent, unboundedTimeoutForAgent, isTimeoutResult, applyRateLimitOutcome, rateLimitPauseReason, classifyResultError, createPhaseClock, PHASE_LABELS, formatPhaseTimings } = createOpenCodeCommandRuntime({ CONFIG, DEFAULT_RETURN_FORMAT, OPENCODE_EXE, defaultBuilderTimeoutMs, defaultContractorOrchestratorTimeoutMs, defaultOrchestratorTimeoutMs, defaultReadOnlyAgentTimeoutMs, defaultWriteAgentTimeoutMs, isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), nowMs });
 
-const { runOpenCode, readOnlyResultRetryable, runOpenCodeWithPolicy, readOnlyRetryBudgetExhaustedResult, logOpenCodeResult } = createOpenCodeRunRuntime({ CONFIG, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, OPENCODE_EXE, acquireProviderLease, agentIdleTimeoutForModel, allowlistedModelOverride, applyModelOverrideToMetadata, applyRateLimitOutcome, buildOpenCodeEnv, classifyResultError, clearAgentActivity, combineAbortSignals: (...args) => combineAbortSignals(...args), commandShape, containmentRecord, createIsolatedOpenCodeRuntime, defaultWriteAgentTimeoutMs, delayWithSignal, detectsOpenCodeFallback, effectiveReadOnlyMetadataError, emptyOpenCodeUsage, inspectOpenCodeEventStream, isManagedReadOnlyAgent: (...args) => isManagedReadOnlyAgent(...args), isTimeoutResult, logEvent, maxReadOnlyAgentRetries, mergeHeavyToolCalls, modelPauseKeyForMetadata, noteAgentActivity, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, parseDependencyRequest, providerKeyForMetadata, providerSlotWaitStorage, providerSlotWaitingJobs, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, readAgentDebugMetadata, readAgentDebugMetadataUncached, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, runSpawnCommand, startProviderLeaseHeartbeat, summarizeStderr, timeoutForAgent, verifyExternalPluginPolicy, wipeIsolatedOpenCodeRuntime, externalRunnerSelection: (...args) => externalRunnerSelection(...args), runExternalCli: (...args) => runExternalCli(...args) });
+const { runOpenCode, readOnlyResultRetryable, runOpenCodeWithPolicy, readOnlyRetryBudgetExhaustedResult, logOpenCodeResult } = createOpenCodeRunRuntime({ CONFIG, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, OPENCODE_EXE, acquireProviderLease, agentIdleTimeoutForModel, allowlistedModelOverride, applyModelOverrideToMetadata, applyRateLimitOutcome, buildOpenCodeEnv, classifyResultError, clearAgentActivity, combineAbortSignals: (...args) => combineAbortSignals(...args), commandShape, containmentRecord, createIsolatedOpenCodeRuntime, defaultWriteAgentTimeoutMs, delayWithSignal, detectsOpenCodeFallback, effectiveReadOnlyMetadataError, emptyOpenCodeUsage, inspectOpenCodeEventStream, isManagedReadOnlyAgent: (...args) => isManagedReadOnlyAgent(...args), isTimeoutResult, logEvent, maxReadOnlyAgentRetries, mergeHeavyToolCalls, modelPauseKeyForMetadata, noteAgentActivity, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, parseDependencyRequest, providerKeyForMetadata, providerSlotWaitStorage, providerSlotWaitingJobs, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, readAgentDebugMetadata, readAgentDebugMetadataUncached, reattestAgentMetadata, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, runSpawnCommand, startProviderLeaseHeartbeat, summarizeStderr, timeoutForAgent, verifyExternalPluginPolicy, wipeIsolatedOpenCodeRuntime, externalRunnerSelection: (...args) => externalRunnerSelection(...args), runExternalCli: (...args) => runExternalCli(...args) });
 // Q-012: codex and agy as external runners; inert unless CODEX_OPENCODE_EXTERNAL_RUNNERS lists one.
 const { externalRunnerName, externalRunnerSelection, externalRunnerStartupProblems, buildRunnerEnv, resolveRunnerExecutable, verifyRunnerExecutable, runExternalCli, externalRunnerStatusLines, captureTargetState, targetStateChanges } = createExternalRunnersRuntime({ acquireProviderLease, activeModelOverrideAllowlist, agentIdleTimeoutForModel, allowlistedModelOverride, classifyResultError, clearAgentActivity, closeDb, combineAbortSignals: (...args) => combineAbortSignals(...args), CONFIG, containmentRecord, DEFAULT_OPENCODE_CONFIG_DIR, effectiveBridgeStateDirectory, isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), isTimeoutResult, logEvent, modelPauseKeyForMetadata, noteAgentActivity, nowMs, OPENCODE_BASE_ENV_KEYS, openCodeCommandLineLengthError, openCodePromptArgument, openLockDb, parseDependencyRequest, parseModelAllowlistEntry, providerKeyForMetadata, providerSlotWaitingJobs, providerSlotWaitStorage, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, resolveWindowsNodeShim, runCommand, runGitReadOnlyCommand, runSpawnCommand, SENSITIVE_ENV_PATTERN, sha256File, startProviderLeaseHeartbeat, summarizeStderr, USER_HOME_DIR });
 
@@ -5291,6 +5323,7 @@ export const __selfTest = {
     buildTrustedGitEnv,
     buildValidationEnv,
     cachedAttestation,
+    reattestAgentMetadata,
     cancelPersistedQueueJob,
     captureGitIndexIdentity,
     captureIntegrationTargetState,

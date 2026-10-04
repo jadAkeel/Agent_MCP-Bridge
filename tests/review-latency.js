@@ -5,9 +5,10 @@
 import { strict as assert } from "node:assert";
 import { createOpenCodeRunRuntime } from "../lib/opencode-run.js";
 
-function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, leaseOk = true, agentOk = true } = {}, overrides = {}) {
+function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, leaseOk = true, agentOk = true, finalMaxAgeMs = 0, reattestHit = true } = {}, overrides = {}) {
   const calls = [];
   const metadata = { name: "builder", mode: "write", provider: "opencode", model: "muse-spark-1.3-contributor-free", variant: "" };
+  const okPluginPolicy = { ok: true, mode: "allowlisted", plugins: [] };
   const lease = { id: "lease-1", expiresAt: Date.now() + 60_000 };
   const heartbeat = Object.assign(async () => { calls.push("heartbeat.stop"); }, { signal: null, pulse: async () => ({ ok: true }) });
   const inspection = {
@@ -18,7 +19,12 @@ function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, le
     runtimeObservedProvider: "", runtimeObservedModel: "", runtimeModelConflict: false, modelEvidenceAmbiguous: false,
   };
   const deps = {
-    CONFIG: { providerWaitMaxMs: 1000, attestationRevalidateAfterMs: revalidateAfterMs, rateLimitHits: 0, requireRuntimeModelEvidence: false },
+    CONFIG: { providerWaitMaxMs: 1000, attestationRevalidateAfterMs: revalidateAfterMs, attestationFinalMaxAgeMs: finalMaxAgeMs, rateLimitHits: 0, requireRuntimeModelEvidence: false },
+    // B-171: the server's age-limited cache read; the harness answers with a hit or a fresh read.
+    reattestAgentMetadata: async () => {
+      calls.push("attest.reuse");
+      return { ok: true, metadata, pluginPolicy: okPluginPolicy, attestationKey: "agent-metadata\0builder\0test", attestedAtMs: Date.now(), attestationCacheHit: reattestHit };
+    },
     MCP_CONTRACTOR_ORCHESTRATOR_AGENT: "opencode-orchestrator-mcp-contractor",
     OPENCODE_EXE: "opencode",
     acquireProviderLease: async ({ providerKey }) => {
@@ -88,7 +94,7 @@ function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, le
 // Like executeOpenCodeJob, the caller passes the cached discovery read, whose plugin policy the
 // run reuses for its early checks; only the attestation reads below the slot logic spawn OpenCode.
 const run = (h, options = {}) => h.runtime.runOpenCode("builder", "write the batch", process.cwd(), false, 60_000, {
-  agentMetadata: { ok: true, metadata: h.metadata, pluginPolicy: { ok: true, mode: "allowlisted", plugins: [] } },
+  agentMetadata: { ok: true, metadata: h.metadata, pluginPolicy: { ok: true, mode: "allowlisted", plugins: [] }, attestationKey: "agent-metadata\0builder\0test", attestedAtMs: Date.now() },
   ...options,
 });
 
@@ -168,6 +174,41 @@ test("B-161: a provider key that changes during the long wait is refused as prov
   assert.equal(result.errorType, "provider_lease_key_mismatch");
   assert.equal(result.providerConcurrencyKey, "opencode");
   assert.deepEqual(h.calls.slice(-2), ["heartbeat.stop", "lease.release"]);
+});
+
+test("B-171: a recent attestation is reused before the slot; no OpenCode read runs", async () => {
+  const h = harness({ finalMaxAgeMs: 600_000 });
+  const result = await run(h);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(h.calls, ["attest.reuse", "lease.acquire:opencode", "heartbeat.start", "spawn", "heartbeat.stop", "lease.release"]);
+  assert.equal(result.runPhaseTimings.finalAttestationCached, true);
+});
+
+test("B-171: an entry older than the age limit is read again through the cache path", async () => {
+  const h = harness({ finalMaxAgeMs: 600_000, reattestHit: false });
+  const result = await run(h);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(h.calls[0], "attest.reuse");
+  assert.equal(h.calls.includes("attest.plugins"), false, "the cache path verifies the plugin policy inside its fresh read");
+  assert.equal(result.runPhaseTimings.finalAttestationCached, false);
+});
+
+test("B-171: the setting at 0 keeps the uncached read; a run without an attestation key reads uncached too", async () => {
+  const h = harness({ finalMaxAgeMs: 600_000 });
+  await h.runtime.runOpenCode("builder", "write the batch", process.cwd(), false, 60_000, {
+    agentMetadata: { ok: true, metadata: h.metadata, pluginPolicy: { ok: true, mode: "allowlisted", plugins: [] } },
+  });
+  assert.deepEqual(h.calls.slice(0, 2), ["attest.plugins", "attest.agent"], "no key: the old path");
+  const h0 = harness({ finalMaxAgeMs: 0 });
+  await run(h0);
+  assert.deepEqual(h0.calls.slice(0, 2), ["attest.plugins", "attest.agent"]);
+});
+
+test("B-171: a pure (isolated) runtime never reuses an attestation", async () => {
+  const h = harness({ finalMaxAgeMs: 600_000 });
+  await run(h, { forcePure: true });
+  assert.deepEqual(h.calls.slice(0, 2), ["isolated.create", "attest.agent"]);
+  assert.equal(h.calls.includes("attest.reuse"), false);
 });
 
 test("B-161: with a pure runtime the isolated root is created before the slot and wiped when no slot comes", async () => {

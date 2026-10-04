@@ -159,6 +159,32 @@ test("B-163: CODEX_OPENCODE_ATTESTATION_TIMEOUT_MS overrides the default", () =>
   assert.equal(output.trim(), "45000");
 });
 
+test("B-171: cachedAttestation honours an age limit and stamps the key, the read time and the hit flag", async () => {
+  const { cachedAttestation, reattestAgentMetadata, clearAttestationCache } = __selfTest.internals;
+  // --self-test turns the cache off (TTL 0); this case needs it on.
+  __selfTest.hooks.attestationCacheTtlOverride = 60_000;
+  clearAttestationCache();
+  let reads = 0;
+  const op = async () => ({ ok: true, metadata: { name: "builder" }, call: ++reads });
+  const okOnly = (value) => Boolean(value?.ok);
+  const first = await cachedAttestation("b171\0key", op, okOnly);
+  assert.equal(reads, 1);
+  assert.equal(first.attestationKey, "b171\0key");
+  assert.equal(first.attestationCacheHit, false);
+  assert.equal(typeof first.attestedAtMs, "number");
+  const recent = await cachedAttestation("b171\0key", op, okOnly, { maxAgeMs: 60_000 });
+  assert.equal(reads, 1, "a fresh entry within the age limit is a hit");
+  assert.equal(recent.attestationCacheHit, true);
+  assert.equal(recent.attestedAtMs, first.attestedAtMs, "the hit reports the time of the read it came from");
+  const stale = await cachedAttestation("b171\0key", op, okOnly, { maxAgeMs: 0 });
+  assert.equal(reads, 2, "an age limit of 0 reads again although the TTL has not passed");
+  assert.equal(stale.attestationCacheHit, false);
+  assert.equal(CONFIG.attestationFinalMaxAgeMs, 10 * 60_000, "default 10 min");
+  assert.equal(typeof reattestAgentMetadata, "function");
+  clearAttestationCache();
+  __selfTest.hooks.attestationCacheTtlOverride = null;
+});
+
 let failed = 0;
 try {
   for (const { name, fn } of tests) {
