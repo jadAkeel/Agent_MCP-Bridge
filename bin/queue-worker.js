@@ -12,6 +12,7 @@
 //   node bin/queue-worker.js --repo <abs> --stop [--now]
 //   node bin/queue-worker.js --repo <abs> --status [--json]
 //   node bin/queue-worker.js --repo <abs> --add more-jobs.jsonl   (Q-015: into the running worker)
+//   node bin/queue-worker.js --repo <abs> --cancel-pending [--key-prefix p] [--status list] [--apply]   (B-167)
 //
 // Exit codes: 0 clean stop (drained, stopped, or --until-empty found the queue empty), 1 refused
 // to start (bad arguments or file, another worker, a failed startup check, a Ctrl+C during the start:
@@ -33,6 +34,11 @@ const TICK_MS = 15_000;
 const SUMMARY_MS = 10 * 60_000;
 const OWN_SERVER_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "server.js");
 const SIGNAL_NAMES = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGINT", "SIGTERM"];
+// B-167: --cancel-pending cancels jobs that have not started; a started one is never touched.
+const BULK_CANCEL_DEFAULT_STATUSES = Object.freeze(["held", "pending", "planned", "blocked"]);
+const STARTED_STATUSES = new Set(["running", "validating", "reviewing", "testing"]);
+const BULK_CANCEL_REASON = "operator bulk cancel (queue-worker --cancel-pending)";
+const BULK_CANCEL_LISTED = 20;
 // B-120: what the worker reports before its first snapshot, or when every snapshot failed.
 const emptySnapshot = () => ({
   counts: { pending: 0, running: 0, blocked: 0, completed: 0, failed: 0, cancelled: 0, interrupted: 0, notResumable: 0, waitingForPause: 0, gaveUp: 0, autoIntegrated: 0, open: 0 },
@@ -47,6 +53,7 @@ const USAGE = [
   "  node bin/queue-worker.js --repo <absolute repository> --status [--json]",
   "  node bin/queue-worker.js --repo <absolute repository> --release",
   "  node bin/queue-worker.js --repo <absolute repository> --add <jobs.jsonl> [--env-from claude|codex]",
+  "  node bin/queue-worker.js --repo <absolute repository> --cancel-pending [--key-prefix <prefix>] [--status <list>] [--apply] [--json]",
   "Options:",
   "  --enqueue <file>      One enqueue_opencode_job input per line, each with an idempotencyKey; every line is checked before anything starts.",
   "  --add <file>          Add the jobs of a file (same format as --enqueue) to the worker already running for the repository; it picks them up at its next check. Refused when no worker runs there.",
@@ -57,6 +64,7 @@ const USAGE = [
   "  --stop [--now]        Ask the running worker to stop starting jobs and exit when its running jobs end; --now cancels them too. Jobs left behind stay parked for the next worker.",
   "  --status [--json]     Print the worker's presence, a parked queue, the queue counts and the paused providers; reads only.",
   "  --release             Remove the parked mark a stopped worker left, so client bridges may adopt the repository's pending jobs again.",
+  "  --cancel-pending      List the repository's jobs that have not started (--status, default held,pending,planned,blocked; --key-prefix: idempotencyKey prefix); with --apply cancel them. Never a running job.",
   "Exit codes: 0 clean stop (--add: the jobs were added), 1 refused to start (--add: refused, nothing added), 2 stopped by an error (also a third Ctrl+C).",
   "",
 ].join("\n");
@@ -64,7 +72,7 @@ const USAGE = [
 class WorkerRefusal extends Error {}
 
 function parseWorkerArguments(argv) {
-  const options = { repo: "", enqueue: "", add: "", untilEmpty: false, envFrom: "", codexConfig: "", claudeConfig: "", stop: false, now: false, status: false, json: false, release: false, help: false };
+  const options = { repo: "", enqueue: "", add: "", untilEmpty: false, envFrom: "", codexConfig: "", claudeConfig: "", stop: false, now: false, status: false, json: false, release: false, help: false, cancelPending: false, keyPrefix: "", statusList: null, apply: false };
   const valueOf = (index, name) => {
     const value = argv[index + 1];
     if (value === undefined || String(value).startsWith("--")) throw new WorkerRefusal(`${name} needs a value.`);
@@ -90,7 +98,16 @@ function parseWorkerArguments(argv) {
     else if (argument === "--until-empty") options.untilEmpty = true;
     else if (argument === "--stop") options.stop = true;
     else if (argument === "--now") options.now = true;
-    else if (argument === "--status") options.status = true;
+    // B-167: with --cancel-pending, --status takes a comma list (the statuses to cancel).
+    else if (argument === "--status") {
+      const next = argv[index + 1];
+      if (argv.includes("--cancel-pending") && next !== undefined && !String(next).startsWith("--")) {
+        options.statusList = String(next).split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+        index += 1;
+      } else options.status = true;
+    } else if (argument === "--cancel-pending") options.cancelPending = true;
+    else if (argument === "--key-prefix") { options.keyPrefix = valueOf(index, "--key-prefix"); index += 1; }
+    else if (argument === "--apply") options.apply = true;
     else if (argument === "--json") options.json = true;
     else if (argument === "--release") options.release = true;
     else throw new WorkerRefusal(`Unknown argument: ${argument}`);
@@ -98,7 +115,21 @@ function parseWorkerArguments(argv) {
   if (options.help) return options;
   if (!options.repo) throw new WorkerRefusal("--repo <absolute repository> is required.");
   if (options.now && !options.stop) throw new WorkerRefusal("--now goes with --stop.");
-  if (options.json && !options.status) throw new WorkerRefusal("--json goes with --status.");
+  if (options.cancelPending) {
+    if (options.enqueue || options.add || options.untilEmpty || options.stop || options.release) {
+      throw new WorkerRefusal("--cancel-pending starts no worker and adds nothing; drop --enqueue, --add, --until-empty, --stop and --release.");
+    }
+    if (options.status) throw new WorkerRefusal("With --cancel-pending, --status needs a comma list of statuses (held, pending, planned, blocked).");
+    const list = options.statusList || [...BULK_CANCEL_DEFAULT_STATUSES];
+    const started = list.filter((status) => STARTED_STATUSES.has(status));
+    if (started.length) throw new WorkerRefusal(`--cancel-pending never cancels a started job; drop ${started.join(", ")} from --status (cancel_opencode_job or --stop --now stop running jobs).`);
+    const unknown = list.filter((status) => !BULK_CANCEL_DEFAULT_STATUSES.includes(status));
+    if (unknown.length || !list.length) throw new WorkerRefusal(`--status for --cancel-pending takes held, pending, planned and blocked; got ${JSON.stringify(list.join(","))}.`);
+    options.statusList = [...new Set(list)];
+  } else if (options.keyPrefix || options.apply || options.statusList) {
+    throw new WorkerRefusal("--key-prefix, --apply and a --status list go with --cancel-pending.");
+  }
+  if (options.json && !options.status && !options.cancelPending) throw new WorkerRefusal("--json goes with --status or --cancel-pending.");
   if (options.add && (options.enqueue || options.untilEmpty || options.stop || options.status || options.release)) {
     throw new WorkerRefusal("--add adds jobs to the worker already running and starts none; drop --enqueue, --until-empty, --stop, --status and --release.");
   }
@@ -239,6 +270,52 @@ function releaseParked(api, repo, out, err) {
   return EXIT_CLEAN;
 }
 
+// B-167: --cancel-pending. Without --apply it lists what it would cancel and changes nothing; with
+// --apply it cancels those jobs through the unstarted-job cancel (one that started meanwhile is left
+// alone and reported). Works with or without a running worker: a pending row the worker holds is
+// cancelled in the database, and the worker drops it at its next plan.
+async function cancelPendingJobs(api, repo, options, out) {
+  const statuses = options.statusList || [...BULK_CANCEL_DEFAULT_STATUSES];
+  const matches = await api.listUnstartedJobs(repo, { statuses, keyPrefix: options.keyPrefix });
+  const filter = `status ${statuses.join(",")}${options.keyPrefix ? `, idempotencyKey prefix ${JSON.stringify(options.keyPrefix)}` : ""}`;
+  const listed = matches.slice(0, BULK_CANCEL_LISTED).map((item) => ({ jobId: item.jobId, idempotencyKey: item.idempotencyKey, status: item.status }));
+  if (!options.apply) {
+    if (options.json) {
+      out.write(`${JSON.stringify({ repo, apply: false, statuses, keyPrefix: options.keyPrefix, matched: matches.length, listed }, null, 2)}
+`);
+      return EXIT_CLEAN;
+    }
+    out.write(`Dry run: ${matches.length} job(s) of ${repo} match (${filter}); nothing was changed. Add --apply to cancel them.
+`);
+    for (const item of listed) out.write(`  ${item.jobId}  ${item.status}  ${item.idempotencyKey || "(no key)"}
+`);
+    if (matches.length > listed.length) out.write(`  ... and ${matches.length - listed.length} more
+`);
+    return EXIT_CLEAN;
+  }
+  const ids = matches.map((item) => item.jobId);
+  const cancelled = ids.length ? await api.cancelUnstartedJobs(ids, BULK_CANCEL_REASON, { repo, unstartedOnly: true }) : [];
+  const notCancelled = ids.filter((id) => !cancelled.includes(id));
+  const summary = `Cancelled ${cancelled.length} of ${matches.length} matching job(s) of ${repo} (${filter})${notCancelled.length ? `; ${notCancelled.length} started or ended meanwhile and were left alone` : ""}.`;
+  api.logEvent("info", "queue_worker.bulk_cancelled", {
+    projectKey: api.files(repo).projectKey,
+    repoName: path.basename(repo),
+    matched: matches.length,
+    cancelled: cancelled.length,
+    statuses,
+    keyPrefix: options.keyPrefix,
+    summary: `Bulk cancel (queue-worker --cancel-pending) in ${path.basename(repo)}: ${cancelled.length} of ${matches.length} matching job(s) cancelled.`,
+  });
+  if (options.json) {
+    out.write(`${JSON.stringify({ repo, apply: true, statuses, keyPrefix: options.keyPrefix, matched: matches.length, cancelled: cancelled.length, notCancelled }, null, 2)}
+`);
+    return EXIT_CLEAN;
+  }
+  out.write(`${summary}
+`);
+  return EXIT_CLEAN;
+}
+
 // Q-015: --add puts the jobs of a file into the queue of the worker already running for the
 // repository (--enqueue is read only at a worker's start, and a second worker is refused). Every
 // line is checked first, as at a start; the rows are written without an owner, so this short
@@ -322,11 +399,20 @@ const DEAD_DEDUPLICATED_STATUSES = new Set(["cancelled", "failed", "interrupted"
 // file added are then cancelled as for a refused line.
 // Q-015: `add` ({ repo }) enqueues for the worker running in another process: the rows are
 // written unowned (that worker adopts them) and a rollback cancels them in the database.
-async function enqueueLines(api, lines, { interrupted = () => false, add = null } = {}) {
+// B-168: one batch per file (api.withEnqueueBatch): the repository root is resolved once per
+// directory and the idempotency lookups share a connection; a line checked in the first loop is not
+// checked again in the second. An api without it (a test stub) checks and enqueues as before.
+async function enqueueLines(api, lines, options = {}) {
+  if (typeof api.withEnqueueBatch !== "function") return await enqueueLinesInBatch(api, lines, options, null);
+  return await api.withEnqueueBatch((batch) => enqueueLinesInBatch(api, lines, options, batch));
+}
+
+async function enqueueLinesInBatch(api, lines, { interrupted = () => false, add = null } = {}, batch = null) {
   const stoppedAt = (line) => `line ${line}: queue_worker_interrupted: the worker was stopped (Ctrl+C) before this line was enqueued`;
   const fileName = add ? "an --add file" : "its --enqueue file";
-  const checkOptions = add ? [{ repo: add.repo }] : [];
-  const enqueueOptions = add ? [{ repo: add.repo, unowned: true }] : [];
+  const batchOption = batch ? { batch } : {};
+  const checkOptions = add ? [{ repo: add.repo, ...batchOption }] : batch ? [batchOption] : [];
+  const enqueueOptions = add ? [{ repo: add.repo, unowned: true, ...batchOption }] : batch ? [batchOption] : [];
   const cancelOptions = add ? [{ repo: add.repo }] : [];
   const errors = [];
   for (const { line, job } of lines) {
@@ -682,6 +768,7 @@ async function runQueueWorker(argv, { out = process.stdout, err = process.stderr
     if (options.status) return await printStatus(api, repo, options, out);
     if (options.stop) return requestStop(api, repo, options, out, err);
     if (options.release) return releaseParked(api, repo, out, err);
+    if (options.cancelPending) return await cancelPendingJobs(api, repo, options, out);
     if (options.add) return await addJobsToRunningWorker(api, repo, options, out, err);
     const code = await runWorker(api, repo, options, io);
     // B-086: one warn line with the reason, instead of the exit handler's process.exited error.
@@ -691,7 +778,7 @@ async function runQueueWorker(argv, { out = process.stdout, err = process.stderr
     if (error instanceof WorkerRefusal) {
       err.write(`${error.message}\n`);
       // --add starts no worker: its refusal is no refused start (queue_worker.refused).
-      if (api && !options.status && !options.stop && !options.release && !options.add) api.recordRefusal(error.message, { errorType: "queue_worker_refused" });
+      if (api && !options.status && !options.stop && !options.release && !options.add && !options.cancelPending) api.recordRefusal(error.message, { errorType: "queue_worker_refused" });
       return EXIT_REFUSED;
     }
     throw error;

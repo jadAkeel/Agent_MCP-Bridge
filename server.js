@@ -299,6 +299,10 @@ let deferredRecoveryRunning = false;
 let deferredRecoveryIdlePasses = 0;
 // dbPath -> { fingerprint, pending }: an unchanged database with no non-terminal work is not reopened.
 const DEFERRED_RECOVERY_DB_MEMO = new Map();
+// B-166: the first recovery pass opens every database; later passes skip a live worker's one.
+let deferredRecoveryFirstPassDone = false;
+// What the last pass did ({ busy, openedDbPaths, skippedWorkerDbPaths }); read by the self-tests.
+let deferredRecoveryLastPass = null;
 let stateDirectoryOverride = "";
 
 // Construct shared services before startup probes can call them.
@@ -317,6 +321,7 @@ const {
   effectiveBridgeStateDirectory,
   stateDbPath,
   resolveProjectStateRoot,
+  withProjectRootCache,
   scrubLegacyLockSecrets,
   openLockDb,
   closeDb,
@@ -3003,7 +3008,8 @@ const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProce
 function queueRunStage(record) {
   if (record.status !== "running") {
     // Q-007: a retry that waits for the provider/model pause of every candidate model to end.
-    if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) return "waiting_for_provider_pause";
+    // B-165: a retry after an attestation failure waits its backoff instead.
+    if (["pending", "planned"].includes(record.status) && queueStartAfterPending(record)) return record.startAfterReason === "infrastructure_retry" ? "waiting_for_infrastructure_retry" : "waiting_for_provider_pause";
     // B-045: a pending job held back by the free-memory floor (jobs of this process only).
     return ["pending", "planned"].includes(record.status) && queueMemoryWaitingJobs.has(record.jobId)
       ? "waiting_for_memory"
@@ -4560,7 +4566,28 @@ function parseQueueWorkerJobLine(text) {
 // existing key with other content refuses the file instead of half-enqueueing it.
 // Q-015: `repo` names the worker's repository explicitly (queue-worker.js --add runs in a short
 // process that is no worker itself); it defaults to this process's own worker repository.
-async function checkQueueWorkerJob(job, { repo = queueWorkerMode?.repo } = {}) {
+// B-168: `batch` (withQueueWorkerEnqueueBatch) shares one database connection across the lines of
+// a file and remembers which job objects passed, so the enqueue does not check them a second time.
+async function checkQueueWorkerJob(job, { repo = queueWorkerMode?.repo, batch = null } = {}) {
+  const checked = await checkQueueWorkerJobUncached(job, { repo, batch });
+  if (batch && checked.ok) batch.checked.set(job, { repo, checked });
+  return checked;
+}
+
+// One --enqueue or --add file: every line is still checked before the first is enqueued, but the
+// repository root is resolved once per directory (not by a git process per lookup) and the
+// idempotency lookups share one connection.
+async function withQueueWorkerEnqueueBatch(fn) {
+  const batch = { checked: new WeakMap(), db: null, dbRepo: "" };
+  try {
+    return await withProjectRootCache(() => fn(batch));
+  } finally {
+    if (batch.db) closeDb(batch.db);
+    batch.db = null;
+  }
+}
+
+async function checkQueueWorkerJobUncached(job, { repo, batch }) {
   if (!repo) return { ok: false, errorType: "queue_worker_not_started", error: "The queue worker is not started." };
   if (effectiveQueueMode() !== "sqlite") {
     return { ok: false, errorType: "queue_worker_needs_sqlite", error: `The queue worker runs durable jobs only: CODEX_OPENCODE_QUEUE_MODE must be sqlite (it is ${effectiveQueueMode()}).` };
@@ -4572,7 +4599,14 @@ async function checkQueueWorkerJob(job, { repo = queueWorkerMode?.repo } = {}) {
   }
   const prepared = await enqueueQueueJob(job, "", { persist: false, schedule: false });
   if (!prepared.ok) return { ok: false, errorType: prepared.errorType || "queue_rejected", error: prepared.error || "The job was refused.", suggestedFix: prepared.suggestedFix || "" };
-  const db = await openLockDb(repo);
+  const shared = Boolean(batch);
+  if (shared && (!batch.db || batch.dbRepo !== repo)) {
+    if (batch.db) closeDb(batch.db);
+    batch.db = null;
+    batch.db = await openLockDb(repo);
+    batch.dbRepo = repo;
+  }
+  const db = shared ? batch.db : await openLockDb(repo);
   try {
     const existing = db.prepare("SELECT job_id, status, record_json FROM opencode_jobs WHERE idempotency_key = ?").get(prepared.record.idempotencyKey);
     if (!existing) return { ok: true, fingerprint: prepared.record.requestFingerprint };
@@ -4583,13 +4617,16 @@ async function checkQueueWorkerJob(job, { repo = queueWorkerMode?.repo } = {}) {
     }
     return { ok: true, fingerprint: prepared.record.requestFingerprint, deduplicates: existing.job_id, existingStatus: existing.status };
   } finally {
-    closeDb(db);
+    if (!shared) closeDb(db);
   }
 }
 
 // Q-015: `unowned` (with `repo`) enqueues for the worker running in another process (--add).
-async function enqueueFromToolInput(job, { repo, unowned = false } = {}) {
-  const checked = await checkQueueWorkerJob(job, { repo });
+// B-168: a line this batch already checked (the same job object, the same repository) is not checked
+// again; the insert itself still refuses an idempotency conflict and deduplicates (persistQueueRecord).
+async function enqueueFromToolInput(job, { repo, unowned = false, batch = null } = {}) {
+  const passed = batch?.checked.get(job);
+  const checked = passed && passed.repo === (repo === undefined ? queueWorkerMode?.repo : repo) ? passed.checked : await checkQueueWorkerJob(job, { repo, batch });
   if (!checked.ok) return checked;
   // schedule: false: the worker releases all starts at once after the last line.
   return await enqueueQueueJob(job, "", { schedule: false, unowned });
@@ -4600,7 +4637,8 @@ async function enqueueFromToolInput(job, { repo, unowned = false } = {}) {
 // Q-015: with `repo`, a job this process does not hold (an unowned row --add wrote for the running
 // worker) is cancelled in the database: a pending row at once, one the worker already started
 // gets a cancellation request (cancel_opencode_job's durable path).
-async function cancelUnstartedQueueJobs(jobIds, reason, { repo = "" } = {}) {
+// B-167: unstartedOnly (--cancel-pending) never requests the cancellation of a started job.
+async function cancelUnstartedQueueJobs(jobIds, reason, { repo = "", unstartedOnly = false } = {}) {
   const cancelled = [];
   const durable = [];
   for (const jobId of jobIds) {
@@ -4624,7 +4662,7 @@ async function cancelUnstartedQueueJobs(jobIds, reason, { repo = "" } = {}) {
     const db = await openLockDb(repo);
     try {
       for (const jobId of durable) {
-        const outcome = await cancelPersistedQueueJob(db, jobId);
+        const outcome = await cancelPersistedQueueJob(db, jobId, undefined, unstartedOnly ? { unstartedOnly, reason } : {});
         if (outcome?.ok && ["cancelled", "cancellation_requested"].includes(outcome.outcome)) cancelled.push(jobId);
       }
     } finally {
@@ -4632,6 +4670,27 @@ async function cancelUnstartedQueueJobs(jobIds, reason, { repo = "" } = {}) {
     }
   }
   return cancelled;
+}
+
+// B-167: queue-worker.js --cancel-pending. The repository's jobs that have not started, with one
+// of `statuses` (only held, pending, planned, blocked) and an idempotency key that starts with
+// `keyPrefix` (empty: any key), oldest first.
+const QUEUE_BULK_CANCEL_STATUSES = Object.freeze(["held", "pending", "planned", "blocked"]);
+async function listUnstartedQueueJobs(repo, { statuses = QUEUE_BULK_CANCEL_STATUSES, keyPrefix = "" } = {}) {
+  const wanted = [...new Set(statuses)].filter((status) => QUEUE_BULK_CANCEL_STATUSES.includes(status));
+  if (!wanted.length) return [];
+  const prefix = String(keyPrefix || "");
+  const db = await openLockDb(repo);
+  try {
+    return db.prepare(`
+      SELECT job_id, idempotency_key, status, created_at FROM opencode_jobs
+      WHERE status IN (${wanted.map(() => "?").join(", ")})
+        AND substr(COALESCE(idempotency_key, ''), 1, length(?)) = ?
+      ORDER BY created_at, job_id
+    `).all(...wanted, prefix, prefix).map((row) => ({ jobId: row.job_id, idempotencyKey: row.idempotency_key || "", status: row.status, createdAt: row.created_at || "" }));
+  } finally {
+    closeDb(db);
+  }
 }
 
 // B-091: --status must not create or migrate anything. A database with a -wal and -shm file has
@@ -4821,6 +4880,8 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   if (deferredRecoveryRunning) return;
   deferredRecoveryRunning = true;
   let passBusy = true;
+  const openedDbPaths = [];
+  const skippedWorkerDbPaths = [];
   try {
   let anyPending = false;
   const queuePersistenceEnabled = effectiveQueueMode() === "sqlite";
@@ -4853,6 +4914,25 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
     // B-075: a queue worker recovers, adopts and schedules only its own repository's database;
     // the other repositories belong to the client bridges (or their own workers).
     if (queueWorkerMode && !sameStateDbPath(dbPath, queueWorkerMode.dbPath)) continue;
+    // B-166: a live queue worker of another process owns this repository and runs its own recovery
+    // pass on it; its heartbeats change the file every few seconds, so the fingerprint memo never
+    // skipped it and every client bridge reopened and queried it every 5 s ("busy") for hours. The
+    // presence file needs only the path: such a database is not opened and does not keep the pass
+    // busy. The check runs on every pass, so once the worker's presence goes stale the next pass
+    // (at most CONFIG.deferredRecoveryIdleMaxMs later) opens and reconciles it as before (B-075);
+    // the memo stays pending for that. The first pass of the process still opens every database
+    // (schema, quarantined locks, integration roots), as before. A parked queue (no live worker)
+    // is still opened and checked below.
+    if (queuePersistenceEnabled && deferredRecoveryFirstPassDone) {
+      const liveWorker = foreignQueueWorkerPresence(dbPath);
+      if (liveWorker && !liveWorker.parked) {
+        noteQueueWorkerPresent(dbPath, liveWorker);
+        KNOWN_STATE_DB_PATHS.add(dbPath);
+        DEFERRED_RECOVERY_DB_MEMO.set(dbPath, { fingerprint: "", pending: true });
+        skippedWorkerDbPaths.push(dbPath);
+        continue;
+      }
+    }
     const fingerprint = await stateDbFingerprint(dbPath);
     const memo = DEFERRED_RECOVERY_DB_MEMO.get(dbPath);
     if (memo && !memo.pending && memo.fingerprint === fingerprint) continue;
@@ -4863,6 +4943,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
     const dbIntegrationRoots = new Set();
     try {
       db = new DatabaseSync(dbPath);
+      openedDbPaths.push(dbPath);
       db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(5000, Number(busyTimeoutMs) || 250))};`);
       db.exec("PRAGMA foreign_keys = ON;");
       db.exec("PRAGMA synchronous = FULL;");
@@ -4987,6 +5068,8 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       // pending jobs (or resuming its interrupted ones) here would make them die with this
       // client, so the queue rows are left alone while its presence file is fresh. The database
       // stays pending: the presence file going stale does not change the database file.
+      // B-166: only the first pass and a parked queue get here; later passes skip a live worker's
+      // database before opening it (above).
       const worker = foreignQueueWorkerPresence(dbPath);
       if (worker) {
         dbPending = true;
@@ -5161,6 +5244,8 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   passBusy = anyPending;
   } finally {
     deferredRecoveryRunning = false;
+    deferredRecoveryFirstPassDone = true;
+    deferredRecoveryLastPass = { busy: passBusy, openedDbPaths, skippedWorkerDbPaths };
     scheduleDeferredRecovery(nextDeferredRecoveryDelayMs(passBusy));
   }
 }
@@ -5670,6 +5755,9 @@ export const __selfTest = {
     runtimeProviderLimitsError,
     activeProviderPauses,
     releaseResumedPauseWaits,
+    // B-165..B-169 (tests/review-queue-cost.js).
+    deferredRecoveryLastPass: () => deferredRecoveryLastPass,
+    withProjectRootCache,
   },
   hooks: {
     get attestationCacheTtlOverride() { return attestationCacheTtlOverride; },
@@ -5730,6 +5818,10 @@ export const queueWorkerApi = Object.freeze({
   checkJob: checkQueueWorkerJob,
   enqueueFromToolInput,
   cancelUnstartedJobs: cancelUnstartedQueueJobs,
+  // B-167, B-168.
+  listUnstartedJobs: listUnstartedQueueJobs,
+  bulkCancelStatuses: QUEUE_BULK_CANCEL_STATUSES,
+  withEnqueueBatch: withQueueWorkerEnqueueBatch,
   queueWorkerSnapshot,
   activity: queueWorkerActivity,
   resolveRepository: resolveProjectStateRoot,
