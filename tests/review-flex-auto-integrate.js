@@ -169,18 +169,227 @@ test("Q-010: a validation that fails in the target rolls the files back and keep
   assert.match(issues(), new RegExp(`\\| queue\\.auto_integration_failed \\| \\S+ \\| job ${record.jobId} builder on opencode/muse-spark-1\\.3-contributor-free \\| Auto-integration stopped at the apply`));
 });
 
-test("Q-010: jobs of one repository integrate one after another, each with its own commit", async () => {
+test("Q-010 / Q-017 (e): with CODEX_OPENCODE_AUTO_INTEGRATION_BATCH=false jobs of one repository integrate one after another, each with its own commit", async () => {
+  assert.equal(internals.CONFIG.autoIntegrationBatch, true, "batching is on by default");
+  // CONFIG is frozen; the test hook stands in for the variable (the scheduler reads either).
+  hooks.autoIntegrationTestHooks.batch = false;
+  try {
+    const before = await head();
+    const runs = await Promise.all([
+      runAutoJob("out/batch-004.json", { "out/batch-004.json": "[4]\n" }, { lockedPaths: ["out/batch-004.json"] }),
+      runAutoJob("out/batch-005.json", { "out/batch-005.json": "[5]\n" }, { lockedPaths: ["out/batch-005.json"] }),
+      runAutoJob("out/batch-006.json", { "out/batch-006.json": "[6]\n" }, { lockedPaths: ["out/batch-006.json"] }),
+    ]);
+    for (const { record } of runs) assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    for (const { record } of runs) assert.equal(record.autoIntegration.batch, undefined, "no batch record");
+    const log = (await git(["log", "--format=%s", `${before}..HEAD`])).trim().split("\n");
+    assert.equal(log.length, 3);
+    assert.equal(AUTO_INTEGRATION_CHAINS.size, 0, "the chain is released");
+    assert.equal((await git(["status", "--porcelain"])).trim(), "");
+  } finally {
+    hooks.autoIntegrationTestHooks.batch = null;
+  }
+});
+
+// Q-017: a finished writer enqueued without the option (so nothing schedules it yet) and the
+// details the queue schedules for it; the tests schedule several in one tick, as jobs that
+// finished while the repository's chain was busy.
+async function finishedJob(file, edits, extra = {}) {
+  const dir = await builderWorktree(edits);
+  const request = job(file, { lockedPaths: [file], autoIntegrate: undefined, ...extra });
+  worktreeOf.set(request.task, { dir, changed: Object.keys(edits) });
+  const enqueued = await enqueueQueueJob(request);
+  assert.equal(enqueued.ok, true, `${enqueued.errorType}: ${enqueued.error}`);
+  const jobId = enqueued.record.jobId;
+  assert.ok(await waitFor(async () => (await durable(jobId))?.status === "completed", 30_000), `${file} did not complete`);
+  const record = await durable(jobId);
+  return { jobId, dir, file, details: { cwd: repo, jobId, agent: "builder", model: "opencode/muse-spark-1.3-contributor-free", worktreePath: dir, allowedEdits: [file], validationCommand: VALIDATION, sourceRecord: record, changedFiles: record.changedFiles } };
+}
+const scheduleTogether = (jobs) => Promise.all(jobs.map((entry) => internals.scheduleAutoIntegration(entry.details)));
+const commitsSince = async (before) => (await git(["log", "--format=%H %s", `${before}..HEAD`])).trim().split("\n").filter(Boolean);
+
+test("Q-017 (a): three new-file jobs that wait for the same turn land in ONE commit", async () => {
+  const jobs = [];
+  for (const number of [20, 21, 22]) jobs.push(await finishedJob(`out/batch-0${number}.json`, { [`out/batch-0${number}.json`]: `[${number}]\n` }));
   const before = await head();
-  const runs = await Promise.all([
-    runAutoJob("out/batch-004.json", { "out/batch-004.json": "[4]\n" }, { lockedPaths: ["out/batch-004.json"] }),
-    runAutoJob("out/batch-005.json", { "out/batch-005.json": "[5]\n" }, { lockedPaths: ["out/batch-005.json"] }),
-    runAutoJob("out/batch-006.json", { "out/batch-006.json": "[6]\n" }, { lockedPaths: ["out/batch-006.json"] }),
-  ]);
-  for (const { record } of runs) assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
-  const log = (await git(["log", "--format=%s", `${before}..HEAD`])).trim().split("\n");
-  assert.equal(log.length, 3);
+  const outcomes = await scheduleTogether(jobs);
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  const after = await head();
+  for (const [index, entry] of jobs.entries()) {
+    assert.equal(outcomes[index]?.status, "committed", JSON.stringify(outcomes[index]));
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.equal(record.autoIntegration.commit, after);
+    assert.deepEqual(record.autoIntegration.files, [entry.file], "each job keeps its own files");
+    assert.deepEqual(record.autoIntegration.batch, { size: 3, jobIds: jobs.map((other) => other.jobId) });
+    assert.equal(existsSync(entry.dir), false, `worktree removed: ${record.autoIntegration.worktreeCleanup}`);
+  }
+  const subject = (await git(["log", "-1", "--format=%s"])).trim();
+  assert.match(subject, /^Auto-integrate 3 jobs \(/);
+  for (const entry of jobs) assert.ok(subject.includes(entry.jobId), `the message names ${entry.jobId}`);
+  assert.deepEqual((await git(["show", "--name-only", "--format=", "HEAD"])).trim().split("\n"), jobs.map((entry) => entry.file));
+  assert.equal((await git(["status", "--porcelain"])).trim(), "", "the target is clean afterwards");
   assert.equal(AUTO_INTEGRATION_CHAINS.size, 0, "the chain is released");
+});
+
+test("Q-017 (b): a job that changes an existing file leaves the batch; the other two land in one commit", async () => {
+  const jobs = [
+    await finishedJob("out/batch-023.json", { "out/batch-023.json": "[23]\n" }),
+    await finishedJob("src/b.txt", { "src/b.txt": "changed in a batch group\n" }, { task: "Change src/b.txt in a batch group." }),
+    await finishedJob("out/batch-024.json", { "out/batch-024.json": "[24]\n" }),
+  ];
+  const before = await head();
+  await scheduleTogether(jobs);
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  const after = await head();
+  for (const entry of [jobs[0], jobs[2]]) {
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.equal(record.autoIntegration.commit, after);
+    assert.deepEqual(record.autoIntegration.batch, { size: 2, jobIds: [jobs[0].jobId, jobs[2].jobId] });
+  }
+  const changer = await durable(jobs[1].jobId);
+  assert.equal(changer.autoIntegration.status, "skipped_not_new_files", JSON.stringify(changer.autoIntegration));
+  assert.deepEqual(changer.autoIntegration.files, ["src/b.txt"]);
+  assert.equal(readFileSync(path.join(repo, "src", "b.txt"), "utf8"), "b\n", "the existing file is untouched");
+  assert.equal(existsSync(jobs[1].dir), true, "its worktree is kept for review");
+  assert.deepEqual((await git(["show", "--name-only", "--format=", "HEAD"])).trim().split("\n"), ["out/batch-023.json", "out/batch-024.json"]);
+});
+
+test("Q-017 (c): two jobs that create the same path are never batched together; each takes the one-by-one path", async () => {
+  const jobs = [
+    await finishedJob("out/batch-dup.json", { "out/batch-dup.json": "[25]\n" }),
+    await finishedJob("out/batch-dup.json", { "out/batch-dup.json": "[25]\n" }, { task: "Write out/batch-dup.json a second time." }),
+    await finishedJob("out/batch-026.json", { "out/batch-026.json": "[26]\n" }),
+  ];
+  const before = await head();
+  await scheduleTogether(jobs);
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  const after = await head();
+  const first = await durable(jobs[0].jobId);
+  const third = await durable(jobs[2].jobId);
+  assert.equal(first.autoIntegration.status, "committed", JSON.stringify(first.autoIntegration));
+  assert.deepEqual(first.autoIntegration.batch, { size: 2, jobIds: [jobs[0].jobId, jobs[2].jobId] }, "the second writer of the path is not in the batch");
+  assert.equal(third.autoIntegration.commit, after);
+  // The second writer lands alone afterwards: its identical file is already in HEAD (B-153).
+  const second = await durable(jobs[1].jobId);
+  assert.equal(second.autoIntegration.status, "already_committed", JSON.stringify(second.autoIntegration));
+  assert.equal(second.autoIntegration.batch, undefined);
+  assert.equal(second.autoIntegration.commit, after);
+  assert.equal(existsSync(jobs[1].dir), false);
+});
+
+test("Q-017 (d): a batch whose validation fails applies nothing, then each job is integrated alone", async () => {
+  const jobs = [
+    await finishedJob("out/batch-027.json", { "out/batch-027.json": "[27]\n" }),
+    await finishedJob("out/batch-028.json", { "out/batch-028.json": "BAD\n" }),
+    await finishedJob("out/batch-029.json", { "out/batch-029.json": "[29]\n" }),
+  ];
+  const before = await head();
+  await scheduleTogether(jobs);
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 2, `one commit per good job: ${commits.join("\n")}`);
+  for (const entry of [jobs[0], jobs[2]]) {
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.equal(record.autoIntegration.batch, undefined, "landed alone");
+    assert.ok(commits.some((line) => line.endsWith(`Auto-integrate ${entry.jobId}: 1 new file(s) by builder on opencode/muse-spark-1.3-contributor-free`)), commits.join("\n"));
+  }
+  const bad = await durable(jobs[1].jobId);
+  assert.equal(bad.autoIntegration.status, "failed", JSON.stringify(bad.autoIntegration));
+  assert.equal(bad.autoIntegration.stage, "apply");
+  assert.equal(existsSync(path.join(repo, "out", "batch-028.json")), false, "rolled back");
+  assert.equal(existsSync(jobs[1].dir), true, "its worktree is kept");
   assert.equal((await git(["status", "--porcelain"])).trim(), "");
+  const opsLog = path.join(fixture.stateDir, "logs", `bridge-${new Date().toISOString().slice(0, 10)}.jsonl`);
+  assert.ok(await waitFor(() => existsSync(opsLog) && readFileSync(opsLog, "utf8").includes("queue.auto_integration_batch_fallback")), "the fallback is in the operations log");
+});
+
+test("Q-017 (f): a member whose worktree changed after its job leaves the batch; the others land in one commit", async () => {
+  const jobs = [
+    await finishedJob("out/batch-030.json", { "out/batch-030.json": "[30]\n" }),
+    await finishedJob("out/batch-031.json", { "out/batch-031.json": "[31]\n" }),
+    await finishedJob("out/batch-032.json", { "out/batch-032.json": "[32]\n" }),
+  ];
+  await writeFile(path.join(jobs[1].dir, "out", "batch-031.json"), "[31, \"changed after the job\"]\n", "utf8");
+  const before = await head();
+  await scheduleTogether(jobs);
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  for (const entry of [jobs[0], jobs[2]]) {
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.deepEqual(record.autoIntegration.batch, { size: 2, jobIds: [jobs[0].jobId, jobs[2].jobId] });
+  }
+  const changed = await durable(jobs[1].jobId);
+  assert.equal(changed.autoIntegration.status, "failed", JSON.stringify(changed.autoIntegration));
+  assert.equal(changed.autoIntegration.errorType, "pipeline_source_identity_changed");
+  assert.equal(existsSync(path.join(repo, "out", "batch-031.json")), false, "the changed file was not applied");
+  assert.equal(existsSync(jobs[1].dir), true, "its worktree is kept for review");
+});
+
+test("Q-017 (g): a member another live process has claimed is left to it; the others land in one commit", async () => {
+  const { closeDb, openLockDb } = internals;
+  const jobs = [
+    await finishedJob("out/batch-033.json", { "out/batch-033.json": "[33]\n" }),
+    await finishedJob("out/batch-034.json", { "out/batch-034.json": "[34]\n" }),
+    await finishedJob("out/batch-035.json", { "out/batch-035.json": "[35]\n" }),
+  ];
+  const db = await openLockDb(repo);
+  try {
+    const row = db.prepare("SELECT record_json FROM opencode_jobs WHERE job_id = ?").get(jobs[1].jobId);
+    db.prepare("UPDATE opencode_jobs SET record_json = ? WHERE job_id = ?").run(
+      JSON.stringify({ ...JSON.parse(row.record_json), autoIntegration: { status: "integrating", claimedBy: `${process.pid}-1-otherclaimer`, at: new Date().toISOString() } }),
+      jobs[1].jobId);
+  } finally {
+    closeDb(db);
+  }
+  const before = await head();
+  const outcomes = await scheduleTogether(jobs);
+  assert.equal(outcomes[1]?.status, "not_claimed", JSON.stringify(outcomes[1]));
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  for (const entry of [jobs[0], jobs[2]]) {
+    const record = await durable(entry.jobId);
+    assert.deepEqual(record.autoIntegration.batch, { size: 2, jobIds: [jobs[0].jobId, jobs[2].jobId] });
+  }
+  const held = await durable(jobs[1].jobId);
+  assert.equal(held.autoIntegration.claimedBy, `${process.pid}-1-otherclaimer`, "the other process keeps its claim");
+  assert.equal(existsSync(path.join(repo, "out", "batch-034.json")), false);
+  assert.equal(existsSync(jobs[1].dir), true);
+});
+
+test("Q-017 (h): a record that cannot be written after the batch commit never sends the job back to the one-by-one path", async () => {
+  const jobs = [
+    await finishedJob("out/batch-036.json", { "out/batch-036.json": "[36]\n" }),
+    await finishedJob("out/batch-037.json", { "out/batch-037.json": "[37]\n" }),
+    await finishedJob("out/batch-038.json", { "out/batch-038.json": "[38]\n" }),
+  ];
+  hooks.autoIntegrationTestHooks.beforeBatchRecord = async (jobId) => {
+    if (jobId === jobs[1].jobId) throw new Error("database is locked (test)");
+  };
+  let outcomes = [];
+  const before = await head();
+  try {
+    outcomes = await scheduleTogether(jobs);
+  } finally {
+    hooks.autoIntegrationTestHooks.beforeBatchRecord = null;
+  }
+  const commits = await commitsSince(before);
+  assert.equal(commits.length, 1, commits.join("\n"));
+  assert.equal(outcomes[1]?.status, "committed", JSON.stringify(outcomes[1]));
+  assert.match(outcomes[1]?.recordError || "", /database is locked/);
+  const unrecorded = await durable(jobs[1].jobId);
+  assert.notEqual(unrecorded.autoIntegration.status, "failed", JSON.stringify(unrecorded.autoIntegration));
+  assert.equal(readFileSync(path.join(repo, "out", "batch-037.json"), "utf8"), "[37]\n", "its file is committed");
+  for (const entry of [jobs[0], jobs[2]]) {
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.deepEqual(record.autoIntegration.batch, { size: 3, jobIds: jobs.map((other) => other.jobId) });
+  }
 });
 
 test("Q-010: an in-place writer or another integration on the files makes the integration wait, then land", async () => {

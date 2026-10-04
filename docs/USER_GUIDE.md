@@ -292,6 +292,9 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
   output, up to `selfCheckPasses` (default 2). The agent itself still has no shell.
 - **Auto-integration.** With `autoIntegrate: true` a finished writer whose patch only adds new
   files is integrated and committed by the bridge (see [section 9](#9-reviewing-and-integrating-changes)).
+  Writers of one repository that finish while an integration runs land together afterwards as one
+  batch with one validation run and one commit, one by one when the batch fails
+  (`CODEX_OPENCODE_AUTO_INTEGRATION_BATCH=false` keeps one commit per job).
 - **Memory and stalls.** The queue starts nothing while free memory is under 1 GB, and an agent
   silent for 10 minutes is stopped (both on by default).
 - **Issue log.** Every failure is one line in `<state-dir>\logs\issues.md` (section 10).

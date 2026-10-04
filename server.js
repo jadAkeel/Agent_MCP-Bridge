@@ -3578,7 +3578,7 @@ async function activeProviderPauses() {
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
 let autoResumeInterruptedOverride = null;
 
-const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_LATER_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, AUTO_INTEGRATION_HEAD_RETRIES, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration, sweepCommittedWorktrees, autoIntegrationTestHooks } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, RepositoryRootSet, cleanupWorktree, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
+const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_LATER_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, AUTO_INTEGRATION_HEAD_RETRIES, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, autoIntegrateQueueJobs, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration, sweepCommittedWorktrees, autoIntegrationTestHooks } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, INTEGRATION_BATCH_MAX_ITEMS, RepositoryRootSet, cleanupWorktree, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
 
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
@@ -5740,6 +5740,8 @@ export const __selfTest = {
     AUTO_INTEGRATION_CHAINS,
     autoIntegrateJobError,
     autoIntegrateQueueJob,
+    autoIntegrateQueueJobs,
+    scheduleAutoIntegration,
     autoIntegrationCommitHooks,
     autoIntegrationClaimerGone,
     rescheduleOpenAutoIntegrations,
