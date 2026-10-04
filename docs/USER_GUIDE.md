@@ -271,7 +271,11 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
   supervisor watchdog) is requeued by the bridge on the next model
   that is not paused. `list_opencode_jobs` shows `attempt=2/4 model=...`; after the last attempt
   the job shows `outcome=gave_up`. Jobs with such a policy that a client restart interrupted are
-  resumed by the next bridge as their next attempt.
+  resumed by the next bridge as their next attempt. A rate limit hit before the model produced
+  anything does not use up an attempt; the job waits for the pause instead (B-169). When the bridge
+  itself cannot check the agent (`agent_metadata_unavailable` and the like, OpenCode slow under
+  load), the job runs again on the same model after 45 s, 90 s and 180 s without using up an
+  attempt, and fails only after the third time (B-165).
 - **Silent rate limits** are detected while the job runs (`provider_rate_limited`), and that
   model is paused for 30 minutes, then 60.
 - **Pause and resume** a provider or one model yourself with `pause_opencode_provider` /
@@ -374,8 +378,12 @@ Good to know:
   when another process now has the same pid, wait until the heartbeat in
   `<state-dir>\workers\<projectKey>.json` is 10 minutes old.
 - While a worker runs, and while its queue is parked, client bridges leave that repository's
-  waiting jobs to it. Jobs you enqueue through MCP still run in the client that enqueued them and
+  waiting jobs to it (while it runs they do not even open its database, B-166). Jobs you enqueue through MCP still run in the client that enqueued them and
   end with it: put unattended work in the worker's file, or add it with `--add` while it runs.
+- **Cancel many waiting jobs at once** (B-167): `--repo C:\path\to\repo --cancel-pending
+  --key-prefix batch-` lists the jobs that have not started (default statuses held, pending,
+  planned, blocked; `--status pending` narrows it) and changes nothing; add `--apply` to cancel
+  them. Running jobs are never touched (use `--stop --now` or `cancel_opencode_job` for those).
 - A stop does not wait for an auto-integration that only waits for a lock; the next worker (or a
   client after `--release`) finishes it.
 - The global worker cap (`set_opencode_concurrency({ globalWorkerLimit })`) counts the worker's

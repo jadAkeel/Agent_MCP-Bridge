@@ -40,7 +40,10 @@ function installExecutor(behaviour) {
     const model = requirement.model ? `${requirement.provider}/${requirement.model}` : "profile";
     calls.push({ task: request.task, model, variant: requirement.variant || "" });
     const outcome = typeof behaviour === "function" ? behaviour(model, request) : behaviour;
-    return execution({ ...outcome, configuredProvider: requirement.provider || "", configuredModel: requirement.model || "" });
+    const built = execution({ ...outcome, configuredProvider: requirement.provider || "", configuredModel: requirement.model || "" });
+    // B-169: the usage of the run (a rate limit before any output is not counted).
+    if (outcome?.usage) built.result.usage = outcome.usage;
+    return built;
   };
 }
 const terminalOf = async (jobId) => (await waitFor(async () => fixture.terminal((await durable(jobId))?.status), 15_000)) && durable(jobId);
@@ -95,7 +98,8 @@ test("Q-007: the options are refused where nothing could honour them", async () 
 
 test("Q-007: a provider failure moves the job to the next model, and the attempts are recorded", async () => {
   calls.length = 0;
-  installExecutor((model) => (model === "opencode/muse-spark-1.3-contributor-free" ? { errorType: "provider_rate_limited" } : {}));
+  // B-169: the model produced output before the limit, so the failure is a counted attempt.
+  installExecutor((model) => (model === "opencode/muse-spark-1.3-contributor-free" ? { errorType: "provider_rate_limited", usage: { steps: 2, outputCount: 300 } } : {}));
   const first = await enqueueQueueJob(readJob({ task: "fallback to the next model", models: [MUSE, GEMINI] }));
   assert.equal(first.ok, true, first.error);
   assert.equal(first.record.scopeContract.modelRequirement.model, "muse-spark-1.3-contributor-free", "the first model is pinned at enqueue");
@@ -283,7 +287,8 @@ test("B-078: a slot refused for a paused model is not an attempt, so the job doe
     calls.push({ task: request.task, model: `${requirement.provider}/${requirement.model}` });
     const reply = (result, text) => ({ response: { content: [{ type: "text", text }] }, result: { changedFiles: [], configuredProvider: requirement.provider, configuredModel: requirement.model, ...result }, validation: null, worktree: null });
     // Attempt 1: the agent ran and hit a rate limit (a counted attempt, the model switches).
-    if (requirement.provider === "opencode" && ++museRuns === 1) return reply({ errorType: "provider_rate_limited" }, "Job failed.\nerrorType: provider_rate_limited");
+    // B-169: with output before the limit (a limit before any output would not be counted either).
+    if (requirement.provider === "opencode" && ++museRuns === 1) return reply({ errorType: "provider_rate_limited", usage: { steps: 2, outputCount: 300 } },"Job failed.\nerrorType: provider_rate_limited");
     // The next model was paused meanwhile: the slot request is refused, the agent never starts.
     if (requirement.provider === "google") return reply({ errorType: "provider_paused", exitCode: "provider_capacity_unavailable", providerCooldownUntil: until }, "Job failed.\nerrorType: provider_paused");
     return reply({ errorType: "" }, "REPORT: done.");
