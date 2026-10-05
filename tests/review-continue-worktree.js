@@ -11,18 +11,20 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createLockPlanRuntime } from "../lib/lock-plan.js";
 
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const root = await mkdtemp(path.join(tmpdir(), "review-continue-worktree-"));
 process.env.CODEX_OPENCODE_STATE_DIR = path.join(root, "global-state");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
+process.env.CODEX_OPENCODE_WORKTREE_ROOT = "global";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.GIT_CONFIG_NOSYSTEM = "1";
 process.env.GIT_CONFIG_GLOBAL = path.join(root, "global.gitconfig");
 await writeFile(process.env.GIT_CONFIG_GLOBAL, "[user]\n\tname = Continue Test\n\temail = continue@example.invalid\n[core]\n\tautocrlf = false\n");
-const { __selfTest } = await import("../server.js");
+const { __selfTest, queueWorkerApi } = await import("../server.js");
 const { finishSkips } = await import("./skip-gate.js");
 const { internals: I, hooks } = __selfTest;
 const saved = { stateDirectoryOverride: hooks.stateDirectoryOverride, queueModeOverride: hooks.queueModeOverride };
@@ -431,6 +433,224 @@ test("Q-018 execution: continuation does not require the checkout's dirty scope 
   assert.equal(await readFile(path.join(source.worktreePath, "src/b.txt"), "utf8"), "continued B\n");
 });
 
+test("Q-018 public: removing an earlier addition refuses an unrepresentable strict union", async () => {
+  const cwd = await repo("strict-union");
+  const source = await retained(cwd);
+  fakeAgent(async (run) => { await rm(path.join(run.cwd, "src/a.txt")); });
+  const result = await execute(writeJob(cwd, "src/a.txt", { continueWorktree: source.worktreePath }));
+  assert.equal(result.result.errorType, "worktree_output_unrepresentable", textOf(result.response));
+  sameFiles(result.result.changedFiles, ["src/a.txt"]);
+  sameFiles(result.result.worktree.thisRunChangedFiles, ["src/a.txt"]);
+  sameFiles(result.result.worktree.changedFiles, []);
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+  assert.equal(existsSync(source.worktreePath), true, "the refused patch remains available for manual repair");
+});
+
+test("Q-018 public: startup retires a dead queue owner and releases its claim in the same pass", async () => {
+  const cwd = await repo("startup-queue-owner");
+  const source = await retained(cwd);
+  const owner = "dead-startup-queue-owner";
+  const expired = new Date(Date.now() - I.CONFIG.queueStaleAfterMs - 60_000).toISOString();
+  await queueOwner(cwd, owner);
+  await database(cwd, (db) => {
+    db.prepare("UPDATE opencode_jobs SET created_at = ?, started_at = ?, heartbeat_at = ?, lease_expires_at = ?, owner_instance_id = 'dead-fixture-instance', owner_process_id = 99999999, owner_generation = 'dead-fixture-generation' WHERE job_id = ?").run(expired, expired, expired, expired, owner);
+    db.prepare("UPDATE worktree_artifacts SET status = 'in_use', job_id = ? WHERE worktree_path = ?").run(owner, source.worktreePath);
+  });
+  await I.reconcileQueueStateAtStartup();
+  const status = await database(cwd, (db) => db.prepare("SELECT status FROM opencode_jobs WHERE job_id = ?").get(owner).status);
+  assert.equal(status, "interrupted");
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained", "startup must recover after retiring stale queue ownership");
+});
+
+test("Q-018 public: schema preserves a nonempty continuation path and rejects invalid types", () => {
+  const schema = I.jobInputShape.continueWorktree;
+  assert.ok(schema, "the public job schema exposes continueWorktree");
+  assert.equal(schema.safeParse(path.join(root, "source")).success, true);
+  assert.equal(schema.safeParse(undefined).success, true);
+  for (const value of ["", false, 42, {}, []]) assert.equal(schema.safeParse(value).success, false, JSON.stringify(value));
+  const parsed = queueWorkerApi.parseJobLine(JSON.stringify(writeJob(root, "src/b.txt", { continueWorktree: path.join(root, "source"), idempotencyKey: "q018-parse" })));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed));
+  assert.equal(parsed.job.continueWorktree, path.join(root, "source"));
+});
+
+test("Q-018 public: the single-agent tool forwards the path and reports per-job versus total work", async () => {
+  const cwd = await repo("public-tool");
+  const source = await retained(cwd);
+  const runs = fakeAgent(async (run) => {
+    assert.equal(await readFile(path.join(run.cwd, "src/a.txt"), "utf8"), "from A\n");
+    await write(run.cwd, "src/b.txt", "from B\n");
+  });
+  const text = textOf(await tool("run_opencode_agent", writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath })));
+  assert.equal(runs.length, 1);
+  assert.equal(path.resolve(runs[0].cwd), path.resolve(source.worktreePath));
+  assert.match(text, new RegExp(`Continued worktree of job ${source.previousJobId}`));
+  assert.match(text, /this run changed 1 file\(s\): src\/b\.txt/);
+  assert.match(text, /worktree total vs base: 2 file\(s\)/);
+  assert.match(text, /integration.*total|integrat.*whole/i);
+  assert.match(text, /allowedEdits.*union/i);
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+test("Q-018 public: read, auto-integration, sanitized and contractor combinations are refused", async () => {
+  const cwd = await repo("option-refusals");
+  const source = await retained(cwd);
+  const common = writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath });
+  const cases = [
+    [{ agent: "reviewer", task: "Review.", cwd, write: false, lockMode: "off", allowedEdits: [], scopeContract: { mode: "read", read: ["src"] }, continueWorktree: source.worktreePath }, "continue_worktree_requires_write_job"],
+    [{ ...common, autoIntegrate: true }, "continue_worktree_not_applicable"],
+    [{ ...common, sanitizedWorkspace: { root: cwd } }, "continue_worktree_not_applicable"],
+    [{ ...common, orchestratorMode: "contractor" }, "continue_worktree_not_applicable"],
+  ];
+  const runs = fakeAgent();
+  for (const [job, expected] of cases) {
+    const planned = I.validateSingleLockPlan(job);
+    assert.equal(planned.errorType, expected, JSON.stringify(planned));
+    assert.ok(planned.suggestedFix?.trim());
+    const queued = await I.enqueueQueueJob(job, "", { schedule: false });
+    refusal(queued, expected);
+    const text = textOf(await tool("run_opencode_agent", job));
+    assert.ok(text.includes(expected), text);
+  }
+  assert.equal(runs.length, 0, "refused jobs never run a fake or real agent");
+});
+
+test("Q-018 public: worktree mode off refuses continuation without mutating frozen CONFIG", () => {
+  const runtime = createLockPlanRuntime({ CONFIG: { ...I.CONFIG, worktreeMode: "off" } });
+  const result = runtime.continueWorktreeJobError({ continueWorktree: "source" }, { lockType: "write", orchestratorMode: "" });
+  assert.equal(result.errorType, "continue_worktree_not_applicable");
+  assert.ok(result.suggestedFix?.trim());
+  assert.equal(I.CONFIG.worktreeMode, "write");
+});
+
+test("Q-018 public: parallel calls, multi-job preflight and pipelines refuse continuation", async () => {
+  const cwd = await repo("parallel-refusal");
+  const source = await retained(cwd);
+  const first = writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath, dryRun: true });
+  const second = writeJob(cwd, "src/c.txt", { dryRun: true });
+  fakeAgent();
+  for (const jobs of [[first], [first, second]]) {
+    const text = textOf(await tool("run_opencode_parallel", { jobs }));
+    assert.ok(text.includes("continue_worktree_unsupported_in_parallel"), text);
+  }
+  const plan = textOf(await tool("validate_delegation_plan", { jobs: [first, second] }));
+  assert.ok(plan.includes("continue_worktree_unsupported_in_parallel"), plan);
+  const pipeline = textOf(await tool("create_multi_agent_pipeline", { cwd, usePolicy: false, jobs: [first, second], finalValidationCommand: VALIDATION }));
+  assert.ok(pipeline.includes("continue_worktree_unsupported_in_parallel"), pipeline);
+});
+
+test("Q-018 public: single-job delegation preflight checks the source without claiming", async () => {
+  const cwd = await repo("plan-dry");
+  const source = await retained(cwd);
+  const runs = fakeAgent();
+  const before = { ...await artifact(cwd, source.worktreePath) };
+  const text = textOf(await tool("validate_delegation_plan", { jobs: [writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath })] }));
+  assert.match(text, /Delegation plan accepted\./);
+  assert.equal(runs.length, 0);
+  assert.deepEqual({ ...await artifact(cwd, source.worktreePath) }, before);
+  const invalid = textOf(await tool("validate_delegation_plan", { jobs: [writeJob(cwd, "src/b.txt", { continueWorktree: path.join(root, "missing-plan") })] }));
+  assert.match(invalid, /worktree_identity_mismatch|worktree_not_retained/);
+});
+
+test("Q-018 public: an in_use artifact is visibly in flight even without a queue view", async () => {
+  const cwd = await repo("view");
+  const source = await retained(cwd);
+  await queueOwner(cwd, "view-job");
+  try {
+    assert.equal((await claim(source, "view-job")).ok, true);
+    const listed = (await I.listRetainedWorktreeArtifacts(cwd)).find((row) => row.worktreePath === source.worktreePath);
+    const view = I.retainedWorktreeView(listed);
+    assert.equal(view.inFlight, true);
+    assert.match(view.recoveryAction, /job.*running/i);
+  } finally { await release(source, "view-job"); await clearQueueOwner(cwd, "view-job"); }
+});
+
+test("Q-018 public: SQLite worker input keeps continuation through encryption and terminal lineage", async () => {
+  const cwd = await repo("queue-roundtrip");
+  const source = await retained(cwd);
+  const job = writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath, idempotencyKey: "q018-queue-chain" });
+  const parsed = queueWorkerApi.parseJobLine(JSON.stringify(job));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed));
+  const enqueued = await queueWorkerApi.enqueueFromToolInput(parsed.job, { repo: cwd });
+  assert.equal(enqueued.ok, true, JSON.stringify(enqueued));
+  const encrypted = await database(cwd, (db) => db.prepare("SELECT request_encrypted FROM opencode_jobs WHERE job_id = ?").get(enqueued.record.jobId).request_encrypted);
+  const request = await I.decryptQueueRequest(encrypted, enqueued.record.jobId);
+  assert.equal(request.continueWorktree, source.worktreePath);
+  const runs = fakeAgent(async (run) => { await write(run.cwd, "src/b.txt", "queued B\n"); });
+  assert.equal(await I.startQueueRecord(enqueued.record), true);
+  await enqueued.record.executionPromise;
+  assert.equal(runs.length, 1);
+  assert.equal(path.resolve(runs[0].cwd), path.resolve(source.worktreePath));
+  const durable = await I.readPersistedQueueRecord(enqueued.record.jobId, cwd);
+  assert.equal(durable.status, "completed", JSON.stringify(durable));
+  assert.equal(durable.continuedFrom, source.previousJobId);
+  assert.equal(durable.worktreePath, source.worktreePath);
+  sameFiles(durable.changedFiles, ["src/b.txt"]);
+  assert.match(I.compactQueueJobLines([durable]), /wt=continued/);
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+test("Q-018 public: a failed durable audit prevents direct and memory continuation from claiming", async () => {
+  const cwd = await repo("audit-write-failure");
+  const source = await retained(cwd);
+  const before = { ...await artifact(cwd, source.worktreePath) };
+  const runs = fakeAgent();
+  await database(cwd, (db) => db.exec("CREATE TRIGGER q018_refuse_direct_audit BEFORE INSERT ON opencode_direct_runs BEGIN SELECT RAISE(ABORT, 'q018 fixture audit write failure'); END"));
+  const oldMode = hooks.queueModeOverride;
+  try {
+    const response = textOf(await tool("run_opencode_agent", writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath })));
+    assert.ok(response.includes("direct_run_audit_start_failed"), response);
+    assert.deepEqual({ ...await artifact(cwd, source.worktreePath) }, before);
+    hooks.queueModeOverride = "memory";
+    const queued = await I.enqueueQueueJob(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }), "", { schedule: false });
+    assert.equal(queued.ok, true, JSON.stringify(queued));
+    assert.equal(await I.startQueueRecord(queued.record), true);
+    await queued.record.executionPromise;
+    assert.equal(queued.record.status, "failed");
+    assert.equal(queued.record.errorType, "direct_run_audit_start_failed");
+    assert.deepEqual({ ...await artifact(cwd, source.worktreePath) }, before);
+    assert.equal(runs.length, 0, "the agent cannot launch without a persisted live owner");
+  } finally {
+    hooks.queueModeOverride = oldMode;
+    await database(cwd, (db) => db.exec("DROP TRIGGER q018_refuse_direct_audit"));
+  }
+});
+
+test("Q-018 public: a running memory-queue continuation retains live claim protection", async () => {
+  const cwd = await repo("memory-queue");
+  const source = await retained(cwd);
+  const oldMode = hooks.queueModeOverride;
+  hooks.queueModeOverride = "memory";
+  let entered;
+  let finish;
+  let record;
+  let timer;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const released = new Promise((resolve) => { finish = resolve; });
+  fakeAgent(async (run) => { entered(); await released; await write(run.cwd, "src/b.txt", "memory B\n"); });
+  try {
+    const queued = await I.enqueueQueueJob(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }), "", { schedule: false });
+    assert.equal(queued.ok, true, JSON.stringify(queued));
+    record = queued.record;
+    assert.equal(await I.startQueueRecord(record), true);
+    await Promise.race([
+      started,
+      record.executionPromise.then(() => { throw new Error(`Memory writer ended before starting: ${record.errorReason || record.errorType}`); }),
+      new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("Memory writer did not start")), 30_000); }),
+    ]);
+    const second = await execute(writeJob(cwd, "src/c.txt", { continueWorktree: source.worktreePath }));
+    assert.equal(second.result.errorType, "worktree_in_use", textOf(second.response));
+    await I.recoverStaleWorktreeClaims(cwd);
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "in_use");
+  } finally {
+    clearTimeout(timer);
+    finish();
+    if (record?.executionPromise) await record.executionPromise;
+    hooks.queueModeOverride = oldMode;
+  }
+  assert.equal(record.status, "completed", JSON.stringify(record.errorReason));
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
 let failed = 0;
 let total = 0;
 try {
@@ -444,6 +664,7 @@ try {
 } finally {
   hooks.stateDirectoryOverride = saved.stateDirectoryOverride;
   hooks.queueModeOverride = saved.queueModeOverride;
+  assert.ok(path.isAbsolute(root) && path.basename(root).startsWith("review-continue-worktree-"), "cleanup stays inside this suite's scratch directory");
   await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
 assert.ok(total > 0, "CODEX_TEST_ONLY must select at least one case");
