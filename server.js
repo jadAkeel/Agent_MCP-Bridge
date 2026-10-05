@@ -2844,8 +2844,9 @@ function truncateResultText(value, limit = CONFIG.queueResultMaxChars) {
   return `${text.slice(0, head)}${marker}${tail ? text.slice(text.length - tail) : ""}`;
 }
 
-const { isBridgeGeneratedWorktree, generatedWorktreeRootForCwd, filterGeneratedWorktreeFiles, resolveWorktreeRoot, shouldUseWorktree, makeWorktreeBranchName, inspectSourceCheckpointState, dirtyCheckpointDetails, reconcileWorktreeArtifactRegistry, reserveWorktreeArtifact, markWorktreeArtifactState, releaseFailedWorktreeReservation, measureRetainedWorktreeBytes, updateRetainedWorktreeMeasurement, createWorktreeForJob, collectWorktreeDiff, cleanupWorktree, cleanupWorktreeUntimed, formatWorktreeSummary, RETAINED_WORKTREE_STATUSES, worktreeTestHooks } = createWorktreeRuntime({
+const { claimRetainedWorktree, releaseRetainedWorktreeClaim, recoverStaleWorktreeClaims, worktreeArtifactStatus, isBridgeGeneratedWorktree, generatedWorktreeRootForCwd, filterGeneratedWorktreeFiles, resolveWorktreeRoot, shouldUseWorktree, makeWorktreeBranchName, inspectSourceCheckpointState, dirtyCheckpointDetails, reconcileWorktreeArtifactRegistry, reserveWorktreeArtifact, markWorktreeArtifactState, releaseFailedWorktreeReservation, measureRetainedWorktreeBytes, updateRetainedWorktreeMeasurement, createWorktreeForJob, collectWorktreeDiff, cleanupWorktree, cleanupWorktreeUntimed, formatWorktreeSummary, RETAINED_WORKTREE_STATUSES, worktreeTestHooks } = createWorktreeRuntime({
   CONFIG,
+  processIsAlive: (...args) => processIsAlive(...args),
   effectiveBridgeStateDirectory,
   projectStateKey,
   safeNamePart,
@@ -4968,6 +4969,10 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
           if (db.prepare("SELECT 1 FROM locks WHERE expires_at = ? LIMIT 1").get(Number.MAX_SAFE_INTEGER)) dbPending = true;
         }
       }
+      // Q-018: recover dead continued-worktree owners before queue adoption.
+      await recoverStaleWorktreeClaims(db);
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worktree_artifacts'").get()
+        && db.prepare("SELECT 1 FROM worktree_artifacts WHERE status = 'in_use' LIMIT 1").get()) dbPending = true;
       const hasJobs = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get();
       if (!hasJobs) continue;
       ensureQueueLeaseSchema(db);
@@ -5442,6 +5447,12 @@ export const __selfTest = {
     createHash,
     createIsolatedOpenCodeRuntime,
     createPipelinePlan,
+    claimRetainedWorktree,
+    releaseRetainedWorktreeClaim,
+    recoverStaleWorktreeClaims,
+    worktreeArtifactStatus,
+    markWorktreeArtifactState,
+    reconcileWorktreeArtifactRegistry,
     createWorktreeForJob,
     formatWorktreeSummary,
     releaseQueueJobLocks,
