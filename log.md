@@ -14,6 +14,12 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-05
+
+| ID | Problem | Cause | Change | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| Q-018 | Related write steps needed a fresh worktree and integration/commit between each job, losing earlier uncommitted work and paying repeated setup and integration costs. | Every writer branched from checkout HEAD; no retained-worktree continuation option existed. | Explicit `continueWorktree` attaches a same-repository retained source with transactional `in_use` claim, owner-fenced release and dead-owner recovery. Each run is judged against its own scope; the final integration lands the union. Continued trees are never removed by the job. Parallel/read-only/autoIntegrate/sanitized/contractor/off modes refuse it; integration refuses `in_use`. Fake-agent temporary-Git regression coverage in `tests/review-continue-worktree.js`; GC protects a live claimed source. | `bridge/continue-worktree` | fixed, not deployed |
+
 ## 2026-10-03
 
 ### Fault log: the bridge's own errors for a fix session (Claude, 2026-10-03)

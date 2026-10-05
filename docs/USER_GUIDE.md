@@ -174,6 +174,14 @@ Talk to Codex like you would talk to a senior engineer. You do not need to name 
 - **Uncommitted files are fine**, as long as they are not the files the job may change (files it only reads do not block it). A queued job that does hit your uncommitted files waits and runs by itself once you commit. See `dirty_worktree_requires_checkpoint` in [section 11](#11-troubleshooting).
 - **Do not ask for the OpenCode Orchestrator** unless you specifically want OpenCode to coordinate its own sub-agents. Codex is already the orchestrator.
 
+### Chain of related steps
+
+1. Run a bounded `builder` write job and keep its reported Worktree path.
+2. Run the next `debugger` or `builder` with the same repository `cwd` and `continueWorktree: "<that path>"`, plus its own `lockedPaths`, `allowedEdits`, Scope Contract and validation command. It sees the earlier uncommitted work; only this run's edits are judged against its scope.
+3. Review the whole chain, then preview and apply one `integrate_opencode_worktree`. Its `allowedEdits` must cover the union of all steps' files; integration lands the total worktree patch.
+
+The worktree is exclusively `in_use` while a continued job runs and returns to `retained` when it ends, even on failure or cancellation. A continued job never removes it. Wait for the job to finish before integration. Use `validate_delegation_plan` or the job's `dryRun` to check it without claiming. Parallel execution still uses one worktree per independent writer. Continuation is unavailable for read-only jobs, parallel plans, pipelines, auto-integration, sanitized workspaces, contractor mode or worktree mode `off`.
+
 ---
 
 ## 7. Choosing agents and models

@@ -3,6 +3,7 @@
 The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded, cheap work to a Gemini-backed agent and keep your own context small. You stay the planner, reviewer, and the only one who integrates changes.
 
 ## When to delegate
+Related or sequential steps continue the previous job's worktree with `continueWorktree` and integrate once at the end; `run_opencode_parallel` only for independent, non-overlapping scopes.
 1. Tiny or obvious change: do it yourself.
 2. Second opinion, exploration, review, or a plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester).
 3. One bounded fix or feature: one `builder` or `debugger` via `run_opencode_agent` with a write Scope Contract.
@@ -10,6 +11,7 @@ The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded
 Do not call the OpenCode orchestrator unless the user names it. Do not call `acquire_agent_lock`/`release_agent_lock`; the bridge manages locks.
 
 ## Job shape
+For a follow-up writer, add `continueWorktree: "<previous Worktree path>"` to the normal write job shape. Its own edits are checked against its own scope; the final integration's `allowedEdits` covers all steps' changes.
 Read-only:
 `{ "agent": "reviewer", "task": "...", "cwd": "<absolute repo path>", "write": false, "lockMode": "off", "scopeContract": { "mode": "read", "read": ["src/payments.ts"] } }`
 

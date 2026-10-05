@@ -521,6 +521,8 @@ const BRIDGE_MCP_INSTRUCTIONS = [
   "This server hands bounded tasks to OpenCode agents. You stay the planner, reviewer and the only integrator.",
   "- Tiny or obvious change: do it yourself. Review, exploration or a plan: one read-only agent (reviewer, explore, planner, architect, tester) via run_opencode_agent with write:false, lockMode:\"off\", scopeContract {mode:\"read\", read:[...]}.",
   "- One bounded fix: a builder or debugger via run_opencode_agent with write:true, lockedPaths, allowedEdits, validationCommand \"git diff --check\" and a write scopeContract (read, write, allowedEdits, forbidden). Writers run in their own git worktree with no installed dependencies.",
+  // Q-018: keep sequential work in its retained source until the chain is ready to integrate.
+  "Related or sequential steps continue the previous job's worktree with `continueWorktree` and integrate once at the end; `run_opencode_parallel` only for independent, non-overlapping scopes.",
   "- Independent scopes: validate_delegation_plan, then run_opencode_parallel (scopes must not overlap); long or many jobs: enqueue_opencode_job and poll list_opencode_jobs / get_opencode_job. Package manifests, lockfiles, schemas, migrations and shared config are serial.",
   "- Integrate: read the report and diff, preview with integrate_opencode_worktree dryRun:true, show the patch, then apply with the same arguments plus reviewed:true and the exact previewReceipt. Run the project's real checks afterwards. Never report success from an agent's own claim.",
   "- Locks are managed by the bridge: do not call acquire_agent_lock / release_agent_lock. Something stuck: get_opencode_bridge_status, then diagnose_opencode_bridge. A refusal names its errorType and the next step.",
