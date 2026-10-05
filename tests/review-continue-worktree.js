@@ -651,6 +651,80 @@ test("Q-018 public: a running memory-queue continuation retains live claim prote
   assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
 });
 
+test("Q-018 integration: a live continuation blocks single, batch and an earlier receipt", async () => {
+  const cwd = await repo("integration-live");
+  const source = await retained(cwd);
+  const contract = { cwd, worktreePath: source.worktreePath, allowedEdits: ["src/a.txt", "src/b.txt"], validationCommand: VALIDATION, cleanupAfterSuccess: false };
+  const preview = await I.integratePatchSerially({ ...contract, dryRun: true });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  let entered;
+  let finish;
+  let running;
+  let timer;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const released = new Promise((resolve) => { finish = resolve; });
+  fakeAgent(async (run) => { entered(); await released; await write(run.cwd, "src/b.txt", "from live B\n"); });
+  try {
+    running = execute(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }));
+    await Promise.race([
+      started,
+      running.then((result) => { throw new Error(`Writer ended before starting: ${result.result?.errorType}`); }),
+      new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("Writer did not start")), 30_000); }),
+    ]);
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "in_use");
+    refusal(await I.integratePatchSerially({ ...contract, dryRun: true }), "worktree_in_use");
+    refusal(await I.integratePatchSerially({
+      cwd, batch: { items: [{ worktreePath: source.worktreePath, allowedEdits: contract.allowedEdits, cleanup: false }] },
+      allowedEdits: contract.allowedEdits, validationCommand: VALIDATION, dryRun: true,
+    }), "worktree_in_use");
+    refusal(await I.integratePatchSerially({ ...contract, reviewed: true, previewReceipt: preview.previewReceipt }), "worktree_in_use");
+    for (const file of contract.allowedEdits) assert.equal(existsSync(path.join(cwd, file)), false, "no integration can write while the source is owned");
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "in_use");
+  } finally {
+    clearTimeout(timer);
+    finish();
+    if (running) accepted(await running);
+  }
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+test("Q-018 integration: one reviewed integration lands A and B and cleans the chain", async () => {
+  const cwd = await repo("integration-chain");
+  fakeAgent(async (run) => {
+    if (run.index === 0) await write(run.cwd, "src/a.txt", "from A\n");
+    else {
+      assert.equal(await readFile(path.join(run.cwd, "src/a.txt"), "utf8"), "from A\n");
+      await write(run.cwd, "src/b.txt", "from B\n");
+    }
+  });
+  const first = await execute(writeJob(cwd, "src/a.txt"));
+  accepted(first);
+  const second = await execute(writeJob(cwd, "src/b.txt", { continueWorktree: first.worktree.path }));
+  accepted(second);
+  const contract = { cwd, worktreePath: first.worktree.path, allowedEdits: ["src/a.txt", "src/b.txt"], validationCommand: VALIDATION, cleanupAfterSuccess: true };
+  const narrow = await I.integratePatchSerially({ ...contract, allowedEdits: ["src/b.txt"], dryRun: true });
+  assert.equal(narrow.ok, false, JSON.stringify(narrow));
+  sameFiles(narrow.disallowedFiles, ["src/a.txt"]);
+  const preview = await I.integratePatchSerially({ ...contract, dryRun: true });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  sameFiles(preview.changedFiles, ["src/a.txt", "src/b.txt"]);
+  assert.equal((await artifact(cwd, first.worktree.path)).status, "retained", "preview does not clean or claim the chain");
+  const applied = await I.integratePatchSerially({ ...contract, reviewed: true, previewReceipt: preview.previewReceipt });
+  assert.equal(applied.ok, true, JSON.stringify(applied));
+  assert.equal(applied.status, "applied");
+  sameFiles(applied.appliedFiles, ["src/a.txt", "src/b.txt"]);
+  assert.equal(applied.validationGate.status, "passed");
+  assert.equal(await readFile(path.join(cwd, "src/a.txt"), "utf8"), "from A\n");
+  assert.equal(await readFile(path.join(cwd, "src/b.txt"), "utf8"), "from B\n");
+  assert.equal((await artifact(cwd, first.worktree.path)).status, "cleaned");
+  assert.equal(existsSync(first.worktree.path), false);
+  const operations = await database(cwd, (db) => db.prepare("SELECT status, affected_paths_json FROM integration_operations WHERE cwd = ?").all(cwd));
+  assert.equal(operations.length, 1, "the complete chain uses one journaled integration");
+  assert.equal(operations[0].status, "committed");
+  sameFiles(JSON.parse(operations[0].affected_paths_json), ["src/a.txt", "src/b.txt"]);
+  refusal(await I.attachRetainedWorktree({ cwd, worktreePath: first.worktree.path, jobId: "after-integration" }), "worktree_not_retained");
+});
+
 let failed = 0;
 let total = 0;
 try {

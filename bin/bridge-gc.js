@@ -251,7 +251,7 @@ function markRegistryCleaned(dbPath, worktreePath, { busyTimeoutMs = DEFAULT_BUS
     const result = db.prepare(`
       UPDATE worktree_artifacts
       SET status = 'cleaned', cleaned_at = ?, updated_at = ?
-      WHERE worktree_path = ? AND status IN ('creating', 'retained', 'cleanup_failed')
+      WHERE worktree_path = ? AND status IN ('creating', 'retained', 'cleanup_failed', 'in_use')
     `).run(now, now, path.resolve(worktreePath));
     return Number(result.changes || 0) > 0;
   } finally {
@@ -862,9 +862,12 @@ async function selfTest() {
     addJob(activeOrphanDb, "job-5", vanishedRepo, "running");
     activeOrphanDb.close();
     const leasedHash = "6666666666666666eeeeeeee";
-    const leasedDb = projectDb(leasedHash, "CREATE TABLE bridge_instances (instance_id TEXT PRIMARY KEY, lease_expires_at TEXT NOT NULL);");
+    // Q-018: a live bridge protects a claimed continued worktree even with every GC force flag.
+    const inUsePath = await fakeWorktree(leasedHash, "builder-builder-6-in-use", vanishedRepo);
+    const leasedDb = projectDb(leasedHash, "CREATE TABLE bridge_instances (instance_id TEXT PRIMARY KEY, lease_expires_at TEXT NOT NULL); CREATE TABLE worktree_artifacts (worktree_path TEXT PRIMARY KEY, cwd TEXT NOT NULL, branch TEXT NOT NULL, job_id TEXT NOT NULL, status TEXT NOT NULL, measured_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cleaned_at TEXT);");
     addJob(leasedDb, "job-6", vanishedRepo, "completed");
     leasedDb.prepare("INSERT INTO bridge_instances VALUES ('live-bridge', ?)").run(new Date(Date.now() + 60_000).toISOString());
+    leasedDb.prepare("INSERT INTO worktree_artifacts VALUES (?, ?, ?, ?, 'in_use', 0, ?, ?, NULL)").run(inUsePath, vanishedRepo, "agent/builder/continued", "job-6", now, now);
     leasedDb.close();
     const integratingHash = "7777777777777777eeeeeeee";
     const integratingDb = projectDb(integratingHash, "CREATE TABLE integration_operations (operation_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, status TEXT NOT NULL);");
@@ -882,6 +885,15 @@ async function selfTest() {
       assert.equal(existsSync(path.join(stateDir, "projects", `${hash}.sqlite`)), true);
     }
     assert.match(guarded.report.databases.find((item) => item.projectHash === leasedHash).reason, /live bridge instance lease/);
+    const inUseItem = guarded.report.worktrees.find((item) => item.path === inUsePath);
+    assert.deepEqual([inUseItem.classification, inUseItem.action], ["project_active", "keep"]);
+    assert.equal(existsSync(path.join(inUsePath, "work.txt")), true);
+    const inUseCheckDb = new DatabaseSync(path.join(stateDir, "projects", `${leasedHash}.sqlite`));
+    try {
+      assert.equal(inUseCheckDb.prepare("SELECT status FROM worktree_artifacts WHERE worktree_path = ?").get(inUsePath).status, "in_use", "GC must not mark a live bridge's continued worktree cleaned");
+    } finally {
+      inUseCheckDb.close();
+    }
     assert.match(guarded.report.databases.find((item) => item.projectHash === integratingHash).reason, /unresolved integration/);
 
     // 5b. A repository on a drive that is not mounted (unplugged, unmapped in an elevated
