@@ -204,6 +204,233 @@ test("Q-018 registry: a live serial integration lock excludes a new claim", asyn
   await release(source, "unblocked-claim");
 });
 
+test("Q-018 registry: a fresh writer's retained row cannot be continued before it finishes", async () => {
+  const cwd = await repo("fresh-live");
+  const source = await retained(cwd);
+  const audit = I.directRunAuditStore();
+  const handle = await audit.start({ cwd, agent: "builder" }, { jobId: source.previousJobId });
+  assert.equal(handle.audit.startedPersisted, true);
+  try {
+    refusal(await claim(source, "premature-B"), "worktree_in_use");
+    refusal(await claim(source, "premature-preview", { dryRun: true }), "worktree_in_use");
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+  } finally { await audit.finish(handle, { errorType: "fixture_finished" }); }
+  assert.equal((await claim(source, "finished-A-next-B")).ok, true);
+  await release(source, "finished-A-next-B");
+});
+
+test("Q-018 registry: containment quarantine blocks even a disjoint continuation", async () => {
+  const cwd = await repo("quarantine");
+  const source = await retained(cwd);
+  await database(cwd, (db) => db.prepare(`INSERT INTO locks
+    (normalized_path, owner_agent, run_id, token, lock_mode, expires_at, created_at, cwd, task)
+    VALUES ('src/unrelated.txt', 'builder', 'q018-quarantine', 'fixture', 'write', ?, ?, ?, '')`)
+    .run(Number.MAX_SAFE_INTEGER, Date.now(), cwd));
+  try {
+    refusal(await claim(source, "disjoint-claim"), "worktree_in_use");
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+  } finally {
+    await database(cwd, (db) => db.prepare("DELETE FROM locks WHERE run_id = 'q018-quarantine'").run());
+  }
+  assert.equal((await claim(source, "after-quarantine-resolved")).ok, true);
+  await release(source, "after-quarantine-resolved");
+});
+
+function writeJob(cwd, file = "src/b.txt", extra = {}) {
+  return {
+    agent: "builder", task: `Write ${file}.`, cwd, write: true, lockMode: "simple",
+    lockedPaths: [file], allowedEdits: [file], validationCommand: VALIDATION, timeoutMs: 600_000,
+    scopeContract: { mode: "write", read: ["src"], write: [file], allowedEdits: [file], forbidden: [".env"], validationCommand: VALIDATION },
+    ...extra,
+  };
+}
+function fakeAgent(onRun = async () => {}) {
+  const runs = [];
+  hooks.agentRuntimeTestHook = {
+    resolveAgent: async (requestedAgent, cwd, allowFallbackToBuild, subagentStrategy) => ({
+      requestedAgent, actualAgent: requestedAgent, requestedAgentMode: "primary", actualAgentMode: "primary",
+      fallbackUsed: false, proxyUsed: false, subagentStrategy, availableAgents: [requestedAgent], discoveryExitCode: 0,
+    }),
+    readAgentDebugMetadata: async (agent) => ({ ok: true, metadata: {
+      name: agent, mode: "primary", provider: "fixture", model: "model-a", variant: "high",
+      canEdit: agent === "builder" || agent === "debugger", canDelegate: false,
+      externalDirectoryDenied: true, webDenied: true, bashAutomaticAllowSafe: true,
+      protectedEditsDenied: true, permissionProfileSha256: `profile-${agent}`,
+    } }),
+    runOpenCodeWithPolicy: async (agent, prompt, cwd, dryRun, lockPlan, timeoutMs, options = {}) => {
+      const run = { agent, prompt, cwd, dryRun, lockPlan, timeoutMs, signal: options.signal, index: runs.length };
+      runs.push(run);
+      const started = Date.now();
+      const outcome = dryRun ? {} : await onRun(run);
+      return {
+        exitCode: 0, stdout: "REPORT: done.", stderr: "", errorType: null, durationMs: 1, dryRun,
+        assistantFinalResponseDetected: true, childExecutionIntervals: [], configuredProvider: "fixture", configuredModel: "model-a",
+        childStartedAtMs: started, childFinishedAtMs: Date.now() + 1, ...outcome,
+      };
+    },
+  };
+  return runs;
+}
+async function execute(job, options = {}) {
+  const jobId = options.jobId || `q018-execution-${++sequence}`;
+  const audit = I.directRunAuditStore();
+  const handle = await audit.start(job, { jobId });
+  assert.equal(handle.audit.startedPersisted, true, "the fake agent has real durable direct-run ownership");
+  let execution;
+  try {
+    execution = await I.executeOpenCodeJob(job, { ...options, jobId });
+    return { ...execution, fixtureJobId: jobId };
+  } finally {
+    await audit.finish(handle, { execution, executionThrew: !execution });
+  }
+}
+function accepted(execution) {
+  assert.ok(!execution.result?.errorType, textOf(execution.response));
+  assert.deepEqual(execution.validation?.disallowedFiles || [], [], textOf(execution.response));
+}
+function sameFiles(actual, expected) { assert.deepEqual([...actual].sort(), [...expected].sort()); }
+
+test("Q-018 execution: B sees A's uncommitted work and only B's edits belong to B", async () => {
+  const cwd = await repo("chain");
+  fakeAgent(async (run) => {
+    if (run.index === 0) await write(run.cwd, "src/a.txt", "from A\n");
+    else {
+      assert.equal(await readFile(path.join(run.cwd, "src/a.txt"), "utf8"), "from A\n");
+      await write(run.cwd, "src/b.txt", "from B\n");
+    }
+  });
+  const first = await execute(writeJob(cwd, "src/a.txt"));
+  accepted(first);
+  assert.ok(first.worktree?.path);
+  const second = await execute(writeJob(cwd, "src/b.txt", { continueWorktree: first.worktree.path }));
+  accepted(second);
+  sameFiles(second.result.changedFiles, ["src/b.txt"]);
+  sameFiles(second.result.worktree.changedFiles, ["src/a.txt", "src/b.txt"]);
+  sameFiles(second.result.worktree.thisRunChangedFiles, ["src/b.txt"]);
+  assert.equal(second.result.worktree.continued, true);
+  assert.equal(second.result.worktree.continuedFrom, first.fixtureJobId);
+  assert.equal(second.worktree.path, first.worktree.path);
+  assert.equal((await artifact(cwd, first.worktree.path)).status, "retained");
+  assert.equal(existsSync(path.join(cwd, "src/a.txt")), false, "the chain has not been integrated implicitly");
+  assert.equal(existsSync(path.join(cwd, "src/b.txt")), false);
+});
+
+test("Q-018 execution: a no-edit continuation retains A's work", async () => {
+  const cwd = await repo("no-edits");
+  const source = await retained(cwd);
+  fakeAgent();
+  const result = await execute(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }));
+  accepted(result);
+  assert.deepEqual(result.result.changedFiles, []);
+  assert.ok(existsSync(source.worktreePath));
+  assert.equal(await readFile(path.join(source.worktreePath, "src/a.txt"), "utf8"), "from A\n");
+  assert.equal(result.worktreeCleanup.cleanup, "retained_for_review");
+  assert.match(result.worktreeCleanup.reason, /continued worktree keeps earlier jobs' work/);
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+for (const outcome of ["success", "failure", "throw", "abort"]) {
+  test(`Q-018 execution: claim is released after ${outcome}`, async () => {
+    const cwd = await repo(`release-${outcome}`);
+    const source = await retained(cwd);
+    const controller = new AbortController();
+    fakeAgent(async (run) => {
+      assert.equal((await artifact(cwd, source.worktreePath)).status, "in_use", "claim covers the complete agent run");
+      await write(run.cwd, "src/b.txt", `B ${outcome}\n`);
+      if (outcome === "throw") throw new Error("Q-018 fixture infrastructure failure");
+      if (outcome === "abort") {
+        controller.abort(new Error("fixture cancellation"));
+        assert.equal(run.signal.aborted, true);
+        return { exitCode: 1, errorType: "agent_cancelled", stderr: "fixture cancellation" };
+      }
+      if (outcome === "failure") return { exitCode: 1, errorType: "agent_exit_nonzero", stderr: "fixture failure" };
+    });
+    const result = await execute(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }), { signal: controller.signal });
+    if (outcome === "success") accepted(result);
+    else assert.equal(result.result.errorType, outcome === "throw" ? "job_infrastructure_failed" : outcome === "abort" ? "agent_cancelled" : "agent_exit_nonzero", textOf(result.response));
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+    assert.ok(existsSync(source.worktreePath));
+    assert.equal(await readFile(path.join(source.worktreePath, "src/a.txt"), "utf8"), "from A\n");
+  });
+}
+
+test("Q-018 execution: a concurrent second writer cannot attach to the claimed source", async () => {
+  const cwd = await repo("running-claim");
+  const source = await retained(cwd);
+  let entered;
+  let finish;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const released = new Promise((resolve) => { finish = resolve; });
+  fakeAgent(async (run) => { entered(); await released; await write(run.cwd, "src/b.txt", "from B\n"); });
+  const running = execute(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }));
+  let timer;
+  try {
+    await Promise.race([
+      started,
+      running.then((result) => { throw new Error(`Writer ended before the fake agent started: ${textOf(result.response)}`); }),
+      new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("Writer never entered the fake agent")), 30_000); }),
+    ]);
+    const competing = await execute(writeJob(cwd, "src/c.txt", { continueWorktree: source.worktreePath }));
+    assert.equal(competing.result.errorType, "worktree_in_use", textOf(competing.response));
+    assert.equal((await artifact(cwd, source.worktreePath)).status, "in_use");
+  } finally { clearTimeout(timer); finish(); await running; }
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+test("Q-018 execution: attach dry-run verifies identity without changing the registry", async () => {
+  const cwd = await repo("attach-dry");
+  const source = await retained(cwd);
+  const before = { ...await artifact(cwd, source.worktreePath) };
+  const attached = await I.attachRetainedWorktree({ cwd, worktreePath: source.worktreePath, jobId: "dry-attach", dryRun: true });
+  assert.equal(attached.ok, true, JSON.stringify(attached));
+  assert.equal(attached.continued, true);
+  assert.equal(attached.continuedFrom, source.previousJobId);
+  assert.equal(attached.branch, source.branch);
+  assert.equal(attached.baseCommit, (await git(source.worktreePath, "rev-parse", "HEAD")).trim());
+  assert.equal(attached.baseTree, (await git(source.worktreePath, "rev-parse", "HEAD^{tree}")).trim());
+  assert.deepEqual({ ...await artifact(cwd, source.worktreePath) }, before);
+});
+
+test("Q-018 execution: wrong repository, non-root, missing and unregistered paths are refused", async () => {
+  const cwd = await repo("identity");
+  const source = await retained(cwd);
+  const other = await repo("identity-other");
+  for (const [target, worktreePath, errors] of [
+    [other, source.worktreePath, ["worktree_identity_mismatch"]],
+    [cwd, path.join(source.worktreePath, "src"), ["worktree_identity_mismatch"]],
+    [cwd, path.join(root, "missing-attach"), ["worktree_identity_mismatch", "worktree_not_retained"]],
+    [cwd, cwd, ["worktree_identity_mismatch", "worktree_not_retained"]],
+  ]) {
+    const result = await I.attachRetainedWorktree({ cwd: target, worktreePath, jobId: "bad-identity", dryRun: true });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.ok(errors.includes(result.errorType), JSON.stringify(result));
+    assert.ok(result.suggestedFix?.trim());
+  }
+  const unregistered = path.join(root, `unregistered-${++sequence}`);
+  await git(cwd, "worktree", "add", "-q", "--detach", unregistered, "HEAD");
+  refusal(await I.attachRetainedWorktree({ cwd, worktreePath: unregistered, jobId: "unregistered" }), "worktree_not_retained");
+});
+
+test("Q-018 execution: a worktree HEAD outside checkout history is refused", async () => {
+  const cwd = await repo("diverged-head");
+  const source = await retained(cwd);
+  await git(source.worktreePath, "add", ".");
+  await git(source.worktreePath, "commit", "-q", "-m", "unapproved source commit");
+  refusal(await I.attachRetainedWorktree({ cwd, worktreePath: source.worktreePath, jobId: "diverged", dryRun: true }), "worktree_identity_mismatch");
+  assert.equal((await artifact(cwd, source.worktreePath)).status, "retained");
+});
+
+test("Q-018 execution: continuation does not require the checkout's dirty scope to be committed", async () => {
+  const cwd = await repo("dirty-checkout");
+  const source = await retained(cwd);
+  await write(cwd, "src/b.txt", "operator's uncommitted B\n");
+  fakeAgent(async (run) => { await write(run.cwd, "src/b.txt", "continued B\n"); });
+  const result = await execute(writeJob(cwd, "src/b.txt", { continueWorktree: source.worktreePath }));
+  accepted(result);
+  assert.equal(await readFile(path.join(cwd, "src/b.txt"), "utf8"), "operator's uncommitted B\n");
+  assert.equal(await readFile(path.join(source.worktreePath, "src/b.txt"), "utf8"), "continued B\n");
+});
+
 let failed = 0;
 let total = 0;
 try {
