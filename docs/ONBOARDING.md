@@ -23,7 +23,7 @@ instead of `&&` there.
 
 | Tool | Needed | Check |
 | --- | --- | --- |
-| Node.js | 22.12 or newer | `node --version` |
+| Node.js | 22.13 or newer | `node --version` |
 | Git | Any current version (the scratch run used 2.39) | `git --version` |
 | OpenCode | 1.18.32 or newer for the default pure profile (1.18.32 is tested; a newer one gets a note and `npm run smoke:live` proves it); exactly 1.18.32 for the Gemini profile, whose plugin manifest pins it | `opencode --version` |
 | Codex CLI **or** Claude Code | One MCP client is enough; setup registers whichever is installed (`--client` chooses) | `codex --version` / `claude --version` |
@@ -40,15 +40,15 @@ claude auth status
 
 **Checked:** the version commands and the sign-in checks of the installed tools.
 
-`opencode auth list` shows the providers OpenCode has credentials for. Most managed agent
-profiles use `opencode/muse-spark-1.3-contributor-free` (in the scratch run it answered with no
-extra sign-in); `reviewer` and `tester` currently pin `google/antigravity-gemini-3.8-flash`,
-which needs the managed Gemini plugin/profile and provider sign-in. The sanitized reader
-uses `openai/gpt-5.6-terra`, which needs OpenCode's OpenAI sign-in. Setup copies these reviewed
-profiles as they are; a pure health check proves discovery, not that every model is available.
-Use the managed Gemini profile for the shipped reviewer/tester, or review a pure-compatible
-profile change separately. Add a provider with `opencode auth login`. The live smoke in step 8
-proves that its selected agent's model answers (the default agent is `planner`).
+`opencode auth list` shows the providers OpenCode has credentials for. The default planner,
+builder, debugger, architect, reviewer and tester use `opencode/muse-spark-1.3-contributor-free`
+and work with the pure profile. The sanitized reader uses `openai/gpt-5.6-terra`, which needs
+OpenCode's OpenAI sign-in. Signing in to Claude Code does not sign OpenCode in to a provider.
+Setup copies these reviewed profiles as they are; a pure health check proves discovery,
+not current model availability. Add a provider with `opencode auth login`. The live smoke
+in step 8 proves that its selected agent's model answers (the default agent is `planner`).
+To select Gemini explicitly, use the Gemini setup profile, its provider sign-in and the
+operator model allowlist described in REFERENCE's Model Selection section.
 
 ## 2. Get the code and install it
 

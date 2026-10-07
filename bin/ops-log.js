@@ -406,7 +406,8 @@ function appendOpsLogLine(stateDir, record, { now = new Date() } = {}) {
     appendIssueLogLine(stateDir, record);
     appendFaultLogEntry(stateDir, record);
   }
-  return Boolean(written);
+  // B-190: a cap marker is useful evidence, but the caller's incident was not persisted.
+  return written === "record";
 }
 
 function appendJsonlLine(stateDir, record, { now = new Date() } = {}) {

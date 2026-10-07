@@ -14,6 +14,49 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-07
+
+### Friend readiness fixes
+
+Plan: first reproduce the six confirmed issues with isolated fixtures; make narrow fixes for
+lease authority, memory queue ownership, setup prerequisites, pure model defaults and logging;
+then run the new regressions, the full local suite and an independent review. No client sync,
+live model calls or deployment. Changes are on `codex/friend-readiness-fixes`, from `8881d77`.
+
+| ID | Problem | Cause | Change | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-185 | A transient hard-lock database error killed a healthy supervised agent while its lease was still valid. | The boolean pulse returned false on any refresh exception; the supervisor treated that as revoked authority. | Preserve authority only until the last confirmed guarded deadline. Definitive token/row loss and expiry still abort. Real supervised-payload regressions cover recovery and fail-closed loss. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-186 | Memory queue jobs and pipelines were treated as if they had durable SQLite owner rows. | A durable queue fence was armed in memory mode, and heartbeat renewal treated absent rows as ownership loss. | Skip durable queue fences and SQLite job/pipeline ownership checks in memory mode; retain hard-lock/provider authority and cancellation. Keep instance heartbeats for continued memory jobs so their persisted audit owner survives provider-slot waits, including shorter configured leases. Regressions cover long-running memory jobs, pipelines, cancellation, live continued claims during provider waits and SQLite loss. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-187 | Setup accepted Node 22.12 even though the unflagged server import requires 22.13. | Setup, package engines and current instructions used an older SQLite import boundary. | Require Node >=22.13.0 consistently; version-injected tests refuse 22.12 before writes and accept 22.13 in a dry run. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-188 | A fresh pure setup shipped reviewer/tester profiles that required the disabled Gemini plugin. | Those two roles pinned Google while setup defaulted to the pure profile. | Default both roles to the existing Muse model with matching prompts; preserve permissions, attestation and explicitly allowlisted Gemini selection. Fresh-copy and Claude-only idempotency tests cover setup. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-189 | Runtime JSONL, issue and fault logs could retain an all-letter URL password. | Runtime redaction relied on a likely-secret heuristic requiring a digit; CLI logging already masked URL passwords broadly. | Apply the CLI-style URL password rule to broad runtime/storage redaction. Keep patch and agent-answer heuristics unchanged. Test all-letter, short and encoded passwords in the real sinks. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-190 | A failed operations-log write or daily cap could hide an incident without a fallback diagnostic. | The runtime ignored the writer's false return; the first cap marker returned true despite dropping the incident. | Return false when only the cap marker is written and emit one bounded redacted stderr diagnostic carrying the incident per continuous failure episode. Successful persistence resets it; intentional OPS_LOG off remains quiet. Disk persistence remains best effort. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-191 | The full suite stopped at an obsolete R-144 cleanup call-count assertion. | Pre-spawn cleanup had already been consolidated into a shared helper before this branch; the test still expected seven inline provider stops. Runtime and test bytes matched baseline `8881d77` before the correction. | Check the current awaited-stop-before-release/quarantine contracts, including the generic helper alias and writer stop. Three in-memory missing-await mutations must fail the check. Preserve all nine existing cases and runtime behavior. | `codex/friend-readiness-fixes` | fixed, not deployed |
+| B-192 | The final server self-test plugin fixture failed under an externally isolated XDG cache. | Its manifest pins `plugin-home/.cache`, but its child changed HOME/config without overriding the inherited XDG_CACHE_HOME. Runtime plugin policy correctly refused the different canonical cache; it was unchanged from `8881d77`. | Set the fixture child's XDG_CACHE_HOME to its own `.cache` beside its existing HOME/config overrides. All acceptance, tampering and manifest-pin assertions stay strict; no runtime change. | `codex/friend-readiness-fixes` | fixed, not deployed |
+
+Verification: targeted setup (17), runtime (10), logging (8), queue (31), spawn (39) and
+continue-worktree (35) checks passed. Independent review found one continuation liveness
+gap, reproduced and corrected; final revised runtime/setup/logging diffs had no actionable
+findings. New regressions are wired into `npm test`.
+
+The final-code `npm test` run passed every preceding command and stopped at the pre-existing
+R-144 assertion after 1354.40 seconds. Corrected R-144: 9/9 passed, including missing-await
+mutations. The exact remaining npm commands were run from the stop point, with the original skip
+ledger preserved. They passed through all 35 continue-worktree cases, then the final server
+self-test exposed the isolated-cache fixture mismatch (B-192). After that one-line fixture
+correction, the full server self-test and aggregate skip gate passed (`NPM_TEST_FINAL_EXIT=0`,
+232.64 seconds). All commands declared in `npm test` are covered across these sequential
+runs; no single uninterrupted npm invocation exited 0. Runtime code did not change during
+these two test-only corrections. Aggregate: 4 optional Windows checks skipped (3 symlink privileges and 1 quoted-path
+constraint in Git for Windows), zero required skips. `git diff --check` passed.
+
+Evidence: `tmp/friend-readiness-npm-test.log`, `tmp/friend-readiness-review2-c.log`,
+`tmp/friend-readiness-npm-test-tail.log`, `tmp/friend-readiness-npm-test-final.log`.
+Verification environment: Windows with Node 24.11.1. TestSprite was not run: no local
+project link was found, and its CLI returned AUTH_REQUIRED.
+No real model request or installation on the friend's own PC was tested. Disk logging stays
+best effort when storage is full or unwritable; the new stderr diagnostic exposes that loss.
+
 ## 2026-10-05
 
 | ID | Problem | Cause | Change | Branch | Status |

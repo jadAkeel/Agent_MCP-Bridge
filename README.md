@@ -15,10 +15,12 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 ## Requirements
 
-- Node.js 22.12 or newer
+- Node.js 22.13 or newer
 - Git
 - OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The default pure profile needs 1.18.32 or newer; 1.18.32 is the tested version, setup refuses an older one and accepts a newer one with a note (`npm run smoke:live` then proves it). The optional Gemini profile needs exactly 1.18.32, the version `opencode/plugin-integrity-manifest.json` pins (`openCodeVersion`).
 - One MCP client: Codex CLI or Claude Code. Both work side by side, but one is enough; setup registers whichever is installed.
+
+The default planner, builder, debugger, architect, reviewer and tester use `opencode/muse-spark-1.3-contributor-free`, which works with the pure profile. Signing in to Claude Code does not sign OpenCode in to a provider. Gemini is optional; it needs the Gemini setup profile and OpenCode provider sign-in.
 
 Python is no longer needed: the bridge reads its TOML entry itself (log.md B-176).
 
@@ -69,7 +71,7 @@ Run these from `<bridge-dir>`.
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
-Every error ends up in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them, and every job failure is also one line of `<state-dir>/logs/issues.md`.
+When the log destination is writable and below its daily cap, errors are recorded in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them, and job failures also appear in `<state-dir>/logs/issues.md`. URL passwords are redacted. Logging is best effort: when a bridge runtime incident cannot be persisted, one redacted `ops_log_write_failed` diagnostic with the incident goes to stderr per continuous failure episode, even with `CODEX_OPENCODE_LOG_LEVEL=off`. `CODEX_OPENCODE_OPS_LOG=off` intentionally disables persistence and this fallback.
 
 ## Unattended runs
 

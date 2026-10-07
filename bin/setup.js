@@ -104,8 +104,8 @@ function selectClients(choice, found) {
 }
 
 function preflight(options, { env, log, commands = {}, run = runCommand, nodeVersion = process.versions.node }) {
-  let ok = versionAtLeast(nodeVersion, [22, 12, 0]);
-  log(`node: ${ok ? "ok" : "wrong version"} (${nodeVersion}); required >=22.12.0${ok ? "" : "; install: https://nodejs.org/"}`);
+  let ok = versionAtLeast(nodeVersion, [22, 13, 0]);
+  log(`node: ${ok ? "ok" : "wrong version"} (${nodeVersion}); required >=22.13.0${ok ? "" : "; install: https://nodejs.org/"}`);
   const found = {};
   const openCodeHint = options.profile === "gemini"
     ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the Gemini profile's plugin manifest pins it): https://opencode.ai/docs/`

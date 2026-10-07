@@ -2660,6 +2660,7 @@ async function runSelfTests() {
         HOME: pluginFixtureHome,
         USERPROFILE: pluginFixtureHome,
         XDG_CONFIG_HOME: path.join(pluginFixtureHome, ".config"),
+        XDG_CACHE_HOME: path.join(pluginFixtureHome, ".cache"),
         CODEX_OPENCODE_EXECUTABLE: pluginFixtureHostExecutable,
         CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "true",
         CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST: pluginFixtureSpec,

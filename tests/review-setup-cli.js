@@ -70,11 +70,31 @@ try {
   const optionsFor = (name, flags = []) => parseArguments(["--yes", "--codex-home", path.join(scratch, name, "codex"),
     "--claude-config", path.join(scratch, name, "claude-custom.json"), ...flags]);
   const output = [];
-  const apply = (options, extra = {}) => runSetup(options, { log: (line) => output.push(line), ...extra });
+  const apply = async (options, extra = {}) => {
+    try { return await runSetup(options, { log: (line) => output.push(line), ...extra }); }
+    catch (error) { throw new Error(error.message + "\n" + output.slice(-4).join("\n"), { cause: error }); }
+  };
   const cli = (options, flags = [], env = process.env) => spawnSync(process.execPath, [path.join(ROOT, "bin", "setup.js"),
     "--yes", "--codex-home", options.codexHome, "--claude-config", options.claudeConfigPath, ...flags],
   { cwd: ROOT, env, encoding: "utf8", windowsHide: true, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
   const fresh = optionsFor("fresh", ["--provider-limit", "3"]);
+
+  await check("Node 22.12 is refused before writing; Node 22.13 is accepted without writing", async () => {
+    const commands = Object.fromEntries(["git", "opencode", "claude"].map((name) => [name, { command: name, args: [] }]));
+    commands.codex = null;
+    const run = () => ({ status: 0, stdout: "1.18.32", stderr: "" });
+    const refused = optionsFor("node-22-12", ["--client", "claude"]);
+    output.length = 0;
+    assert.equal(await apply(refused, { commands, run, nodeVersion: "22.12.0" }), 1);
+    assert.match(output.join("\n"), /node: wrong version \(22\.12\.0\); required >=22\.13\.0/);
+    assert.equal(existsSync(path.dirname(refused.codexHome)), false, "a refused Node version creates no setup destinations");
+    const accepted = optionsFor("node-22-13", ["--client", "claude", "--dry-run"]);
+    output.length = 0;
+    assert.equal(await apply(accepted, { commands, run, nodeVersion: "22.13.0" }), 0);
+    assert.match(output.join("\n"), /node: ok \(22\.13\.0\); required >=22\.13\.0/);
+    assert.match(output.join("\n"), /No files written/);
+    assert.equal(existsSync(path.dirname(accepted.codexHome)), false, "an accepted dry run creates no setup destinations");
+  });
 
   await check("fresh entry, real SHA-256, first-run env and identical Claude registration", async () => {
     assert.equal(await apply(fresh), 0, output.join("\n"));
@@ -99,6 +119,52 @@ try {
     assert.deepEqual(JSON.parse(await readFile(fresh.claudeConfigPath, "utf8")).mcpServers.opencode, { type: "stdio", ...entry });
     assert.ok(output.some((line) => /Bridge daily doctor: healthy/.test(line)));
     assert.ok(output.some((line) => /Live smoke: passed/.test(line)), "the written entry starts a real MCP bridge, with a fake provider CLI and no model request");
+  });
+
+  await check("fresh pure reviewer/tester profiles match their prompts, attestation and explicit model arguments", async () => {
+    if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+    const { __selfTest } = await import("../server.js");
+    const { managedAgentSourceProfile, normalizeAgentDebugMetadata, effectiveReadOnlyMetadataError,
+      openCodeRunArgs, allowlistedModelOverride, applyModelOverrideToMetadata } = __selfTest.internals;
+    const entry = await loadMcpEntry(fresh.configPath);
+    assert.equal(entry.env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS, "false");
+    const geminiRequirement = { provider: "google", model: "antigravity-gemini-3.8-flash", variant: "high" };
+    for (const agent of ["reviewer", "tester"]) {
+      const source = await readFile(path.join(ROOT, "opencode", "agents", agent + ".md"), "utf8");
+      const copied = await readFile(path.join(entry.env.CODEX_OPENCODE_AGENT_DIR, agent + ".md"), "utf8");
+      assert.equal(copied, source, agent + " copies the reviewed source byte-for-byte");
+      const profile = managedAgentSourceProfile(copied, agent);
+      assert.equal(profile.provider, "opencode");
+      assert.equal(profile.model, "muse-spark-1.3-contributor-free");
+      assert.equal(profile.variant, "high");
+      assert.equal(profile.temperature, 0);
+      const prompt = /^---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/.exec(copied)[1];
+      assert.match(prompt, /Use \x60opencode\/muse-spark-1\.3-contributor-free\x60 with variant \x60high\x60/);
+      const debug = { name: agent, mode: profile.mode, model: { providerID: profile.provider, modelID: profile.model },
+        variant: profile.variant, temperature: profile.temperature, prompt,
+        tools: { edit: false, apply_patch: false, write: false, task: false, webfetch: false, websearch: false },
+        permission: ["edit", "task", "external_directory", "webfetch", "websearch", "bash"].map((permission) => ({ permission, pattern: "*", action: "deny" })) };
+      const metadata = normalizeAgentDebugMetadata(debug, agent);
+      for (const field of ["name", "mode", "provider", "model", "variant", "temperature", "promptSha256"]) {
+        assert.equal(metadata[field], profile[field], agent + " source attestation field " + field);
+      }
+      const policy = { expectedAgent: agent, expectedMode: profile.mode, expectedMetadata: metadata };
+      assert.equal(effectiveReadOnlyMetadataError({ ok: true, metadata }, { lockType: "read" }, policy), null);
+      const changedModel = normalizeAgentDebugMetadata({ ...debug, model: { ...debug.model, modelID: "unreviewed-model" } }, agent);
+      assert.equal(effectiveReadOnlyMetadataError({ ok: true, metadata: changedModel }, { lockType: "read" }, policy).errorType, "agent_metadata_changed");
+      const args = openCodeRunArgs(agent, "fixture; do not run", metadata);
+      assert.ok(args.includes("--pure"));
+      assert.ok(args.includes("--model=opencode/muse-spark-1.3-contributor-free"));
+      assert.ok(args.includes("--variant=high"));
+      assert.equal(allowlistedModelOverride(geminiRequirement, agent, []), null, "Gemini still needs operator authorization");
+      const override = allowlistedModelOverride(geminiRequirement, agent, ["google/antigravity-gemini-3.8-flash@high"]);
+      assert.ok(override, "optional Gemini remains selectable through the existing operator allowlist");
+      const overridden = applyModelOverrideToMetadata(metadata, override);
+      assert.equal(overridden.profileProvider, profile.provider);
+      assert.equal(overridden.profileModel, profile.model);
+      assert.equal(overridden.canEdit, false);
+      assert.ok(openCodeRunArgs(agent, "fixture; do not run", overridden).includes("--model=google/antigravity-gemini-3.8-flash"));
+    }
   });
 
   await check("second run is a byte-for-byte no-op, including scratch state", async () => {
@@ -253,6 +319,11 @@ try {
     assert.ok(output.some((line) => /Bridge daily doctor: healthy/.test(line)), "the doctor still compares the Claude entry with the canonical one");
     assert.match(text, /Setup verified\.\n1\. Restart Claude Code\.\n2\. Run npm run smoke:live once\./);
     assert.doesNotMatch(text, /Restart Codex/);
+    const before = await saved(path.dirname(claudeOnly.codexHome));
+    output.length = 0;
+    assert.equal(await apply(claudeOnly, { commands: { codex: null } }), 0);
+    assert.match(output.join("\n"), /already complete; nothing to change/);
+    assert.deepEqual(await saved(path.dirname(claudeOnly.codexHome)), before, "Claude-only setup is a byte-for-byte no-op on its second run");
     const none = optionsFor("no-client");
     output.length = 0;
     assert.equal(await apply(none, { commands: { codex: null, claude: null } }), 1);

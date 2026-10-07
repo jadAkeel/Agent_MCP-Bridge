@@ -98,14 +98,41 @@ await test("R-144 a renewal never turns a quarantined lease back into a finite o
   assert.equal(await providerLeaseExpiry(acquired.lease.id), Number.MAX_SAFE_INTEGER, "the quarantine must keep its no-expiry marker");
 });
 
-await test("R-144 every heartbeat stop that precedes a release or quarantine is awaited", async () => {
-  // stop() became asynchronous; a call that is not awaited silently races the write after it.
-  const calls = [...serverSource.matchAll(/^(.*?)\b(stopProviderLeaseHeartbeat|stopLockHeartbeat)\(\);/gm)];
-  const providerStops = calls.filter((call) => call[2] === "stopProviderLeaseHeartbeat");
-  assert.ok(providerStops.length >= 7, `expected at least 7 provider heartbeat stops in runOpenCode, found ${providerStops.length}`);
+function assertHeartbeatCleanupSource(source) {
+  // Stops may be shared by pre-spawn exits; check the cleanup contract, not a call count.
+  const failureHelper = /const failBeforeSpawn = async \([\s\S]*?\n  \};/.exec(source)?.[0];
+  assert.ok(failureHelper, "the shared pre-spawn cleanup helper was not found");
+  const helperStop = failureHelper.indexOf("await stopHeartbeat();");
+  assert.ok(helperStop >= 0 && failureHelper.indexOf("await releaseProviderLease(lease);") > helperStop,
+    "pre-spawn cleanup must await heartbeat stop before releasing its lease");
+  const finalCleanup = /finally \{\s*clearAgentActivity\(slotWaitJobId\);[\s\S]*?\n  \}/.exec(source)?.[0];
+  assert.ok(finalCleanup, "the provider execution cleanup was not found");
+  const finalStop = finalCleanup.indexOf("await stopProviderLeaseHeartbeat();");
+  assert.ok(finalStop >= 0 && finalCleanup.indexOf("await quarantineProviderLease(") > finalStop
+    && finalCleanup.indexOf("await releaseProviderLease(") > finalStop,
+  "final cleanup must await heartbeat stop before quarantining or releasing its lease");
+  const calls = [...source.matchAll(/^(.*?)\b(stopProviderLeaseHeartbeat|stopLockHeartbeat|stopHeartbeat)\(\);/gm)];
   assert.ok(calls.some((call) => call[2] === "stopLockHeartbeat"), "the write-lock heartbeat stop was not found");
   const unawaited = calls.filter((call) => !/\bawait\s*$/.test(call[1]));
   assert.deepEqual(unawaited.map((call) => call[0].trim()), [], "these heartbeat stops are not awaited");
+}
+
+await test("R-144 every heartbeat stop that precedes a release or quarantine is awaited", async () => {
+  assertHeartbeatCleanupSource(serverSource);
+  // Guard the regression test itself: each cleanup path must reject an unawaited stop.
+  for (const [stop, anchor] of [
+    ["stopHeartbeat", "const failBeforeSpawn = async"],
+    ["stopProviderLeaseHeartbeat", "clearAgentActivity(slotWaitJobId);"],
+    ["stopLockHeartbeat", "await stopLockHeartbeat();"],
+  ]) {
+    const awaited = "await " + stop + "();";
+    const anchorAt = serverSource.indexOf(anchor);
+    const stopAt = serverSource.indexOf(awaited, anchorAt);
+    assert.ok(anchorAt >= 0 && stopAt >= anchorAt, "mutation target missing: " + stop);
+    const mutant = serverSource.slice(0, stopAt) + serverSource.slice(stopAt).replace(awaited, stop + "();");
+    assert.throws(() => assertHeartbeatCleanupSource(mutant), assert.AssertionError,
+      "cleanup assertion must detect an unawaited " + stop);
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 ---
 description: Designs verification plans, identifies edge cases, and reviews or creates tests when explicitly requested.
 mode: all
-model: google/antigravity-gemini-3.8-flash
+model: opencode/muse-spark-1.3-contributor-free
 variant: high
 temperature: 0
 permission:
@@ -36,7 +36,7 @@ You are a senior test engineer.
 
 ## Model Policy
 
-- Use `google/antigravity-gemini-3.8-flash` with variant `high` as the configured model.
+- Use `opencode/muse-spark-1.3-contributor-free` with variant `high` as the configured model.
 - Keep temperature at 0 for deterministic testing and validation.
 - Do not silently switch models.
 - If the configured model is unavailable, report the issue and stop; the bridge never authorizes an automatic fallback.
