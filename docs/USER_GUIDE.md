@@ -687,7 +687,7 @@ The configuration lives in `~/.codex/config.toml`, under `[mcp_servers.opencode]
 | `CODEX_OPENCODE_WORKTREE_ROOT` | `global` | Worktrees live in the state folder, not inside your projects. |
 | `CODEX_OPENCODE_QUEUE_MODE` | `sqlite` | Durable queue with restart recovery. |
 | `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` | `4` | Maximum simultaneous model calls across all sessions. The built-in default is `2`. |
-| `CODEX_OPENCODE_GLOBAL_WORKER_LIMIT` | as your machine allows, e.g. `10` | Maximum agents running at once on all providers together. The built-in default is `0` (no cap). |
+| `CODEX_OPENCODE_GLOBAL_WORKER_LIMIT` | as your machine allows, e.g. `10` | Maximum agents running at once on all providers together. The default is `max(2, floor(available CPU cores / 4))`, capped at 64; explicit `0` disables it. |
 | `CODEX_OPENCODE_MIN_FREE_MEMORY_MB` | default (`1024`) | The queue starts no new job below this much free memory. `0` turns it off. |
 | `CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST` | `git,npm,node,pnpm,yarn,python,pytest` | Programs a job's `validationCommand` may start. The built-in default is `git` only. |
 | `CODEX_OPENCODE_ATTESTATION_CACHE_TTL_MS` | default (30 min) | Reuses agent and plugin checks between jobs. Any change to an agent, skill, or config file resets it. `0` turns it off. |

@@ -16,6 +16,13 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-07
 
+### Performance round A: shared attestation and conservative worker default
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-193 | Client processes repeated identical cold attestation reads and had no global worker cap by default. | Process-local caches and an uncapped environment default. | Positive SQLite cache with fenced cold-read claims, content/build/executable/environment identities, corruption-as-miss and unchanged final pre-spawn age rules; CPU-derived worker default with explicit-zero/runtime precedence. New cross-process, invalidation, corruption, failure and override tests. Cold-start measurements use copied profiles and scratch HOME/XDG, without provider requests. Required gates passed: shared cache 13/13 (including native-format/extensionless-launcher follow-up), runtime control 10/10, attestation 7/7, latency 12/12, quota 8/8, integration bytes 13/13, recovery 33/33, server self-test, syntax and diff check. Report: perf-round-A.md. | `bridge/perf-round` | verified; uncommitted, not deployed |
+
+
 ### Friend readiness fixes
 
 Plan: first reproduce the six confirmed issues with isolated fixtures; make narrow fixes for

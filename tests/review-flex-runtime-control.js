@@ -13,7 +13,8 @@ process.env.CODEX_OPENCODE_OPS_LOG = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT;
-delete process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT;
+// This suite exercises explicit uncapped mode; shared-attestation tests cover the CPU default.
+process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 // Never the operator's ~/.codex/codex-opencode-mcp, not even from a timer after cleanup.
 const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
 const isolatedStateDir = isolateBridgeStateDir("review-flex-runtime-control");
@@ -152,7 +153,7 @@ test("Q-005: invalid pause requests are refused and change nothing", async () =>
 });
 
 test("Q-005: the global worker cap holds back a slot on any provider once that many agents run", async () => {
-  assert.equal(ENV_GLOBAL_WORKER_LIMIT, 0, "no cap unless configured");
+  assert.equal(ENV_GLOBAL_WORKER_LIMIT, 0, "explicit zero disables the automatic cap");
   assert.match(describeConcurrencyLimits().global, /^effective 0 \(no cap\) \(env 0\)$/);
   const changed = await callTool("set_opencode_concurrency", { globalWorkerLimit: 2 });
   assert.notEqual(changed.isError, true, textOf(changed));
