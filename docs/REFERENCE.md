@@ -653,3 +653,13 @@ POSIX code paths are guarded and self-testable, but macOS/Linux setup is not ver
 - Validation commands use a minimal credential-free environment and an operator executable allowlist. An approved `npm test` still executes repository code and therefore remains an authorization decision, not a sandbox.
 - The bridge is a coordination and change-scope boundary, not an operating-system sandbox. Do not use it to execute untrusted or malicious repositories outside an appropriate VM/container.
 - Node may print an experimental `node:sqlite` warning. On the supported Node version this is expected; test failure is determined by the command exit code and assertions, not that warning.
+
+## Provider slot wait budget
+
+Each job may set `maxWaitMs` to a positive integer (milliseconds). This limits only provider-slot waiting; the agent timeout starts after the slot is granted. Without it, `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` remains the budget (20 minutes by default). A larger value is clamped to that budget and reported. Expiry returns `provider_slot_wait_limit_exceeded`: the agent never started and its own timeout is unspent. Run, enqueue, parallel jobs and delegation-plan validation accept the field, including read-only jobs with `lockMode: "off"`.
+
+Progress notifications and `get_opencode_job` include `providerWaitInfo`: holder instance IDs, PIDs, lease ages and expiries, provider/global counts, the requested/effective budget, and an expiry-based estimate. Heartbeats can extend a lease; this estimate does not predict agent completion. Queued jobs persist this information for other clients. Notifications require the MCP request progress token.
+
+```json
+{"agent":"explore","task":"Inspect the module","cwd":"C:\\work\\project","write":false,"lockMode":"off","maxWaitMs":5000,"timeoutMs":120000}
+```

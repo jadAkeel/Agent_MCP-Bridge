@@ -796,3 +796,13 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 ### Integration cleanup after the reply
 
 A reviewed apply reuses a proved unchanged preview and still runs its validation in the checkout. A successful response may say `Source worktree cleanup: pending`: the integration is durable, and the registered source is removed afterwards after its identities are checked again. Use `diagnose_opencode_bridge` to inspect pending cleanup; `node bin/bridge-gc.js --apply` resumes it after a crash. A source edited in the meantime is kept for review. Manual integration also keeps its source when the target moves; auto-integration can remove an unchanged source after its validated commit remains in the target history.
+
+## Provider slot wait budget
+
+Each job may set `maxWaitMs` to a positive integer (milliseconds). This limits only provider-slot waiting; the agent timeout starts after the slot is granted. Without it, `CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS` remains the budget (20 minutes by default). A larger value is clamped to that budget and reported. Expiry returns `provider_slot_wait_limit_exceeded`: the agent never started and its own timeout is unspent. Run, enqueue, parallel jobs and delegation-plan validation accept the field, including read-only jobs with `lockMode: "off"`.
+
+Progress notifications and `get_opencode_job` include `providerWaitInfo`: holder instance IDs, PIDs, lease ages and expiries, provider/global counts, the requested/effective budget, and an expiry-based estimate. Heartbeats can extend a lease; this estimate does not predict agent completion. Queued jobs persist this information for other clients. Notifications require the MCP request progress token.
+
+```json
+{"agent":"explore","task":"Inspect the module","cwd":"C:\\work\\project","write":false,"lockMode":"off","maxWaitMs":5000,"timeoutMs":120000}
+```

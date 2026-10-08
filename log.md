@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-07
 
+### Performance round C: visible caller-bounded provider waits
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-195 | Provider slots could hold a job silently for the full global wait budget. | No caller slot-wait bound or holder details in progress. | Shared job schema adds optional maxWaitMs; the atomic lease path clamps it, reports the effective budget, and returns provider_slot_wait_limit_exceeded with no spawn on expiry. Real lease owners/PIDs/ages/expiry estimates appear immediately and every five seconds, with fenced durable queue snapshots; parallel jobs retain independent bounds. Progress stops when its request ends; queue ownership loss after a grant returns the unused lease. New suite 12/12, required attestation 7/7, latency 12/12, quota 8/8, bytes 13/13, recovery 33/33, server self-test, syntax and diff check passed (85 counted cases plus server self-test). Two real holder processes: first progress 74 ms, 5000 ms caller bound returned in 5028 ms; no agent or waiter lease. Historical DB count/p50/p90 unavailable under the live-state prohibition. Report: perf-round-C.md. | `bridge/perf-round` | verified; uncommitted, not deployed |
+
 ### Performance round B: reviewed analysis reuse and durable cleanup
 
 | ID | Problem | Cause | Change / verification | Branch | Status |
