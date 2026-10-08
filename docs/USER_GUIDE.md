@@ -806,3 +806,14 @@ Progress notifications and `get_opencode_job` include `providerWaitInfo`: holder
 ```json
 {"agent":"explore","task":"Inspect the module","cwd":"C:\\work\\project","write":false,"lockMode":"off","maxWaitMs":5000,"timeoutMs":120000}
 ```
+
+### A paused provider and its fallback
+
+Unpinned `builder`, `debugger` and `tester` jobs using Muse can switch once to the existing
+Gemini Flash `high` fallback when it is in `CODEX_OPENCODE_MODEL_ALLOWLIST`. This happens only
+before any assistant text, reasoning, output tokens or tool execution. Its normal attestation,
+permissions and provider/global slot limits apply; `maxWaitMs` bounds waiting for its slot.
+If both models are paused the original pause remains. Results and queued records show the
+selected model, reason and whether the fallback payload started. To require one model, use
+the existing `scopeContract.modelRequirement`; `CODEX_OPENCODE_BUILDER_MODEL_FALLBACK=false`
+disables automatic rerouting. Reviewers, sanitized/pure and contractor execution keep their policy.

@@ -365,9 +365,16 @@ Writers: `release:activate` pins the new release's `lib/` with its `server.js`; 
 
 The current local Codex entry uses the tested source `server.js` with its exact SHA-256 pin and the
 managed writable OAuth profile. After editing server code (`server.js` or `lib/`), re-test it and update the server and lib pins (`npm run release:activate -- --sync-clients`).
-`CODEX_OPENCODE_BUILDER_MODEL_FALLBACK=true` permits one recorded switch from Muse to Gemini
-for an eligible builder provider failure before any tools execute. Exact per-job model requirements
-disable this switch; other agents do not receive this fallback.
+A paused Muse provider automatically permits one recorded switch to the existing Gemini fallback
+for `builder`, `debugger` and `tester`, only when that exact fallback is operator-allowlisted and
+the attempt produced no text, reasoning, output tokens or tool execution. The fallback repeats
+the same role/permission/model attestation and takes its own provider/global slot. A held slot
+waits with `maxWaitMs` and holder progress; if both choices are paused the original pause is returned.
+Explicit per-job model requirements disable rerouting; reviewer, sanitized/pure and contractor
+execution do not receive it. `CODEX_OPENCODE_BUILDER_MODEL_FALLBACK=false` disables this automatic
+path. `true` additionally keeps the builder's existing fallback for other eligible provider failures.
+Results and durable queue records name the selected model, reason and original pause separately
+from whether its payload actually started; a partial attempt is never restarted on the fallback.
 
 The managed non-sanitized agents default to `opencode/muse-spark-1.3-contributor-free` with variant `high`. The `mcp-sanitized-reader` remains on `openai/gpt-5.6-terra` because its isolated execution forces pure mode. Gemini activation requires `CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS=true`, the exact `@cortexkit/opencode-antigravity-auth@2.2.1` allowlist, the reviewed plugin manifest hash, and a dedicated `XDG_CONFIG_HOME`. The executable still comes from a read-only published release and remains pinned by `CODEX_OPENCODE_EXPECTED_SERVER_SHA256` and `CODEX_OPENCODE_EXPECTED_LIB_SHA256`, but `CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256` must be unset in this hybrid mode.
 
@@ -532,7 +539,7 @@ Every `CODEX_OPENCODE_*` variable that `server.js` reads is listed here with its
 | `CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256` | unset | SHA-256 of that plugin integrity manifest; `release:activate --sync-clients` re-pins it. |
 | `CODEX_OPENCODE_MCP_ORCHESTRATOR_AGENT` | `opencode-orchestrator-mcp-planner` | Agent a requested `orchestrator` resolves to (read-only planner). Change only when a release ships different file names. |
 | `CODEX_OPENCODE_MCP_CONTRACTOR_ORCHESTRATOR_AGENT` | `opencode-orchestrator-mcp-contractor` | Agent used in explicit contractor mode. Same rule. |
-| `CODEX_OPENCODE_BUILDER_MODEL_FALLBACK` | unset (off) | Only the value `true` permits one recorded switch from the builder's model to Gemini (`google/antigravity-gemini-3.8-flash`, variant `high`) after an eligible provider failure before any tool ran. Not for dry runs, jobs with an exact model requirement, or other agents. |
+| `CODEX_OPENCODE_BUILDER_MODEL_FALLBACK` | unset (pause reroute on) | Paused/zero-output rate-limited Muse jobs on builder/debugger/tester can use the existing allowlisted Gemini Flash `high` fallback once. `false` disables this path; `true` additionally permits the builder's other eligible provider failures. Exact model requirements, output/tool execution, dry runs, pure/sanitized and contractor execution refuse rerouting. Both models paused preserves the original pause and counters. |
 | `CODEX_OPENCODE_PASSTHROUGH_ENV` | unset | Comma-separated names of extra environment variables passed to OpenCode child processes. Without it only a fixed base set is passed (`PATH`, home, temp and `XDG_*` folders, locale). A name that looks like a secret (api key, token, auth, credential, password, secret, private key) is still dropped unless `CODEX_OPENCODE_ALLOW_SENSITIVE_ENV=true`. |
 | `CODEX_OPENCODE_ALLOW_SENSITIVE_ENV` | unset (off) | Only the value `true` lets secret-looking names listed in `CODEX_OPENCODE_PASSTHROUGH_ENV` reach OpenCode. |
 | `CODEX_OPENCODE_LOG_LEVEL` | `warn` | `off`, `error`, `warn`, `info` or `debug`: the lowest level of the JSON log lines the bridge writes to stderr. |
