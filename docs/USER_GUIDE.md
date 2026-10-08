@@ -791,3 +791,8 @@ Policy can only make things **stricter**. See "Project Policy" in [REFERENCE.md]
 | **Release** | An immutable copy of the bridge that production runs, pinned by hash. |
 | **Allowlist** | The operator-approved list of models that jobs may request. |
 | **GC** | Garbage collection: the cleanup command for leftover worktrees and databases. |
+
+
+### Integration cleanup after the reply
+
+A reviewed apply reuses a proved unchanged preview and still runs its validation in the checkout. A successful response may say `Source worktree cleanup: pending`: the integration is durable, and the registered source is removed afterwards after its identities are checked again. Use `diagnose_opencode_bridge` to inspect pending cleanup; `node bin/bridge-gc.js --apply` resumes it after a crash. A source edited in the meantime is kept for review. Manual integration also keeps its source when the target moves; auto-integration can remove an unchanged source after its validated commit remains in the target history.

@@ -21,7 +21,8 @@ import { libDigest, libPinError } from "./bin/lib-digest.js";
 import { LIKELY_SECRET_PATTERNS, redactLikelySecrets, redactSensitiveText, patchLikelySecretLines, sanitizePersistedValue, sanitizeLogValue, failureSummary } from "./lib/redaction.js";
 import { binaryTextFilesInPatch, patchFileEntries, diffStatFromPatch } from "./lib/git-patch.js";
 import { createBridgeConfig } from "./lib/config.js";
-import { createAttestationCacheRuntime, attestationInputFingerprint, resolveAttestationExecutable } from "./lib/attestation-cache.js";import { createLoggingRuntime } from "./lib/logging.js";
+import { createAttestationCacheRuntime, attestationInputFingerprint, resolveAttestationExecutable } from "./lib/attestation-cache.js";
+import { createLoggingRuntime } from "./lib/logging.js";
 import { createStateSchema } from "./lib/state/schema.js";
 import { createStateDatabase } from "./lib/state/database.js";
 import { createStateCrypto } from "./lib/state/crypto.js";
@@ -167,6 +168,7 @@ import { createIntegrationSerialRuntime } from "./lib/integration-serial.js";
 import { createOpenCodeRunRuntime } from "./lib/opencode-run.js";
 import { createIntegrationJournalRuntime } from "./lib/integration-journal.js";
 import { createIntegrationPreviewRuntime } from "./lib/integration-preview.js";
+import { createIntegrationCleanupRuntime } from "./lib/integration-cleanup.js";
 import { createQueueLeaseRuntime } from "./lib/queue/leases.js";
 import { createExecuteJobRuntime } from "./lib/execute-job.js";
 import { createOrchestratorPolicyRuntime } from "./lib/orchestrator-policy.js";
@@ -736,7 +738,8 @@ async function runSingleFlight(flights, key, operation) {
 // entry binds the input contents, executable, build and environment. B-193 shares
 // positive results and cold-read claims across processes in the state directory.
 // Failed results and isolated-runtime reads remain fresh; deep status invalidates
-// this build's shared entries. The final pre-spawn age ceiling remains independent.let attestationCacheTtlOverride = null;
+// this build's shared entries. The final pre-spawn age ceiling remains independent.
+let attestationCacheTtlOverride = null;
 const sharedAttestationCache = createAttestationCacheRuntime({
   fingerprint: attestationFingerprint,
   ttlMs: attestationCacheTtlMs,
@@ -746,13 +749,15 @@ const sharedAttestationCache = createAttestationCacheRuntime({
   flightLeaseMs: CONFIG.attestationCommandTimeoutMs * 5 + 60_000,
 });
 const attestationCacheStatus = sharedAttestationCache.attestationCacheStatus;
+
 function attestationCacheTtlMs() {
   if (attestationCacheTtlOverride !== null) return attestationCacheTtlOverride;
   return process.argv.includes("--self-test") ? 0 : CONFIG.attestationCacheTtlMs;
 }
 
 function clearAttestationCache() {
-  sharedAttestationCache.clearAttestationCache();}
+  sharedAttestationCache.clearAttestationCache();
+}
 
 async function statFingerprint(filePath) {
   try {
@@ -763,13 +768,15 @@ async function statFingerprint(filePath) {
   }
 }
 
-async function attestationFingerprint(key = "") {  const configFiles = ["opencode.json", "opencode.jsonc", "config.json", "antigravity.json", "package.json"]
+async function attestationFingerprint(key = "") {
+  const configFiles = ["opencode.json", "opencode.jsonc", "config.json", "antigravity.json", "package.json"]
     .map((name) => path.join(DEFAULT_OPENCODE_CONFIG_DIR, name));
   const executable = await resolveAttestationExecutable(OPENCODE_EXE, buildOpenCodeEnv());
   if (!executable || !BRIDGE_LIB_SHA256_AT_STARTUP) return null;
   const env = buildOpenCodeEnv();
   const envIdentity = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("GIT_")).sort(([a], [b]) => a.localeCompare(b)));
-  const tracked = [...configFiles, OPENCODE_AGENT_DIR, OPENCODE_SKILL_DIR, executable];  try {
+  const tracked = [...configFiles, OPENCODE_AGENT_DIR, OPENCODE_SKILL_DIR, executable];
+  try {
     const managed = managedOpenCodeConfigDirectories();
     for (const directory of [DEFAULT_OPENCODE_CONFIG_DIR, ...managed, path.join(env.HOME, ".opencode")]) {
       tracked.push(...["opencode.json", "opencode.jsonc", "config.json", "agents", "agent", "skills", "skill", "plugins", "plugin"].map((name) => path.join(directory, name)));
@@ -798,7 +805,8 @@ async function attestationFingerprint(key = "") {  const configFiles = ["opencod
     plugins: CONFIG.allowExternalPlugins ? CONFIG.externalPluginAllowlist : [],
     manifestPin: CONFIG.expectedExternalPluginManifestSha256,
     executable,
-  });}
+  });
+}
 
 // A cached value carries the time of the fresh read it came from (`attestedAtMs`) and its key
 // (`attestationKey`), so a later caller can ask for the same attestation with a shorter age limit
@@ -814,7 +822,8 @@ function stampAttestation(value, key, at, cacheHit) {
 }
 
 async function cachedAttestation(key, operation, cacheable, { maxAgeMs = null } = {}) {
-  return sharedAttestationCache.cachedAttestation(key, operation, cacheable, { maxAgeMs });}
+  return sharedAttestationCache.cachedAttestation(key, operation, cacheable, { maxAgeMs });
+}
 
 // B-171: the last attestation before a spawn. It used to be an uncached read for every job (two
 // to three OpenCode cold starts, 30 to 60 s on a loaded host). The inputs it can see are all in the
@@ -2869,13 +2878,22 @@ const { attachRetainedWorktree, claimRetainedWorktree, releaseRetainedWorktreeCl
   integrationTimed: (...args) => integrationTimed(...args),
 });
 
-const { inspectWorktreeSourceIdentity, markUntrackedFilesForDiff, forceAddedIgnoredSourceFiles, ignoredIntegrationSourceFiles, streamGitReadOnlyOutputSha256, captureGitIndexIdentity, seedIndexFromRealIndex, createPatchFromWorkingTree, collectIntegrationPatch, collectIntegrationPatchUntimed, INTEGRATION_BATCH_MAX_ITEMS, INTEGRATION_BATCH_COLLECT_CONCURRENCY, collectIntegrationBatchPatch, writeTemporaryPatchFile, checkPatchApplies, applyPatchFile, applyPatchFileUntimed, simulateIntegrationPatchSnapshot, simulateIntegrationPatchSnapshotUntimed, gitIndexPathSnapshot, isolatedIndexPreservationEvidence, integrationTimingStorage, integrationTimed, INTEGRATION_PHASE_LABELS, formatIntegrationTimings, captureIntegrationTargetState, captureIntegrationTargetStateUntimed, GIT_OBJECT_ID_PATTERN, integrationHeadEntries, capturePatchedPathsState, integrationTargetMovementEvidence, formatIntegrationTargetMove, readOnlyHeadMove, formatReadOnlyHeadMove, captureGitHead } = createIntegrationPatchRuntime({ worktreeArtifactStatus, CONFIG, buildTrustedGitEnv, buildValidationEnv, changedFileValidationErrorType, exactIntegrationFileSnapshot, execFileAsync, expandIgnoredDirectoryEntries, gitChangedFileSnapshotParts, gitEolRecordsFromOutput, ignoredEntryIsRegenerable, inspectRepositoryGitControlSurface, integrationWorktreeRules, logEvent, nowMs, removeRollbackLeaf, runCommand, runGitReadOnlyCommand, safeRollbackParent, snapshotIdentitySha256, snapshotMismatches, splitNulSeparated, transientGitIndexReadError, trustedGitArgs, validateChangedFilesForPlan });
+const { captureIntegrationSourceProof, inspectWorktreeSourceIdentity, markUntrackedFilesForDiff, forceAddedIgnoredSourceFiles, ignoredIntegrationSourceFiles, streamGitReadOnlyOutputSha256, captureGitIndexIdentity, seedIndexFromRealIndex, createPatchFromWorkingTree, collectIntegrationPatch, collectIntegrationPatchUntimed, INTEGRATION_BATCH_MAX_ITEMS, INTEGRATION_BATCH_COLLECT_CONCURRENCY, collectIntegrationBatchPatch, writeTemporaryPatchFile, checkPatchApplies, applyPatchFile, applyPatchFileUntimed, simulateIntegrationPatchSnapshot, simulateIntegrationPatchSnapshotUntimed, gitIndexPathSnapshot, isolatedIndexPreservationEvidence, integrationTimingStorage, integrationTimed, INTEGRATION_PHASE_LABELS, formatIntegrationTimings, captureIntegrationTargetState, captureIntegrationTargetStateUntimed, GIT_OBJECT_ID_PATTERN, integrationHeadEntries, capturePatchedPathsState, integrationTargetMovementEvidence, formatIntegrationTargetMove, readOnlyHeadMove, formatReadOnlyHeadMove, captureGitHead } = createIntegrationPatchRuntime({ worktreeArtifactStatus, CONFIG, buildTrustedGitEnv, buildValidationEnv, changedFileValidationErrorType, exactIntegrationFileSnapshot, execFileAsync, expandIgnoredDirectoryEntries, gitChangedFileSnapshotParts, gitEolRecordsFromOutput, ignoredEntryIsRegenerable, inspectRepositoryGitControlSurface, integrationWorktreeRules, logEvent, nowMs, removeRollbackLeaf, runCommand, runGitReadOnlyCommand, safeRollbackParent, snapshotIdentitySha256, snapshotMismatches, splitNulSeparated, transientGitIndexReadError, trustedGitArgs, validateChangedFilesForPlan });
 
-const { sweepIntegrationPreviews, ensureIntegrationPreviewSweepTimer, integrationPreviewKeyPromise, integrationPreviewKey, claimIntegrationPreviewReceipt, makeIntegrationPreviewReceipt, integrationPreviewReceiptError } = createIntegrationPreviewRuntime({ CONFIG, INTEGRATION_PREVIEWS, INTEGRATION_PREVIEW_TTL_MS, closeDb, integrationTargetMovementEvidence, openLockDb, queueRequestKey });
+const { integrationPreviewReuse, sweepIntegrationPreviews, ensureIntegrationPreviewSweepTimer, integrationPreviewKeyPromise, integrationPreviewKey, claimIntegrationPreviewReceipt, makeIntegrationPreviewReceipt, integrationPreviewReceiptError } = createIntegrationPreviewRuntime({ CONFIG, INTEGRATION_PREVIEWS, INTEGRATION_PREVIEW_TTL_MS, closeDb, integrationTargetMovementEvidence, openLockDb, queueRequestKey });
 
-const { integratePatchSerially, recoverIntegrationRepositorySerially, INTEGRATION_QUARANTINE_RESOLUTION_MODES, verifyQuarantinedOperationRestored, integrationQuarantineOperator, resolveIntegrationQuarantine, formatIntegrationQuarantineResolution } = createIntegrationSerialRuntime({ worktreeArtifactStatus, CONFIG, DEFAULT_LOCK_TTL_MS, INTEGRATION_RECOVERY_BLOCKED_ROOTS, INTEGRATION_RESOLVED_STATUSES, abortSignalErrorType: (...args) => abortSignalErrorType(...args), acquireHardLock: (...args) => acquireHardLock(...args), cleanupIntegratedBatchWorktreesWhileLocked: (...args) => cleanupIntegratedBatchWorktreesWhileLocked(...args), cleanupIntegratedWorktreeWhileLocked: (...args) => cleanupIntegratedWorktreeWhileLocked(...args), closeDb, conflictPathsFromConflict, exactIntegrationFileSnapshot, integratePatchWithoutSerialLock: (...args) => integratePatchWithoutSerialLock(...args), integrationJournalDiagnosis, integrationRecoveryBaseline, integrationRecoveryErrorText, logEvent, openLockDb, readIntegrationJournalFileEvidence, readIntegrationOperationSummary, recoverIntegrationOperationsWhileLocked, releaseHardLock: (...args) => releaseHardLock(...args), runCommand, startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args), transitionIntegrationOperation, truncateText });
+const { integratePatchSerially, recoverIntegrationRepositorySerially, INTEGRATION_QUARANTINE_RESOLUTION_MODES, verifyQuarantinedOperationRestored, integrationQuarantineOperator, resolveIntegrationQuarantine, formatIntegrationQuarantineResolution } = createIntegrationSerialRuntime({ worktreeArtifactStatus, CONFIG, DEFAULT_LOCK_TTL_MS, INTEGRATION_RECOVERY_BLOCKED_ROOTS, INTEGRATION_RESOLVED_STATUSES, abortSignalErrorType: (...args) => abortSignalErrorType(...args), acquireHardLock: (...args) => acquireHardLock(...args), enqueueIntegrationCleanup: (...args) => enqueueIntegrationCleanup(...args), cleanupIntegratedBatchWorktreesWhileLocked: (...args) => cleanupIntegratedBatchWorktreesWhileLocked(...args), cleanupIntegratedWorktreeWhileLocked: (...args) => cleanupIntegratedWorktreeWhileLocked(...args), closeDb, conflictPathsFromConflict, exactIntegrationFileSnapshot, integratePatchWithoutSerialLock: (...args) => integratePatchWithoutSerialLock(...args), integrationJournalDiagnosis, integrationRecoveryBaseline, integrationRecoveryErrorText, logEvent, openLockDb, readIntegrationJournalFileEvidence, readIntegrationOperationSummary, recoverIntegrationOperationsWhileLocked, releaseHardLock: (...args) => releaseHardLock(...args), runCommand, startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args), transitionIntegrationOperation, truncateText });
 
-const { integratePatchWithoutSerialLock, integrationCleanupTargetStateError, cleanupIntegratedWorktreeWhileLocked, cleanupIntegratedBatchWorktreesWhileLocked, recordChangedFiles, getIntegrationScratchCleanupTestHook, setIntegrationScratchCleanupTestHook } = createIntegrationApplyRuntime({ CONFIG, INTEGRATION_RECOVERY_BLOCKED_ROOTS, abortSignalErrorType: (...args) => abortSignalErrorType(...args), applyPatchFile, captureGitHead, captureGitIndexIdentity, captureIntegrationTargetState, capturePatchedPathsState, captureRollbackBaseline, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, checkPatchApplies, cleanupWorktree, closeDb, collectIntegrationBatchPatch, collectIntegrationPatch, exactIntegrationFileSnapshot, filterGeneratedWorktreeFiles, gitChangedFileSnapshot, gitChangedFiles, gitIndexPathSnapshot, inspectRepositoryOperationState, integrationContentMismatches, integrationPreviewReceiptError, integrationRecoveryErrorText, isolatedIndexPreservationEvidence, loadProjectAgentPolicy, logEvent, makeIntegrationPreviewReceipt, openLockDb, prepareIntegrationOperation, quarantineIntegrationOperation, recoverIntegrationOperationsWhileLocked, rollbackVerifiedOwnedChanges, runCommand, runValidationGate, simulateIntegrationPatchSnapshot, snapshotMismatches, transitionIntegrationOperation, validateChangedFilesForPlan, writeTemporaryPatchFile });
+const { integratePatchWithoutSerialLock, integrationCleanupTargetStateError, cleanupIntegratedWorktreeWhileLocked, cleanupIntegratedBatchWorktreesWhileLocked, recordChangedFiles, getIntegrationScratchCleanupTestHook, setIntegrationScratchCleanupTestHook } = createIntegrationApplyRuntime({ CONFIG, INTEGRATION_RECOVERY_BLOCKED_ROOTS, abortSignalErrorType: (...args) => abortSignalErrorType(...args), applyPatchFile, captureGitHead, captureGitIndexIdentity, captureIntegrationTargetState, captureIntegrationSourceProof, integrationPreviewReuse, capturePatchedPathsState, captureRollbackBaseline, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, checkPatchApplies, cleanupWorktree, closeDb, collectIntegrationBatchPatch, collectIntegrationPatch, exactIntegrationFileSnapshot, filterGeneratedWorktreeFiles, gitChangedFileSnapshot, gitChangedFiles, gitIndexPathSnapshot, inspectRepositoryOperationState, integrationContentMismatches, integrationPreviewReceiptError, integrationRecoveryErrorText, isolatedIndexPreservationEvidence, loadProjectAgentPolicy, logEvent, makeIntegrationPreviewReceipt, openLockDb, prepareIntegrationOperation, quarantineIntegrationOperation, recoverIntegrationOperationsWhileLocked, rollbackVerifiedOwnedChanges, runCommand, runValidationGate, simulateIntegrationPatchSnapshot, snapshotIdentitySha256, snapshotMismatches, transitionIntegrationOperation, validateChangedFilesForPlan, writeTemporaryPatchFile });
+const { enqueueIntegrationCleanup, drainDeferredWorktreeCleanup, setDeferredCleanupSchedulingDisabled, deferredWorktreeCleanupRunning } = createIntegrationCleanupRuntime({
+  CONFIG, openLockDb, closeDb, assertIntegrationLockOwned, acquireHardLock: (...args) => acquireHardLock(...args),
+  releaseHardLock: (...args) => releaseHardLock(...args), startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args),
+  cleanupIntegratedWorktreeWhileLocked, runCommand, captureIntegrationTargetState,
+  exactIntegrationFileSnapshot, snapshotIdentitySha256, logEvent,
+  foregroundIntegrationActive: cwd => AUTO_INTEGRATION_CHAINS.has(RepositoryRootSet.key(cwd)),
+  collectIntegrationPatch, cleanupWorktree,
+});
+
 
 const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTableHasCompositePrimaryKey, ensureLockTableSchema, migrateLegacyLockTable, rowsToLocks, expireLocksFromDb, listLocksFromDb, cleanupExpiredLocks, listLocks, acquireHardLock, releaseHardLock, quarantineHardLock, formatLockExpiry, formatAgentLockList, reservedLockAgentError, hardLockPathsForPlan, hardLockTtlForPlan, lockOwnershipLossError, startHardLockHeartbeat, hardLockSummary } = createLockRuntime({
   CONFIG,
@@ -2997,6 +3015,7 @@ async function migrateLegacyEncryptedState(db, dbPath) {
 }
 
 const { directRunAuditStore, abortSignalErrorType, combineAbortSignals, validateDelegationPlanInputs, findActiveLockConflict, formatDelegationPlanJob } = registerLockAndStatusTools({ attestationCacheStatus, attachRetainedWorktree, continueWorktreeJobError: (...args) => continueWorktreeJobError(...args), BRIDGE_INSTANCE_ID, BRIDGE_PROCESS_STARTED_AT, BRIDGE_RUNTIME_DIR, BRIDGE_SOURCE_SHA256, CONFIG, DEFAULT_LOCK_TTL_MS, DEFAULT_SUBAGENT_PROXY_AGENT, GLOBALLY_REQUIRED_MANAGED_AGENTS, GLOBAL_BRIDGE_STATE_DIR, MAX_LOCK_TTL_MS, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, MCP_ORCHESTRATOR_AGENT, MCP_SANITIZED_READER_AGENT, OPENCODE_AGENT_DIR, OPENCODE_EXE, OPENCODE_SKILL_DIR, QUEUE_JOBS, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentIdleTimeoutStatusLine, agentMetadataPolicyOptions, allowlistedModelOverride, applyModelOverrideToMetadata, assessQueuePlan, attestContractorNestedAgents, availableAgentLabels, bridgeSourceFreshness, bridgeSourceFreshnessLines, clearAttestationCache, closeDb, commandShape, compactQueueJobLines: (...args) => compactQueueJobLines(...args), conflictPathsFromConflict, conflictsWithActiveLock, contractorAuthorizationToken: (...args) => contractorAuthorizationToken(...args), decryptIntegrationJournalBytes, describeConcurrencyLimits, diagnoseJobView: (...args) => diagnoseJobView(...args), dirtyCheckpointDetails, effectiveContractorAuthorizationSha256: (...args) => effectiveContractorAuthorizationSha256(...args), effectiveQueueMode, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, encryptIntegrationJournalBytes, enqueueQueueJob, executeOpenCodeJob: (...args) => executeOpenCodeJob(...args), formatAgentLockList, formatLockExpiry, formatRejectedExecution, hardLockPathsForPlan, integrationJournalDiagnosis, jobAgentRuntime: (...args) => jobAgentRuntime(...args), jobInputShape, listAvailableAgents, listLocks, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), listPersistedQueueRecords: (...args) => listPersistedQueueRecords(...args), listRetainedWorktreeArtifacts: (...args) => listRetainedWorktreeArtifacts(...args), makeQueueJobId, managedSkillSourceEvidence, normalizeJobCwd, nowMs, openLockDb, parallelBatchCapacityError: (...args) => parallelBatchCapacityError(...args), parallelProviderKeys: (...args) => parallelProviderKeys(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), providerCapacitySnapshot, queueAgentActivity, queueCapacityReport, queueMemoryGate, queueMemoryStatusLines, queueMemoryWaitingJobs, queueOnlyOptionsError: (...args) => queueOnlyOptionsError(...args), queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), readAgentDebugMetadata, readOnlyRoutingPolicyError: (...args) => readOnlyRoutingPolicyError(...args), recordMatchesProject, refreshRuntimeConcurrency, releaseHardLock, reservedLockAgentError, resolveProjectStateRoot, retainedWorktreeView: (...args) => retainedWorktreeView(...args), runCommand, safeOpenCodeCommand, sanitizedAgentMetadataError, sanitizedDiscoveryContext: (...args) => sanitizedDiscoveryContext(...args), sanitizedRoutingPolicyError, sanitizedWorkspaceSchema, server, summarizeStderr, timeoutForAgent, userAuthorizedOrchestrator: (...args) => userAuthorizedOrchestrator(...args), validateParallelWritePlan: (...args) => validateParallelWritePlan(...args), validateSingleLockPlan: (...args) => validateSingleLockPlan(...args), validationCommandPreflightError, verifyExternalPluginPolicy, verifyJobWorkspaceReadiness, verifySanitizedJobsBeforeDiscovery: (...args) => verifySanitizedJobsBeforeDiscovery(...args), verifySanitizedWorkspace, externalRunnerStatusLines: (...args) => externalRunnerStatusLines(...args) });
+
 const { listRetainedWorktreeArtifacts, QUEUE_JOB_RUNNING_STATUSES, retainedWorktreeView, directRunView, diagnoseJobView, ESSENTIAL_QUEUE_JOB_FIELDS, essentialQueueJobView, queueTimedOutWriterNote, compactQueueJobLines, formatToolRefusal, formatConcurrencyChange } = registerJobTools({ BRIDGE_INSTANCE_ID, CONFIG, MAX_GLOBAL_WORKER_LIMIT, MAX_RUNTIME_CONCURRENCY_LIMIT, QUEUE_JOBS, RETAINED_WORKTREE_STATUSES, assessQueuePlan, authoritativeQueueRecord: (...args) => authoritativeQueueRecord(...args), cancelPersistedQueueJob: (...args) => cancelPersistedQueueJob(...args), closeDb, describeConcurrencyLimits, directRunAuditStore, effectiveBridgeStateDirectory, effectiveQueueMode, formatIdleDuration, formatOpenCodeUsage, logEvent, nowMs, openLockDb, pauseProvider, persistQueueRecord: (...args) => persistQueueRecord(...args), processIsAlive, queueAgentActivity, queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), queueRunStage, readPersistedQueueRecord: (...args) => readPersistedQueueRecord(...args), reconcileParentPipelineAfterQueueTerminal: (...args) => reconcileParentPipelineAfterQueueTerminal(...args), reconcileStaleQueueRecords, recordMatchesProject, requeueQueueJob: (...args) => requeueQueueJob(...args), resolveProjectStateRoot, resumeProvider, scheduleQueue: (...args) => scheduleQueue(...args), server, setRuntimeConcurrency, timedOutWriterNote });
 
 registerPipelineTools({ INTEGRATION_QUARANTINE_RESOLUTION_MODES, OPERATOR_CLI_ENV, PIPELINE_RUNS, VALIDATION_PREFLIGHT_FIX, activatePipelineBatch, authoritativePipelineRecord: (...args) => authoritativePipelineRecord(...args), claimPersistedPipeline: (...args) => claimPersistedPipeline(...args), createPipelinePlan: (...args) => createPipelinePlan(...args), effectiveQueueMode, enqueueQueueJob, finalizePipelineRecord: (...args) => finalizePipelineRecord(...args), formatIntegrationQuarantineResolution, formatRejectedExecution, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), loadProjectAgentPolicy, normalizeJobCwd, persistPipelineRecord: (...args) => persistPipelineRecord(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), pipelineOwnerRejection: (...args) => pipelineOwnerRejection(...args), readPersistedPipelineChildren: (...args) => readPersistedPipelineChildren(...args), recordMatchesProject, refreshPipelineRecord: (...args) => refreshPipelineRecord(...args), resolveIntegrationQuarantine, resolveProjectStateRoot, sanitizedWorkspaceSchema, scheduleQueue: (...args) => scheduleQueue(...args), server, updatePipelineRecord: (...args) => updatePipelineRecord(...args), validationCommandPreflightError, verifySanitizedWorkspace });
@@ -4905,6 +4924,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
   const stateRoot = effectiveBridgeStateDirectory();
   const candidates = [path.join(stateRoot, "bridge-state.sqlite")];
   const cleanupRecoveryCandidates = [];
+  const worktreeCleanupCandidates = new Set();
   const pipelineAggregationCandidates = [];
   // root key -> { cwd, needsRecovery, quarantinedOnly }; only databases scanned in this pass.
   const integrationRecoveryCandidates = new Map();
@@ -4978,6 +4998,12 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       await recoverStaleWorktreeClaims(db);
       if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worktree_artifacts'").get()
         && db.prepare("SELECT 1 FROM worktree_artifacts WHERE status = 'in_use' LIMIT 1").get()) dbPending = true;
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='integration_worktree_cleanup'").get()) {
+        for (const row of db.prepare("SELECT DISTINCT cwd FROM integration_worktree_cleanup WHERE status = 'pending'").all()) {
+          worktreeCleanupCandidates.add(row.cwd);
+          dbPending = true;
+        }
+      }
       const hasJobs = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='opencode_jobs'").get();
       if (!hasJobs) continue;
       ensureQueueLeaseSchema(db);
@@ -5223,6 +5249,11 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
       });
     }
   }
+  for (const cwd of worktreeCleanupCandidates) {
+    await drainDeferredWorktreeCleanup(cwd).catch(error => {
+      logEvent("warn", "integration.deferred_cleanup_recovery_failed", { errorType: error?.errorType || "cleanup_failed" });
+    });
+  }
   for (const candidate of pipelineAggregationCandidates) {
     try {
       // A pipeline this process is finalizing or already drives live is not recovery's to touch.
@@ -5432,7 +5463,8 @@ export const __selfTest = {
     buildTrustedGitEnv,
     buildValidationEnv,
     cachedAttestation,
-    attestationCacheStatus,    reattestAgentMetadata,
+    attestationCacheStatus,
+    reattestAgentMetadata,
     cancelPersistedQueueJob,
     captureGitIndexIdentity,
     captureIntegrationTargetState,
@@ -5502,6 +5534,11 @@ export const __selfTest = {
     integratePatchSerially,
     integrationCleanupTargetStateError,
     integrationPreviewReceiptError,
+    captureIntegrationSourceProof,
+    integrationPreviewReuse,
+    drainDeferredWorktreeCleanup,
+    setDeferredCleanupSchedulingDisabled,
+    enqueueIntegrationCleanup,
     capturePatchedPathsState,
     collectIntegrationBatchPatch,
     integrationBatchOverlaps,

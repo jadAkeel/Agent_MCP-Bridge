@@ -716,7 +716,15 @@ test("Q-018 integration: one reviewed integration lands A and B and cleans the c
   assert.equal(applied.validationGate.status, "passed");
   assert.equal(await readFile(path.join(cwd, "src/a.txt"), "utf8"), "from A\n");
   assert.equal(await readFile(path.join(cwd, "src/b.txt"), "utf8"), "from B\n");
-  assert.equal((await artifact(cwd, first.worktree.path)).status, "cleaned");
+  assert.equal(applied.sourceCleanup.cleanup, "pending");
+  const cleanupDeadline = Date.now() + 20_000;
+  while (await artifact(cwd, first.worktree.path)) {
+    const cleanup = await I.drainDeferredWorktreeCleanup(cwd);
+    assert.ok(!cleanup.some(item => item.cleanup === "retained_for_review"), JSON.stringify(cleanup));
+    assert.ok(Date.now() < cleanupDeadline, JSON.stringify(cleanup));
+    if (await artifact(cwd, first.worktree.path)) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(await artifact(cwd, first.worktree.path), undefined);
   assert.equal(existsSync(first.worktree.path), false);
   const operations = await database(cwd, (db) => db.prepare("SELECT status, affected_paths_json FROM integration_operations WHERE cwd = ?").all(cwd));
   assert.equal(operations.length, 1, "the complete chain uses one journaled integration");

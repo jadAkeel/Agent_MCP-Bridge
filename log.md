@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-07
 
+### Performance round B: reviewed analysis reuse and durable cleanup
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-194 | Reviewed apply recollected the source patch and synchronous removal delayed its reply. | Preview retained receipt metadata only; cleanup ran in the original integration lease. | Exact content/index/control proof allows reuse of bounded in-process patch/analysis; real validation, receipt consumption and drift/rollback gates remain. Durable cleanup_pending tasks are drained under a fresh fenced repository lease, visible to recovery/diagnosis/GC; moved sources/targets remain retained. Foreground auto-integration has priority over cleanup; reviewed applies wait only for a fenced cleanup lease. Engine commits retain the B-154 ancestry policy with exact source/ref evidence. Gates passed: reuse 18/18, batch 24/24, continuation 35/35, auto-integration 23/23, attestation 7/7, latency 12/12, quota 8/8, bytes 13/13, recovery 33/33, GC/server self-tests, syntax and diff check. Three paired samples: median apply reply 8.738 s -> 4.891 s; dry+apply 11.321 s -> 10.236 s. Full cleanup completion costs more; no CPU/IO saving claimed. Report: perf-round-B.md. | `bridge/perf-round` | verified with measured acceptance limits; uncommitted, not deployed |
+
 ### Performance round A: shared attestation and conservative worker default
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

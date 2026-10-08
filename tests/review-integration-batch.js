@@ -455,7 +455,14 @@ try {
     assert.match(applied, /Integration operation: integration-\S+ \(committed\)/, applied);
     assert.equal(repo.exists("out/a/x-1.json") && repo.exists("out/a/x-2.json"), true);
     // Worktrees made by hand (not by the bridge) are only removed when cleanup is explicit: it was.
-    assert.match(applied, /Source worktree cleanup: success \(2 of 2 removed\)/, applied);
+    assert.match(applied, /Source worktree cleanup: pending/, applied);
+    const cleanupDeadline = Date.now() + 20_000;
+    while (dirs.some(dir => existsSync(dir))) {
+      const cleanup = await __selfTest.internals.drainDeferredWorktreeCleanup(repo.root);
+      assert.ok(!cleanup.some(item => item.cleanup === "retained_for_review"), JSON.stringify(cleanup));
+      assert.ok(Date.now() < cleanupDeadline, JSON.stringify(cleanup));
+      if (dirs.some(dir => existsSync(dir))) await new Promise(resolve => setTimeout(resolve, 100));
+    }
     assert.equal(existsSync(dirs[0]) || existsSync(dirs[1]), false, "both source worktrees are gone");
     assert.equal((await repo.git("branch", "--list", "batch-tool-*")).trim(), "", "and their branches");
     // Through the tool an unknown per-item key is refused by the schema, and the batch cap is 25.

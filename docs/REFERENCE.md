@@ -193,6 +193,11 @@ Not guaranteed: the CLIs' own permissions are not attested (reads outside the sc
 
 ## Worktrees And Integration
 
+B-194: an unchanged reviewed apply reuses its dry run's exact patch and apply/simulation analysis in this bridge process. Independent content proof includes source HEAD/tree, logical index, tracked and untracked bytes, ignored-path refusals and Git controls; the target still has to match the reviewed identity. Any missing proof or changed input uses the original full collection and receipt checks. Receipts keep their existing lifetime and durable single-use rule, and the real validation command runs on every apply. Optional analysis shares a 64 MB in-process budget; another process or an evicted/corrupt analysis uses full collection with the same receipt.
+
+After a validated integration, requested cleanup is recorded as `cleanup_pending` before replying. The worktree and branch are removed in the background under a new serial integration lease, after source/target/ref identities are checked again. Changed sources and `in_use` worktrees are retained. Manual integration keeps its full-target cleanup guard; engine-committed auto-integration keeps the existing B-154 commit-ancestry policy, with exact source/ref checks. Cleanup yields to active auto-integration chains; another reviewed integration briefly waits only for an internal cleanup lease. Diagnosis lists pending removal, startup recovery retries it, and `node bin/bridge-gc.js --apply` resumes interrupted cleanup with the same checks. `cleanupAfterSuccess: false` still keeps the source, and pipeline finalization still authorizes cleanup only after its own gates pass.
+
+
 A continued worktree is `in_use` while its job runs, counts toward retained capacity and is listed as in flight (recovery action: "a job is running in it"). It returns to `retained` on every job ending; startup and a later claim recover dead owners. A continued job never removes it.
 
 Recommended production setting:

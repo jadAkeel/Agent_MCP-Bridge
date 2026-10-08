@@ -21,7 +21,7 @@ const execFileAsync = promisify(execFile);
 requireSelfTestRun(import.meta.url);
 const ACTIVE_QUEUE_STATUSES = new Set(["held", "pending", "planned", "blocked", "running", "validating", "reviewing", "testing"]);
 const ACTIVE_PIPELINE_STATUSES = new Set(["running", "cleanup_pending", "cleanup_failed", "awaiting_integration", "integrating"]);
-const LIVE_REGISTRY_STATUSES = new Set(["creating", "retained", "cleanup_failed"]);
+const LIVE_REGISTRY_STATUSES = new Set(["creating", "retained", "cleanup_failed", "in_use", "cleanup_pending"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 
@@ -234,7 +234,10 @@ function inspectProjectDatabase(dbPath, { busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_M
         });
       }
     }
-    return { cwds: [...cwds], activeReasons, registry };
+    const pendingCleanup = hasTable(db, "integration_worktree_cleanup")
+      ? db.prepare("SELECT worktree_path AS path, cwd, status FROM integration_worktree_cleanup WHERE status = 'pending'").all() : [];
+    if (pendingCleanup.length) activeReasons.push(`${pendingCleanup.length} deferred cleanup task(s)`);
+    return { cwds: [...cwds], activeReasons, registry, pendingCleanup };
   } finally {
     db.close();
   }
@@ -313,6 +316,7 @@ async function inventory(stateDir, options) {
     worktrees: [],
     databases: [],
     emptyProjectDirectories: [],
+    pendingCleanup: [],
     summary: {},
   };
 
@@ -332,6 +336,7 @@ async function inventory(stateDir, options) {
     }
   }
 
+  report.pendingCleanup = [...databaseInfo.values()].flatMap(info => info.pendingCleanup || []);
   let projectDirs = [];
   try {
     projectDirs = (await readdir(worktreeRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory() && !entry.isSymbolicLink());
@@ -395,6 +400,12 @@ async function inventory(stateDir, options) {
       if (!entry.isDirectory()) {
         item.classification = "foreign_entry";
         item.reason = "Not a directory; the bridge never creates this shape here.";
+      } else if (["in_use", "cleanup_pending"].includes(registryRow?.status)
+        && (!projectActive || registryRow.status === "cleanup_pending")) {
+        item.classification = registryRow.status;
+        item.reason = registryRow.status === "in_use"
+          ? "A job claimed this worktree; recover its owner before considering removal."
+          : "Durable reviewed cleanup is pending; --apply resumes its identity checks before removal.";
       } else if (projectActive) {
         // Checked before anything that removes: a bridge may be using this project even when
         // its repository is out of sight right now.
@@ -460,7 +471,7 @@ async function inventory(stateDir, options) {
       cwds: info.cwds,
       activeReasons: info.activeReasons,
       registryRows: info.registry.size,
-      staleRegistryRows: [...info.registry.entries()].filter(([worktreePath, row]) => LIVE_REGISTRY_STATUSES.has(row.status) && !existsSync(worktreePath)).map(([worktreePath]) => worktreePath),
+      staleRegistryRows: [...info.registry.entries()].filter(([worktreePath, row]) => LIVE_REGISTRY_STATUSES.has(row.status) && !["cleanup_pending", "in_use"].includes(row.status) && !existsSync(worktreePath)).map(([worktreePath]) => worktreePath),
       hasWorktreeDirectory: existsSync(path.join(worktreeRoot, projectHash)),
       classification: "",
       action: "keep",
@@ -643,6 +654,10 @@ function formatReport(report, applied) {
   lines.push(`Bridge GC (${report.mode}) for ${report.stateDir}`);
   lines.push(`Worktrees: ${report.summary.worktrees} (${formatBytes(report.summary.worktreeBytes)}); removable now: ${report.summary.removableWorktrees} (${formatBytes(report.summary.removableWorktreeBytes)})`);
   lines.push(`Project databases: ${report.summary.databases}; removable now: ${report.summary.removableDatabases}; stale registry rows: ${report.summary.staleRegistryRows}; empty project directories: ${report.summary.emptyProjectDirectories}`);
+  if (report.pendingCleanup?.length) {
+    lines.push(`Deferred reviewed cleanup: ${report.pendingCleanup.length} task(s); --apply resumes the original identity checks.`);
+    for (const row of report.pendingCleanup) lines.push(`  pending ${row.path} (${row.cwd})`);
+  }
   const groups = new Map();
   for (const item of report.worktrees) {
     if (!groups.has(item.classification)) groups.set(item.classification, []);
@@ -682,7 +697,21 @@ function formatReport(report, applied) {
 async function runGc(options) {
   const stateDir = path.resolve(options.stateDir || defaultStateDirectory());
   const report = await inventory(stateDir, options);
-  const applied = options.apply ? await applyReport(report, options) : null;
+  let resumed = [];
+  if (options.apply && report.pendingCleanup.length) {
+    // Import starts no transport/recovery. The cleanup engine uses this explicit
+    // state root and its normal serial lock, source/target checks and ref fences.
+    const { __selfTest } = await import("../server.js");
+    const previous = __selfTest.hooks.stateDirectoryOverride;
+    __selfTest.hooks.stateDirectoryOverride = stateDir;
+    try {
+      for (const cwd of new Set(report.pendingCleanup.map(row => row.cwd))) {
+        resumed.push(...(await __selfTest.internals.drainDeferredWorktreeCleanup(cwd))
+          .map(result => ({ ...result, action: "resume_reviewed_cleanup", ok: result.cleanup === "success" })));
+      }
+    } finally { __selfTest.hooks.stateDirectoryOverride = previous; }
+  }
+  const applied = options.apply ? [...resumed, ...await applyReport(report, options)] : null;
   return { report, applied };
 }
 

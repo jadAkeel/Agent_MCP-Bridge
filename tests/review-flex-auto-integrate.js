@@ -129,6 +129,10 @@ test("Q-010: a new-file-only patch is integrated and committed with the target's
   assert.equal((await git(["show", "--name-only", "--format=", "HEAD"])).trim(), "out/batch-001.json", "exactly the job's files");
   assert.equal((await git(["status", "--porcelain"])).trim(), "", "the target is clean afterwards");
   assert.equal(readFileSync(path.join(repo, "out", "batch-001.json"), "utf8"), "[1, 2, 3]\n");
+  assert.equal(await waitFor(async () => {
+    await internals.drainDeferredWorktreeCleanup(repo);
+    return !existsSync(dir);
+  }, 20_000), true, "deferred cleanup completed within 20 seconds");
   assert.equal(existsSync(dir), false, `the worktree was cleaned up after the passing validation: ${record.autoIntegration.worktreeCleanup}`);
   const list = textOf(await callTool("list_opencode_jobs", { cwd: repo, limit: 10 }));
   assert.match(list, new RegExp(`${record.jobId} .*autoIntegration=committed@${after.slice(0, 12)}`));
@@ -223,6 +227,10 @@ test("Q-017 (a): three new-file jobs that wait for the same turn land in ONE com
     assert.equal(record.autoIntegration.commit, after);
     assert.deepEqual(record.autoIntegration.files, [entry.file], "each job keeps its own files");
     assert.deepEqual(record.autoIntegration.batch, { size: 3, jobIds: jobs.map((other) => other.jobId) });
+    assert.equal(await waitFor(async () => {
+      await internals.drainDeferredWorktreeCleanup(repo);
+      return !existsSync(entry.dir);
+    }, 20_000), true, "deferred batch cleanup completed within 20 seconds");
     assert.equal(existsSync(entry.dir), false, `worktree removed: ${record.autoIntegration.worktreeCleanup}`);
   }
   const subject = (await git(["log", "-1", "--format=%s"])).trim();
