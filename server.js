@@ -5952,7 +5952,8 @@ if (!BRIDGE_RUN_AS_MAIN) {
   await runProviderLeaseWorker();
 } else if (process.argv.includes("--verify-plugin-policy")) {
   await verifyReleaseIntegrity();
-  process.stdout.write(`${JSON.stringify(await verifyExternalPluginPolicy(process.argv[process.argv.indexOf("--verify-plugin-policy") + 1] || process.cwd()))}\n`);
+  // An explicit audit must read the effective config even when a job's shared cache is warm.
+  process.stdout.write(`${JSON.stringify(await verifyExternalPluginPolicyUnshared(process.argv[process.argv.indexOf("--verify-plugin-policy") + 1] || process.cwd()))}\n`);
 } else if (process.argv.includes("--self-test") || process.argv.includes("--self-test-events")) {
   // The suite lives in tests/server-self-test.js; keep `node server.js --self-test` working.
   const suite = path.join(BRIDGE_RUNTIME_DIR, "tests", "server-self-test.js");

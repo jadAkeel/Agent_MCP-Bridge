@@ -140,7 +140,7 @@ test("12 available cores default to 3; explicit zero and runtime overrides remai
     { env: { ...process.env, CODEX_OPENCODE_GLOBAL_WORKER_LIMIT: "0" } });
   assert.deepEqual(JSON.parse(result.stdout), [0, 7]);
 });
-test("two bridge processes 5 seconds apart cause one CLI spawn; touching an agent forces another", async () => {
+test("two bridge processes share one CLI spawn; agent and sidecar config changes invalidate it", async () => {
   const childState = path.join(root, "children");
   const config = path.join(root, "xdg", "opencode");
   await mkdir(path.join(config, "agents"), { recursive: true });
@@ -173,6 +173,17 @@ test("two bridge processes 5 seconds apart cause one CLI spawn; touching an agen
   const third = await execute(process.execPath, [child], { env, cwd: repo });
   assert.equal(JSON.parse(third.stdout).source, "fresh");
   assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 2);
+  const sibling = path.join(config, "config.json");
+  await writeFile(sibling, JSON.stringify({ mcp: { x: { enabled: true } } }));
+  const fourth = await execute(process.execPath, [child], { env, cwd: repo });
+  assert.equal(JSON.parse(fourth.stdout).source, "fresh", "creating an unpinned sibling config invalidates the shared read");
+  assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 3);
+  const details = await stat(sibling);
+  await writeFile(sibling, JSON.stringify({ mcp: { x: { enabled: null } } }));
+  await utimes(sibling, details.atime, details.mtime);
+  const fifth = await execute(process.execPath, [child], { env, cwd: repo });
+  assert.equal(JSON.parse(fifth.stdout).source, "fresh", "equal-size config rewrites with restored mtime invalidate the shared read");
+  assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 4);
 });
 test("simultaneous processes share one cold read", async () => {
   const script = path.join(root, "parallel-child.mjs");
