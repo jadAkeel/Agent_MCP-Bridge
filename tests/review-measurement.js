@@ -5,6 +5,7 @@
 // tests/review-tools-pipelines.js; Git, locks, the worktree registry and SQLite state are real.
 //   node tests/review-measurement.js
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
+import { existsSync } from "node:fs";
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
@@ -32,6 +33,7 @@ const {
   mkdtemp,
   path,
   queueAgentTiming,
+  readFile,
   rm,
   runCommand,
   server,
@@ -345,7 +347,7 @@ test("B-027: a file force-added on an ignored path fails the integration instead
 });
 
 // ---------------------------------------------------------------------------- B-026
-test("B-026: integration reports its phases and rehashes each tree fewer times", async () => {
+test("B-026/B-194: integration reports foreground reuse separately from deferred cleanup", async () => {
   const worktree = await createWorktreeForJob({ cwd: repo, agent: "builder", jobId: "builder-measure-1", lockedPaths: ["src"], allowedEdits: ["src"] });
   assert.equal(worktree.ok, true, JSON.stringify(worktree));
   await writeFile(path.join(worktree.path, "src", "a.txt"), "integrated\n", "utf8");
@@ -354,26 +356,41 @@ test("B-026: integration reports its phases and rehashes each tree fewer times",
   const previewTimings = {};
   const preview = await integrationTimingStorage.run(previewTimings, () => integratePatchSerially({ ...common, dryRun: true }));
   assert.equal(preview.ok, true, JSON.stringify(preview));
-  assert.equal(previewTimings.targetState.count, 1, JSON.stringify(previewTimings));
+  assert.equal(previewTimings.targetState.count, 2, JSON.stringify(previewTimings));
   assert.equal(previewTimings.sourcePatch.count, 1, JSON.stringify(previewTimings));
+  assert.equal(previewTimings.sourceProof.count, 2, JSON.stringify(previewTimings));
 
   const applyTimings = {};
   const applied = await integrationTimingStorage.run(applyTimings, () => integratePatchSerially({ ...common, reviewed: true, previewReceipt: preview.previewReceipt }));
   assert.equal(applied.ok, true, JSON.stringify(applied));
   assert.equal(applied.status, "applied");
-  assert.equal(applied.sourceCleanup?.cleanup, "success", JSON.stringify(applied.sourceCleanup));
-  // Before: 7 target and 3 source whole-tree captures. Now: receipt check, final pre-apply,
-  // integrated state and the cleanup recheck (the immediate repeat runs only with a hook);
-  // source twice. Target captures start from the target index (speed-up option 1).
-  assert.equal(applyTimings.targetState.count, 4, JSON.stringify(applyTimings));
-  assert.equal(applyTimings.sourcePatch.count, 2, JSON.stringify(applyTimings));
-  assert.equal(applyTimings.worktreeRemove.count, 1);
-  assert.equal(applyTimings.validation.count, 1);
-  const text = formatIntegrationTimings({ totalMs: 10, phases: applyTimings });
+  assert.equal(applied.sourceCleanup?.cleanup, "pending", JSON.stringify(applied.sourceCleanup));
+  assert.equal(existsSync(worktree.path), true, "the apply replies before removing its source");
+  // B-194: receipt check, final pre-apply and integrated target; no second patch
+  // collection or source full-index capture. Cleanup has its own later checks.
+  const foregroundTimings = structuredClone(applyTimings);
+  assert.equal(foregroundTimings.targetState.count, 3, JSON.stringify(foregroundTimings));
+  assert.equal(foregroundTimings.sourceProof.count, 1, JSON.stringify(foregroundTimings));
+  assert.equal(foregroundTimings.sourcePatch?.count || 0, 0, JSON.stringify(foregroundTimings));
+  assert.equal(foregroundTimings.freshIndexHash?.count || 0, 0, JSON.stringify(foregroundTimings));
+  assert.equal(foregroundTimings.worktreeRemove?.count || 0, 0, JSON.stringify(foregroundTimings));
+  assert.equal(foregroundTimings.validation.count, 1);
+  assert.equal(applied.validationGate.status, "passed");
+  assert.equal(await readFile(path.join(repo, "src", "a.txt"), "utf8"), "integrated\n");
+  const text = formatIntegrationTimings({ totalMs: 10, phases: foregroundTimings });
   assert.match(text, /^Integration timing: total 10 ms\n/);
-  assert.match(text, /targetState: \d+ ms over 4 call\(s\)/);
-  assert.match(text, /freshIndexHash: \d+ ms over 2 call\(s\)/);
-  assert.match(text, /seededIndexHash: \d+ ms over 4 call\(s\)/);
+  assert.match(text, /targetState: \d+ ms over 3 call\(s\)/);
+  assert.match(text, /sourceProof: \d+ ms over 1 call\(s\)/);
+  assert.match(text, /seededIndexHash: \d+ ms over 3 call\(s\)/);
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const artifacts = await listRetainedWorktreeArtifacts(repo);
+    if (!existsSync(worktree.path) && !artifacts.some(row => row.worktreePath === worktree.path)) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.equal(existsSync(worktree.path), false, "deferred cleanup must finish within its bound");
+  assert.equal((await git(["branch", "--list", worktree.branch])).trim(), "", "the source branch is removed too");
+  assert.equal((await listRetainedWorktreeArtifacts(repo)).some(row => row.worktreePath === worktree.path), false);
   await git(["reset", "-q", "--hard", "HEAD"]);
 });
 
@@ -383,7 +400,10 @@ test("B-026: the tool result carries the integration timing", async () => {
   await writeFile(path.join(worktree.path, "src", "b.txt"), "previewed\n", "utf8");
   const text = textOf(await callTool("integrate_opencode_worktree", { cwd: repo, worktreePath: worktree.path, allowedEdits: ["src/b.txt"], validationCommand: "git diff --check", dryRun: true, previewMode: "stat" }));
   assert.match(text, /Serial integration accepted\./, text);
-  assert.match(text, /Integration timing: total \d+ ms\n {2}(targetState|sourcePatch|freshIndexHash): \d+ ms over 1 call\(s\)/, text);
+  assert.match(text, /^Integration timing: total \d+ ms$/m, text);
+  assert.match(text, /^ {2}targetState: \d+ ms over 2 call\(s\)/m, text);
+  assert.match(text, /^ {2}sourcePatch: \d+ ms over 1 call\(s\)/m, text);
+  assert.match(text, /^ {2}sourceProof: \d+ ms over 2 call\(s\)/m, text);
   await cleanupWorktree({ path: worktree.path, branch: worktree.branch, repoRoot: repo }, "always", true);
 });
 

@@ -5,6 +5,7 @@
 // back-to-back pre-apply capture without a hook, 3 in-worktree attestation cached by base tree.
 //   node tests/review-speedup.js
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
+import { existsSync } from "node:fs";
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
@@ -19,6 +20,7 @@ const {
   createWorktreeForJob,
   integratePatchSerially,
   integrationTimingStorage,
+  listRetainedWorktreeArtifacts,
   mkdir,
   mkdtemp,
   path,
@@ -112,7 +114,7 @@ test("1: the accepted trade-off: a rewrite that keeps size and mtime is only see
   assert.deepEqual(seeded.patch.changedFiles, [], "documented: stat-identical rewrites of the target are not seen");
 });
 
-test("1+2: an apply rehashes the source fully, the target from its index, and skips the repeat", async () => {
+test("1+2/B-194: an apply proves source reuse, seeds the target index, and skips the repeat", async () => {
   const { repo } = await makeRepo({ "src/a.txt": "a\n" });
   repos.push(repo);
   const run = async (jobId, content, hook = null) => {
@@ -127,17 +129,31 @@ test("1+2: an apply rehashes the source fully, the target from its index, and sk
       ...common, reviewed: true, previewReceipt: preview.previewReceipt, ...(hook ? { beforeApplyHook: hook } : {}),
     }));
     assert.equal(applied.ok, true, JSON.stringify(applied));
-    assert.equal(applied.sourceCleanup?.cleanup, "success", JSON.stringify(applied.sourceCleanup));
+    assert.equal(applied.sourceCleanup?.cleanup, "pending", JSON.stringify(applied.sourceCleanup));
+    const foreground = structuredClone(phases);
+    assert.equal(existsSync(worktree.path), true, "cleanup happens after the reply");
+    assert.equal(foreground.sourceProof.count, 1, JSON.stringify(foreground));
+    assert.equal(foreground.sourcePatch?.count || 0, 0, "the approved patch is not collected again");
+    assert.equal(foreground.freshIndexHash?.count || 0, 0, "source byte proof replaces a repeated source index capture");
+    assert.equal(foreground.validation.count, 1, "real validation still runs");
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const artifacts = await listRetainedWorktreeArtifacts(repo);
+      if (!existsSync(worktree.path) && !artifacts.some(row => row.worktreePath === worktree.path)) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(existsSync(worktree.path), false, "the source must be removed within its bound");
+    assert.equal((await git(["branch", "--list", worktree.branch], repo)).trim(), "");
+    assert.equal((await listRetainedWorktreeArtifacts(repo)).some(row => row.worktreePath === worktree.path), false);
     await git([...gitIdentity, "commit", "-q", "-am", jobId], repo);
-    return phases;
+    return foreground;
   };
   const plain = await run("builder-speed-1", "first\n");
-  assert.equal(plain.targetState.count, 4, JSON.stringify(plain));
-  assert.equal(plain.sourcePatch.count, 2);
-  assert.equal(plain.freshIndexHash.count, 2, "source captures keep reading every file");
-  assert.equal(plain.seededIndexHash.count, 4, "target captures start from the target's index");
+  assert.equal(plain.targetState.count, 3, JSON.stringify(plain));
+  assert.equal(plain.seededIndexHash.count, 3, "foreground target captures start from the target's index");
   const hooked = await run("builder-speed-2", "second\n", async () => {});
-  assert.equal(hooked.targetState.count, 5, "with a hook between them both pre-apply captures run");
+  assert.equal(hooked.targetState.count, 4, "with a hook between them both pre-apply captures still run");
+  assert.equal(hooked.seededIndexHash.count, 4);
 });
 
 test("3: the in-worktree attestation key is the repository and base tree, not the worktree path", async () => {
