@@ -14,6 +14,15 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-09
+
+### Housekeeping and deployment of the October rounds
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-201 | The local gate (`npm test`, via `bin/mcp-robustness.js`) depends on the operator's shell: without `XDG_CONFIG_HOME` the bridge reads `~/.config/opencode/opencode.jsonc` and B-179 refuses startup when that personal config enables MCP servers. | The clients always pass `XDG_CONFIG_HOME=<runtime dir>` (bin/setup.js), so production agents never see the personal config; the gate inherits the shell instead. Seen as 3x `external_plugin_integrity_failed` in the fault log. | Not changed: the refusal is correct for an unisolated launch. Rule: run the gate with `XDG_CONFIG_HOME` set to the runtime dir (`C:Users<you>.codexopencode-gemini-runtime-v1`). Candidate fix: the gate scripts set it themselves. | `main` | rule; open as a gate improvement |
+| B-200 | Both clients crashed the bridge on every start from 2026-10-05 to 2026-10-09 (756x `verifyReleaseIntegrity` in the fault log): the pins still named d96912a's server.js while the live working tree moved through batch auto-integration, worktree continuation, readiness and the performance rounds. | Working-tree deployment: every merge to the live checkout needs `--sync-clients`, and none ran after d96912a. | Full `npm test` passed on 511c05f (4 expected skips); `main` fast-forwarded to 511c05f (adds `.github/workflows/ci.yml` from `bridge/ci` and the B-196 pointer); `npm run release:activate -- --sync-clients` re-pinned server.js e56c2d9d -> b40c2bc1 and lib/ 8f8cbe1f -> 400c2537 for Codex and Claude Code (config backup `config.toml.rollback-20261009080752`). Branch cleanup: 33 merged branches and 7 merged worktrees removed, three stale 2026-08/09 branches and a parked H3-5 wip test renamed under `archive/`, the shared-bridge prototype kept on `experiment/shared-bridge-d`. | `main` | deployed at 511c05f; clients must be restarted |
+
 ## 2026-10-08
 
 ### Performance round selected for main
