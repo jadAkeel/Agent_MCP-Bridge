@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The bridge is developed and run on Windows; the suites carry Windows-specific cases.
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      # The runner has no OpenCode CLI, no Codex config and no live bridge: cases that need
+      # them warn instead of failing. The skip summary at the end of npm test lists them.
+      CODEX_TEST_ALLOW_REQUIRED_SKIPS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Several suites create commits in temporary repositories.
+      - name: Configure git identity
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global core.autocrlf false
+
+      - run: npm ci
+
+      - run: npm test
