@@ -700,7 +700,8 @@ test("Q-004: a failed validation gets one fix pass with its output, then validat
   assert.match(text, /Token usage: steps=4 input=2400 output=160/, "both runs' tokens are reported");
   assert.match(text, /Provider error lines in OpenCode stderr[^\n]*: 2/);
   assert.match(text, /Worktree changed files: src\/a\.txt/);
-  assert.doesNotMatch(text, /errorType: validation_command_failed|Error type: validation_command_failed/);
+  assert.match(text, /^Status: completed$/m);
+  assert.doesNotMatch(text, /errorType: validation_command_failed|error type: validation_command_failed/i);
   await cleanRetainedWorktrees();
 });
 
@@ -713,7 +714,7 @@ test("Q-004: still failing after the pass fails the job as before; there is neve
   assert.match(text, /Validation fix pass: used 1 of 1/);
   assert.match(text, /Final validation: failed/);
   assert.match(text, /Validation gate: failed/);
-  assert.match(text, /Error type: validation_command_failed/);
+  assert.match(text, /^Status: failed; error type: validation_command_failed$/m);
   await cleanRetainedWorktrees();
 });
 
@@ -723,7 +724,7 @@ test("Q-004: without the option a failed validation is final", async () => {
     const text = await runDirect(fixWriteJob("src/a.txt", extra));
     assert.equal(runs.length, 1, JSON.stringify(extra));
     assert.doesNotMatch(text, /Validation fix pass/);
-    assert.match(text, /Error type: validation_command_failed/);
+    assert.match(text, /^Status: failed; error type: validation_command_failed$/m);
     await cleanRetainedWorktrees();
   }
 });
@@ -733,7 +734,7 @@ test("Q-004: the pass is skipped, and says why, when too little of the job timeo
   const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1, timeoutMs: 30000 }));
   assert.equal(runs.length, 1);
   assert.match(text, /Validation fix pass: skipped \(only 30 s of the job timeout are left \(a pass needs 60 s\)\)/);
-  assert.match(text, /Error type: validation_command_failed/);
+  assert.match(text, /^Status: failed; error type: validation_command_failed$/m);
   await cleanRetainedWorktrees();
 });
 
@@ -761,7 +762,7 @@ test("Q-004: an agent error in the pass is the job's error", async () => {
   };
   const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1 }));
   assert.equal(calls, 2);
-  assert.match(text, /Error type: agent_timeout/);
+  assert.match(text, /^Status: failed; error type: agent_timeout$/m);
   assert.match(text, /Validation fix pass: used 1 of 1/);
   assert.match(text, /Final validation: skipped_due_to_prior_failure/);
   await cleanRetainedWorktrees();

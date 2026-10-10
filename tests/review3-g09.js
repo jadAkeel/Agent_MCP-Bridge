@@ -101,7 +101,7 @@ async function writerThenDryRun(repo, { allowedEdits = ["app/a.txt"], onRun = as
     agent: "builder", task: "Edit app/a.txt.", cwd: repo, write: true, lockMode: "simple",
     lockedPaths: allowedEdits, allowedEdits, scopeContract: scope(allowedEdits), validationCommand: "git diff --check",
   }, {})).content.map((item) => item.text || "").join("\n");
-  const jobErrorType = /^Error type: (\S+)/m.exec(text)?.[1] || "";
+  const jobErrorType = /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || /^Error type: (\S+)/m.exec(text)?.[1] || (/^Status: (?:completed|dry_run)$/m.test(text) ? "none" : "");
   const retained = await listRetainedWorktreeArtifacts(repo);
   assert.equal(retained.length, 1, `no retained worktree: ${text.slice(0, 1500)}`);
   const worktree = retained[0];

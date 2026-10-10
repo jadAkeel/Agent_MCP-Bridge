@@ -206,7 +206,8 @@ test("B-068: a failing self-check gives the agent a pass with its output, then t
   assert.equal(runs[1].cwd, runs[0].cwd, "the same worktree");
   assert.match(text, /Self-checks: passed; fix passes used 1 of 2; first failure: node tools\/validate\.cjs out\/batch-001\.json exit code 1/);
   assert.match(text, /Validation gate: passed/);
-  assert.doesNotMatch(text, /Error type: self_check_failed/);
+  assert.match(text, /^Status: completed$/m);
+  assert.doesNotMatch(text, /error type: self_check_failed/i);
 });
 
 test("B-068: a check that keeps failing uses every pass, fails the job, and validationCommand never runs", async () => {
@@ -218,7 +219,7 @@ test("B-068: a check that keeps failing uses every pass, fails the job, and vali
     hooks.agentRuntimeTestHook = null;
   }
   assert.equal(runs.length, 3, "the first run and two passes (the default)");
-  assert.match(text, /Error type: self_check_failed/);
+  assert.match(text, /^Status: failed; error type: self_check_failed$/m);
   assert.match(text, /Self-checks: failed \(node tools\/validate\.cjs out\/batch-001\.json, exit code 1\); fix passes used 2 of 2/);
   assert.match(text, /Validation command: node tools\/validate\.cjs out\/batch-001\.json/, "the gate shown is the failing self-check");
   assert.doesNotMatch(text, /Validation command: git diff --check/);

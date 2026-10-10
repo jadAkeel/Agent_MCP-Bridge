@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-10
 
+### Waste-reduction round: item 2
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-205 | Single-agent results repeat ordinary diagnostics and blank lines; queue/audit text stores the verbose preamble even when callers need only outcome and review evidence. | Null preamble entries were joined unfiltered, and the full formatter was always used. Live e2e consumers also assumed quick health contained deep role evidence and source cleanup finished before the integration reply. | Compact single/queued defaults retain Run id, changed files, scope/unsafe and lock/quarantine verdicts, dependencies, HEAD drift and full worktree review; direct writers keep their patch. Tool-level detail:true returns the full block, with separate redacted/encrypted stored detail and unchanged caps. Null entries are removed, intentional paragraphs retained. New compact/storage tests pass 10/10; one actual native explore run: 26 vs 111 lines, 1379 vs 4452 chars (69% less, ~768 caller-context tokens by chars/4). Native e2e, contractor, profile and live smokes passed. Pinned consumers use compact Status or detail; deep health and bounded actual cleanup checks preserve their assertions. Ten targeted suites passed 167/167 (zero skips), offline cross-process concurrency passed 32 checks (zero skips), server event/redaction and self tests passed, git diff --check clean. | bridge/waste-2-results | fixed, not deployed |
+
 ### First CI run on GitHub
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

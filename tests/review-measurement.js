@@ -268,7 +268,7 @@ test("B-024: retried attempts are not counted as post-agent work", async () => {
 test("B-021: a direct run's audit id also names its worktree", async () => {
   installRuntime({ onRun: async ({ cwd }) => writeFile(path.join(cwd, "src", "b.txt"), "direct edit\n", "utf8") });
   const text = textOf(await callTool("run_opencode_agent", {
-    agent: "builder", task: "Edit src/b.txt.", cwd: repo, write: true, lockMode: "simple",
+    agent: "builder", task: "Edit src/b.txt.", cwd: repo, write: true, lockMode: "simple", detail: true,
     lockedPaths: ["src/b.txt"], allowedEdits: ["src/b.txt"], scopeContract: writeScope(["src/b.txt"]),
   }));
   const runId = /Direct run audit: (\S+); terminal metadata persisted/.exec(text)?.[1];

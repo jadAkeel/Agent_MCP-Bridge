@@ -53,6 +53,7 @@ async function smokeAgent(agent) {
   try {
     const response = await callTool("run_opencode_agent", {
       agent,
+      detail: true,
       task: `Return exactly ${marker}. Do not use tools.`,
       cwd,
       write: false,

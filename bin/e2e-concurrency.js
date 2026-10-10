@@ -1036,6 +1036,8 @@ async function main() {
       extraEnv: {
         ...fakeManagedEnv,
         CODEX_OPENCODE_PASSTHROUGH_ENV: "FAKE_METADATA_COUNTER_PATH,FAKE_UNSAFE_METADATA_AFTER,FAKE_RUN_SENTINEL_PATH",
+        // Exercise the uncached pre-spawn guard rather than the default fresh-attestation reuse.
+        CODEX_OPENCODE_ATTESTATION_FINAL_MAX_AGE_MS: "0",
         FAKE_METADATA_COUNTER_PATH: metadataCounterPath,
         // Read 1 is discovery (then served from the attestation cache); read 2 is the
         // uncached immediate pre-spawn read, which must see the drift and fail closed.
@@ -1052,7 +1054,7 @@ async function main() {
       timeoutMs: 5000,
     });
     const metadataCallCount = Number.parseInt(await readFile(metadataCounterPath, "utf8"), 10) || 0;
-    assert.match(metadataDrift, /Error type:\s*agent_metadata_changed/i, `A permission change at the immediate pre-spawn read must fail closed after ${metadataCallCount} metadata reads.\n${metadataDrift}`);
+    assert.match(metadataDrift, /^Status:\s*rejected;\s*error type:\s*agent_metadata_changed$/mi, `A permission change at the immediate pre-spawn read must fail closed after ${metadataCallCount} metadata reads.\n${metadataDrift}`);
     await assert.rejects(access(runSentinelPath), undefined, "The fake OpenCode run command executed after final metadata drift was detected.");
     await clientC.close();
     clientC = null;

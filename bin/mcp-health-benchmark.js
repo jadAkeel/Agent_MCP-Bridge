@@ -68,7 +68,7 @@ try {
       { timeout: 15 * 60 * 1000, maxTotalTimeout: 15 * 60 * 1000 }
     );
     const text = (result?.content || []).map((item) => item?.text || "").join("\n");
-    assert.match(text, /Dry run: yes/i);
+    assert.match(text, /^Status:\s*dry_run$/mi);
     process.stdout.write(`agent_dry_run_ms=${Math.round(performance.now() - started)}\n`);
   }
 } finally {

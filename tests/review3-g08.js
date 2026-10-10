@@ -93,8 +93,8 @@ const writerJob = (repo, paths = ["src"]) => ({
   agent: "builder", task: "Edit src.", cwd: repo, write: true, lockMode: "simple",
   lockedPaths: paths, allowedEdits: paths, scopeContract: writeScope(paths), validationCommand: "git diff --check",
 });
-// run_opencode_agent prints "Error type: x"; a compact parallel job block "Status: failed; error type: x".
-const errorTypeOf = (text) => /^Error type: (\S+)/m.exec(text)?.[1] || /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || "";
+// Default direct/parallel results use Status; detailed results retain Error type.
+const errorTypeOf = (text) => /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || /^Error type: (\S+)/m.exec(text)?.[1] || (/^Status: (?:completed|dry_run)$/m.test(text) ? "none" : "");
 
 async function runWriter(repo, onRun, { parallel = false, paths = ["src"] } = {}) {
   installRuntime(onRun);

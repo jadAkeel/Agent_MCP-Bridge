@@ -254,13 +254,18 @@ test("L-025: a single run_opencode_agent run is stored under its audit id; its p
   assert.match(response, /Worktree patch preview:\ndiff --git/, "the direct response still carries the patch preview");
   const view = JSON.parse(textOf(await callTool("get_opencode_job", { jobId: runId, cwd: repo })));
   assert.equal(view.kind, "direct_run");
+  assert.match(view.resultText, /^Status: completed$/m);
+  assert.match(view.resultText, /^Unsafe changed files: none detected$/m);
+  assert.doesNotMatch(view.resultText, /Requested agent mode:/);
   assert.match(view.resultText, /Assistant final response:\nEdited src\/b\.txt\.\nDIRECT-END/);
   assert.match(view.resultText, /Worktree diff stat:/);
   assert.match(view.resultText, /Worktree patch preview: omitted from this view \(\d+ characters stored\)/);
   assert.doesNotMatch(view.resultText, /diff --git/);
   assert.ok(view.resultDetailTextChars > 5000, JSON.stringify({ chars: view.resultDetailTextChars }));
   const detailed = JSON.parse(textOf(await callTool("get_opencode_job", { jobId: runId, cwd: repo, detail: true })));
-  assert.match(detailed.resultDetailText, /^Worktree patch preview:\ndiff --git/);
+  assert.match(detailed.resultDetailText, /^Requested agent: builder$/m);
+  assert.match(detailed.resultDetailText, /^Timing ms: total=\d+/m);
+  assert.match(detailed.resultDetailText, /^Worktree patch preview:\ndiff --git/m);
   for (const item of await listRetainedWorktreeArtifacts(repo, { jobId: runId })) await cleanupWorktree({ path: item.worktreePath, branch: item.branch, repoRoot: repo }, "always", true);
 });
 
@@ -301,7 +306,7 @@ test("L-026: get_opencode_job for a finished writer leaves the patch preview out
   assert.match(view.omitted, /resultDetailText/);
 
   const detailed = JSON.parse(textOf(await callTool("get_opencode_job", { jobId, cwd: repo, detail: true })));
-  assert.match(detailed.resultDetailText, /^Worktree patch preview:\ndiff --git a\/src\/a\.txt/);
+  assert.match(detailed.resultDetailText, /^Worktree patch preview:\ndiff --git a\/src\/a\.txt/m);
   assert.match(detailed.resultDetailText, /queued edit line 0 with enough text/);
   assert.equal(detailed.completionOutcome || "", "");
   for (const item of await listRetainedWorktreeArtifacts(repo, { jobId })) await cleanupWorktree({ path: item.worktreePath, branch: item.branch, repoRoot: repo }, "always", true);
