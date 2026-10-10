@@ -7,6 +7,7 @@ import { access, cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFi
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { resolveServerEntrypoint } from "./server-entry.js";
@@ -55,10 +56,10 @@ async function callTool(client, name, args = {}) {
 function requireAccepted(text, label) {
   assert.doesNotMatch(
     text,
-    /^(?:OpenCode agent routing failed|Delegation plan rejected|Worktree setup failed|OpenCode result rejected|Integration rejected|Serial integration rejected|OpenCode MCP bridge status: attention required)/im,
+    /^(?:OpenCode agent routing failed|Delegation plan rejected|Worktree setup failed|OpenCode result rejected|Integration rejected|Serial integration rejected|OpenCode MCP bridge status: attention required|Status:\s*(?:failed|rejected)(?:;|$))/im,
     `${label} was rejected or failed:\n${text}`
   );
-  const errorType = text.match(/^Error type:\s*(.+)$/mi)?.[1]?.trim();
+  const errorType = text.match(/^Status:\s*\S+;\s*error type:\s*(\S+)/mi)?.[1] || text.match(/^Error type:\s*(.+)$/mi)?.[1]?.trim();
   if (errorType) {
     assert.equal(errorType.toLowerCase(), "none", `${label} returned error type ${errorType}:\n${text}`);
   }
@@ -205,7 +206,7 @@ async function main() {
     });
     await client.connect(transport);
 
-    const status = await callTool(client, "get_opencode_bridge_status", { cwd: repo });
+    const status = await callTool(client, "get_opencode_bridge_status", { cwd: repo, deep: true });
     assert.match(status, /status: healthy/i);
     assert.match(status, /MCP contractor direct edit permission denied: yes/i);
     assert.match(status, /MCP contractor nested task permission enabled: yes/i);
@@ -280,7 +281,7 @@ async function main() {
     assert.match(preflight, /Actual agent:\s*opencode-orchestrator-mcp-contractor/i);
     printStep("preflight", preflight);
 
-    const execution = await callTool(client, "run_opencode_agent", contractorJob);
+    const execution = await callTool(client, "run_opencode_agent", { ...contractorJob, detail: true });
     requireAccepted(execution, "contractor execution");
     assert.match(execution, /Actual agent used:\s*opencode-orchestrator-mcp-contractor/i);
     assert.match(execution, /Orchestrator mode:\s*contractor/i);
@@ -319,7 +320,13 @@ async function main() {
     });
     requireAccepted(integration, "integration");
     assert.equal((await readFile(path.join(repo, "src", "contractor.txt"), "utf8")).replace(/\r\n/g, "\n"), "contracted\n");
-    await assert.rejects(access(worktreePath));
+    const cleanupDeadline = Date.now() + 30_000;
+    while (Date.now() < cleanupDeadline) {
+      try { await access(worktreePath); }
+      catch (error) { if (error.code === "ENOENT") break; throw error; }
+      await delay(200);
+    }
+    await assert.rejects(access(worktreePath), { code: "ENOENT" });
     printStep("integration", integration);
 
     assert.deepEqual(await metadataSnapshot(operatorOpenCodeData), globalDataBefore, "Contractor E2E mutated shared OpenCode data instead of its isolated XDG data root.");

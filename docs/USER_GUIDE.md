@@ -650,6 +650,8 @@ An operator who runs from releases ends up with a layout like this. `<releases-d
 
 You normally let Codex call these tools. They are listed so you recognise them in its output.
 
+A single agent result now defaults to a compact summary plus the agent report. It keeps changed files, scope and lock decisions, failures, dependencies and retained worktree details; a direct writer also keeps its patch. Use `run_opencode_agent` with `detail: true` for the full bridge block, or `get_opencode_job` with the Run id and `detail: true` to retrieve the stored full block and patch. Queued results use the compact summary too.
+
 | Group | Tool | Purpose |
 | --- | --- | --- |
 | Health | `get_opencode_bridge_status` | Quick daily check. `deep: true` gives a full attestation. |

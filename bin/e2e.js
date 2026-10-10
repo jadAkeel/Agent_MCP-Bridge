@@ -6,6 +6,7 @@ import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } fr
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { resolveServerEntrypoint } from "./server-entry.js";
@@ -54,10 +55,10 @@ async function callTool(client, name, args = {}) {
 function requireAccepted(text, label) {
   assert.doesNotMatch(
     text,
-    /^(?:OpenCode agent routing failed|Delegation plan rejected|Worktree setup failed|OpenCode result rejected|Integration rejected|Serial integration rejected|OpenCode MCP bridge status: attention required)/im,
+    /^(?:OpenCode agent routing failed|Delegation plan rejected|Worktree setup failed|OpenCode result rejected|Integration rejected|Serial integration rejected|OpenCode MCP bridge status: attention required|Status:\s*(?:failed|rejected)(?:;|$))/im,
     `${label} was rejected or failed:\n${text}`
   );
-  const errorType = text.match(/^Error type:\s*(.+)$/mi)?.[1]?.trim();
+  const errorType = text.match(/^Status:\s*\S+;\s*error type:\s*(\S+)/mi)?.[1] || text.match(/^Error type:\s*(.+)$/mi)?.[1]?.trim();
   if (errorType) {
     assert.equal(errorType.toLowerCase(), "none", `${label} returned error type ${errorType}:\n${text}`);
   }
@@ -69,11 +70,21 @@ function previewReceiptFromText(text) {
   return JSON.parse(match[1]);
 }
 
+async function requireWorktreeRemoved(worktreePath) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try { await access(worktreePath); }
+    catch (error) { if (error.code === "ENOENT") return; throw error; }
+    await delay(200);
+  }
+  assert.fail(`Integrated worktree was not removed within 30 seconds: ${worktreePath}`);
+}
+
 function printStep(label, text) {
   const highlights = String(text)
     .split(/\r?\n/)
     .filter((line) =>
-      /^(OpenCode MCP bridge status|Delegation plan accepted|Requested agent:|Actual agent:|Worktree path:|Worktree changed files:|Integration|Validation status:|Final recommendation:)/i.test(line)
+      /^(OpenCode MCP bridge status|Delegation plan accepted|Agent:|Status:|Requested agent:|Actual agent:|Worktree path:|Worktree changed files:|Integration|Validation status:|Final recommendation:)/i.test(line)
     )
     .slice(0, 12);
   process.stdout.write(`${label}: ${highlights.join(" | ") || "completed"}\n`);
@@ -172,7 +183,7 @@ async function main() {
     });
     await client.connect(transport);
 
-    const status = await callTool(client, "get_opencode_bridge_status", { cwd: repo });
+    const status = await callTool(client, "get_opencode_bridge_status", { cwd: repo, deep: true });
     assert.match(status, /status: healthy/i);
     assert.match(status, /Worktree mode: write/i);
     assert.match(status, /Queue mode: sqlite/i);
@@ -190,6 +201,7 @@ async function main() {
 
     const plan = await callTool(client, "run_opencode_agent", {
       agent: "orchestrator",
+      detail: true,
       task: "Inspect src/message.txt and return a concise read-only plan to replace its content with the single word after. Identify the exact affected path, risks, and validation. Do not edit files.",
       cwd: repo,
       orchestratorMode: "planning-only",
@@ -313,8 +325,8 @@ async function main() {
       cleanupAfterSuccess: true,
     });
     requireAccepted(integration, "integration");
-    assert.match(integration, /Source worktree cleanup:\s*success/i);
-    await assert.rejects(access(worktreePath));
+    assert.match(integration, /Source worktree cleanup:\s*(?:success|pending)/i);
+    await requireWorktreeRemoved(worktreePath);
     assert.equal((await readFile(path.join(repo, "src", "message.txt"), "utf8")).replace(/\r\n/g, "\n"), "after\n");
     const statusLines = (await git(repo, ["status", "--short"])).stdout
       .replace(/\\/g, "/")

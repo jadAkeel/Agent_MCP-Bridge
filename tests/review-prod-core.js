@@ -51,7 +51,7 @@ await writeFile(path.join(repo, "Tools", "Validators", "check.cjs"), "process.ex
 await git(["add", "."]);
 await git([...identity, "commit", "-q", "-m", "app and tools"]);
 
-const errorTypeOf = (text) => /^Error type: (\S+)/m.exec(text)?.[1] || /errorType: (\S+)/.exec(text)?.[1] || "";
+const errorTypeOf = (text) => /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || /^Error type: (\S+)/m.exec(text)?.[1] || /errorType: (\S+)/.exec(text)?.[1] || "";
 const plainPlan = (extra = {}) => ({ agent: "builder", cwd: repo, lockType: "write", lockedPaths: ["src"], allowedEdits: ["src/a.txt"], forbiddenEdits: [], sharedFiles: [], serialOnly: [], scopeContract: null, ...extra });
 
 // The agent run: writes `files` into the directory it runs in (the job's worktree).

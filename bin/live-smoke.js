@@ -229,6 +229,7 @@ async function main() {
         name: "run_opencode_agent",
         arguments: {
           agent: options.agent,
+          detail: true,
           task: "Reply with exactly the single word LIVE_SMOKE_OK and nothing else. Do not use tools.",
           cwd: repo,
           write: false,
@@ -238,7 +239,7 @@ async function main() {
         },
       }, undefined, { timeout: options.timeoutMs + 1000 * 60, maxTotalTimeout: options.timeoutMs + 1000 * 60 }));
       report.run.durationMs = Date.now() - runStarted;
-      report.run.errorType = field(run, "Error type") || "none";
+      report.run.errorType = /^Status: \S+; error type: (\S+)/mi.exec(run)?.[1] || field(run, "Error type") || "none";
       report.run.actualAgent = field(run, "Actual agent used");
       report.run.configuredProvider = field(run, "Configured provider");
       report.run.configuredModel = field(run, "Configured model");
