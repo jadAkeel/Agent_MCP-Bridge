@@ -2,6 +2,8 @@
 
 Detailed rules, tool behavior, and the complete configuration table. For daily use, start with [USER_GUIDE.md](USER_GUIDE.md).
 
+`tools/list` advertises a compact description of each tool. Legacy aliases and rarely used fields remain accepted and validated when explicitly supplied; options a tool refuses are not advertised for that tool. Parallel/plan job items refer to the single-job fields (`agent`, `task`, `cwd`, writer locks, `allowedEdits`, `scopeContract`), and `previewReceipt` is an opaque object returned by a dry run and echoed unchanged on apply. This changes discovery text only: registered validation schemas, refusal rules, tool names and calls are unchanged. Full option details follow below.
+
 ## Official Safety Model
 
 ```text

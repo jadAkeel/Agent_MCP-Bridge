@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-10
 
+### Waste reduction: compact tool discovery
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-207 | The tools/list catalogue grew to 63,740 bytes, repeating full jobs and long descriptions, including options some tools refuse. | One shared schema was advertised repeatedly and discovery had no byte budget. | An output-only transformer clones the SDK list, omits redundant default metadata, hides unsupported/legacy/rare advertised fields, uses concise editorial descriptions and opaque parallel/plan jobs and echo receipts. Registered Zod schemas and call handlers remain unchanged; all 28 tools, strict contracts, enabled filtering and metadata stay intact. Actual MCP client: 32,228 bytes, 31,512 saved (49.44%); total cap 33,000 and per-tool caps tested. Verified: 11 budget/compatibility tests (zero skips), provider wait 12, lib pin 11, tools/pipelines 29, frozen self-test and diff check. Existing single-job plan lock-only treatment of queue options is preserved and tested. Report: `C:/Users/10User/bridge-reports/waste-round/item-4.md`. | `bridge/waste-4-tool-list` | fixed, not deployed |
+
 ### Waste reduction: avoid preparing paused jobs
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

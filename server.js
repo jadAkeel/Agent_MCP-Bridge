@@ -185,6 +185,7 @@ import { registerJobTools } from "./lib/tools/jobs.js";
 import { registerIntegrationTools } from "./lib/tools/integration.js";
 import { providerWaitProgressStorage, formatProviderWait } from "./lib/provider-wait.js";
 import { registerParallelTool } from "./lib/tools/parallel.js";
+import { installToolsListAdvertisement } from "./lib/tools-list-advertisement.js";
 import { createProviderLeaseRuntime } from "./lib/provider-leases.js";
 import { createProviderQuarantineRuntime } from "./lib/provider-quarantine.js";
 import { createReleaseIntegrityRuntime } from "./lib/release-integrity.js";
@@ -4129,6 +4130,8 @@ const { createPipelinePlan, verifyParallelLockResults, settleIndependentParallel
 
 registerParallelTool({ providerSlotWaitStorage, CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, compactFileList, compactJobLines, conflictPathsFromConflict, createPhaseClock, createWorktreeForJob, directRunAuditStore, dirtyCheckpointDetails, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatReadOnlyWorkspaceDrift, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, inspectSourceCheckpointState, jobAgentRuntime, jobInputShape, labelParallelRunId, makeQueueJobId, normalizeJobCwd, nowMs, parallelBatchCapacityError, parallelExecutionOverlapEvidence, parallelGroupDeadlineMs, parallelGroupScopeReport, parallelProviderKeys, readAgentDefinition, readOnlyEditsDeniedByAttestation, readOnlyHeadMove, readOnlyRoutingPolicyError, readOnlyWorkspaceDrift, refreshRuntimeConcurrency, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, server, settleIndependentParallelJobs, shouldUseWorktree, startHardLockHeartbeat, validateChangedFilesForPlan, validateParallelWritePlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifyParallelLockResults, verifySanitizedWorkspace });
 
+const untransformedToolsList = installToolsListAdvertisement(server);
+
 async function sha256File(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
@@ -5721,6 +5724,7 @@ export const __selfTest = {
     gitControlSurfaceFingerprint,
     globToRegex,
     jobInputShape,
+    untransformedToolsList,
     openCodeCommandLineLengthError,
     openCodePromptArgument,
     openProviderLeaseDb,
