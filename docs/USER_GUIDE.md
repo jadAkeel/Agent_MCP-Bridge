@@ -642,6 +642,8 @@ An operator who runs from releases ends up with a layout like this. `<releases-d
 
 You normally let Codex call these tools. They are listed so you recognise them in its output.
 
+Tool discovery shows the common options. Existing advanced options and legacy spellings still work and receive the same validation; see [REFERENCE.md](REFERENCE.md) for their full rules. Parallel job objects use the single-job fields, and an integration receipt is passed back unchanged from its dry run.
+
 | Group | Tool | Purpose |
 | --- | --- | --- |
 | Health | `get_opencode_bridge_status` | Quick daily check. `deep: true` gives a full attestation. |
