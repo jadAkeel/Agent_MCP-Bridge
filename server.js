@@ -755,6 +755,7 @@ async function runSingleFlight(flights, key, operation) {
 let attestationCacheTtlOverride = null;
 const sharedAttestationCache = createAttestationCacheRuntime({
   fingerprint: attestationFingerprint,
+  fingerprintScopeKey: (key) => String(key).split(/\0|\\0/).find((part) => path.isAbsolute(part)) || key,
   ttlMs: attestationCacheTtlMs,
   stateDirectory: () => effectiveBridgeStateDirectory(),
   buildIdentity: `${BRIDGE_SOURCE_SHA256}\0${BRIDGE_LIB_SHA256_AT_STARTUP}`,
@@ -762,6 +763,8 @@ const sharedAttestationCache = createAttestationCacheRuntime({
   flightLeaseMs: CONFIG.attestationCommandTimeoutMs * 5 + 60_000,
 });
 const attestationCacheStatus = sharedAttestationCache.attestationCacheStatus;
+const withAttestationFingerprintScope = sharedAttestationCache.withAttestationFingerprintScope;
+const finishAttestationFingerprintScope = sharedAttestationCache.finishAttestationFingerprintScope;
 
 function attestationCacheTtlMs() {
   if (attestationCacheTtlOverride !== null) return attestationCacheTtlOverride;
@@ -848,7 +851,7 @@ async function reattestAgentMetadata(agent, cwd, previous, { maxAgeMs = CONFIG.a
   if (!(maxAgeMs > 0) || !key || attestationCacheTtlMs() <= 0) {
     return readAgentDebugMetadataUncached(agent, cwd, {});
   }
-  return cachedAttestation(key, () => readAgentDebugMetadataUncached(agent, cwd, {}), (value) => Boolean(value?.ok), { maxAgeMs });
+  return withAttestationFingerprintScope(() => cachedAttestation(key, () => readAgentDebugMetadataUncached(agent, cwd, {}), (value) => Boolean(value?.ok), { maxAgeMs }));
 }
 
 function attestationCwdKey(cwd) {
@@ -3052,7 +3055,7 @@ const { continueWorktreeJobError, normalizeLockType, normalizeLockMode, createLo
 
 const { sanitizedDiscoveryContext, verifySanitizedJobsBeforeDiscovery, parallelProviderKeys, jobAgentRuntime, getAgentRuntimeTestHook, setAgentRuntimeTestHook } = createJobDiscoveryRuntime({ allowlistedModelOverride, applyModelOverrideToMetadata, providerKeyForMetadata, readAgentDebugMetadata, resolveAgent, runOpenCodeWithPolicy, verifySanitizedWorkspace });
 
-const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProcessMsOf, buildValidationFixPrompt, buildSelfCheckFixPrompt, selfCheckFailureSummary, selfCheckPassSkipReason, formatSelfCheck, validationFixPassSkipReason, mergeValidationFixRuns, formatValidationFixPass, readOnlyEditsDeniedByAttestation, readOnlyWorkspaceDrift, formatReadOnlyWorkspaceDrift, executeOpenCodeJob } = createExecuteJobRuntime({ attachRetainedWorktree, releaseRetainedWorktreeClaim, CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, OPENCODE_EXE, SELF_CHECK_DEFAULT_PASSES, VALIDATION_PREFLIGHT_FIX, abortSignalErrorType, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, attestContractorNestedAgents, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, combineAbortSignals, compactJobLines, conflictPathsFromConflict, containmentRecord, createPhaseClock, createWorktreeForJob, directExecutionLockConflictDetails, dirtyCheckpointDetails, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, hasWriteIntent, jobAgentRuntime, logEvent, makeQueueJobId, mergeHeavyToolCalls, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, patchPreviewOmittedLine, quarantineHardLock, readAgentDefinition, readOnlyHeadMove, readOnlyRoutingPolicyError, recordChangedFiles, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, shouldUseWorktree, startHardLockHeartbeat, timeoutForAgent, truncateText, updateRetainedWorktreeMeasurement, validateChangedFilesForPlan, validateSingleLockPlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifySanitizedWorkspace });
+const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProcessMsOf, buildValidationFixPrompt, buildSelfCheckFixPrompt, selfCheckFailureSummary, selfCheckPassSkipReason, formatSelfCheck, validationFixPassSkipReason, mergeValidationFixRuns, formatValidationFixPass, readOnlyEditsDeniedByAttestation, readOnlyWorkspaceDrift, formatReadOnlyWorkspaceDrift, executeOpenCodeJob } = createExecuteJobRuntime({ withAttestationFingerprintScope, finishAttestationFingerprintScope, attachRetainedWorktree, releaseRetainedWorktreeClaim, CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, OPENCODE_EXE, SELF_CHECK_DEFAULT_PASSES, VALIDATION_PREFLIGHT_FIX, abortSignalErrorType, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, attestContractorNestedAgents, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, combineAbortSignals, compactJobLines, conflictPathsFromConflict, containmentRecord, createPhaseClock, createWorktreeForJob, directExecutionLockConflictDetails, dirtyCheckpointDetails, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, hasWriteIntent, jobAgentRuntime, logEvent, makeQueueJobId, mergeHeavyToolCalls, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, patchPreviewOmittedLine, quarantineHardLock, readAgentDefinition, readOnlyHeadMove, readOnlyRoutingPolicyError, recordChangedFiles, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, shouldUseWorktree, startHardLockHeartbeat, timeoutForAgent, truncateText, updateRetainedWorktreeMeasurement, validateChangedFilesForPlan, validateSingleLockPlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifySanitizedWorkspace });
 
 function queueRunStage(record) {
   if (record.status !== "running") {
@@ -5477,6 +5480,7 @@ export const __selfTest = {
     buildValidationEnv,
     cachedAttestation,
     attestationCacheStatus,
+    withAttestationFingerprintScope,
     reattestAgentMetadata,
     cancelPersistedQueueJob,
     captureGitIndexIdentity,

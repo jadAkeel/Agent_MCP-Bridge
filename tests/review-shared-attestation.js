@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -37,6 +37,167 @@ test("native executable proof refuses extensionless and script launchers", async
   await writeFile(launcher, "exec node unseen-implementation.js\n");
   assert.equal(await resolveAttestationExecutable(launcher), null);
   assert.equal(await resolveAttestationExecutable(process.execPath), await (await import("node:fs/promises")).realpath(process.execPath));
+});
+test("B-204: parallel content hashes are deterministic and refuse a linked tree", async () => {
+  const tree = path.join(root, "hash-tree");
+  await mkdir(tree);
+  await Promise.all(Array.from({ length: 40 }, (_, i) => writeFile(path.join(tree, `${i}.txt`), `file ${i}`)));
+  const before = await attestationInputFingerprint([tree, input]);
+  assert.equal(before, await attestationInputFingerprint([input, tree, input]));
+  const details = await stat(path.join(tree, "4.txt"));
+  await writeFile(path.join(tree, "4.txt"), "evil 4");
+  await utimes(path.join(tree, "4.txt"), details.atime, details.mtime);
+  assert.notEqual(before, await attestationInputFingerprint([tree, input]));
+  await symlink(tree, path.join(root, "hash-link"), process.platform === "win32" ? "junction" : "dir");
+  assert.equal(await attestationInputFingerprint([path.join(root, "hash-link")]), null);
+});
+test("B-204: warm discovery shares one fingerprint; the final scope catches byte drift", async () => {
+  let fingerprints = 0;
+  const cache = createAttestationCacheRuntime({
+    fingerprint: async () => { fingerprints++; return attestationInputFingerprint([input]); },
+    fingerprintScopeKey: () => "same-cwd", ttlMs: () => 3_600_000,
+    stateDirectory: () => state, buildIdentity: "scopes", assertNoLinkedPath: async () => {},
+  });
+  await cache.cachedAttestation("list", operation, positive);
+  const metadata = await cache.cachedAttestation("metadata", operation, positive);
+  fingerprints = 0;
+  await cache.withAttestationFingerprintScope(async () => {
+    await cache.cachedAttestation("list", operation, positive);
+    assert.equal((await cache.cachedAttestation("metadata", operation, positive)).call, metadata.call);
+    assert.equal(fingerprints, 1, "only one warm discovery fingerprint");
+    await writeFile(input, "drift between discovery and spawn");
+    const final = await cache.withAttestationFingerprintScope(() => cache.cachedAttestation("metadata", operation, positive, { maxAgeMs: 600_000 }));
+    assert.equal(final.attestationCacheHit, false);
+    assert.ok(final.call > metadata.call);
+  });
+  assert.equal(fingerprints, 3, "discovery, independent final input, and cold publication proof");
+});
+test("B-204: concurrent jobs and different cwd keys do not share discovery inputs", async () => {
+  let fingerprints = 0;
+  const cache = createAttestationCacheRuntime({ fingerprint: async () => { fingerprints++; return "stable"; },
+    fingerprintScopeKey: (key) => key.split(":")[0], ttlMs: () => 3_600_000,
+    stateDirectory: () => state, buildIdentity: "separate-scopes", assertNoLinkedPath: async () => {}, });
+  for (const key of ["cwd-a:list", "cwd-a:metadata", "cwd-b:list"]) await cache.cachedAttestation(key, operation, positive);
+  fingerprints = 0;
+  await Promise.all([1, 2].map(() => cache.withAttestationFingerprintScope(async () => {
+    await cache.cachedAttestation("cwd-a:list", operation, positive);
+    await cache.cachedAttestation("cwd-a:metadata", operation, positive);
+    await cache.cachedAttestation("cwd-b:list", operation, positive);
+  })));
+  assert.equal(fingerprints, 4);
+});
+
+test("B-204: a cold metadata command cannot use a warm policy after discovery drift", async () => {
+  await writeFile(input, "safe");
+  let policyReads = 0;
+  let metadataCommands = 0;
+  const cache = createAttestationCacheRuntime({
+    fingerprint: () => attestationInputFingerprint([input]),
+    fingerprintScopeKey: () => "same-cwd", ttlMs: () => 3_600_000,
+    stateDirectory: () => state, buildIdentity: "cold-metadata-policy-drift",
+    assertNoLinkedPath: async () => {},
+  });
+  const readPolicy = async () => {
+    policyReads++;
+    return { ok: await readFile(input, "utf8") === "safe" };
+  };
+  const readList = async () => ({ ok: true, agents: ["explore"] });
+  assert.equal((await cache.cachedAttestation("plugin-policy", readPolicy, positive)).ok, true);
+  await cache.cachedAttestation("list", readList, positive);
+  assert.equal(policyReads, 1);
+  await cache.withAttestationFingerprintScope(async () => {
+    assert.equal((await cache.cachedAttestation("list", readList, positive)).attestationCacheHit, true);
+    const details = await stat(input);
+    await writeFile(input, "evil");
+    await utimes(input, details.atime, details.mtime);
+    const metadata = await cache.cachedAttestation("new-agent-metadata", async () => {
+      const policy = await cache.cachedAttestation("plugin-policy", readPolicy, positive);
+      if (!policy.ok) return { ok: false, errorType: "external_plugin_integrity_failed" };
+      metadataCommands++;
+      return { ok: true };
+    }, positive);
+    assert.equal(metadata.ok, false);
+    assert.equal(metadata.errorType, "external_plugin_integrity_failed");
+  });
+  assert.equal(policyReads, 2, "policy must reread the changed input");
+  assert.equal(metadataCommands, 0, "refuse before the plugin-loading metadata command");
+});
+
+test("B-204: an unidentifiable cold read gives nested policy its own fingerprint", async () => {
+  await writeFile(input, "safe");
+  let policyReads = 0;
+  const fingerprintKeys = [];
+  const cache = createAttestationCacheRuntime({
+    fingerprint: async (key) => {
+      fingerprintKeys.push(key);
+      return key === "unidentifiable-metadata" ? null : attestationInputFingerprint([input]);
+    }, fingerprintScopeKey: () => "same-cwd", ttlMs: () => 3_600_000,
+    stateDirectory: () => state, buildIdentity: "null-fingerprint-scope",
+    assertNoLinkedPath: async () => {},
+  });
+  const readPolicy = async () => { policyReads++; return { ok: true }; };
+  await cache.cachedAttestation("plugin-policy", readPolicy, positive);
+  fingerprintKeys.length = 0;
+  await cache.withAttestationFingerprintScope(async () => {
+    const metadata = await cache.cachedAttestation("unidentifiable-metadata", async () => {
+      const policy = await cache.cachedAttestation("plugin-policy", readPolicy, positive);
+      assert.equal(policy.attestationCacheHit, true, "valid unchanged policy still has an independent cache identity");
+      return { ok: policy.ok };
+    }, positive);
+    assert.equal(metadata.attestationCacheSource, "fresh");
+  });
+  assert.deepEqual(fingerprintKeys, ["unidentifiable-metadata", "plugin-policy"]);
+  assert.equal(policyReads, 1, "the null metadata identity must not force an unnecessary policy read");
+});
+
+test("B-204: rejected hashes drain active root and directory sibling IO before returning", async () => {
+  const script = path.join(root, "hash-drain-child.mjs");
+  await writeFile(script, `
+    import { strict as assert } from "node:assert";
+    import fs from "node:fs";
+    import fsPromises from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    import path from "node:path";
+    let active = 0, started = 0, finished = 0, entered, release, ready, waiting;
+    const fixture = ${JSON.stringify(path.join(root, "mock-hash-inputs"))};
+    const tree = path.join(fixture, "tree");
+    const good = path.join(tree, "good.txt");
+    const bad = path.join(tree, "linked.txt");
+    fsPromises.lstat = async (file) => {
+      if (file === bad) {
+        await ready;
+        // Release in a later event-loop turn: an early rejection must observe
+        // the sibling IO still active rather than pass by scheduling luck.
+        setImmediate(release);
+      }
+      return { mode: 0o100600, size: 16, mtimeMs: 1,
+        isSymbolicLink: () => file === bad,
+        isDirectory: () => file === tree,
+        isFile: () => file === good };
+    };
+    fsPromises.readdir = async () => ["good.txt", "linked.txt"];
+    fs.createReadStream = () => ({
+      async *[Symbol.asyncIterator]() {
+        active++; started++; entered();
+        try { await waiting; yield Buffer.from("synthetic content"); }
+        finally { active--; finished++; }
+      },
+    });
+    syncBuiltinESMExports();
+    const { attestationInputFingerprint } = await import(${JSON.stringify(pathToFileURL(path.join(repo, "lib/attestation-cache.js")).href)});
+    for (const paths of [[good, bad], [tree]]) {
+      active = started = finished = 0;
+      ready = new Promise(resolve => { entered = resolve; });
+      waiting = new Promise(resolve => { release = resolve; });
+      assert.equal(await attestationInputFingerprint(paths), null);
+      assert.equal(started, 1, "one sibling stream must actually start");
+      assert.equal(active, 0, "null must not return while sibling IO remains active");
+      assert.equal(finished, 1, "the started stream must be drained");
+    }
+    console.log(JSON.stringify({ cases: 2, active, started, finished }));
+  `);
+  const child = await execute(process.execPath, [script], { timeout: 20_000 });
+  assert.deepEqual(JSON.parse(child.stdout), { cases: 2, active: 0, started: 1, finished: 1 });
 });
 test("a second instance shares a positive read and preserves Map metadata", async () => {
   const first = await factory().cachedAttestation("role", operation, positive);
@@ -197,6 +358,91 @@ test("simultaneous processes share one cold read", async () => {
   `);
   await Promise.all([execute(process.execPath, [script]), execute(process.execPath, [script]), execute(process.execPath, [script])]);
   assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 1);
+});
+
+test("a follower reuses publication completed between its miss and claim transaction", async () => {
+  const fixture = path.join(root, "cold-claim-race");
+  await mkdir(fixture);
+  const shared = path.join(fixture, "state");
+  const script = path.join(fixture, "child.mjs");
+  const marker = path.join(fixture, "operations.jsonl");
+  await writeFile(script, `
+    import { appendFile, writeFile } from "node:fs/promises";
+    import { existsSync, writeFileSync } from "node:fs";
+    import { DatabaseSync } from "node:sqlite";
+    import path from "node:path";
+    const fixture = ${JSON.stringify(fixture)};
+    const role = process.argv[2];
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    if (role === "follower") {
+      const original = DatabaseSync.prototype.exec;
+      let intercepted = false;
+      DatabaseSync.prototype.exec = function (sql) {
+        if (!intercepted && sql === "BEGIN IMMEDIATE") {
+          intercepted = true;
+          writeFileSync(path.join(fixture, "follower-paused"), "shared miss; no transaction yet");
+          const deadline = Date.now() + 20_000;
+          while (!existsSync(path.join(fixture, "follower-release"))) {
+            if (Date.now() >= deadline) throw new Error("Follower barrier timed out.");
+            Atomics.wait(pause, 0, 0, 25);
+          }
+        }
+        return original.call(this, sql);
+      };
+    }
+    const { createAttestationCacheRuntime } = await import(${JSON.stringify(pathToFileURL(path.join(repo, "lib/attestation-cache.js")).href)});
+    const cache = createAttestationCacheRuntime({ fingerprint: async () => "stable", ttlMs: () => 3_600_000,
+      stateDirectory: () => ${JSON.stringify(shared)}, buildIdentity: "cold-claim-race", assertNoLinkedPath: async () => {} });
+    const value = await cache.cachedAttestation("same", async () => {
+      await appendFile(${JSON.stringify(marker)}, JSON.stringify({ role }) + "\\n");
+      if (role === "owner") {
+        await writeFile(path.join(fixture, "owner-entered"), "claim committed");
+        const deadline = Date.now() + 20_000;
+        while (!existsSync(path.join(fixture, "owner-release"))) {
+          if (Date.now() >= deadline) throw new Error("Owner barrier timed out.");
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+      }
+      return { ok: true, producedBy: role };
+    }, value => value.ok);
+    console.log(JSON.stringify({ source: value.attestationCacheSource, producedBy: value.producedBy }));
+  `);
+  const waitFor = async (name) => {
+    const deadline = Date.now() + 15_000;
+    while (true) {
+      try { await stat(path.join(fixture, name)); return; }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      assert.ok(Date.now() < deadline, `Barrier timed out: ${name}`);
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+  const children = [];
+  const start = (role) => {
+    const child = execute(process.execPath, [script, role], { timeout: 30_000, cwd: repo });
+    child.catch(() => {});
+    children.push(child);
+    return child;
+  };
+  try {
+    const owner = start("owner");
+    await waitFor("owner-entered");
+    const follower = start("follower");
+    await waitFor("follower-paused");
+    await writeFile(path.join(fixture, "owner-release"), "publish before follower begins");
+    assert.deepEqual(JSON.parse((await owner).stdout), { source: "fresh", producedBy: "owner" });
+    const db = new DatabaseSync(path.join(shared, "attestation-cache.sqlite"));
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_entries").get().n, 1);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_flights").get().n, 0);
+    } finally { db.close(); }
+    await writeFile(path.join(fixture, "follower-release"), "published entry; no owner claim");
+    assert.deepEqual(JSON.parse((await follower).stdout), { source: "shared", producedBy: "owner" });
+    const operations = (await readFile(marker, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(operations, [{ role: "owner" }], "publication must prevent a second operation");
+  } finally {
+    await Promise.allSettled(["owner-release", "follower-release"].map(name => writeFile(path.join(fixture, name), "cleanup release")));
+    await Promise.allSettled(children);
+  }
 });
 let failed = 0;
 try {

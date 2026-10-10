@@ -543,6 +543,14 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 3. Restart Codex.
 4. If it still fails, read the error type and use the table above.
 
+### Time before the agent starts
+
+The timing split prints `final-attestation-cached=yes`, `no`, or `n/a`. `yes` means the
+final metadata proof was reused after an independent content fingerprint and within
+the 10-minute freshness limit. Discovery shares its fingerprint across warm cache
+lookups for the same repository; the final check uses a new fingerprint. A cold
+metadata read verifies the current plugin policy before loading plugins.
+
 ### A quarantine that does not clear
 
 **What it is.** Before the bridge applies a reviewed patch to your checkout, it writes a journal entry with the exact bytes of every file the patch touches. If the bridge dies in the middle, it uses that record to undo the patch. When it finds something it cannot explain, for example a file that is neither the old version nor the patched one, it **quarantines** the operation instead of guessing. While the quarantine lasts, every writer in that repository is refused with `integration_recovery_pending`. Readers still work.
