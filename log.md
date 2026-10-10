@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-10
 
+### Waste reduction: attestation
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-204 | Warm read-only jobs repeatedly hash the executable and plugin tree before the agent starts. A cold cache follower can also repeat a read just published by its owner. | Each cache lookup fingerprints independently, same-cwd metadata is read twice, tree IO is serial, and the flight claim does not recheck publication inside its transaction. | Share a fingerprint across warm discovery lookups, skip the same-cwd metadata duplicate, retain an independent final fingerprint and the 10-minute limit, hash with bounded parallel IO and adaptive buffers, drain rejected IO, and recheck publication before claiming. A cold miss closes discovery's snapshot before its plugin-policy check. Timing prints final-attestation-cached. Verified: shared-attestation 20/20 (0 skips), measurement 13/13, latency 12/12, attestation-cache 7/7, server self-test passed, diff check clean. Same-job five-run medians: 4474 to 1376 ms and 5340 to 1278 ms under fluctuating load; an idle-gated pair was 4131 to 1320 ms (2811 ms saved, 189 ms short), with three flagged idle-after samples. CPU attribution confirms part of the during-run increase comes from parallel hashing itself. The user accepted these documented measurements on 2026-10-10, including the host-load limitation. Evidence: C:/Users/10User/bridge-reports/waste-round/item-1.md. | bridge/waste-1-attestation | fixed and verified; documented measurement accepted by user; not deployed |
+
 ### First CI run on GitHub
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

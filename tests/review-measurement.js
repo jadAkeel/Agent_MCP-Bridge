@@ -96,6 +96,17 @@ function installRuntime({ onRun = async () => {} } = {}) {
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+test("B-204: a read-only job reuses its discovery metadata and prints the final cache verdict", async () => {
+  installRuntime();
+  let metadataReads = 0;
+  selfTestHooks.agentRuntimeTestHook.readAgentDebugMetadata = async (agent) => { metadataReads++; return metadataFor(agent); };
+  const response = await callTool("run_opencode_agent", { agent: "explore", task: "Read src/a.txt.", cwd: repo, write: false, lockMode: "off", scopeContract: { mode: "read", read: ["src/a.txt"] } });
+  assert.ok(!response.isError, textOf(response));
+  assert.equal(metadataReads, 1, "the real pre-spawn runtime retains its independent re-attestation");
+  for (const [value, expected] of [[true, "yes"], [false, "no"], [undefined, "n/a"]]) {
+    assert.match(formatPhaseTimings({ phases: {}, run: { finalAttestationCached: value } }), new RegExp(`final-attestation-cached=${expected}`));
+  }
+});
 
 // ---------------------------------------------------------------------------- B-023
 test("B-023: OpenCode's AI_APICallError rate-limit lines count as a recovered provider warning", async () => {
