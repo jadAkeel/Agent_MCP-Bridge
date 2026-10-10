@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-10
 
+### Waste reduction: avoid preparing paused jobs
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-206 | A known paused pinned model could spend workspace, worktree, attestation and snapshot time before its provider-slot refusal; a pause appearing after enqueue could claim a job that cannot run. | The authoritative pause check was late; enqueue's pause assessment could become stale before a scheduler pass. | Accepted operator-allowlisted pins now return the exact never-started slot refusal before setup. The scheduler shares one advisory snapshot per pass and durably holds all-paused candidates before claim, preserving the request, CAS/ownership and attempt; an available fallback remains startable. New advisory reads fail open, existing known-hold release and final lease checks keep their policy; unknown pins still reach validation and unpinned B-197 fallback is unchanged. Verified: pause pre-check regression suite, provider fallback 17, provider wait 12, production quota 8, runtime control 10, model fallback 13, queue cost 5 (all zero skips), frozen server self-test and diff check. Reports and failed-attempt evidence: `C:/Users/10User/bridge-reports/waste-round/item-3.md`. | `bridge/waste-3-pauses` | fixed, not deployed |
+
 ### Waste reduction: attestation
 
 | ID | Problem | Cause | Change / verification | Branch | Status |
