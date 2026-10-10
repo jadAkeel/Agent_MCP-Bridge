@@ -83,10 +83,22 @@ if (isMainModule(import.meta.url)) {
   else if (process.argv.includes("--self-test")) {
     const quiet = process.stdout.write.bind(process.stdout);
     process.stdout.write = () => true;
+    // B-202: the required-skip cases pin the variable themselves, so the self-test gives the
+    // same answer in CI (which sets CODEX_TEST_ALLOW_REQUIRED_SKIPS=1 for the whole run).
+    const ambientAllow = process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS;
+    const withAllow = (value, run) => {
+      if (value === undefined) delete process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS;
+      else process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS = value;
+      try { return run(); } finally {
+        if (ambientAllow === undefined) delete process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS;
+        else process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS = ambientAllow;
+      }
+    };
     const results = [
       finishSkips({ file: "a", total: 3, skips: [] }) === false,
       finishSkips({ file: "b", total: 3, skips: [{ name: "x", reason: "r", optional: true }] }) === false,
-      finishSkips({ file: "c", total: 3, skips: [{ name: "x", reason: "r", optional: false }] }) === true,
+      withAllow(undefined, () => finishSkips({ file: "c", total: 3, skips: [{ name: "x", reason: "r", optional: false }] })) === true,
+      withAllow("1", () => finishSkips({ file: "c-allowed", total: 3, skips: [{ name: "x", reason: "r", optional: false }] })) === false,
       finishSkips({ file: "d", total: 2, skips: [{ name: "x", reason: "r", optional: true }, { name: "y", reason: "r", optional: true }] }) === true,
       finishSkips({ file: "e", total: 2, skips: [], partial: [{ name: "x", reason: "r" }] }) === false,
     ];

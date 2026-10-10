@@ -14,6 +14,14 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-10
+
+### First CI run on GitHub
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-202 | The first GitHub Actions run (PR #3, 2026-10-07) failed at the very first step: `skip-gate self-test failed: [true,true,false,true,true]`. | The workflow sets `CODEX_TEST_ALLOW_REQUIRED_SKIPS=1` for the whole run (the runner has no OpenCode), and the self-test's required-skip case read that ambient value, so the gate reported "allowed" where the case expected "fails". | `tests/skip-gate.js --self-test` pins the variable per case (unset: a required skip fails; `1`: it is a warning) and restores the ambient value. Verified locally with the variable unset and set to 1. | `main` | fixed; pushed, CI run pending |
+
 ## 2026-10-09
 
 ### Housekeeping and deployment of the October rounds
