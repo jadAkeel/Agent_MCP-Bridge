@@ -103,12 +103,22 @@ async function assertRealPath(target, type, label) {
     throw new Error(`${label} must be an absolute path.`);
   }
   const details = await lstat(resolved);
-  const canonical = await realpath(resolved);
   const validType = type === "directory" ? details.isDirectory() : details.isFile();
-  if (details.isSymbolicLink() || !validType || normalizedPath(canonical) !== normalizedPath(resolved)) {
+  if (details.isSymbolicLink() || !validType || await hasLinkedAncestor(resolved)) {
     throw new Error(`${label} must be a real ${type} without linked ancestors: ${resolved}`);
   }
   return resolved;
+}
+
+// B-203: ancestors are lstat-walked instead of comparing realpath() with the given path;
+// realpath also expands Windows 8.3 short names (C:\Users\RUNNER~1 on a GitHub runner).
+async function hasLinkedAncestor(target) {
+  let cursor = path.dirname(target);
+  while (path.dirname(cursor) !== cursor) {
+    if ((await lstat(cursor)).isSymbolicLink()) return true;
+    cursor = path.dirname(cursor);
+  }
+  return false;
 }
 
 async function listCandidateReleaseFiles(root, current = root) {

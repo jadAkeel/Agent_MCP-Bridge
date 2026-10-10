@@ -70,14 +70,21 @@ async function listExactFiles(root, current = root) {
   return files;
 }
 
+// B-203: a link anywhere above `target` is found by lstat-walking the ancestors instead of
+// comparing realpath() with the given path: realpath also expands Windows 8.3 short names
+// (C:\Users\RUNNER~1 on a GitHub runner), which made a plain directory look like a link.
+async function hasLinkedAncestor(target) {
+  let cursor = path.dirname(target);
+  while (path.dirname(cursor) !== cursor) {
+    if ((await lstat(cursor)).isSymbolicLink()) return true;
+    cursor = path.dirname(cursor);
+  }
+  return false;
+}
+
 async function assertUnlinkedDirectory(directory) {
   const details = await lstat(directory);
-  const canonical = await realpath(directory);
-  if (
-    !details.isDirectory()
-    || details.isSymbolicLink()
-    || normalizeFilesystemCase(canonical) !== normalizeFilesystemCase(directory)
-  ) {
+  if (!details.isDirectory() || details.isSymbolicLink() || await hasLinkedAncestor(directory)) {
     throw new Error(`Release destination parent must be a real directory and must not traverse a link or junction: ${directory}`);
   }
 }
@@ -107,12 +114,7 @@ async function prepareUnlinkedDestinationParent(destinationParent) {
 async function readPinnedRegularFile(filePath, expectedSha256, label) {
   const resolved = path.resolve(String(filePath || ""));
   const details = await lstat(resolved);
-  const canonical = await realpath(resolved);
-  if (
-    !details.isFile()
-    || details.isSymbolicLink()
-    || normalizeFilesystemCase(canonical) !== normalizeFilesystemCase(resolved)
-  ) {
+  if (!details.isFile() || details.isSymbolicLink() || await hasLinkedAncestor(resolved)) {
     throw new Error(`${label} must be a real regular file without linked ancestors: ${resolved}`);
   }
   const content = await readFile(resolved);
