@@ -10,8 +10,10 @@ process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
-import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createValidationRuntime } from "../lib/validation-command.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -49,6 +51,75 @@ async function check(name, fn) {
 }
 
 try {
+  const bin = path.join(fixture, "bin");
+  await mkdir(bin);
+  const dailyAllowlist = ["git", "npm", "node", "pnpm", "yarn", "python", "pytest"];
+  const native = (name) => path.join(bin, name + (process.platform === "win32" ? ".exe" : ""));
+  for (const name of dailyAllowlist) await writeFile(native(name), `MZ synthetic ${name}`);
+  const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const hashes = [];
+  const config = { validationExecutableAllowlist: dailyAllowlist, validationExecutableSha256Allowlist: [] };
+  let launches = 0;
+  const runtime = createValidationRuntime({
+    CONFIG: config, buildValidationEnv: () => ({ PATH: bin, PATHEXT: ".CMD;.EXE" }),
+    sha256File: async (file) => { hashes.push(file); return digest(await readFile(file)); },
+    integrationTimed: (_phase, operation) => operation(),
+    runCommand: async () => { launches++; return { exitCode: 0 }; },
+  });
+  const gitPath = realpathSync(path.join(bin, process.platform === "win32" ? "git.EXE" : "git"));
+  const gitSha256 = digest(await readFile(gitPath));
+  await check("daily allowlist resolves paths and hashes only the selected native executable", async () => {
+    hashes.length = 0;
+    const args = ["diff", "--no-ext-diff", "--no-textconv", "--check"];
+    const expected = { ok: true, displayCommand: "git diff --check", executablePath: gitPath, executableSha256: gitSha256,
+      args, commandSha256: digest(JSON.stringify([gitPath, ...args, null])) };
+    assert.equal(JSON.stringify(await runtime.prepareValidationCommand("git diff --check")), JSON.stringify(expected));
+    assert.deepEqual(hashes, [gitPath]);
+    config.validationExecutableAllowlist = ["git"];
+    hashes.length = 0;
+    assert.equal(JSON.stringify(await runtime.prepareValidationCommand("git diff --check")), JSON.stringify(expected));
+    assert.deepEqual(hashes, [gitPath], "the default allowlist must not hash git twice");
+    config.validationExecutableAllowlist = dailyAllowlist;
+  });
+  await check("preflight preserves parse, unknown-executable and pin refusals before any launch", async () => {
+    assert.deepEqual(await runtime.prepareValidationCommand(""), { ok: false, errorType: "validation_command_parse_error", error: "Validation command is empty." });
+    assert.deepEqual(await runtime.prepareValidationCommand('git "unterminated'), { ok: false, errorType: "validation_command_parse_error", error: "Validation command has an unterminated quoted string." });
+    assert.deepEqual(await runtime.validationCommandPreflightError("unknown --version"), { errorType: "validation_command_untrusted", error: "Validation executable is not operator-allowlisted: unknown", command: "unknown --version" });
+    assert.deepEqual(await runtime.prepareValidationCommand("git --version", { requirePinnedExecutable: true }), { ok: false, errorType: "validation_command_untrusted", error: "Project-policy validation requires the exact executable SHA-256 in CODEX_OPENCODE_VALIDATION_EXECUTABLE_SHA256_ALLOWLIST." });
+    assert.equal((await runtime.prepareValidationCommand("git --version", { requirePinnedExecutable: true, operatorExecutableHashes: [gitSha256] })).ok, true);
+    const unavailable = path.join(fixture, "missing", path.basename(gitPath));
+    const command = `"${unavailable}" --version`;
+    assert.deepEqual(await runtime.validationCommandPreflightError(command), { errorType: "validation_command_untrusted", error: `Validation executable could not be resolved through the trusted process PATH: ${unavailable}`, command });
+    const other = path.join(fixture, path.basename(gitPath));
+    await writeFile(other, await readFile(gitPath));
+    assert.deepEqual(await runtime.prepareValidationCommand([other, "--version"]), { ok: false, errorType: "validation_command_untrusted", error: `Validation executable is not operator-allowlisted: ${other}` });
+    assert.equal(launches, 0);
+  });
+  if (process.platform === "win32") await check("a selected Windows shim retains its shim, interpreter and entry hashes", async () => {
+    const shim = path.join(bin, "npm.cmd"), entry = path.join(bin, "entry.js");
+    await writeFile(shim, '"node.exe" "%~dp0entry.js" %*\r\n');
+    await writeFile(entry, "synthetic entry");
+    hashes.length = 0;
+    const prepared = await runtime.prepareValidationCommand("npm --version");
+    const nodePath = realpathSync(native("node")), entryPath = realpathSync(entry), shimPath = realpathSync(path.join(bin, "npm.CMD"));
+    const evidence = { shimPath, shimSha256: digest(await readFile(shimPath)), scriptSha256: digest(await readFile(entryPath)) };
+    const args = [entryPath, "--version"];
+    assert.equal(JSON.stringify(prepared), JSON.stringify({ ok: true, displayCommand: "npm --version", executablePath: nodePath,
+      executableSha256: digest(await readFile(nodePath)), args, commandSha256: digest(JSON.stringify([nodePath, ...args, evidence])), windowsShim: evidence }));
+    assert.deepEqual(hashes, [shimPath, nodePath, entryPath]);
+  });
+  await check("the post-run gate re-prepares and refuses executable drift after approval", async () => {
+    const approved = await runtime.prepareValidationCommand("git --version");
+    await writeFile(gitPath, "MZ changed executable");
+    config.validationExecutableSha256Allowlist = [gitSha256, digest(await readFile(gitPath))];
+    hashes.length = 0;
+    const gate = await runtime.runValidationGate({ command: "git --version", cwd: fixture, trustedSpec: approved });
+    assert.equal(gate.errorType, "validation_command_untrusted");
+    assert.equal(gate.stderr, "The operator-pinned validation executable or exact argument vector changed after policy approval.");
+    assert.deepEqual(hashes, [gitPath]);
+    assert.equal(launches, 0);
+  });
+
   await check("control: the plain runner's timeout leaves the grandchild running, and it writes", async () => {
     const script = await treeScript("control");
     const result = await runCommand(process.execPath, [script], fixture, 700);
