@@ -301,6 +301,49 @@ function schedulerProbe(records, pauses) {
 const scheduledRecord = (jobId, pin, extra = {}) => ({ jobId, cwd: repo, status: "pending", mode: "read",
   request: readJob({ scopeContract: { mode: "read", read: ["src/a.txt"], modelRequirement: pin } }), ...extra });
 
+test("B-212: sanitized direct and queued paused pins reach the routed reader's model policy error", async () => {
+  await reset();
+  await pause(I.providerKeyForMetadata(A));
+  const root = path.join(fixture.root, "sanitized");
+  await mkdir(root, { recursive: true });
+  await writeFile(path.join(root, "allowed.txt"), "sanitized\n");
+  const manifestPath = path.join(fixture.root, "sanitized-manifest.json");
+  const manifest = JSON.stringify({ version: 1, directories: [], files: { "allowed.txt": await I.sha256File(path.join(root, "allowed.txt")) } });
+  await writeFile(manifestPath, manifest);
+  const request = readJob({ cwd: root, subagentStrategy: "reject",
+    scopeContract: { mode: "read", read: ["allowed.txt"], modelRequirement: A },
+    sanitizedWorkspace: { root, manifestPath, manifestSha256: I.createHash("sha256").update(manifest).digest("hex"), requiredFiles: ["allowed.txt"] } });
+  const calls = installRuntime();
+  const reader = I.MCP_SANITIZED_READER_AGENT;
+  hooks.agentRuntimeTestHook.resolveAgent = async agent => ({ requestedAgent: agent, actualAgent: reader,
+    requestedAgentMode: "primary", actualAgentMode: "primary", fallbackUsed: false, proxyUsed: false, availableAgents: [reader], discoveryExitCode: 0 });
+  const metadata = hooks.agentRuntimeTestHook.readAgentDebugMetadata;
+  hooks.agentRuntimeTestHook.readAgentDebugMetadata = async agent => {
+    const result = await metadata(agent);
+    return { ...result, metadata: { ...result.metadata, ...B } };
+  };
+  assert.equal(await I.pinnedProviderPause(request), null);
+  const direct = await I.executeOpenCodeJob(request);
+  assert.equal(direct.result.errorType, "configured_model_requirement_mismatch");
+  assert.equal(direct.resolution.actualAgent, reader);
+  const enqueued = await I.enqueueQueueJob(request, "", { schedule: false });
+  assert.equal(enqueued.ok, true, enqueued.error);
+  I.scheduleQueue();
+  const jobId = enqueued.record.jobId;
+  assert.ok(await waitFor(async () => fixture.terminal((await I.readPersistedQueueRecord(jobId, root))?.status), 15_000));
+  const queued = await I.readPersistedQueueRecord(jobId, root);
+  assert.equal(queued.errorType, "configured_model_requirement_mismatch");
+  assert.equal(queued.startAfterReason || "", "");
+  assert.equal(queued.pauseWaitRequeues || 0, 0);
+  assert.equal(calls.payload, 0);
+  // Also prove a models list cannot bypass the scheduler's sanitized guard.
+  const record = scheduledRecord("sanitized-models", A, { request: { ...request, models: [spec(A)] } });
+  const scheduler = schedulerProbe([record], I.activeProviderPauses);
+  scheduler.runtime.scheduleQueue();
+  assert.ok(await waitFor(() => scheduler.counts.starts.length === 1));
+  assert.equal(scheduler.counts.reads, 0);
+});
+
 test("one scheduler pause read serves existing waits and multiple fresh holds; DB errors preserve known holds but permit fresh jobs", async () => {
   await reset();
   const until = await pause(I.modelPauseKeyForMetadata(A)); await pause(I.modelPauseKeyForMetadata(B));

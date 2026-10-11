@@ -14,6 +14,14 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-11
+
+### Integrator correction: item 3
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-212 | Advisory pause checks accepted a requested-role pin that sanitized routing forbids. | Sanitized direct/queued requests bypass advisory pause lookups and reach fixed-reader policy validation. Real manifest/executor/SQLite queue regression preserves configured_model_requirement_mismatch with no payload or pause accounting; scheduler coverage also guards model lists. Pause10/10, fallback17/17, quota8/8; zero skips. Existing B-132/B-134 release logic and authoritative lease checks unchanged. Docs state deferred preflight errors and the 5-second snapshot contention deadline. | bridge/waste-3-pauses | fixed, not deployed |
+
 ## 2026-10-10
 
 ### Waste reduction: avoid preparing paused jobs
