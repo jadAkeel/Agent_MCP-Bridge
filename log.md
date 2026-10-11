@@ -16,6 +16,13 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-11
 
+### Fix round 1 (review day 1, ledger L-1-*)
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-215 | Validation preflight hashed every allowlisted executable (daily profile: 8 files, 97.6 MB, ~267 ms per job) and hashed the selected one twice under the default allowlist, although only the resolved paths were used (ledger L-1-F1a-3, L-1-F1b-6). | The allowlist loop reused the hashing resolver. | Allowlist entries are resolved by path without reading contents; the selected native executable is hashed once; Windows shims keep their interpreter and script-entry evidence; the post-run gate still re-prepares. Measured: 8 hashes / 97.6 MB -> 1 hash / 3.7 MB per daily-profile preparation; 18 prepared commands and refusals byte-identical. Verified: validation-tree 7/7 (3 new cases), g05-secrets 7/7, server self-test. | `bridge/fix1-attestation-hashing` | fixed, not deployed |
+| B-214 | Cold-cache attestation followers recomputed the full fingerprint (180 MB executable hash + a git start) on every 75-124 ms poll while another process held the cold read: 18 hashes and 3.2 GB read per 5 s wait, ~1.2 cores per waiting job, all discarded (ledger L-1-F1a-1). | The wait loop called `fingerprint(key)` after every sleep to detect input drift. | Polls inspect SQLite only; a follower fingerprints at entry and again before accepting a published entry or claiming a dead owner's read, and runs fresh when inputs changed. Age, publication fencing, failure handling and the final-attestation scope rules are unchanged. Measured: 55-57 -> 2 fingerprints per follower per 15 s wait. Verified: shared-attestation 28/28 (5 new cases: cost, environment drift, takeover, equal-size restored-mtime drift, unreadable input), attestation-cache 7/7, latency 12/12, measurement 13/13. | `bridge/fix1-attestation-hashing` | fixed, not deployed |
+
 ### Waste reduction: reproducible, bounded complete gate
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

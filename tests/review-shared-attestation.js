@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, stat, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, stat, symlink, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -367,6 +367,110 @@ test("simultaneous processes share one cold read", async () => {
   `);
   await Promise.all([execute(process.execPath, [script]), execute(process.execPath, [script]), execute(process.execPath, [script])]);
   assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 1);
+});
+
+for (const drift of [false, true]) test(drift
+  ? "a waiting follower refuses a stale shared publication after its environment changes"
+  : "three followers waiting 15 seconds fingerprint only at entry and shared acceptance", async () => {
+  const fixture = path.join(root, drift ? "follower-drift" : "follower-cost");
+  await mkdir(fixture);
+  const executable = path.join(fixture, "synthetic-opencode.exe");
+  await writeFile(executable, "MZ");
+  await truncate(executable, drift ? 4096 : 180_000_000);
+  const waitFor = async (name) => {
+    const deadline = Date.now() + 20_000;
+    while (true) {
+      try { await stat(path.join(fixture, name)); return; }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      assert.ok(Date.now() < deadline, `Barrier timed out: ${name}`);
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+  const children = [];
+  const start = (role) => {
+    const child = execute(process.execPath, [path.join(repo, "tests", "attestation-follower-fixture.js"), fixture, role], { cwd: repo, timeout: 60_000 });
+    child.catch(() => {});
+    children.push(child);
+    return child;
+  };
+  try {
+    const owner = start("owner");
+    await waitFor("owner-ready");
+    const followers = Array.from({ length: drift ? 1 : 3 }, (_, i) => start(`follower-${i}`));
+    await Promise.all(followers.map((_, i) => waitFor(`follower-${i}-ready`)));
+    await new Promise(resolve => setTimeout(resolve, drift ? 300 : 15_000));
+    if (drift) await writeFile(path.join(fixture, "drift"), "change only the follower's environment");
+    await writeFile(path.join(fixture, "owner-release"), "publish");
+    assert.equal(JSON.parse((await owner).stdout).source, "fresh");
+    const results = (await Promise.all(followers)).map(child => JSON.parse(child.stdout));
+    console.log("Follower measurements: " + JSON.stringify({ waitMs: drift ? 300 : 15_000, results }));
+    if (drift) {
+      assert.equal(results[0].source, "fresh");
+      assert.equal(results[0].producedBy, "follower-0");
+      assert.equal(results[0].environment, "evil");
+      const db = new DatabaseSync(path.join(fixture, "state", "attestation-cache.sqlite"));
+      try { assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_entries").get().n, 1, "owner published the unchanged safe inputs"); }
+      finally { db.close(); }
+    } else {
+      for (const result of results) {
+        assert.equal(result.source, "shared");
+        assert.equal(result.producedBy, "owner");
+        assert.equal(result.fingerprints, 2, "entry and independent acceptance proof only");
+        assert.ok(result.databaseLooks > 20, "the child actually polled the owner's claim");
+        assert.ok(result.elapsedMs >= 15_000);
+      }
+      assert.deepEqual((await readFile(path.join(fixture, "operations.jsonl"), "utf8")).trim().split("\n").map(JSON.parse), [{ role: "owner" }]);
+    }
+  } finally {
+    await writeFile(path.join(fixture, "owner-release"), "cleanup release");
+    await Promise.allSettled(children);
+  }
+});
+
+for (const scenario of ["takeover", "byte-drift", "unreadable"]) test(`a waiting follower checks current inputs before ${scenario === "takeover" ? "claiming a failed owner's read" : scenario === "byte-drift" ? "taking over after equal-size restored-mtime drift" : "accepting with an unreadable input"}`, async () => {
+  const fixture = path.join(root, `follower-${scenario}`);
+  await mkdir(fixture);
+  const file = path.join(fixture, "plugin.js");
+  await writeFile(file, "safe");
+  await utimes(file, 1_700_000_000, 1_700_000_000);
+  let release, entered, polled, fingerprints = 0, readable = true;
+  const pending = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const waiting = new Promise(resolve => { polled = resolve; });
+  const options = { fingerprint: () => attestationInputFingerprint([file]), ttlMs: () => 3_600_000,
+    stateDirectory: () => path.join(fixture, "state"), buildIdentity: scenario, assertNoLinkedPath: async () => {} };
+  const owner = createAttestationCacheRuntime(options).cachedAttestation("same", async () => {
+    entered(); await pending;
+    return { ok: scenario !== "takeover", producedBy: "owner" };
+  }, positive);
+  await ready;
+  const follower = createAttestationCacheRuntime({ ...options,
+    fingerprint: () => { fingerprints++; return readable ? attestationInputFingerprint([file]) : null; },
+    assertNoLinkedPath: async () => { polled(); },
+  }).cachedAttestation("same", async () => ({ ok: true, producedBy: "follower" }), positive);
+  try {
+    await waiting;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    if (scenario === "byte-drift") {
+      const before = await stat(file);
+      await writeFile(file, "evil");
+      await utimes(file, before.atimeMs / 1000, before.mtimeMs / 1000);
+      const after = await stat(file);
+      assert.equal(after.size, before.size);
+      assert.equal(after.mtimeMs, before.mtimeMs);
+    } else if (scenario === "unreadable") readable = false;
+    release();
+    await owner;
+    const value = await follower;
+    assert.equal(value.attestationCacheSource, "fresh");
+    assert.equal(value.producedBy, "follower");
+    assert.equal(fingerprints, scenario === "takeover" ? 3 : 2, "entry, decision, and only a successful owner publication proof");
+    const db = new DatabaseSync(path.join(fixture, "state", "attestation-cache.sqlite"));
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_entries").get().n, scenario === "byte-drift" ? 0 : 1);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_flights").get().n, 0);
+    } finally { db.close(); }
+  } finally { release(); await Promise.allSettled([owner, follower]); }
 });
 
 test("a follower reuses publication completed between its miss and claim transaction", async () => {
