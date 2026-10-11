@@ -43,6 +43,11 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 | ID | Problem | Change / verification | Branch | Status |
 | --- | --- | --- | --- | --- |
 | B-212 | Advisory pause checks accepted a requested-role pin that sanitized routing forbids. | Sanitized direct/queued requests bypass advisory pause lookups and reach fixed-reader policy validation. Real manifest/executor/SQLite queue regression preserves configured_model_requirement_mismatch with no payload or pause accounting; scheduler coverage also guards model lists. Pause10/10, fallback17/17, quota8/8; zero skips. Existing B-132/B-134 release logic and authoritative lease checks unchanged. Docs state deferred preflight errors and the 5-second snapshot contention deadline. | bridge/waste-3-pauses | fixed, not deployed |
+### Integrator correction: item 4
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-213 | Combined detail exceeded discovery budget; job fields/required list and contractor/full-detail guidance disappeared. | Editorial descriptions retain opaque jobs with original required lists and every delegated job/scope field; full bridge detail and hidden contractor docs remain discoverable. Positive inventory covers all28 tools; combined-detail test requires150 bytes of run-agent headroom. All13 catalogue and11 lib-pin tests pass; zero skips; unchanged caps, tools/call schemas and refusals. Docs distinguish server legacy acceptance from advertised strict schema and record SDK private-map dependence (lock1.30.0, caret permitted). | bridge/waste-4-tool-list | fixed, not deployed |
 
 ## 2026-10-10
 

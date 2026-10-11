@@ -655,7 +655,7 @@ An operator who runs from releases ends up with a layout like this. `<releases-d
 
 You normally let Codex call these tools. They are listed so you recognise them in its output.
 
-Tool discovery shows the common options. Existing advanced options and legacy spellings still work and receive the same validation; see [REFERENCE.md](REFERENCE.md) for their full rules. Parallel job objects use the single-job fields, and an integration receipt is passed back unchanged from its dry run.
+Tool discovery shows common options. The server accepts hidden advanced/legacy fields with its existing validation; the advertised strict scope schema excludes legacy fields and `read-only`/`readonly` modes, so clients validating that schema refuse them before a call. See [REFERENCE.md](REFERENCE.md) for all options, including hidden contractor fields. Parallel/plan job objects retain required fields and describe job/scope options; echo integration receipts unchanged from the dry run.
 
 A single agent result now defaults to a compact summary plus the agent report. It keeps changed files, scope and lock decisions, failures, dependencies and retained worktree details; a direct writer also keeps its patch. Use `run_opencode_agent` with `detail: true` for the full bridge block, or `get_opencode_job` with the Run id and `detail: true` to retrieve the stored full block and patch. Queued results use the compact summary too.
 
