@@ -322,8 +322,9 @@ job; the call it makes looks like this:
 1. Read the agent's report and its `Files changed` list.
 2. Every changed file is inside `allowedEdits`; nothing touches manifests, lockfiles, schemas,
    migrations or shared config unless the job was about them (those are serial-only).
-3. No `Unsafe changed files`, no `DEPENDENCY_REQUIRED` line (if there is one: add the package
-   yourself, commit, and re-run the writer).
+3. `Unsafe changed files` says `none detected`; any listed unsafe path blocks integration.
+   No `DEPENDENCY_REQUIRED` request (if there is one: add the package yourself, commit, and
+   re-run the writer).
 4. Read the diff in the worktree (`Worktree path` in the result) or with the dry run below.
 5. For anything non-trivial, have a reviewer (read-only) and a tester look at the worktree
    before you apply: ask Codex to run them with a read Scope Contract on the changed files.

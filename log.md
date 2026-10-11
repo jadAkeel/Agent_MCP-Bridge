@@ -14,6 +14,15 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-11
+
+### Integrator correction: item 2
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-211 | Compact pipeline gates advertised a nonexistent audit lookup, and unbounded unsafe/rejection paths displaced stored reports. | Internal gate execution requests detail:true and persists full redacted bridge evidence in pipeline records. Compact path lists use the existing 40-entry bound; detail and validation arrays stay complete within existing caps. Real executor/finalizer/SQLite reviewer/tester persistence regression and 500-path storage regression pass: compact 11/11, pipelines 30/30, zero skips. Docs cover unsafe lines, rejection names and enqueue detail's no-op. | bridge/waste-2-results | fixed, not deployed |
+
+
 ## 2026-10-10
 
 ### Waste-reduction round: item 2
