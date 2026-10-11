@@ -4,8 +4,9 @@
 // the slot held. The run runtime is driven with stubbed dependencies and the call order is checked.
 import { strict as assert } from "node:assert";
 import { createOpenCodeRunRuntime } from "../lib/opencode-run.js";
+import { isMainModule } from "../bin/main-module.js";
 
-function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, leaseOk = true, agentOk = true, finalMaxAgeMs = 0, reattestHit = true } = {}, overrides = {}) {
+export function harness({ waitedMs = 0, revalidateAfterMs = 60_000, pluginOk = true, leaseOk = true, agentOk = true, finalMaxAgeMs = 0, reattestHit = true } = {}, overrides = {}) {
   const calls = [];
   const metadata = { name: "builder", mode: "write", provider: "opencode", model: "muse-spark-1.3-contributor-free", variant: "" };
   const okPluginPolicy = { ok: true, mode: "allowlisted", plugins: [] };
@@ -221,6 +222,7 @@ test("B-161: with a pure runtime the isolated root is created before the slot an
   assert.deepEqual(h.calls, ["isolated.create", "attest.agent", "lease.acquire:opencode", "isolated.wipe"], "pure mode skips the plugin read");
 });
 
+if (isMainModule(import.meta.url)) {
 let failed = 0;
 for (const { name, fn } of tests) {
   try {
@@ -234,3 +236,4 @@ for (const { name, fn } of tests) {
 }
 console.log(`${failed} of ${tests.length} latency tests failed.`);
 process.exit(failed ? 1 : 0);
+}

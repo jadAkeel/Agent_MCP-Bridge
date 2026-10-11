@@ -199,6 +199,15 @@ test("B-204: rejected hashes drain active root and directory sibling IO before r
   const child = await execute(process.execPath, [script], { timeout: 20_000 });
   assert.deepEqual(JSON.parse(child.stdout), { cases: 2, active: 0, started: 1, finished: 1 });
 });
+for (const [scenario, name] of [
+  ["keys", "B-209: the real server collapses actual worktree metadata keys without collapsing its policy cwd"],
+  ["boundaries", "B-209: discovery fingerprints are closed before real lock and worktree boundaries"],
+  ["slot-wait", "B-209: max-age zero rejects equal-size restored-mtime plugin drift after a long slot wait"],
+]) test(name, async () => {
+  const fixture = path.join(root, `real-server-${scenario}`);
+  const child = await execute(process.execPath, [path.join(repo, "tests", "attestation-scope-fixture.js"), scenario, fixture], { cwd: repo, timeout: 120_000 });
+  assert.equal(JSON.parse(child.stdout.trim().split(/\r?\n/).at(-1)).scenario, scenario);
+});
 test("a second instance shares a positive read and preserves Map metadata", async () => {
   const first = await factory().cachedAttestation("role", operation, positive);
   const second = await factory().cachedAttestation("role", operation, positive);
