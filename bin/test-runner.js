@@ -28,6 +28,8 @@ const HEAVY_FILES = new Set(["server-self-test.js", "review-integration-reuse.js
   "review-integration-batch.js", "review-flex-auto-integrate.js"]);
 const PROFILE_COPY_LIMIT = 16;
 const PROFILE_COPY_TASKS = new Set();
+const CREDENTIAL_FILE_NAMES = new Set(["auth.json", "account.json", "antigravity-accounts.json"]);
+const isCredentialFile = file => CREDENTIAL_FILE_NAMES.has(path.basename(file).toLowerCase());
 
 export function parseCommandChain(chain) {
   if (typeof chain !== "string" || !chain.trim()) throw new Error("Missing canonical test:commands script.");
@@ -228,8 +230,11 @@ export async function runTestCommands({ commands, cwd = ROOT, env = process.env,
 }
 
 export async function copyIfPresent(source, target) {
-  const stats = { files: 0, bytes: 0, peakConcurrentFiles: 0 };
+  const stats = { files: 0, bytes: 0, peakConcurrentFiles: 0, excludedCredentialFiles: 0 };
   if (!source || path.resolve(source) === path.resolve(target)) return stats;
+  // Reject by name before opening a file; even interrupted copies cannot leave
+  // operator OAuth files behind. Native metadata probes need no login material.
+  if (isCredentialFile(source)) { stats.excludedCredentialFiles++; return stats; }
   let sourceStat;
   try { sourceStat = await lstat(source); }
   catch (error) { if (error.code === "ENOENT") return stats; throw error; }
@@ -268,6 +273,7 @@ export async function copyIfPresent(source, target) {
     await mkdir(destination, { recursive: true, mode: info.mode });
     for (const child of await readdir(entry, { withFileTypes: true })) {
       const childSource = path.join(entry, child.name), childTarget = path.join(destination, child.name);
+      if (isCredentialFile(childSource)) { stats.excludedCredentialFiles++; continue; }
       if (child.isDirectory()) await walk(childSource, childTarget);
       else await queueFile(childSource, childTarget);
     }
@@ -283,8 +289,8 @@ export async function copyIfPresent(source, target) {
 export async function prepareTestEnvironment(directory, ambient = process.env, { copyProfiles = true } = {}) {
   const env = { ...ambient }, sourceHome = ambient.USERPROFILE || ambient.HOME || homedir();
   const sourceConfig = ambient.XDG_CONFIG_HOME || path.join(sourceHome, ".config");
-  const sourceData = ambient.XDG_DATA_HOME || path.join(sourceHome, ".local", "share");
   const sourceCache = ambient.XDG_CACHE_HOME || path.join(sourceHome, ".cache");
+  for (const name of Object.keys(env)) if (/^OPENCODE_AUTH_CONTENT$|(?:^|_)(?:API_KEY|TOKEN|PASSWORD|PASSWD|SECRET)$/i.test(name)) delete env[name];
   for (const [key, relative] of Object.entries({ HOME: "home", USERPROFILE: "home", CODEX_HOME: "codex-home",
     CLAUDE_CONFIG_DIR: "claude", APPDATA: "appdata", LOCALAPPDATA: "localappdata",
     XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_CACHE_HOME: "cache",
@@ -299,8 +305,7 @@ export async function prepareTestEnvironment(directory, ambient = process.env, {
   // writes go only to this run. Never hand a test the operator's mutable profiles.
   if (copyProfiles) {
     await copyIfPresent(path.join(sourceConfig, "opencode"), path.join(env.XDG_CONFIG_HOME, "opencode"));
-    // Diagnostic auth/model/plugin prerequisites, without operator sessions, logs or databases.
-    for (const file of ["auth.json", "account.json"]) await copyIfPresent(path.join(sourceData, "opencode", file), path.join(env.XDG_DATA_HOME, "opencode", file));
+    // Public model/plugin prerequisites only: never copy operator data/auth.
     for (const relative of ["packages", "bin", "models.json"]) await copyIfPresent(path.join(sourceCache, "opencode", relative), path.join(env.XDG_CACHE_HOME, "opencode", relative));
     await copyIfPresent(path.join(sourceHome, ".opencode", "agents"), path.join(env.HOME, ".opencode", "agents"));
     await copyIfPresent(path.join(sourceHome, ".opencode", "skills"), path.join(env.HOME, ".opencode", "skills"));
@@ -321,7 +326,37 @@ export async function createTestFixtureRoot() {
   return directory;
 }
 
+export async function scrubTestCredentials(logRoot) {
+  const canonicalRoot = await realpath(logRoot);
+  if ((await lstat(logRoot)).isSymbolicLink()) throw new Error(`Refusing credential cleanup outside this test run: ${logRoot}`);
+  const removed = [];
+  const assertDirectory = async directory => {
+    const canonical = await realpath(directory);
+    if (!canonical.startsWith(`${canonicalRoot}${path.sep}`) || (await lstat(directory)).isSymbolicLink())
+      throw new Error(`Refusing credential cleanup outside this test run: ${directory}`);
+  };
+  const walk = async directory => {
+    await assertDirectory(directory);
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (isCredentialFile(file)) {
+        await assertDirectory(path.dirname(file));
+        const info = await lstat(file);
+        if (info.isDirectory() && !info.isSymbolicLink()) throw new Error(`Credential path is a directory: ${file}`);
+        await rm(file, { force: true }); removed.push(file);
+      } else if (entry.isDirectory() && !entry.isSymbolicLink()) await walk(file);
+    }
+  };
+  for (const relative of ["fixture", "fixtures"]) {
+    const directory = path.join(logRoot, relative);
+    try { await lstat(directory); } catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    await walk(directory);
+  }
+  return removed;
+}
+
 export async function cleanupRunFixtures(logRoot, report) {
+  report.credentialFilesRemoved = [...(report.credentialFilesRemoved || []), ...await scrubTestCredentials(logRoot)];
   if (report.failed) return false;
   const canonicalRoot = await realpath(logRoot);
   for (const relative of ["fixture", "fixtures"]) {
@@ -349,7 +384,9 @@ async function main() {
   const profilePreparations = [];
   const startupMs = Date.now() - runnerStartedAtMs;
   console.log(`Test run: ${logRoot}\nCommands: ${commands.length}; syntax workers: 8; suite workers: 3 (at most 2 heavy); file timeout: 15 min`);
-  const report = await runTestCommands({ commands, env, logRoot,
+  let report;
+  try {
+  report = await runTestCommands({ commands, env, logRoot,
     environmentForCommand: async (command, { slot, lane }) => {
       const profile = ["parallel", "exclusive"].includes(lane) ? `${lane}-${slot}` : "gate-and-syntax";
       if (!profiles.has(profile)) profiles.set(profile, (async () => {
@@ -377,6 +414,12 @@ async function main() {
     if (event === "start") console.log(`START ${command.index + 1}/${commands.length} ${command.argv.join(" ")}`);
     else console.log(`${result.status.toUpperCase()} ${(result.durationMs / 1000).toFixed(1)}s ${command.argv.join(" ")}`);
   } });
+  } catch (error) {
+    // Normal outcomes scrub in cleanupRunFixtures below. Errors before that
+    // path must also remove generated credentials before retaining evidence.
+    await scrubTestCredentials(fixtureRoot);
+    throw error;
+  }
   const commandsMs = report.durationMs, cleanupStartedAtMs = Date.now();
   report.fixtureRoot = fixtureRoot;
   report.fixturesRemoved = await cleanupRunFixtures(fixtureRoot, report);

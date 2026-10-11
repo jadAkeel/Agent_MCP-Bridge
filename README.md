@@ -78,7 +78,10 @@ suites finish. Each command has a 15-minute timeout; failures do not stop the
 remaining checks. Logs, durations, timeout diagnostics and `report.json` are in
 `.test-logs/`. The report includes setup, profile preparation, cleanup and whole-run
 time. Runtime profiles and shared test TEMP live in a private directory outside
-Git; profile copying uses a bounded pool and refuses links. The existing skip summary
+Git; profile copying uses a bounded pool, refuses links and excludes auth/account
+files and credential environment values. Metadata checks do not need operator
+OAuth. Generated credential files are scrubbed on success or failure before any
+non-credential fixture is retained. The existing skip summary
 still reports required and optional skips. The robustness harness uses its own
 empty XDG configuration regardless of the caller's shell.
 

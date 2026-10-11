@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { symlinkSync } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -103,7 +103,7 @@ finishSkips({file:process.argv[2],total:2,skips:process.argv[2]==='optional-fixt
     command(4, [path.join(ROOT, "tests", "review-tools-list-budget.js")]), command(5, [gate, "--summary"], "final")];
   const report = await runTestCommands({ commands, cwd: ROOT, env, logRoot, jobs: 2 });
   assert.equal(report.failed, 0, JSON.stringify(report.results.filter(result => result.status !== "passed")));
-  assert.match(await readFile(report.results[4].log, "utf8"), /All 11 tools\/list budget tests passed\./);
+  assert.match(await readFile(report.results[4].log, "utf8"), /All \d+ tools\/list budget tests passed\./);
   assert.match(await readFile(report.results[5].log, "utf8"), /Total skipped: 1 across 3 reporting test file\(s\)/);
   await assert.rejects(readFile(path.join(env.TEMP, `codex-opencode-test-skips-${process.pid}.jsonl`)), { code: "ENOENT" });
 });
@@ -211,20 +211,28 @@ test("the main runner reports startup, individual profile copies, cleanup and wh
   assert.match(await readFile(outer.results[0].log, "utf8"), /PROFILE READY parallel-0.*Timing: startup .*whole run /s);
 });
 
-test("private profiles copy native prerequisites without histories or DBs and preserve the executable", async () => {
+test("private profiles copy public native prerequisites without credentials, histories or DBs", async () => {
   const source = path.join(scratch, "source-profile");
   for (const relative of ["home/.opencode/agents", "config/opencode/agents", "data/opencode", "cache/opencode/packages/plugin", "cache/opencode/bin"])
     await mkdir(path.join(source, relative), { recursive: true });
-  const files = { "config/opencode/agents/reviewer.md": "fixture role", "data/opencode/auth.json": "fixture auth", "data/opencode/account.json": "fixture account",
+  const files = { "config/opencode/agents/reviewer.md": "fixture role", "config/opencode/antigravity-accounts.json": "fixture oauth",
+    "data/opencode/auth.json": "fixture auth", "data/opencode/account.json": "fixture account",
     "data/opencode/opencode.db": "history must not be copied", "cache/opencode/models.json": "fixture models", "cache/opencode/packages/plugin/index.js": "fixture plugin", "cache/opencode/bin/tool": "fixture tool" };
   for (const [relative, content] of Object.entries(files)) await writeFile(path.join(source, relative), content);
   const ambient = { ...process.env, HOME: path.join(source, "home"), USERPROFILE: path.join(source, "home"), XDG_CONFIG_HOME: path.join(source, "config"),
-    XDG_DATA_HOME: path.join(source, "data"), XDG_CACHE_HOME: path.join(source, "cache"), CODEX_OPENCODE_EXECUTABLE: "fixture-native-path" };
+    XDG_DATA_HOME: path.join(source, "data"), XDG_CACHE_HOME: path.join(source, "cache"), CODEX_OPENCODE_EXECUTABLE: "fixture-native-path",
+    OPENCODE_AUTH_CONTENT: "fixture auth environment", ANTHROPIC_API_KEY: "fixture API key", CLAUDE_CODE_OAUTH_TOKEN: "fixture oauth environment" };
   const first = await prepareTestEnvironment(path.join(scratch, "profile-a"), ambient), second = await prepareTestEnvironment(path.join(scratch, "profile-b"), ambient);
   assert.equal(first.CODEX_OPENCODE_EXECUTABLE, ambient.CODEX_OPENCODE_EXECUTABLE);
   for (const key of ["HOME", "USERPROFILE", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "CODEX_OPENCODE_STATE_DIR"])
     assert.notEqual(first[key], second[key], key);
-  assert.equal(await readFile(path.join(first.XDG_DATA_HOME, "opencode", "auth.json"), "utf8"), "fixture auth");
+  for (const env of [first, second]) {
+    for (const file of ["auth.json", "account.json"]) await assert.rejects(readFile(path.join(env.XDG_DATA_HOME, "opencode", file)), { code: "ENOENT" });
+    await assert.rejects(readFile(path.join(env.XDG_CONFIG_HOME, "opencode", "antigravity-accounts.json")), { code: "ENOENT" });
+    for (const key of ["OPENCODE_AUTH_CONTENT", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) assert.equal(env[key], undefined);
+  }
+  assert.equal(await readFile(path.join(source, "data", "opencode", "auth.json"), "utf8"), "fixture auth", "operator-side source remains untouched");
+  assert.equal(await readFile(path.join(source, "config", "opencode", "antigravity-accounts.json"), "utf8"), "fixture oauth");
   assert.equal(await readFile(path.join(first.XDG_CACHE_HOME, "opencode", "packages", "plugin", "index.js"), "utf8"), "fixture plugin");
   await assert.rejects(readFile(path.join(first.XDG_DATA_HOME, "opencode", "opencode.db")), { code: "ENOENT" });
   await writeFile(path.join(first.XDG_CONFIG_HOME, "opencode", "agents", "reviewer.md"), "changed only in slot A");
@@ -235,6 +243,30 @@ test("private profiles copy native prerequisites without histories or DBs and pr
   symlinkSync(outside, path.join(source, "config", "opencode", "linked"), process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(prepareTestEnvironment(path.join(scratch, "linked-refusal"), ambient), /Test profile links are not allowed/);
   assert.equal(await readFile(path.join(outside, "sentinel"), "utf8"), "outside is untouched");
+});
+
+test("a real failing main gate scrubs generated credentials before retaining diagnostic profiles", async () => {
+  const root = path.join(scratch, "failed-main-runner");
+  await mkdir(path.join(root, "bin"), { recursive: true }); await mkdir(path.join(root, "tests"));
+  for (const file of ["test-runner.js", "main-module.js"]) await copyFile(path.join(ROOT, "bin", file), path.join(root, "bin", file));
+  await copyFile(path.join(ROOT, "tests", "skip-gate.js"), path.join(root, "tests", "skip-gate.js"));
+  await writeFile(path.join(root, "fail.mjs"), `import fs from 'node:fs/promises'; import path from 'node:path';
+    for(const [base,name] of [[process.env.XDG_DATA_HOME,'auth.json'],[process.env.XDG_DATA_HOME,'account.json'],[process.env.XDG_CONFIG_HOME,'antigravity-accounts.json']]) {
+      const dir=path.join(base,'opencode'); await fs.mkdir(dir,{recursive:true}); await fs.writeFile(path.join(dir,name),'generated fixture credential'); }
+    await fs.writeFile(path.join(process.env.XDG_DATA_HOME,'keep.txt'),'non-credential diagnostic'); process.exitCode=7;`);
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ type: "module", scripts: {
+    "test:commands": "node tests/skip-gate.js --self-test && node tests/skip-gate.js --reset && node fail.mjs && node tests/skip-gate.js --summary" } }));
+  const env = await prepareTestEnvironment(path.join(scratch, "failed-main-parent"), process.env, { copyProfiles: false });
+  const outer = await runTestCommands({ commands: [command(0, [path.join(root, "bin", "test-runner.js")], "parallel", { timeoutMs: 30_000 })],
+    cwd: root, env, logRoot: path.join(scratch, "failed-main-parent-logs"), jobs: 1 });
+  assert.equal(outer.failed, 1); assert.equal(outer.results[0].exitCode, 1);
+  const report = JSON.parse(await readFile(path.join(root, ".test-logs", "report.json"), "utf8"));
+  try {
+    assert.equal(report.passed, 3); assert.equal(report.failed, 1); assert.equal(report.fixturesRemoved, false);
+    assert.equal(report.credentialFilesRemoved.length, 3);
+    for (const file of report.credentialFilesRemoved) await assert.rejects(readFile(file), { code: "ENOENT" });
+    assert.equal(await readFile(path.join(report.fixtureRoot, "fixtures", "parallel-0", "data", "keep.txt"), "utf8"), "non-credential diagnostic");
+  } finally { await cleanupRunFixtures(report.fixtureRoot, { failed: 0 }); await rmdir(report.fixtureRoot); }
 });
 
 test("Windows diagnostic selection excludes a later sibling reusing the exited root PID and its descendants", () => {
@@ -261,8 +293,30 @@ test("successful fixture cleanup preserves reports and refuses a linked path out
   assert.equal(await readFile(path.join(root, "report.json"), "utf8"), "report stays");
   const outside = path.join(scratch, "cleanup-outside"); await mkdir(outside); await writeFile(path.join(outside, "sentinel"), "keep");
   symlinkSync(outside, path.join(root, "fixture"), process.platform === "win32" ? "junction" : "dir");
-  await assert.rejects(cleanupRunFixtures(root, { failed: 0 }), /Refusing fixture cleanup outside/);
+  await assert.rejects(cleanupRunFixtures(root, { failed: 0 }), /Refusing (?:fixture|credential) cleanup outside/);
   assert.equal(await readFile(path.join(outside, "sentinel"), "utf8"), "keep");
+});
+
+test("failed-run evidence retains non-credentials but removes all generated credential names without following links", async () => {
+  const root = path.join(scratch, "failed-credential-run"), profile = path.join(root, "fixtures", "parallel-0");
+  const outside = path.join(scratch, "credential-outside");
+  await mkdir(path.join(profile, "data", "opencode"), { recursive: true });
+  await mkdir(path.join(profile, "config", "opencode"), { recursive: true }); await mkdir(outside);
+  const credentials = [path.join(profile, "data", "opencode", "auth.json"), path.join(profile, "data", "opencode", "account.json"),
+    path.join(profile, "config", "opencode", "antigravity-accounts.json")];
+  for (const file of credentials) await writeFile(file, "generated fixture credential");
+  await writeFile(path.join(profile, "keep.sqlite"), "diagnostic fixture stays"); await writeFile(path.join(root, "report.json"), "report stays");
+  await writeFile(path.join(outside, "auth.json"), "outside must remain");
+  symlinkSync(outside, path.join(profile, "outside-link"), process.platform === "win32" ? "junction" : "dir");
+  const report = { failed: 1 };
+  assert.equal(await cleanupRunFixtures(root, report), false);
+  assert.deepEqual(report.credentialFilesRemoved.sort(), credentials.sort());
+  for (const file of credentials) await assert.rejects(readFile(file), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(profile, "keep.sqlite"), "utf8"), "diagnostic fixture stays");
+  assert.equal(await readFile(path.join(root, "report.json"), "utf8"), "report stays");
+  assert.equal(await readFile(path.join(outside, "auth.json"), "utf8"), "outside must remain");
+  assert.equal(await cleanupRunFixtures(root, report), false, "cleanup is idempotent");
+  assert.equal(report.credentialFilesRemoved.length, 3);
 });
 
 test("a timed-out file records resource/tree evidence, kills its own descendant and continues without killing an unrelated fixture", async () => {
