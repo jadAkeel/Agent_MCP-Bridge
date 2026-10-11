@@ -14,6 +14,14 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-11
+
+### Integrator correction: item 4
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-213 | Combined detail exceeded discovery budget; job fields/required list and contractor/full-detail guidance disappeared. | Editorial descriptions retain opaque jobs with original required lists and every delegated job/scope field; full bridge detail and hidden contractor docs remain discoverable. Positive inventory covers all28 tools; combined-detail test requires150 bytes of run-agent headroom. All13 catalogue and11 lib-pin tests pass; zero skips; unchanged caps, tools/call schemas and refusals. Docs distinguish server legacy acceptance from advertised strict schema and record SDK private-map dependence (lock1.30.0, caret permitted). | bridge/waste-4-tool-list | fixed, not deployed |
+
 ## 2026-10-10
 
 ### Waste reduction: compact tool discovery

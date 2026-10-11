@@ -2,7 +2,9 @@
 
 Detailed rules, tool behavior, and the complete configuration table. For daily use, start with [USER_GUIDE.md](USER_GUIDE.md).
 
-`tools/list` advertises a compact description of each tool. Legacy aliases and rarely used fields remain accepted and validated when explicitly supplied; options a tool refuses are not advertised for that tool. Parallel/plan job items refer to the single-job fields (`agent`, `task`, `cwd`, writer locks, `allowedEdits`, `scopeContract`), and `previewReceipt` is an opaque object returned by a dry run and echoed unchanged on apply. This changes discovery text only: registered validation schemas, refusal rules, tool names and calls are unchanged. Full option details follow below.
+`tools/list` advertises common options. The server still accepts and validates hidden advanced/legacy fields, but the advertised strict scope schema excludes legacy properties and `read-only`/`readonly` modes; clients validating against that schema reject them before calling the server. Parallel/plan job items are opaque objects with their original required list and named fields: `agent`, `task`, `cwd`, `write`, `lockMode`, `lockedPaths`, `allowedEdits`, `validationCommand`, and `scopeContract` with `mode`, `read`, `write`, `allowedEdits`, `forbidden`, `validationCommand`. Contractor mode fields remain hidden; run/enqueue descriptions point here to `orchestratorMode`, `userAuthorizedOrchestrator`, `contractorAuthorizationToken`. `previewReceipt` is echoed unchanged from its dry run. Registered call schemas, refusal rules and tool names are unchanged.
+
+The advertisement installer relies on the SDK's private `_requestHandlers` map. The lockfile resolves 1.30.0 while package.json permits `^1.30.0`; an incompatible SDK upgrade fails loudly at startup and in the catalogue regression. Verify that path when updating the SDK.
 
 ## Official Safety Model
 

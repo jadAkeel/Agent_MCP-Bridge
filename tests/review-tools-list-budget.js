@@ -161,7 +161,8 @@ test("remaining advertised fields retain their nested constraints; repeated jobs
     assert.equal(items.type, "object");
     assert.notEqual(items.additionalProperties, false);
     assert.equal(items.properties, undefined);
-    for (const field of ["agent", "task", "cwd", "lockedPaths", "allowedEdits", "scopeContract"]) assert.ok(items.description.includes(field), `${name} does not explain ${field}`);
+    assert.deepEqual(items.required, originalTools.get(name).inputSchema.properties.jobs.items.required);
+    for (const field of ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract", "mode", "read", "forbidden"]) assert.ok(items.description.includes(field), `${name} does not explain ${field}`);
   }
   for (const name of ["integrate_opencode_worktree", "integrate_opencode_worktrees"]) {
     const receipt = advertisedTools.get(name).inputSchema.properties.previewReceipt;
@@ -170,6 +171,62 @@ test("remaining advertised fields retain their nested constraints; repeated jobs
     assert.equal(receipt.properties, undefined);
     assert.match(receipt.description, /unchanged/i);
   }
+});
+
+test("B-213: delegation fields, full detail and contractor discovery stay advertised on each relevant tool", () => {
+  const jobFields = ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract"];
+  const scopeFields = ["mode", "read", "write", "allowedEdits", "forbidden", "validationCommand"];
+  for (const name of ["run_opencode_agent", "enqueue_opencode_job", "create_multi_agent_pipeline"]) {
+    const tool = advertisedTools.get(name);
+    const schema = name === "create_multi_agent_pipeline" ? tool.inputSchema.properties.jobs.items : tool.inputSchema;
+    for (const field of jobFields) assert.ok(Object.hasOwn(schema.properties, field), `${name} lost ${field}`);
+    for (const field of scopeFields) assert.ok(Object.hasOwn(schema.properties.scopeContract.properties, field), `${name} lost scopeContract.${field}`);
+  }
+  for (const name of ["run_opencode_parallel", "validate_delegation_plan"]) {
+    const items = advertisedTools.get(name).inputSchema.properties.jobs.items;
+    for (const field of [...jobFields, ...scopeFields]) assert.match(items.description, new RegExp(`\\b${field}\\b`), `${name} lost ${field}`);
+  }
+  for (const name of ["run_opencode_agent", "enqueue_opencode_job"]) {
+    const tool = advertisedTools.get(name);
+    assert.match(tool.description, /contractor mode.*docs\/REFERENCE\.md/i);
+    for (const field of ["orchestratorMode", "userAuthorizedOrchestrator", "contractorAuthorizationToken"]) assert.equal(Object.hasOwn(tool.inputSchema.properties, field), false);
+  }
+  for (const name of ["get_opencode_job", ...(advertisedTools.get("run_opencode_agent").inputSchema.properties.detail ? ["run_opencode_agent"] : [])]) {
+    assert.match(advertisedTools.get(name).inputSchema.properties.detail.description, /full.*bridge preamble/i);
+  }
+  // Item2 adds detail on its branch. Exercise that combined field here too.
+  const combined = structuredClone(original);
+  combined.tools.find(tool => tool.name === "run_opencode_agent").inputSchema.properties.detail = {
+    type: "boolean", description: "Full bridge preamble and verification blocks with model and phase timing evidence." };
+  const combinedTool = transformToolsList(combined).tools.find(tool => tool.name === "run_opencode_agent");
+  assert.match(combinedTool.inputSchema.properties.detail.description, /full.*bridge preamble/i);
+  assert.ok(bytes(combinedTool) <= TOOL_BUDGETS.run_opencode_agent - 150,
+    `combined run_opencode_agent has less than 150 bytes of headroom: ${bytes(combinedTool)}`);
+});
+
+test("every tool retains its positive advertised field inventory", () => {
+  const expected = {
+    run_opencode_agent: ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract"],
+    enqueue_opencode_job: ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract", "models", "maxAttempts", "autoIntegrate", "idempotencyKey"],
+    run_opencode_parallel: ["jobs", "detail"], validate_delegation_plan: ["jobs"],
+    create_multi_agent_pipeline: ["cwd", "jobs", "reviewerJob", "testerJob"],
+    integrate_opencode_worktree: ["cwd", "worktreePath", "branch", "allowedEdits", "validationCommand", "dryRun", "reviewed", "previewReceipt"],
+    integrate_opencode_worktrees: ["cwd", "items", "validationCommand", "dryRun", "reviewed", "previewReceipt"],
+    set_opencode_concurrency: ["providerLimit", "providerLimits", "queueParallelLimit", "globalWorkerLimit", "reset"],
+    requeue_opencode_job: ["cwd", "jobId", "model", "timeoutMs"], resolve_integration_quarantine: ["cwd", "operationId", "mode", "reason", "confirmation"],
+    pause_opencode_provider: ["provider", "until", "minutes", "reason"], resume_opencode_provider: ["provider"],
+    acquire_agent_lock: ["cwd", "paths", "lockType"], release_agent_lock: ["cwd", "lockId", "token"],
+    get_opencode_job: ["cwd", "jobId", "detail"], list_opencode_jobs: ["cwd", "status", "detail", "limit"],
+    verify_sanitized_workspace: ["contract", "phase"], get_opencode_bridge_status: ["cwd", "deep"],
+    finalize_multi_agent_pipeline: ["cwd", "pipelineId", "skipReviewers", "dryRun"],
+    list_multi_agent_pipelines: ["cwd", "status", "limit"], abandon_multi_agent_pipeline: ["cwd", "pipelineId", "confirmation", "reason"],
+    inspect_opencode_queue_recovery: ["cwd", "reconcileExpired"], cancel_opencode_job: ["cwd", "jobId"],
+    diagnose_opencode_bridge: ["cwd"], run_multi_agent_pipeline: ["cwd", "pipelineId"], get_multi_agent_pipeline: ["cwd", "pipelineId"],
+    list_agent_locks: ["cwd"], list_opencode_agents: ["cwd"],
+  };
+  assert.deepEqual(Object.keys(expected).sort(), [...advertisedTools.keys()].sort());
+  for (const [name, fields] of Object.entries(expected)) for (const field of fields)
+    assert.ok(Object.hasOwn(advertisedTools.get(name).inputSchema.properties, field), `${name} lost advertised ${field}`);
 });
 
 // Portable copies of the two actual job examples in the operator's CLAUDE.md;
