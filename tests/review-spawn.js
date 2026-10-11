@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { strict as assert } from "node:assert";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 const execFileAsync = promisify(execFileCallback);
 const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-review-spawn-"));
@@ -27,6 +29,7 @@ const fakeOpenCodeLog = path.join(fakeOpenCodeDir, "argv.log");
 const fakeOpenCodeExecutable = path.join(fakeOpenCodeDir, process.platform === "win32" ? "opencode.exe" : "opencode");
 const xdgCacheHome = path.join(scratch, "xdg-cache");
 process.env.XDG_CACHE_HOME = xdgCacheHome;
+process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS = "2000";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node,python,python3,py,npm,pnpm,yarn,bun,bunx,deno";
 process.env.CODEX_OPENCODE_EXECUTABLE = fakeOpenCodeExecutable;
@@ -94,6 +97,17 @@ const fixtureAgentDebug = {
   ],
   tools: { apply_patch: false, bash: false, edit: false, skill: false, task: false, webfetch: false, websearch: false, write: false },
 };
+const fixtureWriterName = "fixture-writer";
+const fixtureWriterDebug = {
+  ...fixtureAgentDebug, name: fixtureWriterName,
+  permission: [
+    ...fixtureAgentDebug.permission.filter(rule => rule.permission !== "edit"),
+    { permission: "edit", pattern: "*", action: "allow" },
+    ...internals.DEFAULT_FORBIDDEN_EDIT_PATHS.map(pattern => ({ permission: "edit", pattern, action: "deny" })),
+  ],
+  tools: { ...fixtureAgentDebug.tools, apply_patch: true, edit: true, write: true },
+};
+const fakeDirectStart = path.join(fakeOpenCodeDir, "direct-start.json");
 const fakeEvents = [
   { type: "step_start", sessionID: "ses_fixture" },
   { type: "text", sessionID: "ses_fixture", part: { id: "prt_1", messageID: "msg_1", sessionID: "ses_fixture", type: "text", text: "fixture done", time: { start: 1, end: 2 } } },
@@ -108,12 +122,22 @@ async function buildFakeOpenCode() {
       "#include <string.h>",
       "#include <windows.h>",
       "int main(int argc, char **argv) {",
-      "  if (argc >= 3) { for (int i = 1; i + 1 < argc; i += 1) { if (strcmp(argv[i], \"debug\") == 0 && strcmp(argv[i + 1], \"agent\") == 0) {",
-      `    fputs(${JSON.stringify(JSON.stringify(fixtureAgentDebug))}, stdout); return 0; } } }`,
+      "  if (argc == 2 && strcmp(argv[1], \"--fixture-child\") == 0) { Sleep(60000); return 0; }",
+      "  if (argc >= 3) { for (int i = 1; i + 2 < argc; i += 1) { if (strcmp(argv[i], \"debug\") == 0 && strcmp(argv[i + 1], \"agent\") == 0) {",
+      `    fputs(strcmp(argv[i + 2], "${fixtureWriterName}") == 0 ? ${JSON.stringify(JSON.stringify(fixtureWriterDebug))} : ${JSON.stringify(JSON.stringify(fixtureAgentDebug))}, stdout); return 0; } } }`,
       "  int run = 0; for (int i = 1; i < argc; i += 1) { if (strcmp(argv[i], \"run\") == 0) run = 1; }",
       "  if (!run) { fputs(\"unexpected fake OpenCode arguments\", stderr); return 2; }",
       `  FILE *log = fopen(${JSON.stringify(fakeOpenCodeLog)}, "ab");`,
       "  if (log) { for (int i = 1; i < argc; i += 1) { fputs(argv[i], log); fputc(0x1f, log); } fputc(0x1e, log); fclose(log); }",
+      "  if (argc > 1 && strstr(argv[argc - 1], \"DIRECT_CANCEL\")) {",
+      "    if (strstr(argv[argc - 1], \"DIRECT_WRITE\")) { FILE *edit = fopen(\"src/a.txt\", \"wb\"); if (!edit) return 3; fputs(\"cancelled writer output\\n\", edit); fclose(edit); }",
+      "    STARTUPINFOA si = {0}; PROCESS_INFORMATION pi = {0}; si.cb = sizeof(si);",
+      "    char command[32768]; snprintf(command, sizeof(command), \"\\\"%s\\\" --fixture-child\", argv[0]);",
+      "    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return 4;",
+      `    FILE *started = fopen(${JSON.stringify(fakeDirectStart)}, "wb");`,
+      "    if (started) { fprintf(started, \"{\\\"pid\\\":%lu,\\\"childPid\\\":%lu}\", GetCurrentProcessId(), pi.dwProcessId); fclose(started); }",
+      "    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); Sleep(60000);",
+      "  }",
       "  if (argc > 1 && strstr(argv[argc - 1], \"SLEEP2S\")) Sleep(2000);",
       `  fputs(${JSON.stringify(`${fakeEvents}\n`)}, stdout); fflush(stdout); return 0;`,
       "}",
@@ -136,11 +160,18 @@ async function buildFakeOpenCode() {
     `#!${process.execPath}`,
     "const fs = require('node:fs');",
     "const argv = process.argv.slice(2);",
+    "if (argv[0] === '--fixture-child') { setTimeout(() => {}, 60000); return; }",
     "const debugIndex = argv.indexOf('debug');",
-    `if (debugIndex >= 0 && argv[debugIndex + 1] === 'agent') { process.stdout.write(${JSON.stringify(JSON.stringify(fixtureAgentDebug))}); process.exit(0); }`,
+    `if (debugIndex >= 0 && argv[debugIndex + 1] === 'agent') { process.stdout.write(argv[debugIndex + 2] === ${JSON.stringify(fixtureWriterName)} ? ${JSON.stringify(JSON.stringify(fixtureWriterDebug))} : ${JSON.stringify(JSON.stringify(fixtureAgentDebug))}); process.exit(0); }`,
     "if (!argv.includes('run')) { process.stderr.write('unexpected fake OpenCode arguments'); process.exit(2); }",
     `fs.appendFileSync(${JSON.stringify(fakeOpenCodeLog)}, argv.map((item) => item + '\\x1f').join('') + '\\x1e');`,
     `const done = () => { process.stdout.write(${JSON.stringify(`${fakeEvents}\n`)}); };`,
+    "if (String(argv.at(-1)).includes('DIRECT_CANCEL')) {",
+    "  if (String(argv.at(-1)).includes('DIRECT_WRITE')) fs.writeFileSync('src/a.txt', 'cancelled writer output\\n');",
+    "  const child = require('node:child_process').spawn(process.execPath, [__filename, '--fixture-child'], { stdio: 'ignore' });",
+    `  fs.writeFileSync(${JSON.stringify(fakeDirectStart)}, JSON.stringify({ pid: process.pid, childPid: child.pid }));`,
+    "  setTimeout(done, 60000);",
+    "} else",
     "if (String(argv[argv.length - 1]).includes('SLEEP2S')) setTimeout(done, 2000); else done();",
   ].join("\n"), { encoding: "utf8", mode: 0o755 });
   return true;
@@ -744,6 +775,139 @@ await test("#28 agent timeouts are bounded below the supervisor timer limit", as
   assert.equal(internals.timeoutForAgent("planner", { lockType: "read" }, 3_000_000_000), max);
   assert.equal(internals.timeoutForAgent("planner", { lockType: "read" }, 60_000), 60_000);
 });
+
+// Direct requests exercise the public SDK cancellation/disconnect path and the real supervisor.
+async function waitUntil(probe, timeoutMs, description) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const value = await probe();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  throw new Error("Timed out waiting for " + description);
+}
+function processAlive(pid) {
+  assert.ok(Number.isInteger(pid) && pid > 0, "a real process PID is required");
+  try { process.kill(pid, 0); return true; } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+async function directCancellationFixture({ writer = false, disconnect = false, abort = true } = {}) {
+  if (!fakeOpenCodeReady) skipTest(fakeOpenCodeSkipReason);
+  const repo = await mkdtemp(path.join(scratch, "direct-repo-"));
+  const git = args => execFileAsync("git", args, { cwd: repo, windowsHide: true });
+  await git(["init", "-q"]);
+  await mkdir(path.join(repo, "src"));
+  await writeFile(path.join(repo, "src", "a.txt"), "base\n");
+  await writeFile(path.join(repo, "validate.cjs"), "require('node:fs').writeFileSync('validation-started', 'ran');\n");
+  await git(["add", "."]);
+  await git(["-c", "user.name=Review", "-c", "user.email=review@example.invalid", "commit", "-q", "-m", "fixture"]);
+  await rm(fakeDirectStart, { force: true });
+  const previousStateDirectory = hooks.stateDirectoryOverride;
+  hooks.stateDirectoryOverride = await mkdtemp(path.join(scratch, "direct-state-"));
+  const agent = writer ? fixtureWriterName : fixtureAgentName;
+  const debug = writer ? fixtureWriterDebug : fixtureAgentDebug;
+  let agentResult = null;
+  hooks.agentRuntimeTestHook = {
+    resolveAgent: async requestedAgent => ({ requestedAgent, actualAgent: requestedAgent, requestedAgentMode: "primary", actualAgentMode: "primary",
+      fallbackUsed: false, proxyUsed: false, availableAgents: [requestedAgent], discoveryExitCode: 0 }),
+    readAgentDebugMetadata: async () => ({ ok: true, metadata: internals.normalizeAgentDebugMetadata(structuredClone(debug), agent), pluginPolicy: { ok: true, mode: "pure", plugins: [] } }),
+    runOpenCodeWithPolicy: async (...args) => { agentResult = await internals.runOpenCodeWithPolicy(...args); return agentResult; },
+  };
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "direct-cancel-regression", version: "1.0.0" });
+  await internals.server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const controller = new AbortController();
+  const job = { agent, task: abort ? "DIRECT_CANCEL " + (writer ? "DIRECT_WRITE" : "DIRECT_READ") : "Inspect src/a.txt.",
+    cwd: repo, write: writer, lockMode: "strict", lockedPaths: ["src/a.txt"], allowedEdits: writer ? ["src/a.txt"] : [],
+    timeoutMs: 15000, scopeContract: writer
+      ? { mode: "write", read: ["src/a.txt", "validate.cjs"], write: ["src/a.txt"], allowedEdits: ["src/a.txt"], forbidden: [], shared: [], serialOnly: [], validationCommand: "node validate.cjs" }
+      : { mode: "read", read: ["src/a.txt"] },
+    ...(writer ? { validationCommand: "node validate.cjs" } : {}) };
+  let toolOutcome = null;
+  const pending = client.callTool({ name: "run_opencode_agent", arguments: job }, undefined, { signal: controller.signal, timeout: 60000 })
+    .then(response => ({ response }), error => ({ error })).then(value => { toolOutcome = value; return value; });
+  let runId = "";
+  let started = null;
+  try {
+    if (abort) {
+      started = await waitUntil(async () => {
+        if (toolOutcome) throw new Error("Direct job ended before launch: " + JSON.stringify(toolOutcome));
+        try { return JSON.parse(await readFile(fakeDirectStart, "utf8")); } catch { return null; }
+      }, 15000, "fake agent launch");
+      const audit = await internals.directRunAuditStore().snapshot(repo);
+      const live = audit.records.find(row => row.status === "started");
+      assert.ok(live, JSON.stringify(audit));
+      runId = live.runId;
+      assert.ok((await internals.listLocks(repo)).some(lock => lock.paths.includes("src/a.txt")), "the agent holds its path lock");
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      assert.equal(processAlive(started.pid), true, "the fake agent is running before abort");
+      assert.equal(processAlive(started.childPid), true, "its descendant is running before abort");
+      const abandonedAt = Date.now();
+      if (disconnect) await client.close(); else controller.abort(new Error("fixture client cancellation"));
+      const ended = await waitUntil(async () => {
+        const record = await internals.directRunAuditStore().get(repo, runId);
+        return record?.finishedAt ? record : null;
+      }, 8000, "cancelled direct audit");
+      assert.ok(Date.now() - abandonedAt < 8000);
+      assert.equal(ended.status, "cancelled");
+      assert.equal(ended.errorType, "agent_cancelled_by_client");
+      assert.equal(agentResult.cancelled, true);
+      if (disconnect) {
+        const [nextClient, nextServer] = InMemoryTransport.createLinkedPair();
+        await internals.server.connect(nextServer);
+        await client.connect(nextClient);
+      }
+      const view = JSON.parse((await client.callTool({ name: "get_opencode_job", arguments: { jobId: runId, cwd: repo } })).content[0].text);
+      assert.equal(view.status, "cancelled");
+      assert.equal(view.errorType, "agent_cancelled_by_client");
+      if (writer) {
+        assert.equal(view.worktrees.length, 1, JSON.stringify(view));
+        const retained = view.worktrees[0].worktreePath;
+        assert.equal(await readFile(path.join(retained, "src", "a.txt"), "utf8"), "cancelled writer output\n");
+        assert.equal(existsSync(path.join(retained, "validation-started")), false, "validation never started");
+        assert.equal(await readFile(path.join(repo, "src", "a.txt"), "utf8"), "base\n");
+      }
+      assert.equal(agentResult.terminationErrorType, "", JSON.stringify(agentResult));
+      if (process.platform === "win32") {
+        assert.equal(agentResult.terminationBestEffortSucceeded, true, JSON.stringify(agentResult));
+        assert.equal(agentResult.containmentGuarantee, "windows_taskkill_best_effort");
+      } else assert.equal(agentResult.treeTerminationConfirmed, true, JSON.stringify(agentResult));
+      for (const pid of [started.pid, started.childPid, agentResult.supervisorProcessId]) {
+        assert.equal(processAlive(pid), false, "supervised process " + pid + " ended");
+      }
+      process.stdout.write(`Direct ${writer ? "writer" : "reader"} ${disconnect ? "disconnect" : "abort"} cleanup: ${Date.now() - abandonedAt} ms\n`);
+    } else {
+      const outcome = await pending;
+      assert.ok(outcome.response, String(outcome.error));
+      runId = outcome.response._meta.directRunAudit.runId;
+      assert.equal((await internals.directRunAuditStore().get(repo, runId)).status, "completed");
+    }
+    assert.equal((await internals.listLocks(repo)).length, 0, "path lock released before terminal audit");
+    const handle = await internals.openProviderLeaseDb();
+    try {
+      assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM provider_leases WHERE provider_key = ?").get(internals.providerKeyForMetadata({ provider: "opencode" })).n, 0, "provider slot released");
+    } finally { internals.closeDb(handle); }
+  } finally {
+    // Even a failing regression lets the job's bounded supervisor finish before fixture cleanup.
+    controller.abort();
+    if (!toolOutcome) await waitUntil(() => agentResult || toolOutcome, 30000, "bounded fake agent exit");
+    if (runId) await waitUntil(async () => (await internals.directRunAuditStore().get(repo, runId))?.finishedAt, 15000, "terminal audit cleanup");
+    await pending;
+    // On a failed regression, remove only our fake descendant if the sandbox refused taskkill /T.
+    if (started?.childPid && processAlive(started.childPid)) process.kill(started.childPid);
+    await client.close();
+    await internals.server.close();
+    hooks.agentRuntimeTestHook = null;
+    hooks.stateDirectoryOverride = previousStateDirectory;
+  }
+}
+await test("direct reader request abort ends its process tree and persists client cancellation", () => directCancellationFixture());
+await test("direct writer request abort retains output and never starts validation", () => directCancellationFixture({ writer: true }));
+await test("direct disconnect cancels the run; its Run id survives reconnect", () => directCancellationFixture({ disconnect: true }));
+await test("unaborted direct request retains normal completion", () => directCancellationFixture({ abort: false }));
 
 // ---------------------------------------------------------------------------
 hooks.stateDirectoryOverride = "";

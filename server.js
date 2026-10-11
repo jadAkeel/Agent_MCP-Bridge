@@ -5829,6 +5829,9 @@ export const __selfTest = {
     patchFileEntries,
     SELF_TEST_TEMP_STATE_DIR,
     effectiveBridgeStateDirectory,
+    assertNoLinkedPath,
+    ensureTableColumn,
+    delayWithSignal,
     // tests/review-flex-runners.js (Q-012)
     externalRunnerName,
     externalRunnerSelection,

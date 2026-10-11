@@ -194,7 +194,7 @@ export function createDirectRunAudit({
       )`).run(excess);
     }
   };
-  const write = async (projectKey, record, initial) => {
+  const write = async (projectKey, record, initial, signal = null) => {
     const db = await openDb(projectKey);
     try {
       db.exec("BEGIN IMMEDIATE");
@@ -209,6 +209,11 @@ export function createDirectRunAudit({
             .run(record.runId, projectKey, record.kind, record.jobId, record.startedAt, record.agent,
               identifier(instanceId), Number.isInteger(processId) ? processId : null);
         } else {
+          // Sealing and database opening can yield after finish classified the run.
+          if (record.kind === "direct" && signal?.aborted) {
+            record.status = "cancelled";
+            record.errorType = "agent_cancelled_by_client";
+          }
           const metrics = record.metrics || {};
           const updated = db.prepare(`UPDATE opencode_direct_runs SET status = ?, error_type = ?, finished_at = ?,
             duration_ms = ?, configured_model = ?, model_evidence_present = ?, agent_run_ms = ?, startup_ms = ?,
@@ -281,14 +286,15 @@ export function createDirectRunAudit({
     },
     // `stored` is the result to keep ({ text, detailText, chars, reportTruncated }); a run that
     // does not pass one keeps the execution's own resultRecord or its response text.
-    async finish(handle, { execution, executionThrew = false, childStarted = false, errorType = "", stored = null } = {}) {
+    async finish(handle, { execution, executionThrew = false, childStarted = false, errorType = "", stored = null, signal = null } = {}) {
       const { job, record, audit, projectKey, startMs } = handle;
       const result = execution?.result || {};
-      record.errorType = identifier(errorType || (executionThrew ? "direct_run_exception" : result.errorType
+      const cancelledByClient = record.kind === "direct" && signal?.aborted;
+      record.errorType = identifier(cancelledByClient ? "agent_cancelled_by_client" : errorType || (executionThrew ? "direct_run_exception" : result.errorType
         || (execution?.validation?.disallowedFiles?.length ? "changed_file_validation_error" : "")
         || (execution?.response?.isError ? "direct_run_failed" : "")));
       const spawned = childStarted || Number(result.childStartedAtMs) > 0;
-      record.status = record.errorType ? (spawned ? "failed" : "rejected") : job.dryRun ? "dry_run" : "completed";
+      record.status = cancelledByClient ? "cancelled" : record.errorType ? (spawned ? "failed" : "rejected") : job.dryRun ? "dry_run" : "completed";
       record.finishedAt = new Date().toISOString();
       record.durationMs = Math.max(0, Date.now() - startMs);
       record.configuredModel = identifier(result.configuredModel
@@ -311,7 +317,7 @@ export function createDirectRunAudit({
       }
       if (audit.startedPersisted) {
         try {
-          await write(projectKey, record, false);
+          await write(projectKey, record, false, signal);
           audit.persisted = true;
         } catch {
           audit.errorType = "direct_run_audit_finish_failed";
@@ -331,7 +337,7 @@ export function createDirectRunAudit({
         executionThrew = true;
         originalError = error;
       }
-      const audit = await store.finish(handle, { execution, executionThrew, childStarted });
+      const audit = await store.finish(handle, { execution, executionThrew, childStarted, signal: options.signal });
       if (executionThrew) {
         // Preserve the execution exception and its classification, including when auditing also fails.
         if (originalError instanceof Error) {

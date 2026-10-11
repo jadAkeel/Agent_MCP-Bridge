@@ -16,6 +16,13 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-11
 
+### Fix round 1 (review day 1, ledger L-1-*)
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-217 | Waiting for a provider slot reopened the lease database on every 250-500 ms poll (path link checks, PRAGMAs, CREATE TABLE IF NOT EXISTS, column checks, writer transaction, close): 39 opens per 15 s wait, ~3,100 per 20-minute wait, ~33 s of event-loop-blocking work per waiter (ledger L-1-F1b-4). | Each poll called the full open routine. | One acquisition owns one handle for all its polls and closes it on every exit (grant, expiry, pause refusal, cancellation, thrown error); busy_timeout is bounded by the remaining deadline; schema, BEGIN IMMEDIATE transactions, fencing and progress lines are unchanged. Measured: 39 -> 1 opens per 15 s wait; median look 2.27 -> 0.56 ms. Verified: provider-wait 14/14 (new cases: open count, grant, pause, cancellation, injected failures), prod-quota 8/8, provider-fallback 17/17, measurement 13/13. | `bridge/fix1-cancel-slotwait` | fixed, not deployed |
+| B-216 | A direct run_opencode_agent call that the client cancelled or lost (disconnect, client timeout) kept running: the agent ran to the end of its budget (3/10/15 min by default, up to 24 h), the provider slot and the path lock stayed held and validation still ran (ledger L-1-F1b-1). | The handler took only its arguments object; the MCP request's abort signal was never passed to the executor or the audit, although both already accepted one. | The handler passes the request signal to execution and auditing. An abandoned call ends the agent through the supervisor containment path, skips further validation, releases the slot and lock (or quarantines an unconfirmed tree), keeps a writer's changed output like a failed job, and records status `cancelled` / `agent_cancelled_by_client` under its Run id (also when the abort lands during audit persistence). Verified outside the Codex sandbox: review-spawn 43/43 (new: reader abort, writer abort with validation suppressed, disconnect, normal completion through the public SDK), direct-run-audit 15/15, server self-test passed. | `bridge/fix1-cancel-slotwait` | fixed, not deployed |
+
 ### Waste reduction: reproducible, bounded complete gate
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

@@ -62,6 +62,43 @@ test("direct success, provider failure, pre-provider rejection and dry run survi
   assert.equal((await readFile(dbPath)).includes(Buffer.from("sk-canary")), false);
 });
 
+test("direct client cancellation before spawn, during execution and after a successful return is never completed", async (t) => {
+  const { audit, root } = await fixture(t);
+  for (const childStarted of [false, true]) {
+    const controller = new AbortController();
+    const answer = await audit.run({ cwd: root, agent: "reviewer" }, async ({ onChildSpawn }) => {
+      if (childStarted) onChildSpawn();
+      controller.abort("client disconnected");
+      return response(childStarted ? { cancelled: true, errorType: "agent_cancelled" } : {});
+    }, { signal: controller.signal });
+    const record = await audit.get(root, answer._meta.directRunAudit.runId);
+    assert.equal(record.status, "cancelled");
+    assert.equal(record.errorType, "agent_cancelled_by_client");
+    assert.ok(record.finishedAt);
+  }
+  const controller = new AbortController();
+  const original = new Error("execution fault after abandonment");
+  await assert.rejects(audit.run({ cwd: root, agent: "reviewer" }, async () => {
+    controller.abort();
+    throw original;
+  }, { signal: controller.signal }), error => error === original);
+  const record = await audit.get(root, original.directRunAudit.runId);
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.errorType, "agent_cancelled_by_client");
+});
+test("audit callers without a direct request signal, including memory-queue continuations and parallel jobs, stay unchanged", async (t) => {
+  const { audit, root } = await fixture(t);
+  for (const kind of ["direct", "parallel"]) {
+    const answer = await audit.run({ cwd: root, agent: "reviewer" }, async ({ onChildSpawn }) => {
+      onChildSpawn();
+      return response({ cancelled: true, errorType: "agent_cancelled" });
+    }, { kind });
+    const record = await audit.get(root, answer._meta.directRunAudit.runId);
+    assert.equal(record.status, "failed");
+    assert.equal(record.errorType, "agent_cancelled");
+  }
+});
+
 test("metadata sanitization and thrown execution errors retain the original exception", async (t) => {
   const { audit, root, dbPath } = await fixture(t);
   const original = new Error("execution failed sk-canaryexception");
@@ -204,6 +241,50 @@ const sealed = {
     return Buffer.from(envelope.slice(prefix.length), "base64").toString("utf8");
   },
 };
+
+
+
+test("client cancellation during result sealing or terminal database opening is recorded before commit", async (t) => {
+  for (const phase of ["seal", "open"]) {
+    const controller = new AbortController();
+    const { root, options, openDb } = await fixture(t, sealed);
+    let opens = 0;
+    const audit = createDirectRunAudit({
+      ...options,
+      sealText: async (...args) => {
+        if (phase === "seal") controller.abort();
+        return sealed.sealText(...args);
+      },
+      openDb: async () => {
+        const db = await openDb();
+        if (++opens === 2 && phase === "open") controller.abort();
+        return db;
+      },
+    });
+    const answer = await audit.run({ cwd: root, agent: "reviewer" }, async () => response(), { signal: controller.signal });
+    const record = await audit.get(root, answer._meta.directRunAudit.runId, { includeResult: true });
+    assert.equal(record.status, "cancelled", phase);
+    assert.equal(record.errorType, "agent_cancelled_by_client", phase);
+    assert.ok(record.result.text, phase);
+  }
+});
+
+test("client cancellation preserves stored containment failure and quarantine evidence", async (t) => {
+  const { audit, root } = await fixture(t, sealed);
+  const controller = new AbortController();
+  const text = "Status: process_tree_termination_unconfirmed; Temporary lock released: no (containment quarantined)";
+  const answer = await audit.run({ cwd: root, agent: "reviewer" }, async ({ onChildSpawn }) => {
+    onChildSpawn();
+    controller.abort();
+    return response({ errorType: "process_tree_termination_unconfirmed", cancelled: true }, {
+      resultRecord: { text },
+    });
+  }, { signal: controller.signal });
+  const record = await audit.get(root, answer._meta.directRunAudit.runId, { includeResult: true });
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.errorType, "agent_cancelled_by_client");
+  assert.equal(record.result.text, text);
+});
 
 test("L-025: a run's result text is stored sealed and redacted, and read back by run id", async (t) => {
   const { audit, root, dbPath } = await fixture(t, sealed);

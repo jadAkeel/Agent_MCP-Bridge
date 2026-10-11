@@ -5,6 +5,9 @@ import { mkdir, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fork } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { performance } from "node:perf_hooks";
+import { createProviderLeaseRuntime } from "../lib/provider-leases.js";
 import { createOpenCodeRunRuntime } from "../lib/opencode-run.js";
 import { providerWaitBudget, providerWaitProgressStorage } from "../lib/provider-wait.js";
 import { registerJobTools } from "../lib/tools/jobs.js";
@@ -14,7 +17,6 @@ process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2";
 process.env.CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS = "25";
 process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 const scratch = await mkdtemp(path.join(tmpdir(), "review-provider-wait-"));
-await mkdir(path.join(process.cwd(), "tmp"), { recursive: true });
 process.env.CODEX_OPENCODE_STATE_DIR = scratch;
 const { __selfTest } = await import("../server.js");
 const I = __selfTest.internals;
@@ -132,11 +134,11 @@ test("caller budget is separate, clamped, and validates positive safe integers",
 });
 test("5-second expiry emits real holders immediately; get_job agrees; no spawn or waiter lease", async () => {
   await reset();
-  const workerPath = path.join(process.cwd(), "tmp", "perf-C-slot-holder.mjs");
+  const workerPath = path.join(scratch, "slot-holder.mjs");
   await writeFile(workerPath, `
-    import "../tests/test-env.js";
+    import ${JSON.stringify(pathToFileURL(path.resolve("tests/test-env.js")).href)};
     process.argv.push("--self-test");
-    const { __selfTest } = await import("../server.js");
+    const { __selfTest } = await import(${JSON.stringify(pathToFileURL(path.resolve("server.js")).href)});
     const I = __selfTest.internals;
     const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: 1000 });
     if (!result.ok) throw new Error(JSON.stringify(result));
@@ -336,6 +338,114 @@ test("queue progress ownership loss after grant returns the unused lease", async
     assert.equal(I.providerSlotWaitingJobs.has("queue-lost-owner"), false);
   } finally { clearTimeout(timer); }
 });
+
+// A dedicated runtime counts only handles owned by the wait, not other callers' reads.
+async function measuredLeaseRuntime() {
+  const directory = await mkdtemp(path.join(scratch, "measured-"));
+  const profile = { enabled: false, opens: 0, closes: 0, looks: [] };
+  const handles = new Set();
+  let openingAt = 0;
+  let fault = "";
+  const runtime = createProviderLeaseRuntime({
+    ...I,
+    BRIDGE_INSTANCE_ID: "measured-wait",
+    CONFIG: { ...I.CONFIG, providerConcurrencyLimit: 1, providerLeasePollMs: 250, globalWorkerLimit: 0 },
+    RUNTIME_CONCURRENCY: { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, providerLimits: new Map() },
+    effectiveBridgeStateDirectory: () => directory,
+    assertNoLinkedPath: async (...args) => {
+      openingAt = performance.now();
+      await I.assertNoLinkedPath(...args);
+    },
+    ensureTableColumn: (handle, ...args) => {
+      I.ensureTableColumn(handle, ...args);
+      if (!profile.enabled || handles.has(handle)) return;
+      handles.add(handle);
+      profile.opens++;
+      const exec = handle.exec.bind(handle);
+      let lookAt = openingAt;
+      handle.exec = sql => {
+        if (sql === "BEGIN IMMEDIATE" && !lookAt) lookAt = performance.now();
+        if (sql === "BEGIN IMMEDIATE" && fault && fault !== "reclaim") throw new Error(fault);
+        const result = exec(sql);
+        if (sql === "COMMIT" || sql === "ROLLBACK") {
+          if (lookAt) profile.looks.push(performance.now() - lookAt);
+          lookAt = 0;
+        }
+        return result;
+      };
+    },
+    closeDb: handle => {
+      if (handles.has(handle)) profile.closes++;
+      I.closeDb(handle);
+      assert.throws(() => handle.prepare("SELECT 1"), /not open|closed/);
+    },
+    reclaimProvenGoneProviderQuarantines: async () => {
+      if (fault === "reclaim" && profile.opens) throw new Error("fixture reclaim fault");
+      return 0;
+    },
+    logEvent: () => {},
+  });
+  return { runtime, profile, setFault: value => { fault = value; } };
+}
+test("15-second held-slot wait opens once, closes once and preserves holder progress", async () => {
+  const { runtime, profile } = await measuredLeaseRuntime();
+  const held = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 1000 });
+  assert.equal(held.ok, true);
+  profile.enabled = true;
+  const notifications = [];
+  const started = performance.now();
+  const result = await I.wrapToolHandler("measured-wait", () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: 15000 }))({}, {
+    _meta: { progressToken: "measured-token" }, sendNotification: async value => { notifications.push(value); },
+  });
+  const sorted = [...profile.looks].sort((a, b) => a - b);
+  measurements.held15s = { opens: profile.opens, closes: profile.closes, polls: sorted.length,
+    medianLookMs: Number(sorted[Math.floor(sorted.length / 2)].toFixed(3)), elapsedMs: Math.round(performance.now() - started) };
+  process.stdout.write(`15-second wait: ${JSON.stringify(measurements.held15s)}\n`);
+  assert.equal(result.errorType, "provider_slot_wait_timeout");
+  assert.equal(result.holders, 1); assert.equal(result.capacity, 1);
+  assert.equal(result.agentNeverStarted, true); assert.equal(result.agentTimeoutSpentMs, 0);
+  assert.match(result.error, /1 of 1 slots stayed held.*The agent was not started/);
+  assert.equal(result.waitInfo.holderDetails[0].leaseId, held.lease.id);
+  const messages = notifications.map(value => value.params.message);
+  assert.ok(messages.length >= 3, JSON.stringify(messages));
+  for (const message of messages) assert.match(message, /measured-wait.*pid=.*heartbeats may extend/);
+  assert.equal(profile.closes, profile.opens);
+  assert.equal(profile.opens, 1, "one wait owns one database handle");
+});
+test("wait handle closes on grant, pause, cancellation, query failure and thrown progress", async () => {
+  for (const outcome of ["grant", "pause", "cancel", "query", "progress", "busy", "reclaim"]) {
+    const { runtime, profile, setFault } = await measuredLeaseRuntime();
+    if (outcome !== "grant") {
+      const held = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 1000 });
+      assert.equal(held.ok, true);
+    }
+    if (outcome === "pause") await runtime.recordProviderCooldown({ providerKey: key, durationMs: 60000, errorType: "opencode_quota_exhausted", reason: "fixture" });
+    if (outcome === "query") setFault("fixture query fault");
+    if (outcome === "busy") setFault("database is locked");
+    if (outcome === "reclaim") setFault("reclaim");
+    const controller = new AbortController();
+    const timer = outcome === "cancel" ? setTimeout(() => controller.abort(), 100) : null;
+    profile.enabled = true;
+    try {
+      const promise = runtime.providerSlotWaitStorage.run({ jobId: "profile-" + outcome, onWait: () => {
+        if (outcome === "progress") throw new Error("fixture progress fault");
+      } }, () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: outcome === "reclaim" ? 1000 : 400, signal: controller.signal }));
+      if (outcome === "progress" || outcome === "reclaim") await assert.rejects(promise, new RegExp("fixture " + outcome + " fault"));
+      else {
+        const result = await promise;
+        assert.equal(result.ok, outcome === "grant", outcome);
+        if (outcome === "pause") { assert.equal(result.errorType, "opencode_quota_exhausted"); assert.equal(result.pausedKey, key); }
+        if (outcome === "cancel") assert.equal(result.errorType, "agent_cancelled");
+        if (outcome === "query") assert.equal(result.errorType, "provider_concurrency_failed");
+        if (outcome === "busy") assert.equal(result.errorType, "provider_slot_wait_timeout");
+      }
+      assert.equal(profile.opens, 1, outcome);
+      assert.equal(profile.closes, 1, outcome);
+      assert.equal(runtime.providerSlotWaitingJobs.size, 0, outcome);
+    } finally { clearTimeout(timer); }
+  }
+});
+
 let failed = 0;
 try {
   for (const { name, fn } of tests) {
@@ -349,5 +459,5 @@ try {
   await rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
 process.stdout.write(`${tests.length - failed} of ${tests.length} provider wait tests passed; zero skips.\n`);
-await writeFile("tmp/perf-C-measurements.json", JSON.stringify(measurements, null, 2));
+process.stdout.write(`Provider wait measurements: ${JSON.stringify(measurements)}\n`);
 process.exit(failed ? 1 : 0);
