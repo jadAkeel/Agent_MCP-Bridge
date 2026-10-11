@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { fitResultParts, honestResultPointers } from "../lib/result-text.js";
 
 // Added after the first release: parallel runs (B-018), the job id that names a run's worktree
 // (B-020), numeric timing/usage metadata (B-022, B-024) and the run's result text (L-025). Still
@@ -124,7 +125,7 @@ function cappedResult(stored, redact, maxChars) {
   if (text.length > maxChars) {
     const total = text.length;
     const keep = Math.max(0, maxChars - cutMarker(0, total).length);
-    text = `${text.slice(0, keep)}${cutMarker(keep, total)}`;
+    text = `${text.slice(0, keep)}${cutMarker(keep, total)}`.slice(0, maxChars);
     reportTruncated = true;
   }
   const room = maxChars - text.length;
@@ -135,6 +136,7 @@ function cappedResult(stored, redact, maxChars) {
     detailText = keep >= 200 ? `${detailText.slice(0, keep)}${cutMarker(keep, total)}` : "";
     detailTruncated = true;
   }
+  if (detailTruncated) text = honestResultPointers(text);
   return { view: { v: 1, text, detailText, reportTruncated, detailTruncated }, chars };
 }
 
@@ -247,7 +249,7 @@ export function createDirectRunAudit({
     try {
       const payload = JSON.parse(await openText(row.sealed, runId));
       return {
-        text: String(payload.text ?? ""),
+        text: payload.detailTruncated ? honestResultPointers(payload.text) : String(payload.text ?? ""),
         detailText: String(payload.detailText ?? ""),
         chars: Number(row.chars) || 0,
         reportTruncated: Boolean(payload.reportTruncated),
@@ -294,7 +296,7 @@ export function createDirectRunAudit({
         || (execution?.validation?.disallowedFiles?.length ? "changed_file_validation_error" : "")
         || (execution?.response?.isError ? "direct_run_failed" : "")));
       const spawned = childStarted || Number(result.childStartedAtMs) > 0;
-      record.status = cancelledByClient ? "cancelled" : record.errorType ? (spawned ? "failed" : "rejected") : job.dryRun ? "dry_run" : "completed";
+      record.status = cancelledByClient ? "cancelled" : result.groupRejected ? "rejected" : record.errorType ? (spawned ? "failed" : "rejected") : job.dryRun ? "dry_run" : "completed";
       record.finishedAt = new Date().toISOString();
       record.durationMs = Math.max(0, Date.now() - startMs);
       record.configuredModel = identifier(result.configuredModel
@@ -347,10 +349,17 @@ export function createDirectRunAudit({
         }
         throw new Error(`${redact(String(originalError))}\n${auditNotice(audit)}`, { cause: originalError });
       }
+      const notice = auditNotice(audit);
+      const content = [...(execution.response?.content || [])];
+      const totalChars = content.reduce((sum, item) => sum + (item.text?.length || 0), 0) + notice.length + content.length;
+      if (totalChars > maxResultChars && content[0]?.type === "text") {
+        const room = Math.max(0, maxResultChars - notice.length - content.length);
+        content[0] = { ...content[0], text: fitResultParts(execution.responseParts || { report: redact(content[0].text) }, room).text };
+      }
       return {
         ...execution.response,
         _meta: { ...execution.response?._meta, directRunAudit: audit },
-        content: [...(execution.response?.content || []), { type: "text", text: auditNotice(audit) }],
+        content: [...content, { type: "text", text: notice }],
       };
     },
     notice: auditNotice,

@@ -349,6 +349,8 @@ test("real MCP calls still reject unknown nested scope and echoed receipt fields
     const response = await client.callTool({ name, arguments: args }, undefined, { timeout: 30_000 });
     assert.equal(response.isError, true, `${name} must reject, rather than strip, an unknown nested key`);
     assert.match(textOf(response), /unrecognized_keys|unrecognized key/i);
+    assert.match(textOf(response), /errorType: invalid_tool_arguments/);
+    assert.match(textOf(response), /suggestedFix:.*tools\/list.*retry/);
   }
 });
 
