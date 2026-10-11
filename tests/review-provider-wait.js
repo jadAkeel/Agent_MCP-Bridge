@@ -446,6 +446,58 @@ test("wait handle closes on grant, pause, cancellation, query failure and thrown
   }
 });
 
+test("L-1-F1b-7/12: terminal supervisor failures quarantine once and preserve evidence", async () => {
+  for (const type of ["process_supervisor_exited_without_result", "process_supervisor_watchdog_expired", "process_supervisor_protocol_error"]) {
+    let captures = 0;
+    const evidence = JSON.stringify({ pids: [123], complete: false });
+    const h = harness({}, {
+      runSpawnCommand: async () => ({ stdout: "", stderr: "", exitCode: 1, processTreeUnconfirmed: true,
+        treeTerminationConfirmed: false, terminationErrorType: type }),
+      containmentRecord: async () => { captures++; return evidence; },
+      quarantineProviderLease: async (_lease, record) => { assert.equal(record, evidence); return { ok: true }; },
+      classifyResultError: value => value.terminationErrorType,
+    });
+    const result = await h.runtime.runOpenCode("builder", "task", scratch, false, 60000);
+    assert.equal(result.errorType, type);
+    assert.equal(result.containmentEvidence, evidence);
+    assert.equal(result.providerQuarantine.ok, true);
+    assert.equal(captures, 1);
+    assert.equal(h.calls.includes("lease.release"), false);
+  }
+});
+test("L-1-F1b-11: late admission before or during commit leaves no lease", async () => {
+  for (const stage of ["decision", "commit"]) {
+    const directory = await mkdtemp(path.join(scratch, `late-${stage}-`));
+    const wrapped = new WeakSet();
+    const holdPastDeadline = () => { const end = performance.now() + 100; while (performance.now() < end) {} };
+    const config = { ...I.CONFIG, globalWorkerLimit: 0 };
+    let capacityReads = 0;
+    if (stage === "decision") Object.defineProperty(config, "providerConcurrencyLimit", { get: () => {
+      if (++capacityReads > 1) holdPastDeadline();
+      return 2;
+    } });
+    const runtime = createProviderLeaseRuntime({ ...I, CONFIG: config, BRIDGE_INSTANCE_ID: `late-${stage}`,
+      RUNTIME_CONCURRENCY: { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, providerLimits: new Map() },
+      effectiveBridgeStateDirectory: () => directory,
+      reclaimProvenGoneProviderQuarantines: async () => 0,
+      ensureTableColumn: (handle, ...args) => {
+        I.ensureTableColumn(handle, ...args);
+        if (stage !== "commit" || wrapped.has(handle)) return;
+        wrapped.add(handle);
+        const exec = handle.exec.bind(handle);
+        handle.exec = sql => { const result = exec(sql); if (sql === "COMMIT") holdPastDeadline(); return result; };
+      },
+    });
+    const result = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 1000, maxWaitMs: 80 });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.errorType, "provider_slot_wait_limit_exceeded");
+    console.log(`Late ${stage} grant: ${result.waitedMs} ms against maxWaitMs=80; refused and released`);
+    const handle = await runtime.openProviderLeaseDb();
+    try { assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM provider_leases").get().n, 0); }
+    finally { I.closeDb(handle); }
+  }
+});
+
 let failed = 0;
 try {
   for (const { name, fn } of tests) {

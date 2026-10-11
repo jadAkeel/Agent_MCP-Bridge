@@ -91,6 +91,7 @@ const outputs = {
   // OpenCode logs the agent it runs (B-130: a line of another agent, e.g. compaction, never trips).
   B096_STDERR: { stdout: `${stepStart}\n`, stderr: `${logLine({ agent: fixtureAgentName })}\n` },
   B096_EVENT: { stdout: `${stepStart}\n${errorEvent()}\n`, stderr: "" },
+  B096_QUICK: { stdout: `${stepStart}\n${errorEvent()}\n`, stderr: "" },
 };
 async function buildFakeOpenCode() {
   if (process.platform === "win32") {
@@ -99,7 +100,7 @@ async function buildFakeOpenCode() {
       `  if (strstr(prompt, ${JSON.stringify(marker)})) {`,
       `    fputs(${JSON.stringify(outputs[marker].stdout)}, stdout); fflush(stdout);`,
       `    fputs(${JSON.stringify(outputs[marker].stderr)}, stderr); fflush(stderr);`,
-      "    Sleep(30000); return 0; }",
+      `    ${marker === "B096_QUICK" ? "return 1;" : "Sleep(30000); return 0;"} }`,
     ].join("\n");
     await writeFile(source, [
       "#include <stdio.h>",
@@ -111,6 +112,7 @@ async function buildFakeOpenCode() {
       "  const char *prompt = argc > 1 ? argv[argc - 1] : \"\";",
       branch("B096_STDERR"),
       branch("B096_EVENT"),
+      branch("B096_QUICK"),
       "  fputs(\"unexpected fake OpenCode arguments\", stderr); return 2;",
       "}",
     ].join("\n"), "utf8");
@@ -134,7 +136,7 @@ async function buildFakeOpenCode() {
     "const marker = Object.keys(outputs).find((key) => String(argv[argv.length - 1]).includes(key));",
     "if (!marker) { process.stderr.write('unexpected fake OpenCode arguments'); process.exit(2); }",
     "process.stdout.write(outputs[marker].stdout); process.stderr.write(outputs[marker].stderr);",
-    "setTimeout(() => process.exit(0), 30000);",
+    "if (marker === 'B096_QUICK') process.exit(1); else setTimeout(() => process.exit(0), 30000);",
   ].join("\n"), { encoding: "utf8", mode: 0o755 });
   return "";
 }
@@ -385,6 +387,24 @@ test("B-130: a payload that exits on its own after a final line keeps its result
   assert.equal(result.rateLimited, false, "the payload's own result stands");
   assert.equal(result.exitCode, 0);
   assert.equal(result.rateLimitHits, 1, "the line was seen");
+});
+
+test("L-1-F1b-8: a structured 429 exiting before the grace records the model pause", async () => {
+  if (fakeSkipReason) skipTest(fakeSkipReason);
+  await clearPause();
+  const started = Date.now();
+  const result = await runOpenCode(fixtureAgentName, "B096_QUICK task", workCwd, false, 120_000, { agentMetadata: fixtureMetadata() });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 3000, `quick 429 took ${elapsed} ms`);
+  assert.equal(result.errorType, "opencode_rate_limited");
+  assert.equal(result.rateLimitPause?.pauseKey, pauseKey);
+  assert.equal(result.rateLimitPause?.strikes, 1);
+  assert.ok(Date.parse(result.providerCooldownUntil) - Date.now() > 8 * 60_000);
+  const handle = await openProviderLeaseDb();
+  try { assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM provider_leases").get().n, 0); }
+  finally { internals.closeDb(handle); }
+  console.log(`Quick structured 429: ${elapsed} ms; pause ${result.providerCooldownUntil}`);
+  await clearPause();
 });
 
 test("B-096: end to end, the real stderr line ends a silent run in seconds as provider_rate_limited and pauses the model", async () => {
