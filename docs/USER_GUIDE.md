@@ -547,8 +547,11 @@ When something fails, the bridge returns an error type. Copy it and look it up h
 
 The timing split prints `final-attestation-cached=yes`, `no`, or `n/a`. `yes` means the
 final metadata proof was reused after an independent content fingerprint and within
-the 10-minute freshness limit. Discovery shares its fingerprint across warm cache
-lookups for the same repository; the final check uses a new fingerprint. A cold
+the 10-minute freshness limit. Single-job discovery shares its fingerprint across warm cache
+lookups for the same repository and ends before locks/worktree setup. Agent runs,
+provider waits, retries and reroutes do not keep a fingerprint scope open; the
+final check uses current inputs even with the max-age setting at zero. Parallel
+tools currently retain their original per-lookup fingerprint cost. A cold
 metadata read verifies the current plugin policy before loading plugins.
 
 ### A quarantine that does not clear
