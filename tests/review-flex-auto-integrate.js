@@ -402,6 +402,19 @@ test("Q-017 (h): a record that cannot be written after the batch commit never se
 
 test("Q-010: an in-place writer or another integration on the files makes the integration wait, then land", async () => {
   const { acquireHardLock, releaseHardLock } = internals;
+  // Earlier integrations can finish while their source cleanup still holds the repository lock.
+  let cleanupOutcomes = [];
+  let pendingCleanup = [];
+  assert.ok(await waitFor(async () => {
+    cleanupOutcomes = await internals.drainDeferredWorktreeCleanup(repo);
+    const db = await internals.openLockDb(repo);
+    try {
+      pendingCleanup = db.prepare("SELECT worktree_path, status FROM integration_worktree_cleanup WHERE cwd = ? AND status = 'pending'").all(path.resolve(repo));
+    } finally {
+      internals.closeDb(db);
+    }
+    return pendingCleanup.length === 0;
+  }, 20_000), `previous deferred cleanup must finish before the intentional blocker: ${JSON.stringify({ cleanupOutcomes, pendingCleanup })}`);
   // A finished writer without autoIntegrate gives the terminal job row the outcome is written to.
   const dir = await builderWorktree({ "out/batch-008.json": "[8]\n" });
   const request = job("out/batch-008.json", { lockedPaths: ["out/batch-008.json"], autoIntegrate: undefined });

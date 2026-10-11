@@ -31,6 +31,8 @@ function serverEnvironment(stateDir, extraEnv = {}) {
     CODEX_OPENCODE_STATE_DIR: stateDir,
     CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "false",
     ...extraEnv,
+    // Every fixture bridge uses an empty config, even when the caller has MCP enabled.
+    XDG_CONFIG_HOME: path.join(path.dirname(stateDir), "xdg-config"),
   };
 }
 
@@ -161,6 +163,7 @@ async function main() {
   let crashed = null;
 
   try {
+    await mkdir(path.join(fixtureRoot, "xdg-config"));
     const repo = await createFixtureRepository(fixtureRoot);
     await assertMalformedFramesDoNotCrash(stateDir);
 

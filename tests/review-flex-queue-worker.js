@@ -357,6 +357,10 @@ async function runParent() {
         outcomes.push(await durableIn(repo, enqueued.record.jobId));
       }
       assert.equal(outcomes[0].autoIntegration.status, "committed", JSON.stringify(outcomes[0].autoIntegration));
+      assert.ok(await waitFor(async () => {
+        await internals.drainDeferredWorktreeCleanup(repo);
+        return !existsSync(worktrees["Write out/batch-one.json."].dir);
+      }, 20_000), "deferred cleanup completed within 20 seconds");
       assert.equal(existsSync(worktrees["Write out/batch-one.json."].dir), false, "the landed batch's worktree was removed after the commit");
       assert.equal(outcomes[1].autoIntegration.status, "failed", "the second batch passed alone but failed in the target");
       assert.equal(outcomes[1].autoIntegration.stage, "apply");

@@ -14,6 +14,7 @@ process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2";
 process.env.CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS = "25";
 process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 const scratch = await mkdtemp(path.join(tmpdir(), "review-provider-wait-"));
+await mkdir(path.join(process.cwd(), "tmp"), { recursive: true });
 process.env.CODEX_OPENCODE_STATE_DIR = scratch;
 const { __selfTest } = await import("../server.js");
 const I = __selfTest.internals;

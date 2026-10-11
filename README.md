@@ -71,6 +71,17 @@ Run these from `<bridge-dir>`.
 | `npm test` | Full self-test suite |
 | `npm run test:release` | Release gate: `npm test`, concurrency test, audit, health smoke; writes a receipt |
 
+`npm test` runs the commands retained in `test:commands`, with eight syntax workers
+and three suite workers (at most two of the four longest suites at once, leaving
+capacity for medium and short checks). Timing-sensitive suites run alone after the parallel
+suites finish. Each command has a 15-minute timeout; failures do not stop the
+remaining checks. Logs, durations, timeout diagnostics and `report.json` are in
+`.test-logs/`. The report includes setup, profile preparation, cleanup and whole-run
+time. Runtime profiles and shared test TEMP live in a private directory outside
+Git; profile copying uses a bounded pool and refuses links. The existing skip summary
+still reports required and optional skips. The robustness harness uses its own
+empty XDG configuration regardless of the caller's shell.
+
 When the log destination is writable and below its daily cap, errors are recorded in `<state-dir>/logs/bridge-YYYY-MM-DD.jsonl` (default `~/.codex/codex-opencode-mcp/logs/`), one redacted JSON line each with a readable `summary`: refused tool calls, failed agent runs, MCP validation errors, bridge crashes, and failures of `npm run setup`, `doctor`, `smoke:live`, `release:activate` and `test:release`. `npm run incidents` groups them, and job failures also appear in `<state-dir>/logs/issues.md`. URL passwords are redacted. Logging is best effort: when a bridge runtime incident cannot be persisted, one redacted `ops_log_write_failed` diagnostic with the incident goes to stderr per continuous failure episode, even with `CODEX_OPENCODE_LOG_LEVEL=off`. `CODEX_OPENCODE_OPS_LOG=off` intentionally disables persistence and this fallback.
 
 ## Unattended runs

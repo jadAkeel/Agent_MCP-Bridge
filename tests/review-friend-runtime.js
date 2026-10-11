@@ -196,7 +196,7 @@ test("a continued memory job retains its live claim while waiting for an occupie
     // cadence explicitly. Do not pulse the hard lock or openLockDb during the wait.
     heartbeatTimer = setInterval(I.heartbeatKnownQueueState, I.CONFIG.queueHeartbeatMs);
     await sleep(1300);
-    assert.equal(record.status, "running");
+    assert.equal(record.status, "running", `${record.errorType || ""}: ${record.errorReason || ""}`);
     assert.equal(record.abortController.signal.aborted, false);
     const db = new I.DatabaseSync(I.stateDbPath(cwd));
     try {
@@ -264,7 +264,7 @@ try {
   for (const { name, body } of cases) {
     const began = Date.now();
     try { await body(); console.log(`PASS ${name} (${Date.now() - began} ms)`); }
-    catch (error) { failures += 1; console.error(`FAIL ${name}\n${error.stack || error}`); }
+    catch (error) { failures += 1; console.error(`FAIL ${name} (${Date.now() - began} ms)\n${error.stack || error}`); }
     finally {
       for (const record of I.QUEUE_JOBS.values()) I.clearQueueLeaseFence(record);
       I.QUEUE_JOBS.clear();

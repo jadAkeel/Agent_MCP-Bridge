@@ -193,7 +193,7 @@ const requirement = (provider, model, variant) => ({ provider, model, ...(varian
 const runnerWriteJob = (modelRequirement, file = "src/a.txt", extra = {}) => writeJob(file, { scopeContract: { ...writeScope(file), modelRequirement }, ...extra });
 const runnerReadJob = (modelRequirement, extra = {}) => readJob({ scopeContract: { mode: "read", read: ["src/a.txt"], modelRequirement }, ...extra });
 const run = async (job) => textOf(await callTool("run_opencode_agent", { ...job, detail: true }));
-const errorTypeOf = (text) => /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || /^Error type: (\S+)/m.exec(text)?.[1] || "";
+const errorTypeOf = (text) => /^Status: \S+; error type: (\S+)/m.exec(text)?.[1] || /^Error type: (\S+)/m.exec(text)?.[1] || /^errorType: (\S+)/m.exec(text)?.[1] || "";
 const cooldownKeys = async () => new Set(((await providerCapacitySnapshot()).cooldowns || []).map((item) => item.providerKey));
 const resumeAll = async () => { for (const provider of ["codex", "agy", "openai"]) await resumeProvider({ provider }); };
 

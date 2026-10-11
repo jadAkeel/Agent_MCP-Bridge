@@ -35,8 +35,13 @@ function fixtureEnv(name) {
     CODEX_OPENCODE_EXECUTABLE: path.join(base, "disabled-opencode-fixture") };
 }
 const parentEnv = fixtureEnv("parent");
+const ledgerTemp = Object.fromEntries(["TEMP", "TMP", "TMPDIR"].map(key => [key, process.env[key]]));
 for (const key of Object.keys(process.env)) if (/^(CODEX_OPENCODE_|OPENCODE_)/i.test(key)) delete process.env[key];
 Object.assign(process.env, parentEnv);
+// finishSkips must append to the gate's shared PPID/temp ledger; only the stdio child needs its own temp.
+for (const [key, value] of Object.entries(ledgerTemp)) {
+  if (value === undefined) delete process.env[key]; else process.env[key] = value;
+}
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 const { __selfTest } = await import("../server.js");
 const I = __selfTest.internals;

@@ -28,3 +28,6 @@ Thumbs.db
 
 # Release gate receipts (bin/release-gate.js)
 .release-gate/
+
+# Per-command test output and duration reports
+.test-logs/

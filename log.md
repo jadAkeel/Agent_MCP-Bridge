@@ -14,6 +14,14 @@ How a fix lands: edit and test in the `C:\Users\<you>\bridge-fixes` worktree (br
 then, with the user's explicit approval, `git merge --ff-only bridge/migration-fixes` in the live
 tree and `node bin/release-activate.js --sync-clients`, then restart the clients.
 
+## 2026-10-11
+
+### Waste reduction: reproducible, bounded complete gate
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-208 | The complete gate inherited the operator's XDG config, stopped at the first failure and had no per-command timing or watchdog. Naive parallelism inflated long-suite times; an in-checkout TEMP changed non-Git fixtures into Git projects. | A shell chain, ambient configuration, shared mutable profiles, unbounded/sequential profile copying and overly broad heavy-suite scheduling. | `npm test` now runs the preserved 162 original argv groups plus two regression suites through direct Node children: syntax 8, suites 3, at most 2 of the 4 longest files, with 15 timing-sensitive suites exclusive. Per-file logs/results, a 15-minute owned-tree watchdog, continued checks after failure and the original skip ledger remain; private profiles/TEMP are outside Git, bounded link-refusing copies exclude histories, and successful runs clean their own fixtures. Robustness forces its own empty XDG config. Narrow consumer/fixture prerequisites preserve deferred-cleanup, error and artifact assertions; combined catalogue remains 32,347 bytes under unchanged caps. Final uninterrupted `npm test`: 164/164 commands passed, zero failures/timeouts, server self-test passed, runner 11/11, robustness isolation 2/2, friend runtime 10/10; 4 optional skips, 0 required and no skip override. Whole npm invocation 1,650,122 ms (27.50 min), runner including preparation/cleanup 1,647,997 ms (27.47 min), cleanup 21,726 ms; the <35 min acceptance is met. Failed/interrupted trials and one unproven intermittent friend-runtime failure remain documented, with diagnostic-only instrumentation. Host load varies, so these are observed acceptance times, not a controlled speedup claim. Report: `C:/Users/10User/bridge-reports/waste-round/item-5.md`. | `bridge/waste-5-gate` | fixed, verified; not deployed |
+
 ## 2026-10-10
 
 ### Waste reduction: compact tool discovery
