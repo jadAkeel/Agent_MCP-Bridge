@@ -38,6 +38,11 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 | --- | --- | --- | --- | --- |
 | B-211 | Compact pipeline gates advertised a nonexistent audit lookup, and unbounded unsafe/rejection paths displaced stored reports. | Internal gate execution requests detail:true and persists full redacted bridge evidence in pipeline records. Compact path lists use the existing 40-entry bound; detail and validation arrays stay complete within existing caps. Real executor/finalizer/SQLite reviewer/tester persistence regression and 500-path storage regression pass: compact 11/11, pipelines 30/30, zero skips. Docs cover unsafe lines, rejection names and enqueue detail's no-op. | bridge/waste-2-results | fixed, not deployed |
 
+### Integrator correction: item 3
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-212 | Advisory pause checks accepted a requested-role pin that sanitized routing forbids. | Sanitized direct/queued requests bypass advisory pause lookups and reach fixed-reader policy validation. Real manifest/executor/SQLite queue regression preserves configured_model_requirement_mismatch with no payload or pause accounting; scheduler coverage also guards model lists. Pause10/10, fallback17/17, quota8/8; zero skips. Existing B-132/B-134 release logic and authoritative lease checks unchanged. Docs state deferred preflight errors and the 5-second snapshot contention deadline. | bridge/waste-3-pauses | fixed, not deployed |
 
 ## 2026-10-10
 

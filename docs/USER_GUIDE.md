@@ -292,6 +292,7 @@ between jobs (log.md B-060, B-061, Q-005 to Q-010):
   with `set_opencode_concurrency({ providerLimits: { codex: 5, agy: 2 } })` (`null` clears one,
   `reset: true` clears all); the queue worker and the other client pick it up within seconds.
 - **Already-paused models.** A job pinned to an allowlisted model fails before preparing its worktree or reading agent metadata when that model, its provider or a shared quota is already paused. This refusal does not spend a retry attempt within the existing pause-wait limit. The queue holds a job before claiming it when all its models are paused and resumes it when one becomes available. A free fallback keeps the job eligible, and an unpinned builder keeps its existing fallback behavior.
+  Sanitized requests bypass this advisory check because their fixed reader cannot accept model overrides; invalid pins reach the existing policy error. For other accepted pins, a pause can defer a permanent preflight error until the pause ends. Each direct pinned job's provider snapshot can wait up to 5 seconds under database contention before failing open.
 - **Shared quotas.** With `CODEX_OPENCODE_QUOTA_GROUPS=chatgpt:codex,openai` a rate limit on
   either side (the codex runner or an OpenCode `openai/...` model) pauses both, and a job with
   `models: ["codex/...", "openai/..."]` waits for the pause instead of trying the other one.
