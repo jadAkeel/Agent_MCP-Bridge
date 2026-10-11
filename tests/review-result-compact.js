@@ -118,6 +118,22 @@ test("caller wait limits, provider failures, rate-limit pause and unenforced rol
   for (const token of ["provider_slot_wait_limit_exceeded", "clamped from 5000", "holder-id", "provider_rate_limited", "fixture:default paused until tomorrow (pause 2)", "Role enforcement: none", "not checked", "Permission denials observed: 1", "original pause preserved"]) assert.ok(text.includes(token), token);
 });
 
+test("hundreds of unsafe paths do not displace the stored report or its rejection verdict", () => {
+  const unsafeFiles = Array.from({ length: 500 }, (_, index) => `outside/${String(index).padStart(3, "0")}-${"x".repeat(25)}.js`);
+  const rejection = { headline: "OpenCode result rejected.", errorType: "worktree_changed_file_validation_error",
+    conflictingPaths: unsafeFiles, disallowedFiles: unsafeFiles, unresolvedFiles: unsafeFiles, rollback: "failed" };
+  const views = viewsFor({ changedFiles: unsafeFiles, stdout: "REPORT START\nCritical report evidence.\nREPORT END" }, {
+    unsafeFiles, lockViolation: `\nWrite lock verification:\n${formatter.formatRejectedExecution(rejection)}`,
+    compactLockViolation: `\nWrite lock verification:\n${formatter.formatRejectedExecution({ ...rejection, compactPaths: true })}`,
+  });
+  const line = views.compact.split("\n").find(line => line.startsWith("Unsafe changed files:"));
+  assert.ok(line.includes(unsafeFiles[39])); assert.ok(!line.includes(unsafeFiles[40])); assert.match(line, /\(\+460 more\)/);
+  const fitted = formatter.fitRedactedJobResult(views.storedParts, 12_000);
+  assert.equal(fitted.reportTruncated, false);
+  for (const evidence of ["REPORT END", "OpenCode result rejected.", "worktree_changed_file_validation_error", "rollback: failed", "(+460 more)"]) assert.ok(fitted.text.includes(evidence), evidence);
+  assert.ok(views.detailText.includes(unsafeFiles.at(-1)), "full detail keeps all underlying rejection evidence");
+});
+
 test("dependency absence and bare headings add no request marker; malformed payload keeps one", () => {
   for (const stdout of ["DEPENDENCY_REQUIRED None.", "DEPENDENCY_REQUIRED\nNone."]) {
     const lines = formatter.compactJobLines({ resolution, result: { ...normal, stdout } });

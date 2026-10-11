@@ -32,6 +32,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 | ID | Problem | Cause | Change / verification | Branch | Status |
 | --- | --- | --- | --- | --- | --- |
 | B-209 | A max-age-zero pre-spawn policy read could reuse plugin fingerprints from before a provider wait. Boundary tests did not prove warm discovery closed before locks/worktrees. | `runAgent` opened a new scope across the whole provider wait/retry/reroute lifecycle. Cache misses in test setup could also close discovery automatically and conceal a deleted explicit close. | Remove only the run-agent scope; retain warm discovery and its explicit pre-setup close. Three regressions use the actual server cache/key builder, real Git worktrees and exact equal-size/restored-mtime plugin bytes; the max-age-zero slot-wait case reproduces the original payload bypass, then refuses before a second metadata read and releases the granted lease. An actual deletion mutation of the discovery-close call fails the warm boundary regression (22/23), restored code passes 23/23, zero skips. Latency12, attestation-cache7 and measurement13 also pass; syntax/diff checks pass. Policy-byte and payload seams are simulated; native plugin-policy coverage remains in the existing suites. Parallel tools retain their original per-lookup cost; no default-path saving is claimed for removing the run scope. | `bridge/waste-1-attestation` | fixed, verified; not deployed |
+### Integrator correction: item 2
+
+| ID | Problem | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- |
+| B-211 | Compact pipeline gates advertised a nonexistent audit lookup, and unbounded unsafe/rejection paths displaced stored reports. | Internal gate execution requests detail:true and persists full redacted bridge evidence in pipeline records. Compact path lists use the existing 40-entry bound; detail and validation arrays stay complete within existing caps. Real executor/finalizer/SQLite reviewer/tester persistence regression and 500-path storage regression pass: compact 11/11, pipelines 30/30, zero skips. Docs cover unsafe lines, rejection names and enqueue detail's no-op. | bridge/waste-2-results | fixed, not deployed |
+
 
 ## 2026-10-10
 

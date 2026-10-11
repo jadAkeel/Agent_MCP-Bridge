@@ -646,6 +646,34 @@ test("4: run_opencode_agent passes allowFallbackToBuild, subagentStrategy and pr
   assert.deepEqual(resolveCalls.at(-1), { requestedAgent: "reviewer", allowFallbackToBuild: true, subagentStrategy: "proxy", proxyAgent: "architect" });
 });
 
+test("B-211: reviewer and tester full bridge evidence survives pipeline persistence without a job lookup", async () => {
+  const previousGate = selfTestHooks.pipelineGateExecutorTestHook, previousRuntime = selfTestHooks.agentRuntimeTestHook;
+  try {
+    selfTestHooks.pipelineGateExecutorTestHook = null;
+    for (const failedReviewer of [false, true]) {
+      await resetRepo(); installRuntime();
+      const original = selfTestHooks.agentRuntimeTestHook.runOpenCodeWithPolicy;
+      selfTestHooks.agentRuntimeTestHook.runOpenCodeWithPolicy = async (...args) => {
+        const result = await original(...args);
+        result.stdout = `Stored ${args[0]} report.\nGATE_VERDICT: ${failedReviewer && args[0] === "reviewer" ? "fail" : "pass"}`;
+        return result;
+      };
+      const record = pipelineRecord(`full-gates-${failedReviewer}`, { status: "awaiting_finalization",
+        reviewerJob: { agent: "reviewer", task: "Review.", detail: false }, testerJob: { agent: "tester", task: "Test.", detail: false } });
+      await persistPipelineRecord(record);
+      const outcome = await finalizePipelineRecord(record);
+      assert.equal(outcome.ok, !failedReviewer, outcome.errorType);
+      const persisted = await readPersistedPipelineRecord(record.pipelineId, repo);
+      for (const name of ["reviewer", "tester"]) {
+        const gate = persisted[`${name}Result`];
+        for (const evidence of [`Requested agent: ${name}`, "Configured model: model-a", "Timing ms:", "OpenCode final response verification:", "Accepted.", `Stored ${name} report.`]) assert.ok(gate.text.includes(evidence), `${name}: ${evidence}`);
+        assert.ok(!gate.text.includes("get_opencode_job with detail: true returns the full bridge block"));
+        assert.equal(gate.status, failedReviewer && name === "reviewer" ? "failed" : "passed");
+      }
+    }
+  } finally { selfTestHooks.pipelineGateExecutorTestHook = previousGate; selfTestHooks.agentRuntimeTestHook = previousRuntime; }
+});
+
 test("5: queue assessment judges a reader by its read scope and a writer never conflicts with itself", async () => {
   const writerId = "review-running-writer";
   QUEUE_JOBS.set(writerId, { jobId: writerId, status: "running", mode: "write", cwd: repo, agent: "builder", lockedPaths: ["src/b.txt"], allowedEdits: ["src/b.txt"] });
