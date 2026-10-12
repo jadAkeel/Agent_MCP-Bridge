@@ -16,6 +16,12 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-11
 
+### Fix round 2, docs
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-242 | Docs disagreed with the code: run/enqueue descriptions pointed at the whole of docs/REFERENCE.md for the hidden contractor fields (L-1-F2-10); the dirt-policy passage said unrelated dirt always blocks; "re-attests immediately before spawn" ignored the cached final attestation; the get_opencode_job passage did not say that `resultDetailTextChars` means two things; only one slot-wait expiry type was named; the attestation cache TTL was given as 30 min in USER_GUIDE; claude/CLAUDE.md stated "currently 4" slots (code default 2) and promised a patch preview for parallel Run ids; e2e scripts could leave credential files in a retained %TEMP% fixture. | Docs not updated with the code; the e2e fixtures were kept on failure as a whole. | Descriptions now point to `docs/REFERENCE.md#orchestrator-modes`, which lists the three fields and their refusals (tools/list 31,402 -> 31,426 B; tools-list-budget 13/13). REFERENCE: `strict` default vs `unrelated_ok` from setup; the final attestation rule (before the slot, repeated after a long wait, reuse under `CODEX_OPENCODE_ATTESTATION_FINAL_MAX_AGE_MS`, fresh for pure runtimes); diagnostics may be middle-cut, the report only at its end; `resultDetailTextChars` is the pre-cap length for queue jobs and the retained length for Run ids; parallel writers carry no preview. REFERENCE, USER_GUIDE and claude/CLAUDE.md name `provider_slot_wait_timeout` (no `maxWaitMs`) and `provider_slot_wait_limit_exceeded` (`maxWaitMs` set). bin/e2e.js and bin/e2e-contractor.js remove auth.json, account.json and antigravity-accounts.json from the fixture on success, failure, throw (exit event) and SIGINT/SIGTERM/SIGHUP/SIGBREAK; `node --check` only, not run (live providers). | `bridge/fix2-gate` | fixed, not deployed |
+
 ### Fix round 2, batch E: everything before the agent starts (ledger L-1-F1a-*)
 
 | ID | Problem | Cause | Change / verification | Branch | Status |

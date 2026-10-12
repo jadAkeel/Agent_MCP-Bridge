@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { lstatSync, readdirSync, rmSync } from "node:fs";
+import { constants as osConstants, homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,6 +16,68 @@ const execFileAsync = promisify(execFile);
 const keepFixture = process.argv.includes("--keep");
 const MCP_TOOL_TIMEOUT_MS = 25 * 60 * 1000;
 const serverEntrypoint = resolveServerEntrypoint();
+
+// The operator's OpenCode auth content reaches the bridge only through OPENCODE_AUTH_CONTENT, but
+// OpenCode can write (refreshed) credentials into the fixture's XDG data home. A retained fixture
+// keeps its evidence, never a credential file: success, failure, a throw and a signal all remove them.
+const CREDENTIAL_FILE_NAMES = new Set(["auth.json", "account.json", "antigravity-accounts.json"]);
+
+function scrubFixtureCredentials(root) {
+  const removed = [];
+  const failures = [];
+  const walk = (directory) => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") failures.push(`${directory}: ${error?.message || error}`);
+      return;
+    }
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name);
+      let info;
+      try {
+        info = lstatSync(file);
+      } catch (error) {
+        if (error?.code !== "ENOENT") failures.push(`${file}: ${error?.message || error}`);
+        continue;
+      }
+      if (CREDENTIAL_FILE_NAMES.has(entry.name.toLowerCase()) && !info.isDirectory()) {
+        try {
+          rmSync(file, { force: true });
+          removed.push(file);
+        } catch (error) {
+          failures.push(`${file}: ${error?.message || error}`);
+        }
+      } else if (info.isDirectory() && !info.isSymbolicLink()) {
+        walk(file);
+      }
+    }
+  };
+  walk(root);
+  return { removed, failures };
+}
+
+// Synchronous, so it also runs from the exit event (a throw or process.exit) and from a signal.
+function guardFixtureCredentials(root) {
+  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+  const onSignal = (signal) => {
+    scrubFixtureCredentials(root);
+    process.stderr.write(`Interrupted by ${signal}; credential files removed from the fixture ${root}.\n`);
+    process.exit(128 + (osConstants.signals[signal] || 1));
+  };
+  for (const signal of signals) process.on(signal, onSignal);
+  process.on("exit", () => scrubFixtureCredentials(root));
+}
+
+function reportRetainedFixtureCredentials(root) {
+  const { removed, failures } = scrubFixtureCredentials(root);
+  if (removed.length) process.stdout.write(`Credential files removed from the retained fixture: ${removed.join(", ")}\n`);
+  if (failures.length) {
+    process.stderr.write(`Could not clear credential files from the retained fixture: ${failures.join("; ")}\n`);
+    process.exitCode = 1;
+  }
+}
 
 async function configurePureOpenCodeAgents(agentDirectory) {
   for (const name of await readdir(agentDirectory)) {
@@ -106,6 +169,7 @@ async function boundedJsonFile(filePath, maxBytes) {
 async function main() {
   const tempBase = path.resolve(tmpdir());
   const fixtureRoot = await mkdtemp(path.join(tempBase, "codex-opencode-e2e-"));
+  guardFixtureCredentials(fixtureRoot);
   const repo = path.join(fixtureRoot, "repo");
   const stateDir = path.join(fixtureRoot, "state");
   const configHome = path.join(fixtureRoot, "config-home");
@@ -347,6 +411,7 @@ async function main() {
       await rm(resolvedFixture, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     } else {
       process.stdout.write(`E2E fixture retained at: ${resolvedFixture}\n`);
+      reportRetainedFixtureCredentials(resolvedFixture);
     }
   }
 }
