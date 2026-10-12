@@ -731,9 +731,17 @@ test("Q-004: without the option a failed validation is final", async () => {
 
 test("Q-004: the pass is skipped, and says why, when too little of the job timeout is left", async () => {
   const runs = installAgentRuntime(async ({ cwd }) => writeFile(path.join(cwd, "src", "a.txt"), "trailing \n", "utf8"));
+  const started = performance.now();
   const text = await runDirect(fixWriteJob("src/a.txt", { validationFixPasses: 1, timeoutMs: 30000 }));
+  const elapsedMs = performance.now() - started;
   assert.equal(runs.length, 1);
-  assert.match(text, /Validation fix pass: skipped \(only 30 s of the job timeout are left \(a pass needs 60 s\)\)/);
+  const reason = /Validation fix pass: skipped \(only (\d+) s of the job timeout are left \(a pass needs 60 s\)\)/.exec(text);
+  assert.ok(reason, text);
+  // Post-agent checks consume real time, so a loaded host can correctly report 29 s here.
+  // Bound that value by the measured whole journey rather than assuming zero elapsed time.
+  const remainingSeconds = Number(reason[1]);
+  assert.ok(remainingSeconds <= 30 && remainingSeconds >= Math.max(0, Math.round((30000 - elapsedMs) / 1000)),
+    `reported ${remainingSeconds} s after ${elapsedMs} ms of a 30000 ms job`);
   assert.match(text, /^Status: failed; error type: validation_command_failed$/m);
   await cleanRetainedWorktrees();
 });
