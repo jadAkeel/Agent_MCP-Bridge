@@ -716,7 +716,7 @@ async function runSelfTests() {
     }
   );
   assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "manual" } }).errorType, "manual_lock_misuse");
-  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "legacy" } }).errorType, "manual_lock_misuse");
+  assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "legacy" } }).errorType, "write_lock_conflict");
   assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "internal" } }, { queueConflict: true }).errorType, "queue_lock_conflict");
   assert.equal(directExecutionLockConflictDetails({ conflict: { origin: "internal" } }, { lockType: "read" }).errorType, "read_lock_conflict");
   const disjointDirtyDetails = dirtyCheckpointDetails({

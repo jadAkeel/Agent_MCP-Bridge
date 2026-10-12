@@ -90,6 +90,39 @@ test("B-040: an expired pause is dropped and the provider takes jobs again", asy
   await internals.releaseProviderLease(lease.lease);
 });
 
+test("L-2-F7-8: the pause deadline returned, logged and shared is the stored one", async () => {
+  const key = `${internals.CONFIG.providerConcurrencyKey}:review-stored-deadline`;
+  const first = await internals.recordProviderCooldown({ providerKey: key, durationMs: 60 * 60_000, errorType: "opencode_quota_exhausted", reason: "origin pause" });
+  assert.equal(first.recorded, true);
+  const second = await internals.recordProviderCooldown({ providerKey: key, durationMs: 10 * 60_000, errorType: "opencode_quota_exhausted", reason: "shorter pause" });
+  assert.equal(second.recorded, true);
+  assert.equal(second.untilAt, first.untilAt, "a shorter request keeps the stored deadline and reports it");
+  const db = await internals.openProviderLeaseDb({ deadlineAt: Date.now() + 5000 });
+  try {
+    const stored = db.prepare("SELECT until_at FROM provider_cooldowns WHERE provider_key = ?").get(key);
+    assert.equal(Number(stored.until_at), first.untilAt, "the reported deadline is the persisted one");
+  } finally {
+    internals.closeDb(db);
+  }
+  // Quota-group members paused from the reported deadline share the origin's moment.
+  const member = `${internals.CONFIG.providerConcurrencyKey}:review-stored-member`;
+  const shared = await internals.recordProviderCooldown({ providerKey: member, untilAt: second.untilAt, errorType: "provider_rate_limited", reason: "quota group" });
+  assert.equal(shared.recorded, true);
+  assert.equal(shared.untilAt, first.untilAt, "members share one absolute deadline with the origin");
+});
+
+test("L-2-F7-1: a model-less tool rate-limit line is not a provider diagnostic; a real 429 is", () => {
+  const MUSE = "muse-spark-1.3-contributor-free";
+  const stepStart = JSON.stringify({ type: "step_start", sessionID: "ses_A" });
+  const identity = { provider: "opencode", model: MUSE, agent: "builder" };
+  const webfetch = 'timestamp=2026-10-02T18:05:25.000Z level=ERROR service=webfetch error="Rate limit exceeded. Please try again later."';
+  const webfetchInspection = internals.inspectOpenCodeEventStream(stepStart, webfetch, identity);
+  assert.notEqual(webfetchInspection.providerErrorType, "opencode_rate_limited", "a tool's own rate-limit line pauses nothing");
+  const real429 = `timestamp=2026-10-02T18:05:23.000Z level=ERROR run=x message="stream error" providerID=opencode modelID=${MUSE} session.id=ses_A small=false agent=builder mode=all error.error="APIError: HTTP 429 Too Many Requests: Rate limit exceeded"`;
+  const realInspection = internals.inspectOpenCodeEventStream(stepStart, real429, identity);
+  assert.equal(realInspection.providerErrorType, "opencode_rate_limited", "a real provider 429 still pauses as today");
+});
+
 test("B-040: zero or missing reset time records no pause", async () => {
   assert.equal((await internals.recordProviderCooldown({ providerKey: "review-quota-zero:google", durationMs: 0, errorType: "opencode_quota_exhausted" })).recorded, false);
 });

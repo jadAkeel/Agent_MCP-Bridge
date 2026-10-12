@@ -17,7 +17,7 @@ process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2";
 process.env.CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS = "25";
 process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 const scratch = await mkdtemp(path.join(tmpdir(), "review-provider-wait-"));
-process.env.CODEX_OPENCODE_STATE_DIR = scratch;
+delete process.env.CODEX_OPENCODE_STATE_DIR;
 const { __selfTest } = await import("../server.js");
 const I = __selfTest.internals;
 __selfTest.hooks.stateDirectoryOverride = scratch;
@@ -140,14 +140,17 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
     process.argv.push("--self-test");
     const { __selfTest } = await import(${JSON.stringify(pathToFileURL(path.resolve("server.js")).href)});
     const I = __selfTest.internals;
+    __selfTest.hooks.stateDirectoryOverride = ${JSON.stringify(scratch)};
     const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: 1000 });
     if (!result.ok) throw new Error(JSON.stringify(result));
     process.send({ lease: result.lease, pid: process.pid });
     process.on("disconnect", () => process.exit(0));
   `);
   const identities = [];
+  const holderEnv = { ...process.env };
+  delete holderEnv.CODEX_OPENCODE_STATE_DIR;
   for (let index = 0; index < 2; index++) {
-    const child = fork(workerPath, [], { env: process.env, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const child = fork(workerPath, [], { env: holderEnv, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     workerProcesses.push(child);
     const identity = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Slot holder startup timed out")), 10000);
@@ -245,6 +248,109 @@ test("global cap names holders on other providers", async () => {
     assert.equal(result.waitInfo.holders, 0); assert.equal(result.waitInfo.globalWorkers.held, 2);
     assert.equal(result.waitInfo.holderDetails.length, 2);
   } finally { await I.setRuntimeConcurrency({ globalWorkerLimit: 0 }); }
+});
+test("L-2-F7-2: a quarantined holder never fails the waiter; diagnostics name the quarantine", async () => {
+  await reset(); await holders();
+  const now = Date.now();
+  await db(handle => {
+    handle.prepare("INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("quarantine-1", key, "bridge-gone", 2 ** 30, now - 5000, now - 1000, Number.MAX_SAFE_INTEGER,
+        JSON.stringify({ complete: false, recordedAt: now }));
+  });
+  const started = Date.now();
+  const result = await I.acquireProviderLease({ providerKey: key, timeoutMs: 2000, maxWaitMs: 500 });
+  const elapsed = Date.now() - started;
+  assert.notEqual(result.errorType, "provider_concurrency_failed", JSON.stringify(result));
+  assert.equal(result.errorType, "provider_slot_wait_limit_exceeded");
+  assert.ok(elapsed >= 450 && elapsed < 2000, `waited the budget instead of failing at once: ${elapsed} ms`);
+  const quarantined = (result.waitInfo.holderDetails || []).filter(holder => holder.quarantined);
+  assert.equal(quarantined.length, 1, JSON.stringify(result.waitInfo.holderDetails));
+  assert.equal(quarantined[0].expiresAt, "quarantined (no expiry)");
+  assert.equal(quarantined[0].expiresInMs, null);
+  assert.equal(result.waitInfo.holderCount, 3);
+  assert.equal(result.waitInfo.holderDetailsOmitted, 0);
+});
+test("L-2-F7-2: a quarantine on another provider never fails a waiter under the global cap", async () => {
+  await reset(); await holders();
+  const now = Date.now();
+  await db(handle => {
+    handle.prepare("INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("quarantine-global", key, "bridge-gone", 2 ** 30, now - 5000, now - 1000, Number.MAX_SAFE_INTEGER,
+        JSON.stringify({ complete: false, recordedAt: now }));
+  });
+  assert.equal((await I.setRuntimeConcurrency({ globalWorkerLimit: 3 })).ok, true);
+  try {
+    const result = await I.acquireProviderLease({ providerKey: "another-provider", timeoutMs: 2000, maxWaitMs: 300 });
+    assert.notEqual(result.errorType, "provider_concurrency_failed", JSON.stringify(result));
+    assert.equal(result.errorType, "provider_slot_wait_limit_exceeded");
+    assert.ok((result.waitInfo.holderDetails || []).some(holder => holder.quarantined === true), JSON.stringify(result.waitInfo.holderDetails));
+  } finally { await I.setRuntimeConcurrency({ globalWorkerLimit: 0 }); }
+});
+test("L-2-F7-3: maxWaitMs is one job-wide budget shared by every slot wait of the job", async () => {
+  await reset(); await holders();
+  const waitBudget = {};
+  const attempt = () => I.providerSlotWaitStorage.run({ jobId: `job-wide-${Math.random()}` },
+    () => I.acquireProviderLease({ providerKey: key, timeoutMs: 2000, maxWaitMs: 1500, waitBudget }));
+  const started = Date.now();
+  const first = await attempt();
+  const second = await attempt();
+  const total = Date.now() - started;
+  assert.equal(first.errorType, "provider_slot_wait_limit_exceeded");
+  assert.equal(second.errorType, "provider_slot_wait_limit_exceeded");
+  assert.ok(first.waitedMs >= 1400, `first wait spent the shared budget: ${first.waitedMs} ms`);
+  assert.ok(second.waitedMs < 400, `second wait had no budget left: ${second.waitedMs} ms`);
+  assert.ok(total >= 1400 && total < 2200, `two waits share one 1,500 ms budget, not two: ${total} ms`);
+  console.log(`Two waits with maxWaitMs=1,500 shared one budget: ${total} ms total`);
+});
+test("L-2-F7-3: without maxWaitMs the provider default is the job-wide budget the same way", async () => {
+  await reset(); await holders();
+  const waitBudget = {};
+  const attempt = () => I.providerSlotWaitStorage.run({ jobId: `job-wide-default-${Math.random()}` },
+    () => I.acquireProviderLease({ providerKey: key, timeoutMs: 400, waitBudget }));
+  const started = Date.now();
+  const first = await attempt();
+  const second = await attempt();
+  const total = Date.now() - started;
+  assert.equal(first.errorType, "provider_slot_wait_timeout");
+  assert.equal(second.errorType, "provider_slot_wait_timeout");
+  assert.ok(total >= 350 && total < 900, `two waits share one 400 ms default budget, not two: ${total} ms`);
+});
+test("L-2-F7-4: cancel during quarantine reclaim is honoured within ~100ms", async () => {
+  const directory = await mkdtemp(path.join(scratch, "reclaim-cancel-"));
+  const runtime = createProviderLeaseRuntime({ ...I, BRIDGE_INSTANCE_ID: "reclaim-cancel",
+    CONFIG: { ...I.CONFIG, providerConcurrencyLimit: 1, providerLeasePollMs: 25, globalWorkerLimit: 0 },
+    RUNTIME_CONCURRENCY: { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, providerLimits: new Map() },
+    effectiveBridgeStateDirectory: () => directory,
+    reclaimProvenGoneProviderQuarantines: async () => { await sleep(1500); return 0; },
+  });
+  // The fill uses a budget longer than the slow reclaim so the slot is held first.
+  const held = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 5000 });
+  assert.equal(held.ok, true, JSON.stringify(held));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 100);
+  try {
+    const started = Date.now();
+    const result = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 10000, maxWaitMs: 10000, signal: controller.signal });
+    const elapsed = Date.now() - started;
+    console.log(`Cancel during a 1.5 s reclaim honoured after ${elapsed} ms`);
+    assert.equal(result.errorType, "agent_cancelled");
+    assert.ok(elapsed < 1000, `cancel honoured late: ${elapsed} ms`);
+  } finally { clearTimeout(timer); await runtime.releaseProviderLease(held.lease); }
+});
+test("L-2-F7-4: cancel after the grant never starts the post-grant re-attestation and releases the slot", async () => {
+  const controller = new AbortController();
+  const h = harness({ waitedMs: 120000, revalidateAfterMs: 60000, finalMaxAgeMs: 60000 }, {
+    acquireProviderLease: async () => {
+      controller.abort();
+      return { ok: true, lease: { id: "lease-1", expiresAt: Date.now() + 60000 }, waitedMs: 120000 };
+    },
+  });
+  const result = await h.runtime.runOpenCode("builder", "work", scratch, false, 120000, { signal: controller.signal,
+    agentMetadata: { ok: true, metadata: h.metadata, pluginPolicy: { ok: true }, attestationKey: "recent", attestedAtMs: Date.now() } });
+  assert.equal(result.errorType, "agent_cancelled");
+  assert.ok(!h.calls.includes("spawn"), "no agent started");
+  assert.ok(h.calls.includes("lease.release"), "the granted slot was released");
+  assert.equal(h.calls.filter(call => call === "attest.reuse").length, 1, "only the pre-lease attestation ran");
 });
 test("parallel expiry does not cancel another provider's job", async () => {
   await reset(); await holders();
@@ -443,6 +549,58 @@ test("wait handle closes on grant, pause, cancellation, query failure and thrown
       assert.equal(profile.closes, 1, outcome);
       assert.equal(runtime.providerSlotWaitingJobs.size, 0, outcome);
     } finally { clearTimeout(timer); }
+  }
+});
+
+test("L-1-F1b-7/12: terminal supervisor failures quarantine once and preserve evidence", async () => {
+  for (const type of ["process_supervisor_exited_without_result", "process_supervisor_watchdog_expired", "process_supervisor_protocol_error"]) {
+    let captures = 0;
+    const evidence = JSON.stringify({ pids: [123], complete: false });
+    const h = harness({}, {
+      runSpawnCommand: async () => ({ stdout: "", stderr: "", exitCode: 1, processTreeUnconfirmed: true,
+        treeTerminationConfirmed: false, terminationErrorType: type }),
+      containmentRecord: async () => { captures++; return evidence; },
+      quarantineProviderLease: async (_lease, record) => { assert.equal(record, evidence); return { ok: true }; },
+      classifyResultError: value => value.terminationErrorType,
+    });
+    const result = await h.runtime.runOpenCode("builder", "task", scratch, false, 60000);
+    assert.equal(result.errorType, type);
+    assert.equal(result.containmentEvidence, evidence);
+    assert.equal(result.providerQuarantine.ok, true);
+    assert.equal(captures, 1);
+    assert.equal(h.calls.includes("lease.release"), false);
+  }
+});
+test("L-1-F1b-11: late admission before or during commit leaves no lease", async () => {
+  for (const stage of ["decision", "commit"]) {
+    const directory = await mkdtemp(path.join(scratch, `late-${stage}-`));
+    const wrapped = new WeakSet();
+    const holdPastDeadline = () => { const end = performance.now() + 100; while (performance.now() < end) {} };
+    const config = { ...I.CONFIG, globalWorkerLimit: 0 };
+    let capacityReads = 0;
+    if (stage === "decision") Object.defineProperty(config, "providerConcurrencyLimit", { get: () => {
+      if (++capacityReads > 1) holdPastDeadline();
+      return 2;
+    } });
+    const runtime = createProviderLeaseRuntime({ ...I, CONFIG: config, BRIDGE_INSTANCE_ID: `late-${stage}`,
+      RUNTIME_CONCURRENCY: { providerLimit: null, queueParallelLimit: null, globalWorkerLimit: null, providerLimits: new Map() },
+      effectiveBridgeStateDirectory: () => directory,
+      reclaimProvenGoneProviderQuarantines: async () => 0,
+      ensureTableColumn: (handle, ...args) => {
+        I.ensureTableColumn(handle, ...args);
+        if (stage !== "commit" || wrapped.has(handle)) return;
+        wrapped.add(handle);
+        const exec = handle.exec.bind(handle);
+        handle.exec = sql => { const result = exec(sql); if (sql === "COMMIT") holdPastDeadline(); return result; };
+      },
+    });
+    const result = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 1000, maxWaitMs: 80 });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.errorType, "provider_slot_wait_limit_exceeded");
+    console.log(`Late ${stage} grant: ${result.waitedMs} ms against maxWaitMs=80; refused and released`);
+    const handle = await runtime.openProviderLeaseDb();
+    try { assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM provider_leases").get().n, 0); }
+    finally { I.closeDb(handle); }
   }
 });
 

@@ -37,8 +37,8 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.equal(packageJson.scripts.test, "node bin/test-runner.js");
   const commands = parseCommandChain(packageJson.scripts["test:commands"]);
   validateGateManifest(commands);
-  assert.equal(commands.length, 164);
-  const additions = ["tests/review-test-runner.js", "tests/review-mcp-robustness-isolation.js"];
+  assert.equal(commands.length, 169);
+  const additions = ["tests/review-test-runner.js", "tests/review-mcp-robustness-isolation.js", "lib/result-text.js", "lib/tools-call-errors.js", "tests/review-postrun.js", "tests/review-f2-results.js", "tests/review-prespawn.js"];
   const original = commands.filter(command => !command.argv.some(arg => additions.includes(arg))).map(command => command.argv);
   assert.equal(original.length, 162);
   assert.equal(createHash("sha256").update(JSON.stringify(original)).digest("hex"), "f8a95274918ebbe3953c2894b8d38e3a8772bf02e0a5d4de2276baefe931f36b");

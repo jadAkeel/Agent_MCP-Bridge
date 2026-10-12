@@ -182,7 +182,7 @@ test("L-025: the default parallel block is compact; detail: true appends the bri
   ]) assert.doesNotMatch(compact, unwanted);
 
   const detailed = textOf(await callTool("run_opencode_parallel", { jobs: [job], detail: true }));
-  for (const wanted of [/Bridge detail \(get_opencode_job with detail: true returns it later\):/, /Temporary lock acquired:/, /Lock mode:/, /Tool outcomes:/, /Timing ms: total=\d+/, /sharedSetup=\d+/, /Runtime-observed provider:/]) {
+  for (const wanted of [/Bridge detail \(get_opencode_job with detail: true returns any retained detail later\):/, /Temporary lock acquired:/, /Lock mode:/, /Tool outcomes:/, /Timing ms: total=\d+/, /sharedSetup=\d+/, /Runtime-observed provider:/]) {
     assert.match(detailed, wanted);
   }
   assert.ok(detailed.length > compact.length + 1500, `detail ${detailed.length} vs compact ${compact.length}`);
@@ -259,7 +259,7 @@ test("L-025: a single run_opencode_agent run is stored under its audit id; its p
   assert.doesNotMatch(view.resultText, /Requested agent mode:/);
   assert.match(view.resultText, /Assistant final response:\nEdited src\/b\.txt\.\nDIRECT-END/);
   assert.match(view.resultText, /Worktree diff stat:/);
-  assert.match(view.resultText, /Worktree patch preview: omitted from this view \(\d+ characters stored\)/);
+  assert.match(view.resultText, /Worktree patch preview: omitted from this view \(\d+ preview characters before storage fitting\)/);
   assert.doesNotMatch(view.resultText, /diff --git/);
   assert.ok(view.resultDetailTextChars > 5000, JSON.stringify({ chars: view.resultDetailTextChars }));
   const detailed = JSON.parse(textOf(await callTool("get_opencode_job", { jobId: runId, cwd: repo, detail: true })));
@@ -297,7 +297,7 @@ test("L-026: get_opencode_job for a finished writer leaves the patch preview out
   assert.notEqual(view.resultTextTruncated, true);
   assert.ok(view.resultText.includes(report), "the whole report, first line to last");
   assert.match(view.resultText, /Worktree diff stat:\n.*src\/a\.txt/);
-  assert.match(view.resultText, /Worktree patch preview: omitted from this view \(\d+ characters stored\)\. integrate_opencode_worktree with dryRun: true shows the patch; get_opencode_job with detail: true returns the stored preview\./);
+  assert.match(view.resultText, /Worktree patch preview: omitted from this view \(\d+ preview characters before storage fitting\)\. integrate_opencode_worktree with dryRun: true shows the patch; get_opencode_job with detail: true returns any retained preview\./);
   assert.doesNotMatch(view.resultText, /diff --git/);
   assert.doesNotMatch(view.resultText, /the middle was truncated/);
   assert.ok(view.resultText.length < 16000, `result text ${view.resultText.length}`);
@@ -335,23 +335,20 @@ test("L-026: fitJobResultText cuts the preamble before the report, and the repor
   const limit = 24000;
   const head = `HEAD-START\n${"preamble line\n".repeat(300)}HEAD-END`;
   const tail = "TAIL: worktree review\nTAIL: Write lock verification: Accepted.";
-  const standIn = "STAND-IN: agent reviewer; status completed";
 
-  const fits = fitJobResultText({ head, headStandIn: standIn, report: reportOf("R1", 8000), tail }, limit);
+  const fits = fitJobResultText({ head, report: reportOf("R1", 8000), tail }, limit);
   assert.equal(fits.reportTruncated, false);
-  assert.equal(fits.movedHead, "");
   assert.ok(fits.text.startsWith("HEAD-START"), "a result that fits is left as it is");
 
   const report = reportOf("R2", 21000);
-  const shortened = fitJobResultText({ head, headStandIn: standIn, report, tail }, limit);
+  const shortened = fitJobResultText({ head, report, tail }, limit);
   assert.ok(head.length + report.length + tail.length > limit);
   assert.equal(shortened.reportTruncated, false, "shortening the preamble is enough; no report was cut");
-  assert.equal(shortened.movedHead, head, "the preamble is handed back so it can be kept as detail");
-  assert.ok(shortened.text.includes(report) && shortened.text.includes(standIn) && shortened.text.includes(tail));
+  assert.ok(shortened.text.includes(report) && shortened.text.includes("HEAD-START") && shortened.text.includes(tail));
   assert.ok(shortened.text.length <= limit);
 
   const huge = reportOf("R3", 30000);
-  const cut = fitJobResultText({ head, headStandIn: standIn, report: huge, tail }, limit);
+  const cut = fitJobResultText({ head, report: huge, tail }, limit);
   assert.equal(cut.reportTruncated, true);
   assert.ok(cut.text.length <= limit, `fitted ${cut.text.length}`);
   assert.ok(cut.text.includes(tail), "the lines after the report are kept");
