@@ -61,6 +61,9 @@ Rules:
 - Shared and serial-only files require serial handling.
 - `lockType` is `read` or `write`. `serial_integration` (also spelled `serial` or `integration`) is the lock the bridge's own integration takes; an agent job that requests it is refused with `lock_type_reserved` (log.md B-110), and every lock type other than `read` is held to `allowedEdits` after execution.
 - A path with `[`, `]`, `{`, `}` or `!` but no `*` or `?` that names an existing file or directory (Next.js `app/[slug]/page.tsx`) is compared literally by every scope check: it allows itself and its descendants, not `app/s/page.tsx` (log.md B-111). Any other entry with those characters is a glob.
+- Literal bracket paths receive the same link and junction boundary checks as other paths, and a target outside the repository is refused.
+- Writable-scope recording stops enumeration at the 200,000-entry limit before statting an oversized directory's children, and a pre-agent refusal reports any failed worktree cleanup with its path.
+- Lock acquisition preserves `integration_recovery_pending`, reports path failures as `lock_path_unsafe`, `lock_path_ambiguous` or `lock_path_resolution_failed` and database failures as `lock_database_failed`, and uses `manual_lock_misuse` only for a conflicting manual lock.
 - `read` is guidance, not a restriction. The bridge prints it in the agent's prompt and uses it to decide whether a reader overlaps a writer, but nothing stops the agent from reading other files in the checkout or worktree: the managed agent profiles set no per-path read permission, and `external_directory: deny` only keeps them inside their working directory. Only edits are enforced. For real read isolation use a sanitized workspace (see [Sanitized Workspaces](#sanitized-workspaces)).
 
 ## Main Tools
@@ -428,6 +431,7 @@ For production, point the Codex MCP entry at a new published snapshot outside th
 
 ## Behaviour after the 2026-09-29 review
 
+- The in-process positive attestation cache retains at most 256 entries and evicts expired or least recently used entries.
 - Environment values are validated at startup: a choice variable (`CODEX_OPENCODE_WORKTREE_MODE`, `..._QUEUE_MODE`, `..._LOG_LEVEL`, ...) set to an unknown value stops the bridge with a message naming the allowed values instead of silently falling back. A numeric variable that is unset or empty keeps its default; any other value must be an integer in range (a `..._MS` value at most 2147483647, the timer limit), or the bridge stops at startup naming the variable (R-137).
 - Bridge git carries the operator's system/global `core.autocrlf`, `core.eol`, `core.safecrlf` and `core.symlinks` (repository-local values still win), treats every path it passes as a literal (`GIT_LITERAL_PATHSPECS=1`), and never runs repository-configured programs (`gpg.program`, `core.pager`, `core.fsmonitor` hooks, `diff.external`). Repository-local config that names such a program is refused (`git_repository_config_unsafe`).
 - Integration applies the patch to an isolated index and checks out only the patch paths; a conflict fails before any file of the checkout is written. Patches are handled as bytes. Rollback restores the exact pre-apply bytes.
