@@ -218,7 +218,7 @@ function executor(overrides = {}) {
   return createExecuteJobRuntime({ ...I, CONFIG: { ...I.CONFIG, worktreeMode: "off" },
     nowMs: () => Date.now(), logEvent: () => {}, makeQueueJobId: () => "prespawn-fixture", hardLockPathsForPlan: () => paths,
     combineAbortSignals: () => null, DEFAULT_SUBAGENT_PROXY_AGENT: "planner", updateRetainedWorktreeMeasurement: async () => {},
-    providerCapacitySnapshot: null, validateSingleLockPlan: () => ({ lockPlan }), verifyJobWorkspaceReadiness: async () => ({ ok: true }),
+    providerCapacitySnapshot: null, validateSingleLockPlan: () => ({ lockPlan }), validateSingleLockPlanAsync: async () => ({ lockPlan }), verifyJobWorkspaceReadiness: async () => ({ ok: true }),
     readOnlyRoutingPolicyError: () => null, sanitizedRoutingPolicyError: () => null, effectiveReadOnlyMetadataError: () => null,
     agentMetadataPolicyOptions: () => ({}), validationCommandPreflightError: async () => null,
     jobAgentRuntime: () => ({ resolveAgent, readAgentDebugMetadata: async () => metadata("builder") }),
