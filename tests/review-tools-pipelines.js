@@ -408,8 +408,8 @@ test("2+16+18: parallel writers: an empty worktree is removed, the deadline is r
 test("16: the parallel deadline covers retries and validation", async () => {
   const builder = { agent: "builder", lockType: "write", timeoutMs: 1000 * 60 * 30, validationCommand: "git diff --check" };
   const reader = { agent: "reviewer", lockType: "read", timeoutMs: 1000 * 60 * 3, validationCommand: "" };
-  assert.equal(parallelGroupDeadlineMs([builder]), 1000 * 60 * 30 + CONFIG.validationCommandTimeoutMs + 1000 * 60);
-  assert.equal(parallelGroupDeadlineMs([reader]), Math.max(CONFIG.readOnlyRetryMaxElapsedMs, 1000 * 60 * 3) + 1000 * 60);
+  assert.equal(parallelGroupDeadlineMs([builder]), 1000 * 60 * 30 + CONFIG.validationCommandTimeoutMs + CONFIG.providerWaitMaxMs + 1000 * 60);
+  assert.equal(parallelGroupDeadlineMs([reader]), Math.max(CONFIG.readOnlyRetryMaxElapsedMs, 1000 * 60 * 3) + CONFIG.providerWaitMaxMs + 1000 * 60);
 });
 
 test("17: a group-scope snapshot fault keeps every job result and Run id", async () => {
