@@ -228,7 +228,9 @@ test("B-018/B-020/B-021: parallel jobs are audited, their worktrees are in diagn
   assert.match(lookup.note, /run_opencode_parallel/);
 
   const missing = textOf(await callTool("get_opencode_job", { jobId: "builder-0-00000000", cwd: repo }));
-  assert.match(missing, /OpenCode job not found: builder-0-00000000\. Neither the queue, the direct\/parallel run audit, nor the worktree registry/);
+  assert.match(missing, /OpenCode job not found\./);
+  assert.match(missing, /job_not_found/);
+  assert.match(missing, /Neither the queue, the direct\/parallel run audit, nor the worktree registry of this repository has id builder-0-00000000\./);
 
   await cleanupWorktree({ path: retained.worktreePath, branch: retained.branch, repoRoot: repo }, "always", true);
   assert.equal((await listRetainedWorktreeArtifacts(repo, { jobId: runId })).length, 0);
