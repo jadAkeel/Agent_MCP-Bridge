@@ -168,6 +168,25 @@ test("B-074: CODEX_OPENCODE_RATE_LIMIT_HITS=1 stops at the first line (there is 
   watcher.stop();
 });
 
+test("L-2-F7-1: stderr lines with no model and no session never join the streak; the run's own 429s still trip", async () => {
+  let trips = 0;
+  const watcher = createRateLimitWatcher({ ...watch({ minSpreadMs: 150 }), onTrip: () => { trips += 1; } });
+  const webfetch = (at) => `timestamp=${at.toISOString()} level=ERROR service=webfetch error="Rate limit exceeded. Please try again later."`;
+  watcher.stderrLine(webfetch(new Date()));
+  await sleep(250);
+  watcher.stderrLine(webfetch(new Date()));
+  assert.equal(watcher.state.hits, 0, "model-less tool lines never count toward the streak");
+  assert.equal(trips, 0);
+  assert.equal(watcher.state.tripped, false);
+  // The run's own provider 429s, spread the same way, still trip the watcher.
+  watcher.stderrLine(logLine({ at: new Date() }));
+  await sleep(250);
+  watcher.stderrLine(logLine({ at: new Date() }));
+  assert.equal(trips, 1);
+  assert.equal(watcher.state.evidence.modelID, MUSE);
+  watcher.stop();
+});
+
 test("B-061: once the run's session is known only that session's lines count", async () => {
   await writeFile(logPath, "", "utf8");
   const running = spawnChild("session", 8000, { rateLimitWatch: watch({ logPath }) });

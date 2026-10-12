@@ -48,14 +48,14 @@ const pinnedWrite = (pin = A, extra = {}) => {
   return { ...job, scopeContract: { ...job.scopeContract, modelRequirement: pin }, ...extra };
 };
 
-function orderingProbe(snapshot = I.providerCapacitySnapshot) {
+function orderingProbe(snapshot = I.providerPauseSnapshot) {
   const calls = { pauseRead: 0, readiness: 0, validationPreflight: 0, discovery: 0, metadata: 0,
     payload: 0, worktree: 0, snapshot: 0, patch: 0, lock: 0 };
   const forbidden = (name) => async () => { calls[name]++; throw new Error(`unexpected ${name}`); };
   const runtime = createExecuteJobRuntime({
     ...I, nowMs: () => Date.now(),
     makeQueueJobId: (agent) => `${agent}-pause-ordering-probe`, hasWriteIntent,
-    providerCapacitySnapshot: async () => { calls.pauseRead++; return snapshot(); },
+    providerPauseSnapshot: async () => { calls.pauseRead++; return snapshot(); },
     verifyJobWorkspaceReadiness: async () => { calls.readiness++; return { ok: false, errorType: "fixture_workspace_probe", error: "ordering probe reached normal preflight" }; },
     validationCommandPreflightError: (...args) => { calls.validationPreflight++; return I.validationCommandPreflightError(...args); },
     createWorktreeForJob: forbidden("worktree"), gitChangedFileSnapshot: forbidden("snapshot"),
