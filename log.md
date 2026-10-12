@@ -16,6 +16,19 @@ tree and `node bin/release-activate.js --sync-clients`, then restart the clients
 
 ## 2026-10-11
 
+### Fix round 2, batch D: from agent exit to the decided result (ledger L-1-F1b-*)
+
+| ID | Problem | Cause | Change / verification | Branch | Status |
+| --- | --- | --- | --- | --- | --- |
+| B-225 | The read-only HEAD-move description and the containment record were each computed twice per run (L-1-F1b-12). | Two call sites. | Computed once (6 -> 3 git starts for the HEAD description, 2 -> 1 containment captures). | `bridge/fix2-postrun` | fixed, not deployed |
+| B-224 | A slot could be granted after the wait deadline or after cancellation (L-1-F1b-11). | No recheck at grant. | The grant rechecks deadline and cancellation and removes a late committed lease; test: late grants refused at 130 ms against an 80 ms deadline, zero leases left. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-223 | A fix pass ignored the validation time that triggered it, so a job could run about twice its timeout (L-1-F1b-10). | Remaining time counted agent time only. | Remaining job time subtracts agent time and post-run time; self-checks and validation get at most the remaining time; a spent budget fails the check before it starts. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-222 | A terminal structured 429 that exited quickly (`opencode_rate_limited`) recorded no provider pause (L-1-F1b-8). | Only `provider_rate_limited` recorded a pause. | Both error types record the existing model and quota-group pauses; test: pause recorded in 175-279 ms. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-221 | An unexpected supervisor exit or a supervisor watchdog expiry released the slot and the lock without containment (L-1-F1b-7). | Only `process_tree_termination_unconfirmed` triggered quarantine; a supervisor exit without a close event had no bound. | A launched payload whose supervisor fails, exits without a result, or whose watchdog expires without a confirmed termination is `processTreeUnconfirmed` and quarantines slot and lock (OpenCode and external runners); a 5 s grace after supervisor exit bounds the wait for its result. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-220 | A failed validation that changed files was detected only after any fix pass, so a fix pass could run on a tree the validation mutated (L-1-F1b-5). | The mutation check ran after the fix-pass loop. | Each run's evaluation checks validation mutations (and validation HEAD moves) before the fix-pass decision; a mutation fails the job as `validation_mutated_workspace` and no fix pass starts. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-219 | A run that crossed the output cap kept running to the end of its budget although its result was already failed (L-1-F1b-3). | Truncation only set a flag. | Crossing the raw stdout or stderr cap requests supervisor termination at once; test: ended in 308 ms against a 60 s budget, tree gone. | `bridge/fix2-postrun` | fixed, not deployed |
+| B-218 | After the agent exited, the changed-file checks listed and hashed the checkout three times in series and rebuilt the forbidden-path matchers for every file (L-1-F1b-2). | Separate snapshot calls per check; isWithinAnyPath compiled its matchers per call. | One snapshot (ordinary + ignored parts) serves both post-run checks; the post-validation snapshot and HEAD read run only when a self-check or validation command ran; matchers compiled once per snapshot. Measured on 3,000 dirty 4 KiB files: 13.7-14.3 s -> 3.8-4.3 s (70-72 %), git starts 11 -> 5, matcher 243 -> 13 us per file. Verified by the integrator: review-postrun 11/11 (new), review-spawn 43/43, b096 15/15, validation-tree 7/7, provider-wait 16/16, flex-rate-limit 12/12. | `bridge/fix2-postrun` | fixed, not deployed |
+
 ### Fix round 1 (review day 1, ledger L-1-*)
 
 | ID | Problem | Cause | Change / verification | Branch | Status |
