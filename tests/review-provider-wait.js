@@ -17,7 +17,7 @@ process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = "2";
 process.env.CODEX_OPENCODE_PROVIDER_LEASE_POLL_MS = "25";
 process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 const scratch = await mkdtemp(path.join(tmpdir(), "review-provider-wait-"));
-process.env.CODEX_OPENCODE_STATE_DIR = scratch;
+delete process.env.CODEX_OPENCODE_STATE_DIR;
 const { __selfTest } = await import("../server.js");
 const I = __selfTest.internals;
 __selfTest.hooks.stateDirectoryOverride = scratch;
@@ -140,14 +140,17 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
     process.argv.push("--self-test");
     const { __selfTest } = await import(${JSON.stringify(pathToFileURL(path.resolve("server.js")).href)});
     const I = __selfTest.internals;
+    __selfTest.hooks.stateDirectoryOverride = ${JSON.stringify(scratch)};
     const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: 1000 });
     if (!result.ok) throw new Error(JSON.stringify(result));
     process.send({ lease: result.lease, pid: process.pid });
     process.on("disconnect", () => process.exit(0));
   `);
   const identities = [];
+  const holderEnv = { ...process.env };
+  delete holderEnv.CODEX_OPENCODE_STATE_DIR;
   for (let index = 0; index < 2; index++) {
-    const child = fork(workerPath, [], { env: process.env, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const child = fork(workerPath, [], { env: holderEnv, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     workerProcesses.push(child);
     const identity = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Slot holder startup timed out")), 10000);

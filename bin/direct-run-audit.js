@@ -212,7 +212,7 @@ export function createDirectRunAudit({
               identifier(instanceId), Number.isInteger(processId) ? processId : null);
         } else {
           // Sealing and database opening can yield after finish classified the run.
-          if (record.kind === "direct" && signal?.aborted) {
+          if (["direct", "parallel"].includes(record.kind) && signal?.aborted) {
             record.status = "cancelled";
             record.errorType = "agent_cancelled_by_client";
           }
@@ -291,7 +291,7 @@ export function createDirectRunAudit({
     async finish(handle, { execution, executionThrew = false, childStarted = false, errorType = "", stored = null, signal = null } = {}) {
       const { job, record, audit, projectKey, startMs } = handle;
       const result = execution?.result || {};
-      const cancelledByClient = record.kind === "direct" && signal?.aborted;
+      const cancelledByClient = ["direct", "parallel"].includes(record.kind) && signal?.aborted;
       record.errorType = identifier(cancelledByClient ? "agent_cancelled_by_client" : errorType || (executionThrew ? "direct_run_exception" : result.errorType
         || (execution?.validation?.disallowedFiles?.length ? "changed_file_validation_error" : "")
         || (execution?.response?.isError ? "direct_run_failed" : "")));
