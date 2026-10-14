@@ -52,10 +52,12 @@ const commitFile = async (relative, content, message) => {
 // Auto-integration harness (like tests/review-flex-auto-integrate.js): a builder's worktree with
 // uncommitted new files, and a fake agent that reports it.
 let worktrees = 0;
+const worktreeBaseCommits = new Map();
 async function builderWorktree(edits) {
   worktrees += 1;
   const dir = path.join(root, `wt-${worktrees}`);
   await git(["worktree", "add", "-q", "-b", `agent/builder/wt-${worktrees}`, dir, "HEAD"]);
+  worktreeBaseCommits.set(dir, await head(dir));
   for (const [relative, content] of Object.entries(edits)) {
     await mkdir(path.dirname(path.join(dir, ...relative.split("/"))), { recursive: true });
     await writeFile(path.join(dir, ...relative.split("/")), content, "utf8");
@@ -69,17 +71,27 @@ const autoJob = (file, extra = {}) => ({
 });
 const worktreeOf = new Map();
 const plainExecutions = new Map();
-hooks.queueJobExecutorTestHook = async (request) => {
+hooks.queueJobExecutorTestHook = async (request, { jobId }) => {
   const plain = plainExecutions.get(request.task);
   if (plain) return await plain(request);
   const planned = worktreeOf.get(request.task);
-  const diff = await internals.collectWorktreeDiff({ path: planned.dir, baseCommit: "" });
+  const branch = (await git(["branch", "--show-current"], planned.dir)).trim();
+  const baseCommit = worktreeBaseCommits.get(planned.dir);
+  assert.ok(baseCommit, "the fixture must retain its native creation HEAD");
+  const db = await openLockDb(repo);
+  try {
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO worktree_artifacts (worktree_path, cwd, branch, job_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'retained', ?, ?)`).run(path.resolve(planned.dir), path.resolve(repo), branch, jobId, now, now);
+  } finally { closeDb(db); }
+  const diff = await internals.collectWorktreeDiff({ path: planned.dir, baseCommit });
+  assert.equal(diff.errorType, null, diff.error || "the fixture must capture a real complete source identity");
   if (planned.afterFinish) await planned.afterFinish(planned.dir);
   return {
     response: { content: [{ type: "text", text: "REPORT: wrote the batch." }] },
     result: { errorType: "", changedFiles: planned.changed, configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free", worktree: { patchSha256: diff.patchSha256, sourceStateSha256: diff.sourceStateSha256 } },
     validation: { status: "passed" },
-    worktree: { path: planned.dir, branch: "", baseCommit: diff.sourceBaseCommit, baseTree: "" },
+    worktree: { path: planned.dir, branch, baseCommit: diff.sourceBaseCommit, baseTree: "" },
   };
 };
 async function runAutoJob(file, edits, extra = {}, afterFinish = null) {
@@ -336,7 +348,7 @@ test("B-153: files already in HEAD with the worktree's exact content are 'alread
   assert.notEqual(await head(), before);
   assert.equal(record.autoIntegration.commit, await head());
   assert.equal(existsSync(dir), false, `the worktree is removed: ${record.autoIntegration.worktreeCleanup}`);
-  assert.match(record.autoIntegration.worktreeCleanup, /^success/);
+  assert.match(record.autoIntegration.worktreeCleanup, /^after commit: success/);
 });
 
 test("B-153: a worktree removed by hand before the integration is named, not 'spawn git ENOENT'", async () => {
@@ -349,7 +361,7 @@ test("B-153: a worktree removed by hand before the integration is named, not 'sp
   await git(["worktree", "prune"]);
 });
 
-test("B-154: when the engine keeps the worktree after the commit, the bridge removes it itself", async () => {
+test("B-154: when the engine supplies no cleanup decision after the commit, the bridge removes the worktree itself", async () => {
   const testHooks = hooks.autoIntegrationTestHooks;
   testHooks.skipEngineCleanup = true;
   try {
@@ -360,6 +372,56 @@ test("B-154: when the engine keeps the worktree after the commit, the bridge rem
     assert.equal((await git(["for-each-ref", `refs/heads/agent/builder/${path.basename(dir)}`])).trim(), "", "its branch went with it");
   } finally {
     testHooks.skipEngineCleanup = false;
+  }
+});
+
+test("B-154: an explicit real-engine retention decision preserves the source through sweep", async () => {
+  const file = "out/batch-107.json", content = "[107]\n";
+  const testHooks = hooks.autoIntegrationTestHooks;
+  const previous = testHooks.beforeUpdateRef;
+  let detached = false, sourceBranch = "";
+  testHooks.beforeUpdateRef = async (...args) => {
+    if (previous) await previous(...args);
+    if (detached) return;
+    const planned = worktreeOf.get(autoJob(file).task);
+    sourceBranch = (await git(["branch", "--show-current"], planned.dir)).trim();
+    assert.ok(sourceBranch, "detach the actual recorded source branch");
+    await git(["checkout", "-q", "--detach", "HEAD"], planned.dir);
+    detached = true;
+  };
+  try {
+    const before = await head();
+    const { record, dir, jobId } = await runAutoJob(file, { [file]: content });
+    assert.equal(detached, true, "the real commit hook must detach the source before engine cleanup");
+    assert.equal(record.status, "completed");
+    assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+    assert.deepEqual(record.autoIntegration.files, [file]);
+    const commit = await head();
+    assert.notEqual(commit, before);
+    assert.equal(record.autoIntegration.commit, commit);
+    assert.equal(readFileSync(path.join(repo, file), "utf8"), content);
+    assert.match(record.autoIntegration.worktreeCleanup, /^retained_for_review \(source_branch_identity_unverified\)$/);
+    assert.equal(record.worktreeBranch, sourceBranch);
+    const assertRetained = async () => {
+      assert.equal(existsSync(dir), true, "the source directory survives");
+      assert.equal(readFileSync(path.join(dir, file), "utf8"), content, "the original source bytes survive exactly");
+      assert.equal(await head(dir), worktreeBaseCommits.get(dir));
+      assert.equal((await git(["rev-parse", `refs/heads/${sourceBranch}`])).trim(), worktreeBaseCommits.get(dir), "the original source branch survives unchanged");
+      assert.ok((await git(["worktree", "list", "--porcelain"])).includes(dir.replace(/\\/g, "/")), "the native worktree registration survives");
+      const db = await openLockDb(repo);
+      try {
+        const artifact = db.prepare("SELECT worktree_path, cwd, branch, job_id, status FROM worktree_artifacts WHERE worktree_path = ?").get(path.resolve(dir));
+        assert.deepEqual({ ...artifact }, { worktree_path: path.resolve(dir), cwd: path.resolve(repo), branch: sourceBranch, job_id: jobId, status: "retained" });
+      } finally { closeDb(db); }
+    };
+    await assertRetained();
+    const db = await openLockDb(repo);
+    try { await sweepCommittedWorktrees(db); } finally { closeDb(db); }
+    await assertRetained();
+    assert.equal(await head(), commit, "sweep preserves successful commit accounting");
+    assert.equal((await durable(jobId)).autoIntegration.worktreeCleanup, record.autoIntegration.worktreeCleanup, "sweep preserves the explicit retention decision");
+  } finally {
+    testHooks.beforeUpdateRef = previous;
   }
 });
 

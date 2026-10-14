@@ -93,8 +93,8 @@ test("B-056 a bridge over stdio logs an unknown tool, an invalid call and an uns
   } finally {
     await client.close().catch(() => {});
   }
-  // The SDK answers an unknown tool and invalid arguments with isError; the bridge's own
-  // refusal (formatRejectedExecution) is a normal result that carries "errorType: unsafe_path".
+  // Unknown tools remain SDK request failures; invalid arguments remain isError but are
+  // annotated input refusals. The bridge's unsafe-path refusal is a normal typed result.
   assert.deepEqual(answers.map((answer) => answer.isError === true), [true, true, false, false, true], JSON.stringify(answers));
   assert.match(answers[2].content[0].text, /^errorType: unsafe_path$/m);
   assert.ok(answers[4].content[0].text.includes(FAKE_TOKEN), "the answer itself is unchanged");
@@ -105,25 +105,31 @@ test("B-056 a bridge over stdio logs an unknown tool, an invalid call and an uns
   const lines = linesOf(stateDir);
   assert.ok(lines.length >= 3, `expected at least 3 lines, got ${lines.length}:\n${text}`);
   const failedRequests = lines.filter((line) => line.event === "mcp.request_failed");
-  assert.deepEqual(failedRequests.map((line) => line.tool).sort(), ["[github credential redacted]", "definitely_not_a_bridge_tool", "get_opencode_job"]);
+  assert.deepEqual(failedRequests.map((line) => line.tool).sort(), ["[github credential redacted]", "definitely_not_a_bridge_tool"]);
   assert.match(failedRequests.find((line) => line.tool === "[github credential redacted]").summary, /^MCP error -32602: Tool \[github credential redacted\] not found/);
   for (const line of failedRequests) {
     assert.equal(line.level, "error");
     assert.equal(line.method, "tools/call");
     assert.equal(line.code, -32602);
     assert.equal(typeof line.durationMs, "number");
+    assert.ok(Number.isFinite(line.durationMs) && line.durationMs >= 0, JSON.stringify(line));
   }
   const refused = lines.filter((line) => line.event === "tool.refused");
-  assert.equal(refused.length, 1, text);
-  assert.equal(refused[0].tool, "run_opencode_agent");
-  assert.equal(refused[0].errorType, "unsafe_path");
-  assert.equal(refused[0].level, "warn");
+  assert.deepEqual(refused.map((line) => `${line.tool}/${line.errorType}`).sort(), ["get_opencode_job/invalid_tool_arguments", "run_opencode_agent/unsafe_path"]);
+  for (const line of refused) {
+    assert.equal(line.level, "warn");
+    assert.equal(typeof line.durationMs, "number");
+    assert.ok(Number.isFinite(line.durationMs) && line.durationMs >= 0, JSON.stringify(line));
+  }
   for (const line of [...failedRequests, ...refused]) {
     assert.equal(typeof line.summary, "string");
     assert.ok(line.summary.length > 0 && line.summary.length <= 400, JSON.stringify(line));
     assert.equal(line.summarySha256, undefined, "summary is readable text, not hashed by sanitizeLogValue");
   }
-  assert.match(failedRequests.find((line) => line.tool === "get_opencode_job").summary, /cwd/);
+  const invalidArguments = refused.find((line) => line.tool === "get_opencode_job");
+  assert.match(invalidArguments.summary, /cwd/);
+  assert.match(invalidArguments.summary, /MCP error -32602/);
+  assert.match(invalidArguments.summary, /Check tools\/list.*schema, correct the arguments, and retry/);
   assert.ok(!text.includes(FAKE_TOKEN) && !text.includes("ghp_FAKE"), "the fake token must not reach the operations log");
   assert.equal(lines.some((line) => /list_opencode_jobs/.test(JSON.stringify(line))), false, "a successful call is not logged");
 });

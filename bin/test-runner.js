@@ -7,6 +7,7 @@ import { createWriteStream } from "node:fs";
 import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { readSkipLedger, SKIP_METADATA_PREFIX } from "../tests/skip-gate.js";
 import { fileURLToPath } from "node:url";
 import { isMainModule } from "./main-module.js";
 
@@ -16,7 +17,7 @@ const EXCLUSIVE_FILES = new Set([
   "review-provider-wait.js", "review-spawn.js", "review-provider-fallback.js", "review-queue-features.js",
   "review-round5.js", "review-friend-runtime.js", "review-flex-runners.js", "review-flex-rate-limit.js",
   "review-batch-race.js", "review-shared-attestation.js", "review-pause-precheck.js", "review-validation-tree.js",
-  "review-test-runner.js",
+  "review-test-runner.js", "review-flex-auto-integrate.js",
   "review-flex-self-check.js", "review-flex-queue-worker.js",
 ]);
 const PRIORITY_FILES = ["server-self-test.js", "review-integration-reuse.js", "review-integration-recovery.js",
@@ -114,7 +115,7 @@ async function terminateOwnedTree(child, diagnostics) {
   return { ok: killed.ok, method: "owned_handle_and_verified_descendants", targets: targets.length, output: killed.output };
 }
 
-async function runOne(command, { cwd, env, logRoot, onProgress, timeoutMs }) {
+async function runOne(command, { cwd, env, logRoot, onProgress, timeoutMs, onContainmentFailure }) {
   const file = command.file || command.argv.find(arg => !arg.startsWith("-")) || "node";
   const log = path.join(logRoot, `${String(command.index + 1).padStart(3, "0")}-${path.basename(file).replace(/[^A-Za-z0-9._-]/g, "_")}.log`);
   const startedAtMs = Date.now(), startedAt = new Date(startedAtMs).toISOString();
@@ -145,6 +146,7 @@ async function runOne(command, { cwd, env, logRoot, onProgress, timeoutMs }) {
       termination = await terminateOwnedTree(child, diagnostics);
       output(`TIMEOUT TERMINATION: ${JSON.stringify(termination)}\n`);
     } catch (error) { termination = { ok: false, error: String(error.message) }; }
+    if (termination?.ok !== true) onContainmentFailure?.("timeout termination was not confirmed");
     finishTimeout();
   }, command.timeoutMs ?? timeoutMs);
   const first = await Promise.race([completion, timeoutFinished]);
@@ -154,7 +156,10 @@ async function runOne(command, { cwd, env, logRoot, onProgress, timeoutMs }) {
     let closeTimer;
     exit = await Promise.race([completion, new Promise(resolve => { closeTimer = setTimeout(() => resolve({ code: null, signal: null }), 5000); })]);
     clearTimeout(closeTimer);
-    if (!closed) { child?.stdout?.destroy(); child?.stderr?.destroy(); child?.unref(); }
+    if (!closed) {
+      onContainmentFailure?.("the timed-out direct child did not close");
+      child?.stdout?.destroy(); child?.stderr?.destroy(); child?.unref();
+    }
   }
   clearTimeout(timer);
   const result = { ...command, log, pid: child?.pid || null, startedAt, finishedAt: new Date().toISOString(),
@@ -205,12 +210,36 @@ export async function runTestCommands({ commands, cwd = ROOT, env = process.env,
   const startedAtMs = Date.now();
   await writeFile(path.join(logRoot, "manifest.json"), JSON.stringify({ node: process.execPath, cwd, syntaxJobs, jobs, timeoutMs, commands }, null, 2));
   const results = [];
+  const isSkipSummary = command => command.lane === "final" && command.argv.includes("--summary")
+    && command.argv.some(arg => path.basename(arg) === "skip-gate.js");
+  let skipMetadata;
+  let skipMetadataError = "";
+  let containmentFailure = "";
+  const abort = command => results.push({ ...command, status: "aborted", pid: null, startedAt: null,
+    finishedAt: new Date().toISOString(), exitCode: null, durationMs: 0, executionError: containmentFailure, summaryLines: [] });
   const run = async (command, slot = 0) => {
+    if (containmentFailure) { abort(command); return; }
+    let dispatched = false;
     try {
       const commandEnv = environmentForCommand ? await environmentForCommand(command, { slot, lane: command.lane }) : env;
-      results.push(await runOne(command, { cwd, env: commandEnv, logRoot, timeoutMs, onProgress }));
+      // A timeout can become uncontained while this command's profile is being prepared.
+      if (containmentFailure) { abort(command); return; }
+      if (isSkipSummary(command)) {
+        const directory = process.platform === "win32" ? commandEnv.TEMP || commandEnv.TMP
+          : commandEnv.TMPDIR || commandEnv.TMP || commandEnv.TEMP;
+        skipMetadata = readSkipLedger(directory, process.pid, { allowRequiredSkips: commandEnv.CODEX_TEST_ALLOW_REQUIRED_SKIPS === "1" });
+      }
+      dispatched = true;
+      results.push(await runOne(command, { cwd, env: commandEnv, logRoot, timeoutMs, onProgress,
+        onContainmentFailure: reason => {
+          containmentFailure ||= `Dispatch aborted: containment could not be confirmed for command ${command.index + 1} (${command.argv.join(" ")}): ${reason}.`;
+        } }));
     }
-    catch (error) { results.push({ ...command, status: "failed", exitCode: null, durationMs: 0, executionError: String(error.stack || error) }); }
+    catch (error) {
+      if (isSkipSummary(command) && !dispatched) skipMetadataError = String(error.message);
+      if (containmentFailure && !dispatched) abort(command);
+      else results.push({ ...command, status: "failed", exitCode: null, durationMs: 0, executionError: String(error.stack || error) });
+    }
   };
   for (const command of commands.filter(command => command.lane === "prelude")) await run(command);
   await pool(commands.filter(command => command.lane === "syntax"), syntaxJobs, run);
@@ -224,7 +253,9 @@ export async function runTestCommands({ commands, cwd = ROOT, env = process.env,
   const report = { startedAt: new Date(startedAtMs).toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - startedAtMs,
     suiteWorkers: jobs, heavySuiteWorkers: Math.min(2, jobs),
     commandCount: commands.length, passed: results.filter(result => result.status === "passed").length,
-    failed: results.filter(result => result.status !== "passed").length, results };
+    failed: results.filter(result => result.status !== "passed").length, results,
+    ...(skipMetadata ? { skipMetadata } : commands.some(isSkipSummary)
+      ? { skipMetadataError: containmentFailure || `Skip ledger was not captured before the final summary: ${skipMetadataError || "see the failed final command"}.` } : {}) };
   await writeFile(path.join(logRoot, "report.json"), JSON.stringify(report, null, 2));
   return report;
 }
@@ -439,6 +470,8 @@ async function main() {
     wallMs: report.durationMs, profilePreparations };
   await writeFile(path.join(logRoot, "report.json"), JSON.stringify(report, null, 2));
   await writeFile(path.join(root, "report.json"), JSON.stringify({ ...report, logRoot }, null, 2));
+  if (report.skipMetadata) console.log(SKIP_METADATA_PREFIX + JSON.stringify(report.skipMetadata));
+  else console.log(`Skip metadata unavailable: ${report.skipMetadataError}`);
   console.log("\nDurations (slowest first):");
   for (const result of [...report.results].sort((a, b) => b.durationMs - a.durationMs))
     console.log(`${result.status.toUpperCase().padEnd(7)} ${(result.durationMs / 1000).toFixed(1).padStart(7)}s ${result.argv.join(" ")}`);

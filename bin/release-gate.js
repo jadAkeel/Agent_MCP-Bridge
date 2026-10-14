@@ -34,6 +34,7 @@ import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.
 import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
 import { digestTree } from "./plugin-tree-digest.js";
 import { recordCliFailure } from "./ops-log.js";
+import { MAX_SKIP_METADATA_BYTES, SKIP_METADATA_PREFIX, validateSkipMetadata } from "../tests/skip-gate.js";
 
 const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 requireSelfTestRun(import.meta.url);
@@ -174,6 +175,30 @@ function outputTail(output, lines = FAILED_OUTPUT_TAIL_LINES) {
 function parseStepOutput(output) {
   const skips = [];
   const lines = String(output || "").split(/\r?\n/);
+  const summary = /^Checks: (\d+) passed, skipped: (\d+)\s*$/m.exec(String(output || ""));
+  const checks = summary ? { passed: Number(summary[1]), skipped: Number(summary[2]) } : null;
+  const messages = lines.filter(line => line.trimStart().startsWith(SKIP_METADATA_PREFIX.split(":")[0]));
+  const aggregates = [...String(output || "").matchAll(/^Total skipped: (\d+)(?: across (\d+) reporting test file\(s\))?/gm)];
+  if (messages.length) {
+    try {
+      if (messages.length !== 1) throw new Error("duplicate structured skip metadata messages");
+      const message = messages[0].trimStart();
+      if (!message.startsWith(SKIP_METADATA_PREFIX) || Buffer.byteLength(message, "utf8") > MAX_SKIP_METADATA_BYTES + SKIP_METADATA_PREFIX.length)
+        throw new Error("invalid or oversized structured skip metadata message");
+      const metadata = validateSkipMetadata(JSON.parse(message.slice(SKIP_METADATA_PREFIX.length)));
+      for (const aggregate of aggregates) if (Number(aggregate[1]) !== metadata.counts.total
+        || (aggregate[2] !== undefined && Number(aggregate[2]) !== metadata.counts.files))
+        throw new Error("runner skip summary differs from structured ledger counts");
+      // Structured ledger details are authoritative for this step. Legacy lines and
+      // aggregate summaries may repeat them; never append those a second time.
+      for (const row of metadata.rows) for (const detail of row.details || []) skips.push({ file: row.file, ...detail });
+      const failed = metadata.rows.filter(row => row.failed);
+      return { skips, checks, skipCounts: metadata.counts,
+        ...(failed.length ? { skipMetadataError: `skip gate failed for ${failed.map(row => row.file).join(", ")}` } : {}) };
+    } catch (error) {
+      return { skips: [], checks, skipMetadataError: String(error.message) };
+    }
+  }
   for (const line of lines) {
     const skip = /^skip\s+(.+?):\s+(.+)$/.exec(line.trim());
     if (skip) skips.push({ name: skip[1], reason: skip[2] });
@@ -182,9 +207,12 @@ function parseStepOutput(output) {
   }
   let nodeTestSkipped = 0;
   for (const match of String(output || "").matchAll(/^ℹ skipped (\d+)\s*$/gm)) nodeTestSkipped += Number(match[1]);
+  const legacyCount = skips.length + nodeTestSkipped;
   if (nodeTestSkipped) skips.push({ name: "node --test", reason: `${nodeTestSkipped} test(s) reported skipped; see the step output` });
-  const summary = /^Checks: (\d+) passed, skipped: (\d+)\s*$/m.exec(String(output || ""));
-  const checks = summary ? { passed: Number(summary[1]), skipped: Number(summary[2]) } : null;
+  if (/^Test (?:run:|runner:)/m.test(String(output || "")))
+    return { skips, checks, skipMetadataError: "test runner printed no structured skip metadata" };
+  if (aggregates.some(match => !Number.isSafeInteger(Number(match[1])) || Number(match[1]) !== legacyCount))
+    return { skips, checks, skipMetadataError: "skip summary has no matching complete skip disclosure" };
   return { skips, checks };
 }
 
@@ -260,11 +288,14 @@ async function runReleaseGate({
       exitCode,
       durationMs: now() - stepStarted,
       skips: parsed.skips,
+      ...(parsed.skipCounts ? { skipCounts: parsed.skipCounts } : {}),
+      ...(parsed.skipMetadataError ? { skipMetadataError: parsed.skipMetadataError } : {}),
       ...(parsed.checks ? { checks: parsed.checks } : {}),
     };
     receipt.steps.push(record);
     receipt.skips.push(...parsed.skips.map((skip) => ({ step: step.name, ...skip })));
     if (exitCode !== 0) receipt.failure = `${step.name} failed (exit ${exitCode}).`;
+    else if (parsed.skipMetadataError) receipt.failure = `${step.name} has invalid skip metadata: ${parsed.skipMetadataError}.`;
     else if (step.requireCheckSummary && !parsed.checks) receipt.failure = `${step.name} printed no "Checks: <n> passed, skipped: <n>" line.`;
     if (receipt.failure) {
       // The end of a failed step's output, so the receipt alone says what broke.
@@ -539,6 +570,55 @@ async function selfTest() {
 
     // node --test's skipped count is recorded.
     assert.deepEqual(parseStepOutput("ℹ skipped 2\n").skips, [{ name: "node --test", reason: "2 test(s) reported skipped; see the step output" }]);
+
+    // Complete structured disclosure wins over repeated legacy lines and summaries.
+    const metadata = { version: 1, runnerPid: process.pid, allowRequiredSkips: false,
+      rows: [{ file: "skip-fixture", total: 5, skipped: 2, partial: 1, required: 0, failed: false, details: [
+        { name: "optional a", reason: "missing scratch privilege", optional: true, partial: false },
+        { name: "optional b", reason: "scratch platform", optional: true, partial: false },
+        { name: "passed c", reason: "optional scratch section", optional: true, partial: true },
+      ] }], counts: { files: 1, skipped: 2, partial: 1, required: 0, total: 3 } };
+    const message = value => SKIP_METADATA_PREFIX + JSON.stringify(value) + "\n";
+    const clone = () => JSON.parse(JSON.stringify(metadata));
+    const structured = parseStepOutput(message(metadata) + "skip optional a: missing scratch privilege\nskip optional b: scratch platform\n"
+      + "ok passed c (1 ms) [partly skipped: optional scratch section]\nℹ skipped 3\nTotal skipped: 3 across 1 reporting test file(s).\n");
+    assert.deepEqual(structured.skips, metadata.rows[0].details.map(detail => ({ file: "skip-fixture", ...detail })));
+    assert.deepEqual(structured.skipCounts, metadata.counts);
+    assert.equal(structured.skipMetadataError, undefined);
+    const zero = { version: 1, runnerPid: process.pid, allowRequiredSkips: false,
+      rows: [{ file: "zero", total: 3, skipped: 0, partial: 0, required: 0, failed: false }],
+      counts: { files: 1, skipped: 0, partial: 0, required: 0, total: 0 } };
+    assert.deepEqual(parseStepOutput(message(zero)).skips, []);
+    assert.deepEqual(parseStepOutput(message(zero)).skipCounts, zero.counts);
+    const badCount = clone(); badCount.counts.total++;
+    const missingDetails = clone(); delete missingDetails.rows[0].details;
+    const badClassification = clone(); badClassification.rows[0].details[0].optional = false;
+    const badZeroDetails = JSON.parse(JSON.stringify(zero)); badZeroDetails.rows[0].details = null;
+    const badEnvelope = clone(); badEnvelope.version = 2;
+    const oversized = clone(); oversized.rows[0].details[0].reason = "x".repeat(MAX_SKIP_METADATA_BYTES);
+    const malformedOutputs = [message(metadata) + message(metadata), SKIP_METADATA_PREFIX + "{broken\n", "TEST_RUNNER_SKIP_METADATA {broken}\n", message(badCount), message(missingDetails),
+      message(badClassification), message(badZeroDetails), message(badEnvelope), message(oversized), message(metadata) + "Total skipped: 2 across 1 reporting test file(s).\n",
+      message(metadata) + "Total skipped: 3 across 2 reporting test file(s).\n", "Test runner: 4/4 passed\nTotal skipped: 0\n", "Total skipped: 2\n"];
+    for (const output of malformedOutputs) assert.ok(parseStepOutput(output).skipMetadataError, "malformed/incomplete disclosure must not look green");
+    const required = clone(); required.rows[0].details[0].optional = false;
+    required.rows[0].required = 1; required.counts.required = 1;
+    assert.match(parseStepOutput(message(required)).skipMetadataError, /failure policy/);
+    required.rows[0].failed = true;
+    assert.match(parseStepOutput(message(required)).skipMetadataError, /skip gate failed/);
+    required.allowRequiredSkips = true; required.rows[0].failed = false;
+    assert.equal(parseStepOutput(message(required)).skipMetadataError, undefined);
+    const allSkipped = clone(); allSkipped.allowRequiredSkips = true; allSkipped.rows[0].total = 2; allSkipped.rows[0].failed = true;
+    assert.match(parseStepOutput(message(allSkipped)).skipMetadataError, /skip gate failed/);
+    const metadataRan = [];
+    const invalidMetadata = await runReleaseGate({ sourceRoot: source, receiptPath, steps, log: quiet,
+      runStep: async step => { metadataRan.push(step.name); return { exitCode: 0, output: step.name === "npm test" ? malformedOutputs[0] : outputs[step.name] }; } });
+    assert.deepEqual(metadataRan, ["installed dependencies", "npm test"]);
+    assert.equal(invalidMetadata.receipt.ok, false);
+    assert.match(invalidMetadata.receipt.failure, /invalid skip metadata: duplicate/);
+    assert.match(invalidMetadata.receipt.steps[1].skipMetadataError, /duplicate/);
+    assert.ok(invalidMetadata.receipt.steps[1].outputTail.length);
+    assert.equal((await readGateReceipt(receiptPath)).ok, false);
+    assert.deepEqual(parseStepOutput("skip legacy case: legacy reason\nTotal skipped: 1\n").skips, [{ name: "legacy case", reason: "legacy reason" }]);
 
     // A link inside the source tree is refused rather than digested through (a junction needs
     // no privilege on Windows), and so is a missing tree.

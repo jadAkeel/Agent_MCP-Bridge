@@ -114,20 +114,40 @@ test("B-023: OpenCode's AI_APICallError rate-limit lines count as a recovered pr
     JSON.stringify({ type: "step_start", sessionID: "ses_root", part: { type: "step-start" } }),
     JSON.stringify({ type: "text", sessionID: "ses_root", part: { id: "p1", messageID: "m1", type: "text", text: "All done.", time: { end: 1 } } }),
   ].join("\n");
-  const stderr = [
+  const identity = { provider: "fixture", model: "model-a", agent: "builder" };
+  const unscopedStderr = [
     'ERROR 2026-09-29T13:40:01 +2ms service=session error.error="AI_APICallError: Rate limit exceeded. Please retry after a brief wait." stream error',
     'ERROR 2026-09-29T13:40:09 +1ms service=session error.error="AI_APICallError: Output token rate limit exceeded. Please retry after a brief wait." stream error',
   ].join("\n");
-  const inspection = inspectOpenCodeEventStream(stdout, stderr);
+  const stderr = unscopedStderr.replaceAll("service=session ", "service=session providerID=fixture modelID=model-a session.id=ses_root agent=builder ");
+  const inspection = inspectOpenCodeEventStream(stdout, stderr, identity);
   assert.equal(inspection.finalResponseDetected, true);
   assert.equal(inspection.apiErrorDetected, false, "a run that produced its answer is not failed by retried attempts");
   assert.equal(inspection.recoveredTransientProviderError, true);
   assert.equal(inspection.providerWarningType, "opencode_rate_limited");
   assert.equal(inspection.providerRetryWarningCount, 2);
 
-  const failed = inspectOpenCodeEventStream(stdout.split("\n")[0], stderr);
+  const failed = inspectOpenCodeEventStream(stdout.split("\n")[0], stderr, identity);
   assert.equal(failed.providerErrorType, "opencode_rate_limited", "without an answer the same lines are the failure cause");
-  assert.equal(inspectOpenCodeEventStream(stdout, "").providerRetryWarningCount, 0);
+  assert.equal(inspectOpenCodeEventStream(stdout, "", identity).providerRetryWarningCount, 0);
+
+  const unrelatedInputs = [
+    ["unscoped", unscopedStderr],
+    ["session", stderr.replaceAll("session.id=ses_root", "session.id=ses_other")],
+    ["model", stderr.replaceAll("modelID=model-a", "modelID=model-other")],
+    ["provider", stderr.replaceAll("providerID=fixture", "providerID=other-fixture")],
+  ];
+  for (const [label, unrelatedStderr] of unrelatedInputs) {
+    const unrelated = inspectOpenCodeEventStream(stdout, unrelatedStderr, identity);
+    assert.equal(unrelated.providerRetryWarningCount, 0, label);
+    assert.equal(unrelated.recoveredTransientProviderError, false, label);
+    assert.equal(unrelated.providerWarningType, "", label);
+    assert.equal(unrelated.apiErrorDetected, false, label);
+    assert.equal(unrelated.providerErrorType, "", label);
+  }
+  const mixed = inspectOpenCodeEventStream(stdout, [stderr, ...unrelatedInputs.map(([, lines]) => lines)].join("\n"), identity);
+  assert.equal(mixed.recoveredTransientProviderError, true);
+  assert.equal(mixed.providerRetryWarningCount, 2, "unrelated diagnostics must not inflate the matching warning count");
 });
 
 // ---------------------------------------------------------------------------- B-022

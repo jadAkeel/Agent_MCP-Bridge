@@ -654,8 +654,6 @@ async function startAndRunWorker(api, repo, options, io, { interrupted, handOver
   const claim = api.claimPresence(repo);
   if (!claim.ok) return refuse(`Refused to start: ${claim.error}`, claim.errorType);
   const files = claim.files;
-  // A stop request left from an earlier worker must not stop this one at its first check.
-  try { rmSync(files.stop, { force: true }); } catch { /* The tick reads it; a stale one only drains early. */ }
   let released = false;
   const release = () => {
     if (released) return;

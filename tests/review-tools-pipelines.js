@@ -6,6 +6,9 @@
 // self-test agentRuntimeTestHook, everything else (Git, locks, SQLite state) is real.
 //   node tests/review-tools-pipelines.js
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
+import { readFile } from "node:fs/promises";
+import { createPipelineFinalizeRuntime } from "../lib/pipelines/finalize.js";
+import { createPipelineStoreRuntime } from "../lib/pipelines/store.js";
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 // Read once at import: writer worktrees on, a small snapshot bound for the group-scope fault
 // test, and node allowlisted so a validation command can write ignored output.
@@ -25,6 +28,7 @@ const {
   MCP_SANITIZED_READER_PROMPT,
   PIPELINE_RUNS,
   QUEUE_JOBS,
+  activatePipelineBatch,
   assert,
   assessQueuePlan,
   buildTrustedGitEnv,
@@ -40,6 +44,7 @@ const {
   finalizePipelineRecord,
   finalizePipelineSourceCleanup,
   hasAmbiguousPathPattern,
+  heartbeatKnownQueueState,
   makeInternalQueueContractorProof,
   mergePipelineIntegrationQueue,
   mkdir,
@@ -241,10 +246,334 @@ async function durableItem(pipelineId, index = 0) {
   return (await readPersistedPipelineRecord(pipelineId, repo)).integrationQueue[index];
 }
 
+async function pipelineObservationRow(pipelineId) {
+  const db = await openLockDb(repo);
+  try {
+    return db.prepare("SELECT revision, updated_at, request_encrypted, details_encrypted, record_json FROM opencode_pipelines WHERE pipeline_id = ?").get(pipelineId);
+  } finally { closeDb(db); }
+}
+
+async function observationPipeline(pipelineId) {
+  const job = { agent: "reviewer", task: "Observe the scratch pipeline.", cwd: repo, write: false, lockType: "read", lockMode: "off", dryRun: true };
+  const record = pipelineRecord(pipelineId, { status: "planned", jobs: [job] });
+  await persistPipelineRecord(record);
+  const child = await enqueueQueueJob(job, pipelineId, { schedule: false, initialStatus: "held", persist: false });
+  assert.equal(child.ok, true, JSON.stringify(child));
+  const activated = await activatePipelineBatch(record, [child.record]);
+  assert.equal(activated.ok, true, JSON.stringify(activated));
+  QUEUE_JOBS.delete(child.record.jobId);
+  PIPELINE_RUNS.set(pipelineId, record);
+  return { record, child: child.record };
+}
+
+async function changeObservedChild(child, changes) {
+  const db = await openLockDb(repo);
+  try {
+    const row = db.prepare("SELECT status, record_json FROM opencode_jobs WHERE job_id = ?").get(child.jobId);
+    const snapshot = { ...JSON.parse(row.record_json), status: row.status, ...changes };
+    db.prepare("UPDATE opencode_jobs SET status = ?, record_json = ?, revision = revision + 1 WHERE job_id = ?")
+      .run(snapshot.status, JSON.stringify(snapshot), child.jobId);
+  } finally { closeDb(db); }
+}
+
+// Factory injection measures work at the existing dependency boundaries, without a production hook.
+function observationRuntime({ onPersist = async () => {}, onSnapshot = () => {}, readOperation = async () => null } = {}) {
+  const work = { hooks: 0, encryptions: 0, opens: 0, writes: 0 };
+  const children = new Map();
+  const runtime = createPipelineStoreRuntime({
+    BRIDGE_INSTANCE_ID, CONFIG, PIPELINE_PERSISTENCE_CHAINS: new Map(), PIPELINE_RUNS: new Map(), QUEUE_JOBS: children,
+    effectiveQueueMode: () => "memory",
+    recordMatchesProject: (record, cwd) => record.cwd === cwd,
+    queueRecordSnapshot: (record) => { onSnapshot(); return { ...record }; },
+    getPipelinePersistenceTestHook: () => async (candidate) => { work.hooks += 1; await onPersist(candidate); },
+    encryptIntegrationJournalBytes: async () => { work.encryptions += 1; return `fixture-envelope-${work.encryptions}`; },
+    openLockDb: async () => {
+      work.opens += 1;
+      return { prepare: () => ({ run: () => { work.writes += 1; return { changes: 1 }; } }) };
+    },
+    closeDb: () => {}, logEvent: () => {}, readIntegrationOperationSummary: readOperation,
+  });
+  const record = pipelineRecord("review-observation-factory", {
+    status: "planned", revision: 1, ownerInstanceId: BRIDGE_INSTANCE_ID, ownerGeneration: "fixture-generation", queueJobIds: ["fixture-child"],
+  });
+  const child = { jobId: "fixture-child", cwd: repo, agent: "builder", status: "pending", changedFiles: [] };
+  children.set(child.jobId, child);
+  return { runtime, record, child, work };
+}
+
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
 // ---------------------------------------------------------------------------------------------
+test("F6-01: owning-tool observations persist changes, then keep the revision, ciphertext and queue event stable", async () => {
+  const { record, child } = await observationPipeline("review-observation-tools");
+  const previousHook = selfTestHooks.pipelinePersistenceTestHook;
+  let writes = 0;
+  selfTestHooks.pipelinePersistenceTestHook = (candidate) => { if (candidate.pipelineId === record.pipelineId) writes += 1; };
+  const inspect = async () => JSON.parse(textOf(await callTool("get_multi_agent_pipeline", { pipelineId: record.pipelineId, cwd: repo })));
+  try {
+    const before = await pipelineObservationRow(record.pipelineId);
+    const first = await inspect();
+    assert.equal(first.revision, before.revision + 1);
+    assert.equal(writes, 1);
+    assert.equal(first.events.filter((event) => event.type === "queue_status").length, 1);
+    const stable = await pipelineObservationRow(record.pipelineId);
+    writes = 0;
+    for (let count = 0; count < 3; count += 1) {
+      const repeated = await inspect();
+      assert.equal(repeated.revision, first.revision);
+      assert.equal(repeated.updatedAt, first.updatedAt);
+      assert.deepEqual(repeated.events, first.events);
+    }
+    await callTool("list_multi_agent_pipelines", { cwd: repo });
+    assert.deepEqual(await pipelineObservationRow(record.pipelineId), stable);
+    assert.equal(writes, 0);
+
+    for (const changes of [
+      { status: "running" }, { errorType: "fixture_observation_error" },
+      { worktreePath: path.join(scratch, "observed-writer") }, { changedFiles: ["src/a.txt"] },
+      { changedFiles: ["src/a.txt", "src/b.txt"] },
+    ]) {
+      const prior = await pipelineObservationRow(record.pipelineId);
+      await changeObservedChild(child, changes);
+      const changed = await inspect();
+      assert.equal(changed.revision, prior.revision + 1, JSON.stringify(changes));
+      assert.notEqual((await pipelineObservationRow(record.pipelineId)).details_encrypted, prior.details_encrypted);
+      const changedRow = await pipelineObservationRow(record.pipelineId);
+      await inspect();
+      assert.deepEqual(await pipelineObservationRow(record.pipelineId), changedRow);
+    }
+    const beforeComplete = await pipelineObservationRow(record.pipelineId);
+    await changeObservedChild(child, { status: "completed", errorType: "", worktreeBranch: "fixture-branch" });
+    const complete = await inspect();
+    assert.equal(complete.revision, beforeComplete.revision + 1);
+    assert.equal(complete.status, "awaiting_integration");
+    assert.equal(complete.integrationQueue.length, 1);
+    assert.ok(complete.finishedAt);
+    const completedRow = await pipelineObservationRow(record.pipelineId);
+    await inspect();
+    assert.deepEqual(await pipelineObservationRow(record.pipelineId), completedRow);
+    await changeObservedChild(child, { worktreeBranch: "fixture-new-branch" });
+    assert.equal((await inspect()).revision, completedRow.revision + 1, "Integration identity changes persist even when event jobs are identical.");
+    const writerRow = await pipelineObservationRow(record.pipelineId);
+    await changeObservedChild(child, { noChanges: true });
+    const noChanges = await inspect();
+    assert.equal(noChanges.revision, writerRow.revision + 1);
+    assert.equal(noChanges.status, "awaiting_finalization");
+    assert.deepEqual(noChanges.integrationQueue, []);
+    const noChangesRow = await pipelineObservationRow(record.pipelineId);
+    await inspect();
+    assert.deepEqual(await pipelineObservationRow(record.pipelineId), noChangesRow);
+  } finally {
+    selfTestHooks.pipelinePersistenceTestHook = previousHook;
+    PIPELINE_RUNS.delete(record.pipelineId);
+  }
+});
+
+test("F6-01: unchanged refresh invokes no hook, encryption or SQL; persist:false derives and empty patches still write", async () => {
+  const { runtime, record, child, work } = observationRuntime();
+  await runtime.refreshPipelineRecord(record);
+  assert.deepEqual(work, { hooks: 1, encryptions: 1, opens: 1, writes: 1 });
+  const stable = structuredClone(record);
+  const observation = record.events[0];
+  await runtime.refreshPipelineRecord(record);
+  await runtime.refreshPipelineRecord(record, { persist: false });
+  assert.deepEqual(record, stable);
+  assert.equal(record.events[0], observation);
+  assert.deepEqual(work, { hooks: 1, encryptions: 1, opens: 1, writes: 1 });
+  child.status = "completed";
+  child.noChanges = true;
+  await runtime.refreshPipelineRecord(record, { persist: false });
+  assert.equal(record.status, "awaiting_finalization");
+  assert.equal(record.revision, stable.revision);
+  assert.equal(record.updatedAt, stable.updatedAt);
+  assert.equal(record.detailsEncrypted, stable.detailsEncrypted);
+  assert.ok(record.finishedAt);
+  assert.deepEqual(work, { hooks: 1, encryptions: 1, opens: 1, writes: 1 });
+  await runtime.updatePipelineRecord(record, {});
+  let evaluations = 0;
+  await runtime.updatePipelineRecord(record, () => { evaluations += 1; return {}; });
+  assert.equal(evaluations, 1);
+  assert.equal(record.revision, stable.revision + 2);
+  assert.deepEqual(work, { hooks: 3, encryptions: 3, opens: 3, writes: 3 });
+
+  for (const status of ["failed", "interrupted", "not_resumable", "cancelled"]) {
+    const fixture = observationRuntime();
+    fixture.child.status = status;
+    fixture.child.errorType = "fixture_child_failure";
+    fixture.child.errorReason = "Observable child failure.";
+    await fixture.runtime.refreshPipelineRecord(fixture.record);
+    assert.equal(fixture.record.status, status === "cancelled" ? "cancelled" : "failed");
+    assert.equal(fixture.record.revision, 2);
+    assert.ok(fixture.record.finishedAt);
+    assert.deepEqual(fixture.record.errors, [{ jobId: fixture.child.jobId, status, errorType: fixture.child.errorType, errorReason: fixture.child.errorReason }]);
+    assert.equal(fixture.work.writes, 1);
+  }
+
+  const recovery = observationRuntime({ readOperation: async () => ({
+    pipelineId: "review-observation-factory", pipelineJobId: "fixture-child", status: "committed",
+  }) });
+  recovery.record.status = "awaiting_integration";
+  recovery.record.integrationQueue = [{ jobId: recovery.child.jobId, status: "integrating", operationId: "fixture-operation" }];
+  recovery.child.status = "completed";
+  recovery.child.worktreePath = path.join(scratch, "dry-recovery-writer");
+  recovery.child.changedFiles = ["src/a.txt"];
+  await recovery.runtime.refreshPipelineRecord(recovery.record, { persist: false });
+  assert.equal(recovery.record.status, "awaiting_finalization");
+  assert.equal(recovery.record.integrationQueue[0].status, "integrated");
+  assert.equal(recovery.record.events[0].type, "integration_journal_reconciled");
+  assert.equal(recovery.record.revision, 1);
+  assert.deepEqual(recovery.work, { hooks: 0, encryptions: 0, opens: 0, writes: 0 });
+
+  const concurrentRecovery = observationRuntime({ readOperation: async () => ({
+    pipelineId: "review-observation-factory", pipelineJobId: "fixture-child", status: "committed",
+  }) });
+  concurrentRecovery.record.status = "awaiting_integration";
+  concurrentRecovery.record.integrationQueue = [{ jobId: concurrentRecovery.child.jobId, status: "integrating", operationId: "fixture-operation" }];
+  concurrentRecovery.child.status = "completed";
+  concurrentRecovery.child.worktreePath = path.join(scratch, "concurrent-recovery-writer");
+  concurrentRecovery.child.changedFiles = ["src/a.txt"];
+  await Promise.all([
+    concurrentRecovery.runtime.refreshPipelineRecord(concurrentRecovery.record),
+    concurrentRecovery.runtime.refreshPipelineRecord(concurrentRecovery.record),
+  ]);
+  assert.equal(concurrentRecovery.record.status, "awaiting_finalization");
+  assert.equal(concurrentRecovery.record.events.filter((event) => event.type === "integration_journal_reconciled").length, 1);
+  assert.equal(concurrentRecovery.record.events.filter((event) => event.type === "queue_status").length, 1);
+  assert.deepEqual(concurrentRecovery.work, { hooks: 2, encryptions: 2, opens: 2, writes: 2 });
+});
+
+test("F6-01: serialized refresh retains intervening audit events and private validation specs", async () => {
+  let reached;
+  const held = new Promise((resolve) => { reached = resolve; });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let observed;
+  const snapshotsRead = new Promise((resolve) => { observed = resolve; });
+  const { runtime, record, child, work } = observationRuntime({
+    onPersist: async (candidate) => { if (candidate.events?.at(-1)?.type === "audit_added") { reached(); await gate; } },
+    onSnapshot: () => observed(),
+  });
+  child.status = "completed";
+  child.worktreePath = path.join(scratch, "audit-writer");
+  child.changedFiles = ["src/a.txt"];
+  record.integrationQueue = [{ jobId: child.jobId, status: "integrated", validationSpec: { command: "git diff --check" } }];
+  const finalValidationSpec = { command: "git status --short", trusted: true };
+  const audit = { type: "audit_added", at: "2000-01-01T00:00:00.000Z" };
+  const writing = runtime.updatePipelineRecord(record, (current) => ({ finalValidationSpec, events: current.events.concat(audit) }));
+  let refreshing;
+  try {
+    await held;
+    refreshing = runtime.refreshPipelineRecord(record);
+    await snapshotsRead;
+    release();
+    await Promise.all([writing, refreshing]);
+    assert.equal(work.writes, 2);
+    assert.equal(record.status, "awaiting_finalization");
+    assert.deepEqual(record.events[0], audit);
+    assert.equal(record.events[1].type, "queue_status");
+    assert.deepEqual(record.finalValidationSpec, finalValidationSpec);
+    assert.deepEqual(record.integrationQueue[0].validationSpec, { command: "git diff --check" });
+    assert.equal(record.integrationQueue[0].status, "integrated");
+  } finally {
+    release();
+    await Promise.allSettled([writing, refreshing]);
+  }
+});
+
+test("F6-01: queued observations and journal recovery cannot write or reopen a frozen pipeline", async () => {
+  for (const status of ["completed", "failed", "cancelled", "cleanup_pending", "cleanup_failed", "finalizing"]) {
+    for (const journal of [false, true]) {
+      let reached;
+      const held = new Promise((resolve) => { reached = resolve; });
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      let observed;
+      const observationRead = new Promise((resolve) => { observed = resolve; });
+      const { runtime, record, child, work } = observationRuntime({
+        onPersist: async () => { reached(); await gate; },
+        onSnapshot: () => observed(),
+        readOperation: async () => {
+          observed();
+          return { pipelineId: record.pipelineId, pipelineJobId: child.jobId, status: "committed" };
+        },
+      });
+      if (journal) record.integrationQueue = [{ jobId: child.jobId, status: "integrating", operationId: "fixture-operation" }];
+      const writing = runtime.updatePipelineRecord(record, { status, events: [{ type: status === "cancelled" ? "pipeline_abandoned" : "finalization_started" }] });
+      let refreshing;
+      try {
+        await held;
+        refreshing = runtime.refreshPipelineRecord(record);
+        await observationRead;
+        release();
+        await Promise.all([writing, refreshing]);
+        assert.equal(record.status, status);
+        assert.equal(record.revision, 2);
+        assert.deepEqual(work, { hooks: 1, encryptions: 1, opens: 1, writes: 1 });
+        assert.equal(record.events.length, 1);
+        if (journal) assert.equal(record.integrationQueue[0].status, "integrating");
+      } finally {
+        release();
+        await Promise.allSettled([writing, refreshing]);
+      }
+    }
+  }
+});
+
+test("F6-01: missing manifests fail closed, foreign inspection writes nothing and stale writes still fail CAS", async () => {
+  const missing = pipelineRecord("review-observation-missing", { status: "running", queueJobIds: ["missing-observation-child"], expectedChildCount: 1 });
+  await persistPipelineRecord(missing);
+  const beforeMissing = await pipelineObservationRow(missing.pipelineId);
+  const viewed = JSON.parse(textOf(await callTool("get_multi_agent_pipeline", { pipelineId: missing.pipelineId, cwd: repo })));
+  assert.equal(viewed.status, "failed");
+  assert.equal(viewed.revision, beforeMissing.revision + 1);
+  assert.equal(viewed.batchState, "incomplete");
+  assert.equal(viewed.errors.at(-1).errorType, "pipeline_child_record_missing");
+  assert.equal(viewed.events.at(-1).type, "pipeline_child_manifest_invalid");
+  const failedRow = await pipelineObservationRow(missing.pipelineId);
+  await callTool("get_multi_agent_pipeline", { pipelineId: missing.pipelineId, cwd: repo });
+  assert.deepEqual(await pipelineObservationRow(missing.pipelineId), failedRow);
+
+  const foreign = pipelineRecord("review-observation-foreign", { status: "running", ownerInstanceId: "foreign-observation-owner", ownerGeneration: "foreign-generation" });
+  await persistPipelineRecord(foreign);
+  const foreignRow = await pipelineObservationRow(foreign.pipelineId);
+  const foreignView = JSON.parse(textOf(await callTool("get_multi_agent_pipeline", { pipelineId: foreign.pipelineId, cwd: repo })));
+  assert.equal(foreignView.readOnlyForeignOwner, true);
+  await assert.rejects(updatePipelineRecord(foreign, {}), (error) => error.errorType === "pipeline_foreign_owner");
+  assert.deepEqual(await pipelineObservationRow(foreign.pipelineId), foreignRow);
+
+  const stale = pipelineRecord("review-observation-stale", { finalValidationSpec: { command: "git diff --check" }, events: [{ type: "created" }] });
+  await persistPipelineRecord(stale);
+  const db = await openLockDb(repo);
+  try { db.prepare("UPDATE opencode_pipelines SET revision = revision + 1 WHERE pipeline_id = ?").run(stale.pipelineId); } finally { closeDb(db); }
+  const freshRow = await pipelineObservationRow(stale.pipelineId);
+  await assert.rejects(updatePipelineRecord(stale, () => ({ status: "running" })), (error) => error.errorType === "pipeline_concurrent_update");
+  assert.deepEqual(await pipelineObservationRow(stale.pipelineId), freshRow);
+  assert.deepEqual(stale.finalValidationSpec, { command: "git diff --check" });
+  assert.deepEqual(stale.events, [{ type: "created" }]);
+  PIPELINE_RUNS.delete(missing.pipelineId);
+});
+
+test("F6-01: heartbeats renew leases independently of unchanged owning-tool observations", async () => {
+  const { record } = await observationPipeline("review-observation-heartbeat");
+  try {
+    const args = { pipelineId: record.pipelineId, cwd: repo };
+    await callTool("get_multi_agent_pipeline", args);
+    const stable = await pipelineObservationRow(record.pipelineId);
+    const past = "2000-01-01T00:00:00.000Z";
+    const db = await openLockDb(repo);
+    try { db.prepare("UPDATE opencode_pipelines SET owner_heartbeat_at = ?, owner_lease_expires_at = ? WHERE pipeline_id = ?").run(past, past, record.pipelineId); } finally { closeDb(db); }
+    await callTool("get_multi_agent_pipeline", args);
+    assert.deepEqual(await pipelineObservationRow(record.pipelineId), stable);
+    assert.equal((await readPersistedPipelineRecord(record.pipelineId, repo)).ownerLeaseExpiresAt, past);
+    heartbeatKnownQueueState();
+    const renewed = await readPersistedPipelineRecord(record.pipelineId, repo);
+    assert.ok(Date.parse(renewed.ownerLeaseExpiresAt) > Date.now());
+    assert.notEqual(renewed.ownerHeartbeatAt, past);
+    assert.deepEqual(await pipelineObservationRow(record.pipelineId), stable);
+  } finally { PIPELINE_RUNS.delete(record.pipelineId); }
+});
+
 test("1: integration item outcomes are classified, dry runs never change the item", async () => {
   const pending = { status: "pending", operationId: "op-own" };
   assert.equal(nextPipelineIntegrationItemStatus(pending, { ok: false, errorType: "integration_preview_contains_sensitive_text" }, { dryRun: true }), "pending");
@@ -441,6 +770,41 @@ test("18: a sanitized before_wave failure carries its JOB label and Run id", asy
   assert.match(text, /JOB 1\nRun id: [^\n]+\nExecution rejected|JOB 1\nRun id: [^\n]+\n.*Sanitized workspace changed between preflight and the parallel wave/s, text);
 });
 
+test("F6-02: validation-boundary mutation names the changed file and retains the real source worktree", async () => {
+  await resetRepo();
+  const source = await writerWorktree("f6-boundary-source", { "src/a.txt": "reviewed source\n" });
+  const previousGate = selfTestHooks.pipelineGateExecutorTestHook;
+  let gateCalls = 0;
+  selfTestHooks.pipelineGateExecutorTestHook = async () => { gateCalls++; throw new Error("Mutation must block both gates."); };
+  try {
+    const record = pipelineRecord("review-f6-boundary-mutation", {
+      status: "awaiting_finalization",
+      integrationQueue: [pipelineItem("f6-boundary-source", source, { status: "integrated", cleanupRequested: true })],
+      reviewerJob: { agent: "reviewer", task: "Review." },
+      testerJob: { agent: "tester", task: "Test." },
+    });
+    await persistPipelineRecord(record);
+    const result = await finalizePipelineRecord(record, {
+      beforeFinalValidationHook: async ({ cwd }) => writeFile(path.join(cwd, "src/b.txt"), "boundary mutation\n", "utf8"),
+    });
+    assert.equal(result.errorType, "final_validation_mutated_workspace");
+    assert.equal(record.status, "awaiting_finalization");
+    assert.deepEqual(record.finalValidationResult.mutationFiles, ["src/b.txt"]);
+    assert.match(record.finalValidationResult.stderr, /src\/b\.txt/);
+    assert.equal(gateCalls, 0);
+    assert.ok(existsSync(source.worktree.path));
+    assert.equal((await collectIntegrationPatch({ cwd: repo, worktreePath: source.worktree.path, sourceBaseCommit: source.identity.sourceBaseCommit })).sourceStateSha256, source.identity.sourceStateSha256);
+    const persisted = await readPersistedPipelineRecord(record.pipelineId, repo);
+    assert.deepEqual(persisted.finalValidationResult.mutationFiles, ["src/b.txt"]);
+    assert.ok(!JSON.stringify(persisted).includes("ordinarySnapshot"));
+    assert.ok(!JSON.stringify(result).includes("ordinarySnapshot"));
+  } finally {
+    selfTestHooks.pipelineGateExecutorTestHook = previousGate;
+    await cleanupWorktree(source.worktree, "always", true);
+    await resetRepo();
+  }
+});
+
 test("3: finalization ignores ignored output of the final validation and of the gates", async () => {
   await resetRepo();
   const validationPipeline = pipelineRecord("review-final-ignored-validation", {
@@ -529,9 +893,15 @@ test("8: concurrent item updates both land; the journal decides a crashed integr
   });
   await persistPipelineRecord(refreshed);
   await insertJournalOperation({ operationId: "op-refresh", pipelineId: refreshed.pipelineId, jobId: "job-r", status: "committed", patchSha256: "p".repeat(64), sourceStateSha256: "s".repeat(64) });
+  const beforeRecovery = await pipelineObservationRow(refreshed.pipelineId);
   const viewed = JSON.parse(textOf(await callTool("get_multi_agent_pipeline", { pipelineId: refreshed.pipelineId, cwd: repo })));
   assert.equal(viewed.integrationQueue[0].status, "integrated");
   assert.equal(viewed.status, "awaiting_finalization");
+  assert.equal(viewed.revision, beforeRecovery.revision + 1);
+  const recovered = await pipelineObservationRow(refreshed.pipelineId);
+  assert.notEqual(recovered.details_encrypted, beforeRecovery.details_encrypted);
+  await callTool("get_multi_agent_pipeline", { pipelineId: refreshed.pipelineId, cwd: repo });
+  assert.deepEqual(await pipelineObservationRow(refreshed.pipelineId), recovered);
 
   const requalified = pipelineRecord("review-requalified-quarantine", {
     integrationQueue: [{ jobId: "job-q", status: "quarantined", operationId: "op-requalified", patchSha256: "p".repeat(64), sourceStateSha256: "s".repeat(64) }],
@@ -616,6 +986,137 @@ test("21: cleanup recovery removes the authorized worktree although another item
   assert.equal(existsSync(retained.worktree.path), true);
   assert.equal(record.sourceCleanupResults.find((result) => result.worktreePath === retained.worktree.path).reason, "integration_source_changed_after_review");
   await cleanupWorktree(retained.worktree, "always", true);
+});
+
+async function checkPipelineCleanupBranchGuard({ recover, advance }) {
+  await resetRepo();
+  const suffix = `${recover ? "restart" : "normal"}-${advance ? "race" : "stable"}`;
+  const source = await writerWorktree(`d6-${suffix}`, { "src/a.txt": "reviewed source\n" });
+  const headA = (await git(["rev-parse", "HEAD"], source.worktree.path)).trim();
+  const branchRef = `refs/heads/${source.worktree.branch}`;
+  const newFile = path.join(source.worktree.path, "src", "after-review", "kept.txt");
+  let headB = "";
+  let lastCollectedHead = "";
+  let cleanupCalls = 0;
+  try {
+    const item = pipelineItem(`d6-${suffix}`, source, { status: "integrated", cleanupRequested: true });
+    let record = pipelineRecord(`d6-cleanup-${suffix}`, { status: "awaiting_finalization", integrationQueue: [item] });
+    if (recover) {
+      const authorization = {
+        worktreePath: item.worktreePath, branch: item.branch, sourceBaseCommit: item.sourceBaseCommit,
+        patchSha256: item.patchSha256, sourceStateSha256: item.sourceStateSha256,
+      };
+      const targetState = await captureIntegrationTargetState(repo);
+      assert.equal(targetState.ok, true, JSON.stringify(targetState));
+      Object.assign(record, {
+        status: "cleanup_pending", cleanupPending: true, cleanupState: "authorized",
+        sourceCleanupResults: [{ ...authorization, cleanup: "authorized" }],
+        events: [{ type: "source_cleanup_authorized", at: new Date().toISOString(),
+          targetStateSha256: targetState.targetStateSha256,
+          trackedTargetStateSha256: trackedTargetStateSha256(targetState), worktrees: [authorization] }],
+      });
+      await persistPipelineRecord(record);
+      const restored = await readPersistedPipelineRecord(record.pipelineId, repo);
+      assert.ok(restored && restored !== record, "recovery must reload the durable authorization");
+      assert.equal(restored.sourceCleanupResults[0].patchSha256, item.patchSha256);
+      record = restored;
+    }
+    const runtime = createPipelineFinalizeRuntime({
+      CONFIG, runCommand, captureIntegrationTargetState, trackedTargetStateSha256, updatePipelineRecord,
+      collectIntegrationPatch: async (options) => {
+        const collected = await collectIntegrationPatch(options);
+        if (collected.ok) lastCollectedHead = collected.sourceHead;
+        return collected;
+      },
+      cleanupWorktree: async (worktree, ...args) => {
+        cleanupCalls++;
+        assert.equal(lastCollectedHead, headA, "the final real source collection must precede branch movement");
+        if (advance) {
+          await mkdir(path.dirname(newFile), { recursive: true });
+          await writeFile(newFile, "new source work after final collection\n", "utf8");
+          await git(["add", "."], source.worktree.path);
+          await gitCommit("source advances before shared cleanup", source.worktree.path);
+          headB = (await git(["rev-parse", "HEAD"], source.worktree.path)).trim();
+          assert.notEqual(headB, headA);
+        }
+        return cleanupWorktree(worktree, ...args);
+      },
+    });
+    let results;
+    if (recover) {
+      const resumed = await runtime.resumeAuthorizedPipelineCleanup(record);
+      assert.equal(resumed.ok, true, JSON.stringify(resumed));
+      results = record.sourceCleanupResults;
+      const persisted = await readPersistedPipelineRecord(record.pipelineId, repo);
+      assert.equal(persisted.status, "completed");
+      assert.equal(persisted.cleanupPending, false);
+      assert.equal(persisted.cleanupState, advance ? "completed_with_retained_sources" : "completed");
+      assert.equal(persisted.sourceCleanupResults[0].cleanup, advance ? "retained_for_review" : "success");
+    } else {
+      results = await runtime.finalizePipelineSourceCleanup(record, { authorizeCleanup: async () => {} });
+    }
+    assert.equal(cleanupCalls, 1, "actual shared cleanup must execute");
+    const registered = (await git(["worktree", "list", "--porcelain"])).split(/\r?\n/).some((line) =>
+      line.startsWith("worktree ") && pipelineIntegrationItemMatches({ cwd: repo },
+        { worktreePath: line.slice("worktree ".length) }, { worktreePath: source.worktree.path }));
+    assert.equal(registered, advance);
+    assert.equal(existsSync(source.worktree.path), advance);
+    if (advance) {
+      assert.equal(results[0].cleanup, "retained_for_review", JSON.stringify(results));
+      assert.equal(results[0].reason, "source_branch_identity_changed");
+      assert.equal((await git(["rev-parse", "--verify", branchRef])).trim(), headB);
+      assert.equal(await readFile(newFile, "utf8"), "new source work after final collection\n");
+    } else {
+      assert.equal(results[0].cleanup, "success", JSON.stringify(results));
+      assert.equal((await runCommand("git", ["show-ref", "--verify", "--quiet", branchRef], repo, 15_000)).exitCode, 1);
+    }
+  } finally {
+    if (existsSync(source.worktree.path)) await cleanupWorktree(source.worktree, "always", true);
+    await resetRepo();
+  }
+}
+
+test("D6-C3-001: final source tip movement retains the real worktree, new contents and branch", async () => {
+  await checkPipelineCleanupBranchGuard({ recover: false, advance: true });
+});
+
+test("D6-C3-001: unchanged source still removes its worktree and branch", async () => {
+  await checkPipelineCleanupBranchGuard({ recover: false, advance: false });
+});
+
+test("D6-C3-001: fresh-runtime durable cleanup recovery retains a source that advances at removal", async () => {
+  await checkPipelineCleanupBranchGuard({ recover: true, advance: true });
+});
+
+test("D6-C3-001: fresh-runtime durable cleanup recovery removes an unchanged source", async () => {
+  await checkPipelineCleanupBranchGuard({ recover: true, advance: false });
+});
+
+test("D6-C3-001: an unresolvable real source HEAD after authorization retains the worktree", async () => {
+  await resetRepo();
+  const source = await writerWorktree("d6-dangling", { "src/a.txt": "retained source\n" });
+  const branchRef = `refs/heads/${source.worktree.branch}`;
+  const head = (await git(["rev-parse", "HEAD"], source.worktree.path)).trim();
+  let cleanupCalls = 0;
+  const runtime = createPipelineFinalizeRuntime({
+    CONFIG, runCommand, collectIntegrationPatch,
+    cleanupWorktree: async (...args) => { cleanupCalls++; return cleanupWorktree(...args); },
+  });
+  try {
+    const results = await runtime.finalizePipelineSourceCleanup(pipelineRecord("d6-dangling", {
+      integrationQueue: [pipelineItem("d6-dangling", source, { status: "integrated", cleanupRequested: true })],
+    }), { authorizeCleanup: async () => { await git(["update-ref", "-d", branchRef]); } });
+    assert.notEqual((await runCommand("git", ["rev-parse", "--verify", "HEAD^{commit}"], source.worktree.path, 15_000)).exitCode, 0);
+    assert.equal(results[0].cleanup, "retained_for_review", JSON.stringify(results));
+    assert.equal(results[0].reason, "integration_source_changed_after_cleanup_authorization");
+    assert.equal(cleanupCalls, 0, "failed final source collection must not enter shared cleanup");
+    assert.equal(existsSync(source.worktree.path), true);
+    assert.equal(await readFile(path.join(source.worktree.path, "src/a.txt"), "utf8"), "retained source\n");
+  } finally {
+    await git(["update-ref", branchRef, head]);
+    await cleanupWorktree(source.worktree, "always", true);
+    await resetRepo();
+  }
 });
 
 test("22: pipeline gates read the integrated checkout and use a job id per attempt", async () => {

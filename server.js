@@ -2882,7 +2882,7 @@ const { integrationPreviewReuse, sweepIntegrationPreviews, ensureIntegrationPrev
 const { integratePatchSerially, recoverIntegrationRepositorySerially, INTEGRATION_QUARANTINE_RESOLUTION_MODES, verifyQuarantinedOperationRestored, integrationQuarantineOperator, resolveIntegrationQuarantine, formatIntegrationQuarantineResolution } = createIntegrationSerialRuntime({ worktreeArtifactStatus, CONFIG, DEFAULT_LOCK_TTL_MS, INTEGRATION_RECOVERY_BLOCKED_ROOTS, INTEGRATION_RESOLVED_STATUSES, abortSignalErrorType: (...args) => abortSignalErrorType(...args), acquireHardLock: (...args) => acquireHardLock(...args), enqueueIntegrationCleanup: (...args) => enqueueIntegrationCleanup(...args), cleanupIntegratedBatchWorktreesWhileLocked: (...args) => cleanupIntegratedBatchWorktreesWhileLocked(...args), cleanupIntegratedWorktreeWhileLocked: (...args) => cleanupIntegratedWorktreeWhileLocked(...args), closeDb, conflictPathsFromConflict, exactIntegrationFileSnapshot, integratePatchWithoutSerialLock: (...args) => integratePatchWithoutSerialLock(...args), integrationJournalDiagnosis, integrationRecoveryBaseline, integrationRecoveryErrorText, logEvent, openLockDb, readIntegrationJournalFileEvidence, readIntegrationOperationSummary, recoverIntegrationOperationsWhileLocked, releaseHardLock: (...args) => releaseHardLock(...args), runCommand, startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args), transitionIntegrationOperation, truncateText });
 
 const { integratePatchWithoutSerialLock, integrationCleanupTargetStateError, cleanupIntegratedWorktreeWhileLocked, cleanupIntegratedBatchWorktreesWhileLocked, recordChangedFiles, getIntegrationScratchCleanupTestHook, setIntegrationScratchCleanupTestHook } = createIntegrationApplyRuntime({ CONFIG, INTEGRATION_RECOVERY_BLOCKED_ROOTS, abortSignalErrorType: (...args) => abortSignalErrorType(...args), applyPatchFile, captureGitHead, captureGitIndexIdentity, captureIntegrationTargetState, captureIntegrationSourceProof, integrationPreviewReuse, capturePatchedPathsState, captureRollbackBaseline, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, checkPatchApplies, cleanupWorktree, closeDb, collectIntegrationBatchPatch, collectIntegrationPatch, exactIntegrationFileSnapshot, filterGeneratedWorktreeFiles, gitChangedFileSnapshot, gitChangedFiles, gitIndexPathSnapshot, inspectRepositoryOperationState, integrationContentMismatches, integrationPreviewReceiptError, integrationRecoveryErrorText, isolatedIndexPreservationEvidence, loadProjectAgentPolicy, logEvent, makeIntegrationPreviewReceipt, openLockDb, prepareIntegrationOperation, quarantineIntegrationOperation, recoverIntegrationOperationsWhileLocked, rollbackVerifiedOwnedChanges, runCommand, runValidationGate, simulateIntegrationPatchSnapshot, snapshotIdentitySha256, snapshotMismatches, transitionIntegrationOperation, validateChangedFilesForPlan, writeTemporaryPatchFile });
-const { enqueueIntegrationCleanup, drainDeferredWorktreeCleanup, setDeferredCleanupSchedulingDisabled, deferredWorktreeCleanupRunning } = createIntegrationCleanupRuntime({
+const { enqueueIntegrationCleanup, cleanupCommittedWorktree, drainDeferredWorktreeCleanup, setDeferredCleanupSchedulingDisabled, deferredWorktreeCleanupRunning } = createIntegrationCleanupRuntime({
   CONFIG, openLockDb, closeDb, assertIntegrationLockOwned, acquireHardLock: (...args) => acquireHardLock(...args),
   releaseHardLock: (...args) => releaseHardLock(...args), startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args),
   cleanupIntegratedWorktreeWhileLocked, runCommand, captureIntegrationTargetState,
@@ -2892,7 +2892,7 @@ const { enqueueIntegrationCleanup, drainDeferredWorktreeCleanup, setDeferredClea
 });
 
 
-const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTableHasCompositePrimaryKey, ensureLockTableSchema, migrateLegacyLockTable, rowsToLocks, expireLocksFromDb, listLocksFromDb, cleanupExpiredLocks, listLocks, acquireHardLock, releaseHardLock, quarantineHardLock, formatLockExpiry, formatAgentLockList, reservedLockAgentError, hardLockPathsForPlan, hardLockTtlForPlan, lockOwnershipLossError, startHardLockHeartbeat, hardLockSummary } = createLockRuntime({
+const { lockPaths, conflictsWithActiveLock, makeLockId, makeLockToken, lockTableHasCompositePrimaryKey, ensureLockTableSchema, migrateLegacyLockTable, rowsToLocks, expireLocksFromDb, listLocksFromDb, cleanupExpiredLocks, listLocks, acquireHardLock, releaseHardLock, beginFinalizerValidationProtection, restoreFinalizerReadLease, quarantineHardLock, formatLockExpiry, formatAgentLockList, reservedLockAgentError, hardLockPathsForPlan, hardLockTtlForPlan, lockOwnershipLossError, startHardLockHeartbeat, hardLockSummary } = createLockRuntime({
   CONFIG,
   DEFAULT_LOCK_TTL_MS,
   MAX_LOCK_TTL_MS,
@@ -3011,7 +3011,7 @@ async function migrateLegacyEncryptedState(db, dbPath) {
   return true;
 }
 
-const { directRunAuditStore, abortSignalErrorType, combineAbortSignals, validateDelegationPlanInputs, findActiveLockConflict, prepareDelegationJobs, formatDelegationPlanJob } = registerLockAndStatusTools({ withProjectRootCache, providerSlotWaitStorage, attestationCacheStatus, attachRetainedWorktree, continueWorktreeJobError: (...args) => continueWorktreeJobError(...args), BRIDGE_INSTANCE_ID, BRIDGE_PROCESS_STARTED_AT, BRIDGE_RUNTIME_DIR, BRIDGE_SOURCE_SHA256, CONFIG, DEFAULT_LOCK_TTL_MS, DEFAULT_SUBAGENT_PROXY_AGENT, GLOBALLY_REQUIRED_MANAGED_AGENTS, GLOBAL_BRIDGE_STATE_DIR, MAX_LOCK_TTL_MS, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, MCP_ORCHESTRATOR_AGENT, MCP_SANITIZED_READER_AGENT, OPENCODE_AGENT_DIR, OPENCODE_EXE, OPENCODE_SKILL_DIR, QUEUE_JOBS, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentIdleTimeoutStatusLine, agentMetadataPolicyOptions, allowlistedModelOverride, applyModelOverrideToMetadata, assessQueuePlan, attestContractorNestedAgents, availableAgentLabels, bridgeSourceFreshness, bridgeSourceFreshnessLines, clearAttestationCache, closeDb, commandShape, compactQueueJobLines: (...args) => compactQueueJobLines(...args), conflictPathsFromConflict, conflictsWithActiveLock, contractorAuthorizationToken: (...args) => contractorAuthorizationToken(...args), decryptIntegrationJournalBytes, describeConcurrencyLimits, diagnoseJobView: (...args) => diagnoseJobView(...args), dirtyCheckpointDetails, directExecutionLockConflictDetails: (...args) => directExecutionLockConflictDetails(...args), effectiveContractorAuthorizationSha256: (...args) => effectiveContractorAuthorizationSha256(...args), effectiveQueueMode, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, encryptIntegrationJournalBytes, enqueueQueueJob, executeOpenCodeJob: (...args) => executeOpenCodeJob(...args), prepareOpenCodeJob: (...args) => prepareOpenCodeJob(...args), shouldUseWorktree, formatAgentLockList, formatLockExpiry, formatRejectedExecution, hardLockPathsForPlan, integrationJournalDiagnosis, jobAgentRuntime: (...args) => jobAgentRuntime(...args), jobInputShape, listAvailableAgents, listLocks, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), listPersistedQueueRecords: (...args) => listPersistedQueueRecords(...args), queryPersistedQueueRecords: (...args) => queryPersistedQueueRecords(...args), listRetainedWorktreeArtifacts: (...args) => listRetainedWorktreeArtifacts(...args), makeQueueJobId, managedSkillSourceEvidence, normalizeJobCwd, nowMs, openLockDb, parallelBatchCapacityError: (...args) => parallelBatchCapacityError(...args), parallelProviderKeys: (...args) => parallelProviderKeys(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), providerCapacitySnapshot, queueAgentActivity, queueCapacityReport, queueMemoryGate, queueMemoryStatusLines, queueMemoryWaitingJobs, queueOnlyOptionsError: (...args) => queueOnlyOptionsError(...args), queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), readAgentDebugMetadata, readOnlyRoutingPolicyError: (...args) => readOnlyRoutingPolicyError(...args), recordMatchesProject, refreshRuntimeConcurrency, releaseHardLock, reservedLockAgentError, resolveProjectStateRoot, retainedWorktreeView: (...args) => retainedWorktreeView(...args), runCommand, safeOpenCodeCommand, sanitizedAgentMetadataError, sanitizedDiscoveryContext: (...args) => sanitizedDiscoveryContext(...args), sanitizedRoutingPolicyError, sanitizedWorkspaceSchema, server, summarizeStderr, timeoutForAgent, userAuthorizedOrchestrator: (...args) => userAuthorizedOrchestrator(...args), validateParallelWritePlan: (...args) => validateParallelWritePlan(...args), validateSingleLockPlan: (...args) => validateSingleLockPlan(...args), validationCommandPreflightError, verifyExternalPluginPolicy, verifyJobWorkspaceReadiness, verifySanitizedJobsBeforeDiscovery: (...args) => verifySanitizedJobsBeforeDiscovery(...args), verifySanitizedWorkspace, externalRunnerStatusLines: (...args) => externalRunnerStatusLines(...args) });
+const { directRunAuditStore, abortSignalErrorType, combineAbortSignals, validateDelegationPlanInputs, findActiveLockConflict, prepareDelegationJobs, formatDelegationPlanJob } = registerLockAndStatusTools({ withProjectRootCache, providerSlotWaitStorage, attestationCacheStatus, attachRetainedWorktree, continueWorktreeJobError: (...args) => continueWorktreeJobError(...args), BRIDGE_INSTANCE_ID, BRIDGE_PROCESS_STARTED_AT, BRIDGE_RUNTIME_DIR, BRIDGE_SOURCE_SHA256, CONFIG, DEFAULT_LOCK_TTL_MS, DEFAULT_SUBAGENT_PROXY_AGENT, GLOBALLY_REQUIRED_MANAGED_AGENTS, GLOBAL_BRIDGE_STATE_DIR, MAX_LOCK_TTL_MS, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, MCP_ORCHESTRATOR_AGENT, MCP_SANITIZED_READER_AGENT, OPENCODE_AGENT_DIR, OPENCODE_EXE, OPENCODE_SKILL_DIR, QUEUE_JOBS, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentIdleTimeoutStatusLine, agentMetadataPolicyOptions, allowlistedModelOverride, applyModelOverrideToMetadata, assessQueuePlan, attestContractorNestedAgents, availableAgentLabels, bridgeSourceFreshness, bridgeSourceFreshnessLines, clearAttestationCache, closeDb, commandShape, compactQueueJobLines: (...args) => compactQueueJobLines(...args), conflictPathsFromConflict, conflictsWithActiveLock, contractorAuthorizationToken: (...args) => contractorAuthorizationToken(...args), decryptIntegrationJournalBytes, describeConcurrencyLimits, diagnoseJobView: (...args) => diagnoseJobView(...args), dirtyCheckpointDetails, directExecutionLockConflictDetails: (...args) => directExecutionLockConflictDetails(...args), effectiveContractorAuthorizationSha256: (...args) => effectiveContractorAuthorizationSha256(...args), effectiveQueueMode, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, encryptIntegrationJournalBytes, enqueueQueueJob, executeOpenCodeJob: (...args) => executeOpenCodeJob(...args), prepareOpenCodeJob: (...args) => prepareOpenCodeJob(...args), shouldUseWorktree, formatAgentLockList, formatLockExpiry, formatRejectedExecution, hardLockPathsForPlan, integrationJournalDiagnosis, jobAgentRuntime: (...args) => jobAgentRuntime(...args), jobInputShape, listAvailableAgents, listLocks, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), queryPersistedPipelineRecords: (...args) => queryPersistedPipelineRecords(...args), listPersistedQueueRecords: (...args) => listPersistedQueueRecords(...args), queryPersistedQueueRecords: (...args) => queryPersistedQueueRecords(...args), listRetainedWorktreeArtifacts: (...args) => listRetainedWorktreeArtifacts(...args), makeQueueJobId, managedSkillSourceEvidence, normalizeJobCwd, nowMs, openLockDb, parallelBatchCapacityError: (...args) => parallelBatchCapacityError(...args), parallelProviderKeys: (...args) => parallelProviderKeys(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), providerCapacitySnapshot, queueAgentActivity, queueCapacityReport, queueMemoryGate, queueMemoryStatusLines, queueMemoryWaitingJobs, queueOnlyOptionsError: (...args) => queueOnlyOptionsError(...args), queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), readAgentDebugMetadata, readOnlyRoutingPolicyError: (...args) => readOnlyRoutingPolicyError(...args), recordMatchesProject, refreshRuntimeConcurrency, releaseHardLock, reservedLockAgentError, resolveProjectStateRoot, retainedWorktreeView: (...args) => retainedWorktreeView(...args), runCommand, safeOpenCodeCommand, sanitizedAgentMetadataError, sanitizedDiscoveryContext: (...args) => sanitizedDiscoveryContext(...args), sanitizedRoutingPolicyError, sanitizedWorkspaceSchema, server, summarizeStderr, timeoutForAgent, userAuthorizedOrchestrator: (...args) => userAuthorizedOrchestrator(...args), validateParallelWritePlan: (...args) => validateParallelWritePlan(...args), validateSingleLockPlan: (...args) => validateSingleLockPlan(...args), validationCommandPreflightError, verifyExternalPluginPolicy, verifyJobWorkspaceReadiness, verifySanitizedJobsBeforeDiscovery: (...args) => verifySanitizedJobsBeforeDiscovery(...args), verifySanitizedWorkspace, externalRunnerStatusLines: (...args) => externalRunnerStatusLines(...args) });
 
 const { listRetainedWorktreeArtifacts, QUEUE_JOB_RUNNING_STATUSES, retainedWorktreeView, directRunView, diagnoseJobView, ESSENTIAL_QUEUE_JOB_FIELDS, essentialQueueJobView, queueTimedOutWriterNote, compactQueueJobLines, formatToolRefusal, formatConcurrencyChange } = registerJobTools({ releaseFinishedQueueDetails: (record) => releaseFinishedQueueDetails(record), providerSlotWaitingJobs, BRIDGE_INSTANCE_ID, CONFIG, MAX_GLOBAL_WORKER_LIMIT, MAX_RUNTIME_CONCURRENCY_LIMIT, QUEUE_JOBS, RETAINED_WORKTREE_STATUSES, assessQueuePlan, authoritativeQueueRecord: (...args) => authoritativeQueueRecord(...args), cancelPersistedQueueJob: (...args) => cancelPersistedQueueJob(...args), closeDb, describeConcurrencyLimits, directRunAuditStore, effectiveBridgeStateDirectory, effectiveQueueMode, formatIdleDuration, formatOpenCodeUsage, logEvent, nowMs, openLockDb, pauseProvider, persistQueueRecord: (...args) => persistQueueRecord(...args), processIsAlive, queueAgentActivity, queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), queueRunStage, readPersistedQueueRecord: (...args) => readPersistedQueueRecord(...args), reconcileParentPipelineAfterQueueTerminal: (...args) => reconcileParentPipelineAfterQueueTerminal(...args), reconcileStaleQueueRecords, recordMatchesProject, requeueQueueJob: (...args) => requeueQueueJob(...args), resolveProjectStateRoot, resumeProvider, scheduleQueue: (...args) => scheduleQueue(...args), server, setRuntimeConcurrency, timedOutWriterNote });
 
@@ -3610,7 +3610,7 @@ async function activeProviderPauses() {
 // Self-test only: stands in for CODEX_OPENCODE_AUTO_RESUME_INTERRUPTED (CONFIG is frozen).
 let autoResumeInterruptedOverride = null;
 
-const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_LATER_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, AUTO_INTEGRATION_HEAD_RETRIES, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, autoIntegrateQueueJobs, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration, sweepCommittedWorktrees, committedWorktreeSweepPending, autoIntegrationTestHooks } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, INTEGRATION_BATCH_MAX_ITEMS, RepositoryRootSet, cleanupWorktree, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
+const { autoIntegrateJobError, AUTO_INTEGRATION_CHAINS, AUTO_INTEGRATION_WAITING, AUTO_INTEGRATION_RETRYABLE_ERRORS, AUTO_INTEGRATION_LATER_ERRORS, AUTO_INTEGRATION_ROUNDS, AUTO_INTEGRATION_LATER_MAX, AUTO_INTEGRATION_HEAD_RETRIES, autoIntegrationLaterDelayMs, AUTO_INTEGRATION_EMPTY_INDEX_RETRIES, autoIntegrationCommitHooks, AUTO_INTEGRATION_FINAL_STATUSES, AUTO_INTEGRATION_CLAIM_STALE_MS, autoIntegrationClaimerGone, autoIntegrateQueueJob, autoIntegrateQueueJobs, AUTO_INTEGRATION_RESCHEDULED, rescheduleOpenAutoIntegrations, scheduleAutoIntegration, sweepCommittedWorktrees, committedWorktreeSweepPending, autoIntegrationTestHooks } = createAutoIntegrationRuntime({ BRIDGE_INSTANCE_ID, CONFIG, INTEGRATION_BATCH_MAX_ITEMS, RepositoryRootSet, cleanupWorktree, cleanupCommittedWorktree, decryptQueueRequest, delayWithSignal, effectiveQueueMode, integratePatchSerially, logEvent, patchTerminalQueueSummary: (...args) => patchTerminalQueueSummary(...args), processIsAlive, resolveProjectStateRoot, runCommand });
 
 
 // node:sqlite reports constraint failures as code ERR_SQLITE_ERROR with the extended result
@@ -4063,6 +4063,8 @@ const {
   scheduleQueueRetryPolicy,
   requeueQueueJob,
   getQueueRetryPoliciesInFlight,
+  getQueueRetryPolicyTestHook,
+  setQueueRetryPolicyTestHook,
 } = createQueueRetryRuntime({
   CONFIG,
   QUEUE_TERMINAL_STATUSES,
@@ -4110,11 +4112,11 @@ function nextQueueScheduleDelay(records, hasCapacity, progressed = true, now = D
 
 const { pauseWaitCheckedAt, pauseWaitCandidates, releaseResumedPauseWaits, queueWakeAt, queueSchedulerRunning, queueScheduleRequested, scheduleQueue } = createQueueSchedulerRuntime({ CONFIG, INTEGRATION_RECOVERY_BLOCKED_ROOTS, QUEUE_JOBS, activeProviderPauses, allowlistedModelOverride, effectiveQueueMode, effectiveQueueWriteConflictPolicy, findQueueWriteConflict, holdQueueForMemory, logEvent, modelPauseKeyForMetadata, nextQueueScheduleDelay, parseModelAllowlistEntry, providerKeyForMetadata, quotaGroupProviderKeys, queueDrainRequested, queueMemoryGate, queueRecordOwnedElsewhere, refreshRuntimeConcurrency, releaseQueueMemoryHold, runningQueueRecords, startQueueRecord, updateQueueRecordDurable, updateQueueRecordDurableReacquiringLease });
 
-const { makePipelineId, pipelinePrivateDetails, pipelineRecordDurableSummary, encryptPipelinePrivateDetails, decryptPipelinePrivateDetails, pipelineOwnedByThisInstance, claimPersistedPipeline, pipelineOwnerRejection, enqueuePipelinePersistence, writePipelineRecordSnapshot, persistPipelineRecord, PIPELINE_INTEGRATION_CLOSED_STATUSES, updatePipelineRecord, reconcilePipelineIntegrationOperationStates, readPersistedPipelineRecord, listPersistedPipelineRecords, authoritativePipelineRecord, readPersistedPipelineChildren, pipelineJobStatus, mergePipelineIntegrationQueue, refreshPipelineRecord, reconcileParentPipelineAfterQueueTerminal, trackedTargetStateSha256 } = createPipelineStoreRuntime({ BRIDGE_INSTANCE_ID, CONFIG, PIPELINE_PERSISTENCE_CHAINS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, decryptIntegrationJournalBytes, decryptQueueRequest, effectiveQueueMode, encryptIntegrationJournalBytes, encryptQueueRequest, formatRejectedExecution, getPipelinePersistenceTestHook: () => pipelinePersistenceTestHook, logEvent, openLockDb, persistedQueueRecordFromRow, queueRecordSnapshot, readIntegrationOperationSummary, readPersistedQueueRecord, recordMatchesProject, safeNamePart, stateCapacityError });
+const { makePipelineId, pipelinePrivateDetails, pipelineRecordDurableSummary, encryptPipelinePrivateDetails, decryptPipelinePrivateDetails, pipelineOwnedByThisInstance, claimPersistedPipeline, pipelineOwnerRejection, enqueuePipelinePersistence, writePipelineRecordSnapshot, persistPipelineRecord, PIPELINE_INTEGRATION_CLOSED_STATUSES, updatePipelineRecord, reconcilePipelineIntegrationOperationStates, readPersistedPipelineRecord, listPersistedPipelineRecords, queryPersistedPipelineRecords, authoritativePipelineRecord, readPersistedPipelineChildren, pipelineJobStatus, mergePipelineIntegrationQueue, refreshPipelineRecord, reconcileParentPipelineAfterQueueTerminal, trackedTargetStateSha256 } = createPipelineStoreRuntime({ BRIDGE_INSTANCE_ID, CONFIG, PIPELINE_PERSISTENCE_CHAINS, PIPELINE_RUNS, QUEUE_JOBS, closeDb, decryptIntegrationJournalBytes, decryptQueueRequest, effectiveQueueMode, encryptIntegrationJournalBytes, encryptQueueRequest, formatRejectedExecution, getPipelinePersistenceTestHook: () => pipelinePersistenceTestHook, logEvent, openLockDb, persistedQueueRecordFromRow, queueRecordSnapshot, readIntegrationOperationSummary, readPersistedQueueRecord, recordMatchesProject, safeNamePart, stateCapacityError });
 
 const { formatIntegrationBatchSummary } = registerIntegrationTools({ INTEGRATION_BATCH_MAX_ITEMS, PIPELINE_INTEGRATION_CLOSED_STATUSES, PIPELINE_RUNS, authoritativePipelineRecord, claimPersistedPipeline, formatIntegrationTargetMove, formatIntegrationTimings, formatRejectedExecution, integratePatchSerially, integrationTimingStorage, isBridgeGeneratedWorktree, loadProjectAgentPolicy, nowMs, pipelineOwnedByThisInstance, pipelineOwnerRejection, reconcilePipelineIntegrationOperationStates, refreshPipelineRecord, resolveProjectStateRoot, server, updatePipelineRecord });
 
-const { PIPELINE_TERMINAL_GATE_ERROR_TYPES, PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES, deferPipelineFinalization, PIPELINE_GATE_VERDICT_INSTRUCTION, PIPELINE_GATE_VERDICT_LINE, parsePipelineGateVerdict, PIPELINE_GATE_VERDICT_ERROR_TYPES, runPipelineReadOnlyGate, cleanupAuthorizationMatchesItem, finalizePipelineSourceCleanup, resumeAuthorizedPipelineCleanup, FINALIZING_PIPELINE_IDS, finalizePipelineRecord, finalizePipelineRecordUnderLease, finalizePipelineRecordWhileLocked, getPipelineGateExecutorTestHook, setPipelineGateExecutorTestHook } = createPipelineFinalizeRuntime({ CONFIG, DEFAULT_LOCK_TTL_MS, PIPELINE_INTEGRATION_CLOSED_STATUSES, abortSignalErrorType, acquireHardLock, captureIntegrationTargetState, changedFileValidationErrorType, changedFilesBetween, cleanupWorktree, collectIntegrationPatch, combineAbortSignals, conflictPathsFromConflict, conflictsWithActiveLock, executeOpenCodeJob, gitChangedFileSnapshot, isManagedReadOnlyAgent, listLocks, loadProjectAgentPolicy, nowMs, reconcilePipelineIntegrationOperationStates, refreshPipelineRecord, releaseHardLock, resolveProjectStateRoot, runCommand, runValidationGate, startHardLockHeartbeat, trackedTargetStateSha256, truncateResultText, updatePipelineRecord, verifySanitizedWorkspace });
+const { PIPELINE_TERMINAL_GATE_ERROR_TYPES, PIPELINE_TERMINAL_FINAL_VALIDATION_ERROR_TYPES, deferPipelineFinalization, PIPELINE_GATE_VERDICT_INSTRUCTION, PIPELINE_GATE_VERDICT_LINE, parsePipelineGateVerdict, PIPELINE_GATE_VERDICT_ERROR_TYPES, runPipelineReadOnlyGate, cleanupAuthorizationMatchesItem, finalizePipelineSourceCleanup, resumeAuthorizedPipelineCleanup, FINALIZING_PIPELINE_IDS, finalizePipelineRecord, finalizePipelineRecordUnderLease, finalizePipelineRecordWhileLocked, getPipelineGateExecutorTestHook, setPipelineGateExecutorTestHook } = createPipelineFinalizeRuntime({ CONFIG, DEFAULT_LOCK_TTL_MS, PIPELINE_INTEGRATION_CLOSED_STATUSES, abortSignalErrorType, acquireHardLock, beginFinalizerValidationProtection, captureIntegrationTargetState, changedFileValidationErrorType, changedFilesBetween, cleanupWorktree, collectIntegrationPatch, combineAbortSignals, conflictPathsFromConflict, conflictsWithActiveLock, containmentRecord, executeOpenCodeJob, isManagedReadOnlyAgent, listLocks, loadProjectAgentPolicy, nowMs, quarantineHardLock, reconcilePipelineIntegrationOperationStates, refreshPipelineRecord, releaseHardLock, restoreFinalizerReadLease, resolveProjectStateRoot, runCommand, runValidationGate, startHardLockHeartbeat, trackedTargetStateSha256, truncateResultText, updatePipelineRecord, verifySanitizedWorkspace });
 
 const { createPipelinePlan, verifyParallelLockResults, settleIndependentParallelJobs, PARALLEL_GROUP_DEADLINE_MARGIN_MS, parallelGroupDeadlineMs, parallelGroupScopeReport, parallelExecutionOverlapEvidence, labelParallelRunId } = createParallelPlanRuntime({ BRIDGE_INSTANCE_ID, CONFIG, captureGitHead, changedFilesBetween, gitChangedFileSnapshot, isManagedReadOnlyAgent, makePipelineId, readOnlyHeadMove, readOnlyWorkspaceDrift, scopeChangedFileViolations, timeoutForAgent, validateDelegationPlanInputs });
 
@@ -4892,23 +4894,51 @@ function suppressQueueWorkerExitLog(code) {
   processExitLogSuppressedCode = code;
 }
 
-// B-127: retries the retry policy deferred because the interrupted run's child was still alive
-// (requeue_orphan_child_alive, marked retryDeferredAt). Once that child is gone the policy runs
-// again, once per job and process; true while such a child still lives, so the unchanged-file memo
-// keeps this database in the pass (a process ending does not touch the database file).
+// Retry terminal intent, including legacy policy-bearing failed/interrupted rows and B-127
+// orphan deferrals. Only a completed policy decision reserves the job permanently; a failed or still-deferred
+// dispatch is retried by a later bounded pass. Live children and in-flight dispatches keep the
+// unchanged-file memo pending (a process ending does not touch the database file).
 const QUEUE_DEFERRED_RETRIES_SCHEDULED = new Set();
-function retryDeferredByOrphans(db) {
+const QUEUE_DEFERRED_RETRIES_IN_FLIGHT = new Set();
+const QUEUE_DEFERRED_RETRY_FINAL_ACTIONS = new Set(["requeued", "gave_up", "none", "not_eligible", "resume_disabled"]);
+const QUEUE_RETRY_RECOVERY_BATCH = 64;
+const QUEUE_RETRY_RECOVERY_CURSORS = new Map();
+function retryDeferredByOrphans(db, dbPath) {
   let waiting = false;
-  const rows = db.prepare(`
-    SELECT job_id, cwd, record_json FROM opencode_jobs
-    WHERE status = 'interrupted' AND request_encrypted IS NOT NULL AND request_encrypted <> ''
-      AND json_valid(record_json)
-      AND COALESCE(json_extract(record_json, '$.retryDeferredAt'), '') <> ''
-      AND COALESCE(json_extract(record_json, '$.requeuedAs'), '') = ''
-      AND COALESCE(json_extract(record_json, '$.completionOutcome'), '') <> 'gave_up'
-  `).all();
+  // Keep this predicate identical to the additive partial index. CASE guards each JSON
+  // operation independently: malformed retained summaries cannot abort index creation/scans.
+  const query = db.prepare(`
+    SELECT job_id, cwd, record_json FROM opencode_jobs INDEXED BY opencode_jobs_retry_decision_idx
+    WHERE status IN ('failed', 'interrupted') AND request_encrypted IS NOT NULL AND request_encrypted <> ''
+      AND (cancellation_requested_at IS NULL OR cancellation_requested_at = '')
+      AND json_type(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END) = 'object'
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.parentJobId'), '') = ''
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.requeuedAs'), '') = ''
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.completionOutcome'), '') <> 'gave_up'
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.retryDecisionOutcome'), '') NOT IN ('requeued', 'gave_up', 'none', 'not_eligible', 'resume_disabled')
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.cancellationRequested'), 0) = 0
+      AND COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.cancellationRequestedAt'), '') = ''
+      AND (COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.retryDecisionPendingAt'), '') <> ''
+        OR COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.retryDeferredAt'), '') <> ''
+        OR CAST(COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.maxAttempts'), 0) AS INTEGER) > 0
+        OR CAST(COALESCE(json_extract(CASE WHEN json_valid(record_json) THEN record_json ELSE '{}' END, '$.retryAttempt'), 0) AS INTEGER) > 0)
+      AND job_id > ? ORDER BY job_id LIMIT ?
+  `);
+  let cursor = QUEUE_RETRY_RECOVERY_CURSORS.get(dbPath) || "";
+  let rows = query.all(cursor, QUEUE_RETRY_RECOVERY_BATCH + 1);
+  if (cursor && !rows.length) {
+    cursor = "";
+    rows = query.all(cursor, QUEUE_RETRY_RECOVERY_BATCH + 1);
+  }
+  const more = rows.length > QUEUE_RETRY_RECOVERY_BATCH;
+  rows = rows.slice(0, QUEUE_RETRY_RECOVERY_BATCH);
+  QUEUE_RETRY_RECOVERY_CURSORS.set(dbPath, more ? rows.at(-1).job_id : "");
+  if (more) waiting = true;
   for (const row of rows) {
-    if (QUEUE_DEFERRED_RETRIES_SCHEDULED.has(row.job_id)) continue;
+    if (QUEUE_DEFERRED_RETRIES_SCHEDULED.has(row.job_id)) {
+      if (QUEUE_DEFERRED_RETRIES_IN_FLIGHT.has(row.job_id)) waiting = true;
+      continue;
+    }
     let summary = {};
     try { summary = JSON.parse(row.record_json || "{}"); } catch { continue; }
     if (summary.orphanChildProcessAlive && processIsAlive(Number(summary.orphanChildProcessId || 0))) {
@@ -4916,7 +4946,17 @@ function retryDeferredByOrphans(db) {
       continue;
     }
     QUEUE_DEFERRED_RETRIES_SCHEDULED.add(row.job_id);
-    scheduleQueueRetryPolicy(row.cwd || summary.cwd || "", row.job_id);
+    QUEUE_DEFERRED_RETRIES_IN_FLIGHT.add(row.job_id);
+    waiting = true;
+    void scheduleQueueRetryPolicy(row.cwd || summary.cwd || "", row.job_id).then((outcome) => {
+      QUEUE_DEFERRED_RETRIES_IN_FLIGHT.delete(row.job_id);
+      if (QUEUE_DEFERRED_RETRY_FINAL_ACTIONS.has(outcome?.action)) return;
+      QUEUE_DEFERRED_RETRIES_SCHEDULED.delete(row.job_id);
+      // The dispatch can settle after this scan stored its memo. Keep the exact database
+      // pending; do not wake the queue or schedule an immediate recovery loop.
+      const memo = DEFERRED_RECOVERY_DB_MEMO.get(dbPath);
+      DEFERRED_RECOVERY_DB_MEMO.set(dbPath, { fingerprint: memo?.fingerprint || "", pending: true });
+    });
   }
   return waiting;
 }
@@ -5153,7 +5193,7 @@ async function reconcileQueueStateAtStartup({ busyTimeoutMs = 5000 } = {}) {
           AND (json_extract(record_json, '$.autoIntegration.status') IS NULL
             OR json_extract(record_json, '$.autoIntegration.status') IN ('waiting_for_lock', 'integrating'))
         LIMIT 1`).get()) dbPending = true;
-      if (retryDeferredByOrphans(db)) dbPending = true;
+      if (retryDeferredByOrphans(db, dbPath)) dbPending = true;
       if (db.prepare(`
         SELECT 1 FROM opencode_jobs
         WHERE status IN ('held', 'pending', 'planned', 'blocked', 'running', 'validating', 'reviewing', 'testing')
@@ -5447,6 +5487,9 @@ export const __selfTest = {
     integrationJournalDiagnosis,
     integrationRecoveryBaseline,
     quarantineHardLock,
+    beginFinalizerValidationProtection,
+    restoreFinalizerReadLease,
+    conflictPathsFromConflict,
     realPathBoundaryReason,
     reconcileWorktreeArtifactRegistry,
     recoverIntegrationRepositorySerially,
@@ -5570,6 +5613,8 @@ export const __selfTest = {
     drainDeferredWorktreeCleanup,
     setDeferredCleanupSchedulingDisabled,
     enqueueIntegrationCleanup,
+    cleanupCommittedWorktree,
+    assertIntegrationLockOwned,
     capturePatchedPathsState,
     collectIntegrationBatchPatch,
     integrationBatchOverlaps,
@@ -5641,6 +5686,7 @@ export const __selfTest = {
     readOnlyResultRetryable,
     readOnlyRoutingPolicyError,
     readPersistedPipelineRecord,
+    queryPersistedPipelineRecords,
     readPersistedQueueRecord,
     reconcileParentPipelineAfterQueueTerminal,
     runPipelineReadOnlyGate,
@@ -5898,6 +5944,8 @@ export const __selfTest = {
     set pipelineGateExecutorTestHook(value) { setPipelineGateExecutorTestHook(value); },
     get queueJobExecutorTestHook() { return getQueueJobExecutorTestHook(); },
     set queueJobExecutorTestHook(value) { setQueueJobExecutorTestHook(value); },
+    get queueRetryPolicyTestHook() { return getQueueRetryPolicyTestHook(); },
+    set queueRetryPolicyTestHook(value) { setQueueRetryPolicyTestHook(value); },
     get queuePersistTestHook() { return queuePersistTestHook; },
     set queuePersistTestHook(value) { queuePersistTestHook = value; },
     get bridgeStartupRecovery() { return bridgeStartupRecovery; },

@@ -13,7 +13,7 @@
 //
 // CODEX_TEST_ALLOW_REQUIRED_SKIPS=1 turns a required skip into a loud warning instead of a
 // failure, for a machine that knowingly lacks a prerequisite; the summary says so.
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,8 +30,61 @@ export class SkipTest extends Error {
 export const optionalSkip = (reason) => { throw new SkipTest(reason, { optional: true }); };
 export const requiredSkip = (reason) => { throw new SkipTest(reason); };
 
-const ledgerPath = (ppid = process.ppid) => path.join(tmpdir(), `codex-opencode-test-skips-${ppid}.jsonl`);
+const ledgerPath = (ppid = process.ppid, directory = tmpdir()) => path.join(directory, `codex-opencode-test-skips-${ppid}.jsonl`);
 const allowRequired = () => process.env.CODEX_TEST_ALLOW_REQUIRED_SKIPS === "1";
+
+export const SKIP_METADATA_PREFIX = "TEST_RUNNER_SKIP_METADATA: ";
+export const MAX_SKIP_METADATA_BYTES = 1024 * 1024;
+
+// One authoritative message carries the complete ledger, not a tail of suite output.
+export function validateSkipMetadata(metadata) {
+  const fail = message => { throw new Error(`Invalid test-runner skip metadata: ${message}`); };
+  const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const keys = (value, allowed) => object(value) && Object.keys(value).every(key => allowed.includes(key));
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  if (!keys(metadata, ["version", "runnerPid", "allowRequiredSkips", "rows", "counts"]) || metadata.version !== 1
+    || !Number.isSafeInteger(metadata.runnerPid) || metadata.runnerPid <= 0 || typeof metadata.allowRequiredSkips !== "boolean"
+    || !Array.isArray(metadata.rows)) fail("invalid envelope");
+  if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > MAX_SKIP_METADATA_BYTES) fail("message exceeds 1 MiB");
+  const counts = { files: metadata.rows.length, skipped: 0, partial: 0, required: 0, total: 0 };
+  for (const row of metadata.rows) {
+    if (!keys(row, ["file", "total", "skipped", "partial", "required", "failed", "details"])
+      || typeof row.file !== "string" || !row.file.trim() || ![row.total, row.skipped, row.partial, row.required].every(count)
+      || typeof row.failed !== "boolean") fail("invalid ledger row");
+    const details = Object.hasOwn(row, "details") ? row.details : [];
+    if (!Array.isArray(details) || details.length !== row.skipped + row.partial) fail(`missing or inconsistent details for ${row.file}`);
+    let skipped = 0, partial = 0, required = 0;
+    for (const detail of details) {
+      if (!keys(detail, ["name", "reason", "optional", "partial"]) || typeof detail.name !== "string" || !detail.name.trim()
+        || typeof detail.reason !== "string" || !detail.reason.trim() || typeof detail.optional !== "boolean"
+        || typeof detail.partial !== "boolean" || (detail.partial && !detail.optional)) fail(`invalid skip detail for ${row.file}`);
+      if (detail.partial) partial++;
+      else { skipped++; if (!detail.optional) required++; }
+    }
+    if (skipped !== row.skipped || partial !== row.partial || required !== row.required) fail(`classification counts differ for ${row.file}`);
+    const failed = (row.total > 0 && row.skipped >= row.total) || (row.required > 0 && !metadata.allowRequiredSkips);
+    if (row.failed !== failed) fail(`failure policy differs for ${row.file}`);
+    counts.skipped += skipped; counts.partial += partial; counts.required += required;
+  }
+  counts.total = counts.skipped + counts.partial;
+  if (!keys(metadata.counts, Object.keys(counts)) || !Object.entries(counts).every(([key, value]) => count(value) && metadata.counts[key] === value))
+    fail("aggregate counts differ from ledger details");
+  return metadata;
+}
+
+export function readSkipLedger(directory, parentPid, { allowRequiredSkips = allowRequired() } = {}) {
+  if (typeof directory !== "string" || !path.isAbsolute(directory) || !Number.isSafeInteger(parentPid) || parentPid <= 0)
+    throw new Error("Skip ledger capture requires the final child's absolute temp directory and runner PID.");
+  const ledger = ledgerPath(parentPid, directory), info = lstatSync(ledger);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKIP_METADATA_BYTES) throw new Error(`Invalid skip ledger file: ${ledger}`);
+  const text = readFileSync(ledger, "utf8");
+  if (Buffer.byteLength(text, "utf8") > MAX_SKIP_METADATA_BYTES) throw new Error("Skip ledger exceeds 1 MiB.");
+  const rows = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  const counts = { files: rows.length, skipped: 0, partial: 0, required: 0, total: 0 };
+  for (const row of rows) { counts.skipped += row?.skipped; counts.partial += row?.partial; counts.required += row?.required; }
+  counts.total = counts.skipped + counts.partial;
+  return validateSkipMetadata({ version: 1, runnerPid: parentPid, allowRequiredSkips, rows, counts });
+}
 
 // skips: [{ name, reason, optional }]; partial: [{ name, reason }] for a passed case whose
 // optional part could not run. Returns true when the gate fails.
@@ -58,7 +111,10 @@ export function finishSkips({ file, total, skips = [], partial = [] }) {
   process.stdout.write(`${lines.join("\n")}\n`);
   const ledger = ledgerPath();
   if (existsSync(ledger)) {
-    appendFileSync(ledger, `${JSON.stringify({ file, total, skipped: skips.length, partial: partial.length, required: required.length, failed })}\n`);
+    const details = count ? [...skips.map(skip => ({ name: skip.name, reason: skip.reason, optional: Boolean(skip.optional), partial: false })),
+      ...partial.map(skip => ({ name: skip.name, reason: skip.reason, optional: true, partial: true }))] : [];
+    appendFileSync(ledger, `${JSON.stringify({ file, total, skipped: skips.length, partial: partial.length, required: required.length, failed,
+      ...(count ? { details } : {}) })}\n`);
   }
   return failed;
 }

@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -629,13 +629,37 @@ async function applyReport(report, options) {
       results.push(outcome);
     }
   }
+  const worktreeRoot = path.resolve(report.stateDir, "worktrees");
   for (const directory of report.emptyProjectDirectories) {
     const outcome = { path: directory, action: "remove_empty_directory", ok: false, detail: "" };
     try {
-      await rm(directory, { recursive: true, force: true });
-      outcome.ok = !existsSync(directory);
+      const target = path.resolve(directory);
+      if (!path.isAbsolute(directory) || path.relative(worktreeRoot, path.dirname(target)) !== "") {
+        throw new Error("empty project directory must be directly beneath the expected worktree root");
+      }
+      // Check ancestors before the target: a redirected parent must be refused even when
+      // the project directory does not exist at the redirected location.
+      let cursor = path.parse(target).root;
+      for (const segment of path.relative(cursor, target).split(path.sep).filter(Boolean)) {
+        cursor = path.join(cursor, segment);
+        const details = await lstat(cursor);
+        if (details.isSymbolicLink() || !details.isDirectory()) {
+          throw new Error(`refusing a link, junction or non-directory in empty project directory path: ${cursor}`);
+        }
+      }
+      // The inventory is only a snapshot. rmdir atomically refuses a directory that a
+      // writer populated afterwards; never recursively remove it after checking emptiness.
+      await rmdir(target);
+      outcome.ok = true;
     } catch (error) {
-      outcome.detail = String(error?.message || error);
+      if (error?.code === "ENOENT") {
+        outcome.ok = true;
+        outcome.detail = "already gone";
+      } else if (["ENOTEMPTY", "EEXIST"].includes(error?.code)) {
+        outcome.detail = "kept: directory is no longer empty";
+      } else {
+        outcome.detail = `kept: ${String(error?.message || error)}`;
+      }
     }
     results.push(outcome);
   }
@@ -713,6 +737,93 @@ async function runGc(options) {
   }
   const applied = options.apply ? [...resumed, ...await applyReport(report, options)] : null;
   return { report, applied };
+}
+
+async function selfTestEmptyProjectDirectories(fixtureRoot) {
+  const canonicalFixtureRoot = await realpath(fixtureRoot);
+  const root = path.join(canonicalFixtureRoot, "empty-directory-races");
+  const stateDir = path.join(root, "state");
+  const worktreeRoot = path.join(stateDir, "worktrees");
+  const options = { stateDir, apply: true, includeRetained: false, olderThanDays: 7, deleteBranches: false, forceDirty: false, pruneDatabases: false };
+  const checkFixtureTarget = async (directory) => {
+    assert.ok(path.isAbsolute(directory) && isPathInside(canonicalFixtureRoot, path.resolve(directory)), "GC regression target escaped its fresh fixture");
+    let existing = directory;
+    try { await lstat(existing); } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      existing = path.dirname(existing);
+    }
+    assert.ok(isPathInside(canonicalFixtureRoot, await realpath(existing)), "GC regression target was redirected outside its fresh fixture");
+  };
+  const applyFixtureReport = async (report, applyOptions = options) => {
+    assert.equal(report.worktrees.length, 0, "empty-directory regressions must not remove worktrees");
+    assert.equal(report.databases.length, 0, "empty-directory regressions must not remove databases");
+    for (const directory of report.emptyProjectDirectories) await checkFixtureTarget(directory);
+    return applyReport(report, applyOptions);
+  };
+  const [populated, empty, gone, linked] = ["late-populated", "still-empty", "already-gone", "late-link"].map((name) => path.join(worktreeRoot, name));
+  for (const directory of [populated, empty, gone, linked]) await mkdir(directory, { recursive: true });
+  const report = await inventory(stateDir, options);
+  assert.deepEqual([...report.emptyProjectDirectories].sort(), [populated, empty, gone, linked].sort());
+
+  const child = path.join(populated, "builder-new");
+  const sentinel = path.join(child, "important-work.txt");
+  await mkdir(child);
+  await writeFile(sentinel, "work created after inventory\n", "utf8");
+  await checkFixtureTarget(gone);
+  await rmdir(gone);
+  const linkTarget = path.join(root, "link-target");
+  const linkSentinel = path.join(linkTarget, "keep.txt");
+  await mkdir(linkTarget);
+  await writeFile(linkSentinel, "linked work stays\n", "utf8");
+  await checkFixtureTarget(linked);
+  await rmdir(linked);
+  await symlink(linkTarget, linked, process.platform === "win32" ? "junction" : "dir");
+  const outside = path.join(root, "outside-worktree-root");
+  await mkdir(outside);
+  report.emptyProjectDirectories.push(outside);
+
+  const applied = await applyFixtureReport(report);
+  const outcomeFor = (directory) => applied.find((outcome) => outcome.path === directory);
+  assert.equal(outcomeFor(populated).ok, false, "a late worktree must not be reported as removed");
+  assert.match(outcomeFor(populated).detail, /^kept: directory is no longer empty$/);
+  assert.equal((await lstat(child)).isDirectory(), true);
+  assert.equal(await readFile(sentinel, "utf8"), "work created after inventory\n");
+  assert.equal(outcomeFor(empty).ok, true);
+  assert.equal(existsSync(empty), false, "a still-empty project directory is removed");
+  assert.equal(outcomeFor(gone).ok, true);
+  assert.equal(outcomeFor(gone).detail, "already gone");
+  assert.equal(existsSync(gone), false);
+  assert.equal(outcomeFor(linked).ok, false);
+  assert.match(outcomeFor(linked).detail, /^kept: .*link, junction/);
+  assert.equal((await lstat(linked)).isSymbolicLink(), true);
+  assert.equal(await readFile(linkSentinel, "utf8"), "linked work stays\n");
+  assert.equal(outcomeFor(outside).ok, false);
+  assert.match(outcomeFor(outside).detail, /^kept: .*directly beneath/);
+  assert.equal((await lstat(outside)).isDirectory(), true);
+
+  // A late junction replacing the worktree root is refused before looking through it.
+  const ancestorState = path.join(root, "ancestor-state");
+  const ancestorRoot = path.join(ancestorState, "worktrees");
+  const ancestorProject = path.join(ancestorRoot, "project");
+  const ancestorOptions = { ...options, stateDir: ancestorState };
+  await mkdir(ancestorProject, { recursive: true });
+  const ancestorReport = await inventory(ancestorState, ancestorOptions);
+  assert.deepEqual(ancestorReport.emptyProjectDirectories, [ancestorProject]);
+  await checkFixtureTarget(ancestorProject);
+  await rmdir(ancestorProject);
+  await checkFixtureTarget(ancestorRoot);
+  await rmdir(ancestorRoot);
+  const ancestorTarget = path.join(root, "ancestor-target");
+  const ancestorSentinel = path.join(ancestorTarget, "project", "keep.txt");
+  await mkdir(path.dirname(ancestorSentinel), { recursive: true });
+  await writeFile(ancestorSentinel, "ancestor-linked work stays\n", "utf8");
+  await symlink(ancestorTarget, ancestorRoot, process.platform === "win32" ? "junction" : "dir");
+  const ancestorApplied = await applyFixtureReport(ancestorReport, ancestorOptions);
+  assert.equal(ancestorApplied.length, 1);
+  assert.equal(ancestorApplied[0].ok, false);
+  assert.match(ancestorApplied[0].detail, /^kept: .*link, junction/);
+  assert.equal((await lstat(ancestorRoot)).isSymbolicLink(), true);
+  assert.equal(await readFile(ancestorSentinel, "utf8"), "ancestor-linked work stays\n");
 }
 
 async function selfTest() {
@@ -988,6 +1099,7 @@ async function selfTest() {
     assert.match(busyRepair.detail, /locked|busy/i);
     assert.equal(busyApplied.some((outcome) => outcome.action === "remove_empty_directory" && outcome.path === laterEmptyDirectory && outcome.ok), true,
       "steps after the failed repair still run and are recorded");
+    await selfTestEmptyProjectDirectories(fixtureRoot);
     process.stdout.write("Bridge GC self-test passed.\n");
     selfTestPassed("bridge-gc");
   } finally {

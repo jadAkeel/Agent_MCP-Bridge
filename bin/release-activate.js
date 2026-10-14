@@ -58,14 +58,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { LEGACY_PUBLISH_ENTRIES, buildRelease } from "./build-release.js";
 import { parse as parseToml } from "smol-toml";
-import { loadMcpEntry, runFreshHealthcheck } from "./fresh-healthcheck.js";
+import { loadMcpEntry, runFreshHealthcheck, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { LIB_PIN_ENV, isLibDigestPath, libDigest, libDigestOf } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { RECEIPT_KIND, REQUIRED_STEPS, assertReleaseSourceComplete, readGateReceipt, runReleaseGate, sourceTreeDigest, validateGateReceipt } from "./release-gate.js";
@@ -76,6 +76,14 @@ requireSelfTestRun(import.meta.url);
 const SERVER_NAME = "opencode";
 const KEEP_CONFIG_BACKUPS = 2;
 const RELEASE_MANIFEST = "release-manifest.json";
+const IMMUTABLE_RELEASE_ENV_KEYS = Object.freeze([
+  "CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256",
+  "CODEX_OPENCODE_PLUGIN_MANIFEST_PATH",
+  "CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256",
+  "XDG_CONFIG_HOME",
+  "CODEX_OPENCODE_AGENT_DIR",
+  "CODEX_OPENCODE_SKILL_DIR",
+]);
 // Files a release copies from the source tree (build-release.js LEGACY_PUBLISH_ENTRIES).
 const BRIDGE_SOURCE_PATHS = ["server.js", "bin", "lib", "opencode", "tests", "package.json", "package-lock.json"];
 const RENAME_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000];
@@ -230,6 +238,43 @@ function tomlHeader(line) {
   return key;
 }
 
+// The optional immutable rewrite is bound to the next server's own paths and raw hashes.
+// It cannot promote an unpinned entry or authorize other environment changes.
+function validateImmutableReleaseEnv(originalDocument, serverPath, immutableReleaseEnv) {
+  if (!immutableReleaseEnv || typeof immutableReleaseEnv !== "object" || Array.isArray(immutableReleaseEnv)) {
+    throw new Error("Immutable release bindings must be an object containing exactly the six release fields.");
+  }
+  const keys = Reflect.ownKeys(immutableReleaseEnv);
+  if (keys.length !== IMMUTABLE_RELEASE_ENV_KEYS.length || keys.some((key) => !IMMUTABLE_RELEASE_ENV_KEYS.includes(key))) {
+    throw new Error("Immutable release bindings have missing or unknown fields.");
+  }
+  const originalPin = originalDocument?.mcp_servers?.[SERVER_NAME]?.env?.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
+  if (typeof originalPin !== "string" || !/^[a-f0-9]{64}$/i.test(originalPin.trim())) {
+    throw new Error("Immutable release bindings require an already manifest-pinned original entry with a valid pin.");
+  }
+  if (typeof serverPath !== "string" || !path.isAbsolute(serverPath) || path.basename(serverPath).toLowerCase() !== "server.js") {
+    throw new Error("Immutable release bindings require one absolute candidate server.js path.");
+  }
+  const releaseRoot = path.dirname(path.resolve(serverPath));
+  const pluginManifestPath = path.join(releaseRoot, "opencode", "plugin-integrity-manifest.json");
+  const paths = {
+    CODEX_OPENCODE_PLUGIN_MANIFEST_PATH: pluginManifestPath,
+    XDG_CONFIG_HOME: releaseRoot,
+    CODEX_OPENCODE_AGENT_DIR: path.join(releaseRoot, "opencode", "agents"),
+    CODEX_OPENCODE_SKILL_DIR: path.join(releaseRoot, "opencode", "skills"),
+  };
+  for (const [key, expected] of Object.entries(paths)) {
+    if (immutableReleaseEnv[key] !== expected) throw new Error(`Inconsistent immutable release binding ${key}; it must name the candidate release.`);
+  }
+  for (const [key, file] of [
+    ["CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256", path.join(releaseRoot, RELEASE_MANIFEST)],
+    ["CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256", pluginManifestPath],
+  ]) {
+    const expected = createHash("sha256").update(readFileSync(file)).digest("hex");
+    if (immutableReleaseEnv[key] !== expected) throw new Error(`Inconsistent immutable release binding ${key}; it must hash the candidate release file.`);
+  }
+}
+
 // Rewrites only the MCP entry's args line (in [mcp_servers.opencode]) and the hash
 // lines given (in [mcp_servers.opencode.env]); every other byte of the config is kept.
 // Headers with trailing comments and [[array.tables]] end a section too, so a later
@@ -242,7 +287,15 @@ function tomlHeader(line) {
 // written before the server.js split lacks it, so a missing line is inserted right after the
 // server pin line (else right after the env header) instead of refused. removeLibPin drops
 // the line, for an entry whose tree has no lib/ (a release built before the split).
-function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifestSha256 = "", libSha256 = "", removeLibPin = false } = {}) {
+// D4-F10-001: an already manifest-pinned entry also moves its six immutable bindings.
+function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifestSha256 = "", libSha256 = "", removeLibPin = false, immutableReleaseEnv, ...unknownOptions } = {}) {
+  if (Reflect.ownKeys(unknownOptions).length) throw new Error("Unknown release rewrite options.");
+  if (immutableReleaseEnv !== undefined) {
+    validateImmutableReleaseEnv(parseTomlDocuments([text])[0], serverPath, immutableReleaseEnv);
+    if (pluginManifestSha256 && pluginManifestSha256 !== immutableReleaseEnv.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256) {
+      throw new Error("Inconsistent immutable release binding CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 and plugin pin option.");
+    }
+  }
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const lines = text.split(/\r?\n/);
   const libLine = `${LIB_PIN_ENV} = "${libSha256}"`;
@@ -253,6 +306,7 @@ function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifes
   let libDone = false;
   let envHeaderAt = -1;
   let serverPinAt = -1;
+  const immutableDone = new Set();
   const out = [];
   for (const line of lines) {
     const header = tomlHeader(line);
@@ -268,6 +322,13 @@ function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifes
       continue;
     }
     if (section === `mcp_servers.${SERVER_NAME}.env`) {
+      const immutableKey = immutableReleaseEnv !== undefined ? /^\s*([A-Za-z0-9_]+)\s*=/.exec(line)?.[1] : "";
+      if (IMMUTABLE_RELEASE_ENV_KEYS.includes(immutableKey)) {
+        immutableDone.add(immutableKey);
+        if (immutableKey === "CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256") manifestDone = true;
+        out.push(`${immutableKey} = ${JSON.stringify(immutableReleaseEnv[immutableKey])}`);
+        continue;
+      }
       if (/^\s*CODEX_OPENCODE_EXPECTED_SERVER_SHA256\s*=/.test(line)) {
         serverPinAt = out.length;
         if (serverSha256) {
@@ -292,6 +353,9 @@ function rewriteConfig(text, { serverPath = "", serverSha256 = "", pluginManifes
   if (serverPath && !argsDone) throw new Error(`Config has no args line under [mcp_servers.${SERVER_NAME}].`);
   if (serverSha256 && !hashDone) throw new Error(`Config has no CODEX_OPENCODE_EXPECTED_SERVER_SHA256 under [mcp_servers.${SERVER_NAME}.env].`);
   if (serverPath.includes("'")) throw new Error("Release path must not contain a single quote.");
+  if (immutableReleaseEnv !== undefined && immutableDone.size !== IMMUTABLE_RELEASE_ENV_KEYS.length) {
+    throw new Error("Config is missing immutable release binding lines; nothing was rewritten.");
+  }
   if (libSha256 && !libDone) {
     const insertAfter = serverPinAt >= 0 ? serverPinAt : envHeaderAt;
     if (insertAfter < 0) throw new Error(`Config has no [mcp_servers.${SERVER_NAME}.env] table to hold ${LIB_PIN_ENV}.`);
@@ -330,15 +394,27 @@ function withoutRewrittenFields(document) {
 
 // Parses the config before and after a rewrite and refuses it unless the only differences
 // are the opencode args line and its integrity pins. Returns the parsed rewritten config.
-function assertRewritePreservesConfig(originalText, rewrittenText) {
+function assertRewritePreservesConfig(originalText, rewrittenText, { immutableReleaseEnv, ...unknownOptions } = {}) {
+  if (Reflect.ownKeys(unknownOptions).length) throw new Error("Unknown config preservation options.");
   const [before, after] = parseTomlDocuments([originalText, rewrittenText]);
+  const comparableAfter = immutableReleaseEnv === undefined ? after : structuredClone(after);
+  if (immutableReleaseEnv !== undefined) {
+    const entry = after?.mcp_servers?.[SERVER_NAME];
+    validateImmutableReleaseEnv(before, entry?.args?.length === 1 ? entry.args[0] : "", immutableReleaseEnv);
+    for (const key of IMMUTABLE_RELEASE_ENV_KEYS) {
+      if (entry.env?.[key] !== immutableReleaseEnv[key]) throw new Error(`Rewritten config has an inconsistent immutable release binding ${key}.`);
+      const originalEnv = before.mcp_servers[SERVER_NAME].env;
+      if (Object.hasOwn(originalEnv, key)) comparableAfter.mcp_servers[SERVER_NAME].env[key] = originalEnv[key];
+      else delete comparableAfter.mcp_servers[SERVER_NAME].env[key];
+    }
+  }
   const names = new Set([...Object.keys(before?.mcp_servers || {}), ...Object.keys(after?.mcp_servers || {})]);
   for (const name of names) {
     if (name !== SERVER_NAME && !isDeepStrictEqual(before?.mcp_servers?.[name], after?.mcp_servers?.[name])) {
       throw new Error(`Rewriting the config would change [mcp_servers.${name}]; nothing was written.`);
     }
   }
-  if (!isDeepStrictEqual(withoutRewrittenFields(before), withoutRewrittenFields(after))) {
+  if (!isDeepStrictEqual(withoutRewrittenFields(before), withoutRewrittenFields(comparableAfter))) {
     throw new Error(`Rewriting the config would change more than the ${SERVER_NAME} args and integrity pins; nothing was written.`);
   }
   return after;
@@ -885,7 +961,7 @@ async function syncClaudeCodeEntry(configPath, {
     recovered = " (an interrupted earlier update had left it missing; the saved entry was restored first)";
   }
   await rm(recoveryPath, { force: true });
-  const desired = claudeEntryFor(await loadMcpEntry(configPath, SERVER_NAME));
+  const desired = claudeEntryFor(await loadMcpEntry(configPath, SERVER_NAME), current.entry);
   if (sameClaudeEntry(current.entry, desired)) {
     return { ok: true, updated: false, message: `Claude Code entry already matches the Codex entry (${desired.args[0]}); nothing to update${recovered}.` };
   }
@@ -1116,6 +1192,166 @@ function selfTestRewrite() {
   assert.match(clientToolTimeoutWarning(withTimeout("1800.0"), {}), /^WARNING: .*3000/, "The contractor timeout and the slot wait count too.");
   assert.match(clientToolTimeoutWarning(withTimeout("1801.0"), { CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS: "1000" }), /^Client tool timeout covers/, "a configured slot-wait budget (1 s) replaces the default");
   assert.match(clientToolTimeoutWarning("[mcp_servers.opencode]\n", {}), /no tool_timeout_sec/);
+}
+
+async function selfTestImmutableTransition(fixture) {
+  const operationalEnv = {
+    CODEX_OPENCODE_STATE_DIR: path.join(fixture, "private-state"),
+    XDG_DATA_HOME: path.join(fixture, "private-data"),
+    XDG_CACHE_HOME: path.join(fixture, "private-cache"),
+    XDG_STATE_HOME: path.join(fixture, "private-xdg-state"),
+    GIT_CONFIG_GLOBAL: path.join(fixture, "trusted-git-config"),
+    CODEX_OPENCODE_QUEUE_MODE: "sqlite",
+    CODEX_OPENCODE_LOG_LEVEL: "warn",
+  };
+  const hash = (content) => createHash("sha256").update(content).digest("hex");
+  const release = async (name) => {
+    const root = path.join(fixture, `immutable-${name}`);
+    const files = {
+      "server.js": `// native fixture ${name}\n`,
+      "lib/fixture.js": `// native library ${name}\n`,
+      "opencode/.gitignore": "node_modules\n",
+      "opencode/opencode.jsonc": '{"plugin":[]}\n',
+      "opencode/antigravity.json": '{"debug":false}\n',
+      "opencode/agents/fixture.md": "fixture agent\n",
+      "opencode/skills/fixture/SKILL.md": "fixture skill\n",
+    };
+    const pluginRelative = "opencode/plugin-integrity-manifest.json";
+    files[pluginRelative] = `${JSON.stringify({
+      version: 1,
+      plugins: [],
+      configs: [{ path: path.join(root, "opencode", "opencode.jsonc"), sha256: hash(files["opencode/opencode.jsonc"]), scope: "global", plugins: [] }],
+      settings: [{ path: path.join(root, "opencode", "antigravity.json"), sha256: hash(files["opencode/antigravity.json"]), requiredValues: { debug: false } }],
+    }, null, 2)}\n`;
+    const digests = {};
+    for (const [relative, content] of Object.entries(files)) {
+      const target = path.join(root, ...relative.split("/"));
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, "utf8");
+      digests[relative] = hash(content);
+    }
+    const manifestPath = path.join(root, RELEASE_MANIFEST);
+    const manifestContent = `${JSON.stringify({ version: 1, files: digests }, null, 2)}\n`;
+    await writeFile(manifestPath, manifestContent, "utf8");
+    const env = {
+      CODEX_OPENCODE_EXPECTED_SERVER_SHA256: digests["server.js"],
+      [LIB_PIN_ENV]: (await libDigest(root)).sha256,
+      CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256: hash(manifestContent),
+      CODEX_OPENCODE_PLUGIN_MANIFEST_PATH: path.join(root, ...pluginRelative.split("/")),
+      CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256: digests[pluginRelative],
+      XDG_CONFIG_HOME: root,
+      CODEX_OPENCODE_AGENT_DIR: path.join(root, "opencode", "agents"),
+      CODEX_OPENCODE_SKILL_DIR: path.join(root, "opencode", "skills"),
+      CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "false",
+      ...operationalEnv,
+    };
+    return { root, files, manifestPath, entry: { command: process.execPath, args: [path.join(root, "server.js")], env } };
+  };
+  // Independently constructed entries must both satisfy the real native verifier first.
+  const a = await release("A"), b = await release("B space");
+  assert.equal((await validateCandidateReleaseEntry(a.entry)).integrityMode, "immutable-release");
+  assert.equal((await validateCandidateReleaseEntry(b.entry)).integrityMode, "immutable-release");
+  const prefix = `# keep original bytes\r\nmodel = "operator setting"\r\n[projects.${JSON.stringify(path.join(fixture, "trusted-repo"))}]\r\ntrust_level = "trusted"\r\n\r\n`;
+  const suffix = '\r\n\r\n[mcp_servers.unrelated] # keep\r\ncommand = "untouched"\r\nargs = ["other-arg"]\r\n[[history]]\r\nargs = ["history-arg"]\r\n';
+  const configText = (env) => prefix + [
+    "[mcp_servers.opencode] # bridge",
+    `command = ${JSON.stringify(process.execPath)}`,
+    `args = [${JSON.stringify(a.entry.args[0])}]`,
+    "startup_timeout_sec = 120",
+    "tool_timeout_sec = 3300.0",
+    "[mcp_servers.opencode.env] # integrity",
+    ...Object.entries(env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+  ].join("\r\n") + suffix;
+  const original = configText(a.entry.env);
+  const immutableReleaseEnv = Object.fromEntries(IMMUTABLE_RELEASE_ENV_KEYS.map((key) => [key, b.entry.env[key]]));
+  const rewriteOptions = {
+    serverPath: b.entry.args[0],
+    serverSha256: b.entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256,
+    pluginManifestSha256: b.entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256,
+    libSha256: b.entry.env[LIB_PIN_ENV],
+    immutableReleaseEnv,
+  };
+  const candidate = rewriteConfig(original, rewriteOptions);
+  assert.equal(candidate.pluginManifestPinned, true);
+  const parsed = assertRewritePreservesConfig(original, candidate.text, { immutableReleaseEnv });
+  const entry = parsed.mcp_servers[SERVER_NAME];
+  assert.equal((await validateCandidateReleaseEntry(entry)).integrityMode, "immutable-release");
+  assert.deepEqual(entry.args, b.entry.args);
+  for (const key of IMMUTABLE_RELEASE_ENV_KEYS) assert.equal(entry.env[key], b.entry.env[key], key);
+  for (const [key, value] of Object.entries(operationalEnv)) assert.equal(entry.env[key], value, key);
+  assert.equal(entry.env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS, "false");
+  assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, b.entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256);
+  assert.equal(entry.env[LIB_PIN_ENV], b.entry.env[LIB_PIN_ENV]);
+  assert.ok(candidate.text.startsWith(prefix) && candidate.text.endsWith(suffix), "unrelated TOML bytes remain exact");
+  assert.ok(candidate.text.includes("tool_timeout_sec = 3300.0\r\n"));
+  assert.deepEqual(parsed.mcp_servers.unrelated, parseTomlDocuments([original])[0].mcp_servers.unrelated);
+  assert.throws(() => assertRewritePreservesConfig(original, candidate.text), /would change more than/, "the old preservation mode gains no general environment whitelist");
+
+  // Each path/hash is independently checked against B, not merely whitelisted by name.
+  for (const key of IMMUTABLE_RELEASE_ENV_KEYS) {
+    const wrong = { ...immutableReleaseEnv, [key]: a.entry.env[key] };
+    assert.throws(() => rewriteConfig(original, { ...rewriteOptions, immutableReleaseEnv: wrong }), /inconsistent immutable release binding/i, key);
+    assert.throws(() => assertRewritePreservesConfig(original, candidate.text, { immutableReleaseEnv: wrong }), /inconsistent immutable release binding/i, key);
+    const missing = { ...immutableReleaseEnv };
+    delete missing[key];
+    assert.throws(() => rewriteConfig(original, { ...rewriteOptions, immutableReleaseEnv: missing }), /missing or unknown fields/, key);
+  }
+  assert.throws(() => rewriteConfig(original, { ...rewriteOptions, immutableReleaseEnv: { ...immutableReleaseEnv, CODEX_OPENCODE_STATE_DIR: "changed" } }), /missing or unknown fields/);
+  assert.throws(() => rewriteConfig(original, { ...rewriteOptions, arbitraryEnv: "changed" }), /Unknown release rewrite options/);
+  assert.throws(() => rewriteConfig(original, { arbitraryEnv: "changed" }), /Unknown release rewrite options/);
+  assert.throws(() => assertRewritePreservesConfig(original, candidate.text, { immutableReleaseEnv, arbitraryEnv: "changed" }), /Unknown config preservation options/);
+  assert.throws(() => rewriteConfig(original, { ...rewriteOptions, pluginManifestSha256: a.entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 }), /Inconsistent immutable release binding/);
+  const missingLine = original.replace(`XDG_CONFIG_HOME = ${JSON.stringify(a.root)}\r\n`, "");
+  assert.throws(() => rewriteConfig(missingLine, rewriteOptions), /missing immutable release binding lines/);
+  const changedBinding = candidate.text.replace(`XDG_CONFIG_HOME = ${JSON.stringify(b.root)}`, `XDG_CONFIG_HOME = ${JSON.stringify(a.root)}`);
+  assert.throws(() => assertRewritePreservesConfig(original, changedBinding, { immutableReleaseEnv }), /inconsistent immutable release binding/);
+  for (const changed of [
+    candidate.text.replace(JSON.stringify(operationalEnv.CODEX_OPENCODE_STATE_DIR), JSON.stringify(path.join(fixture, "changed-state"))),
+    candidate.text.replace(JSON.stringify(operationalEnv.GIT_CONFIG_GLOBAL), JSON.stringify(path.join(fixture, "changed-git-config"))),
+    candidate.text.replace('trust_level = "trusted"', 'trust_level = "untrusted"'),
+    candidate.text.replace("tool_timeout_sec = 3300.0", "tool_timeout_sec = 1"),
+    candidate.text.replace("history-arg", "changed-history"),
+  ]) assert.throws(() => assertRewritePreservesConfig(original, changed, { immutableReleaseEnv }), /would change more than/);
+  assert.throws(() => assertRewritePreservesConfig(original, candidate.text.replace("other-arg", "changed-other"), { immutableReleaseEnv }), /would change \[mcp_servers.unrelated\]/);
+
+  // Pin-only refresh retains its old behavior; unpinned/empty-pin hybrid entries stay hybrid.
+  const pinOnly = rewriteConfig(original, {
+    serverSha256: a.entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256,
+    pluginManifestSha256: a.entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256,
+    libSha256: a.entry.env[LIB_PIN_ENV],
+  });
+  assert.equal(pinOnly.text, original);
+  assertRewritePreservesConfig(original, pinOnly.text);
+  for (const pin of [undefined, "", " "]) {
+    const hybridEnv = { ...a.entry.env, CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "true" };
+    if (pin === undefined) delete hybridEnv.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256;
+    else hybridEnv.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 = pin;
+    const hybridText = configText(hybridEnv);
+    const hybrid = rewriteConfig(hybridText, { ...rewriteOptions, immutableReleaseEnv: undefined, pluginManifestSha256: a.entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 });
+    const hybridEntry = assertRewritePreservesConfig(hybridText, hybrid.text).mcp_servers[SERVER_NAME];
+    for (const key of IMMUTABLE_RELEASE_ENV_KEYS) assert.equal(hybridEntry.env[key], hybridEnv[key], key);
+    assert.equal(hybridEntry.env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS, "true");
+    assert.equal((await validateCandidateReleaseEntry(hybridEntry)).integrityMode, "server-pinned");
+    assert.throws(() => rewriteConfig(hybridText, rewriteOptions), /already manifest-pinned original entry/);
+    assert.throws(() => assertRewritePreservesConfig(hybridText, candidate.text, { immutableReleaseEnv }), /already manifest-pinned original entry/);
+  }
+  const invalidOriginal = original.replace(a.entry.env.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256, "invalid-pin");
+  assert.throws(() => rewriteConfig(invalidOriginal, rewriteOptions), /already manifest-pinned original entry/);
+  const incompatible = candidate.text.replace('CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "false"', 'CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "true"');
+  assert.throws(() => assertRewritePreservesConfig(original, incompatible, { immutableReleaseEnv }), /would change more than/);
+  await assert.rejects(validateCandidateReleaseEntry(parseTomlDocuments([incompatible])[0].mcp_servers[SERVER_NAME]), /Immutable releases must use pure mode/);
+
+  const agentPath = path.join(b.root, "opencode", "agents", "fixture.md");
+  try {
+    await writeFile(agentPath, "tampered agent\n", "utf8");
+    await assert.rejects(validateCandidateReleaseEntry(entry), /file does not match its manifest digest/);
+  } finally { await writeFile(agentPath, b.files["opencode/agents/fixture.md"], "utf8"); }
+  const manifestBytes = await readFile(b.manifestPath);
+  try {
+    await writeFile(b.manifestPath, Buffer.concat([manifestBytes, Buffer.from("\n")]));
+    await assert.rejects(validateCandidateReleaseEntry(entry), /release manifest does not match/);
+    assert.throws(() => rewriteConfig(original, rewriteOptions), /inconsistent immutable release binding/i, "the built manifest pin cannot be refreshed over tampering");
+  } finally { await writeFile(b.manifestPath, manifestBytes); }
 }
 
 async function writeCodexConfig(configPath, { command = process.execPath, serverPath, env = {} }) {
@@ -1516,29 +1752,37 @@ async function selfTestClaudeSync(fixture) {
   const newServer = path.join(fixture, "server-daily-new", "server.js");
   const codexEnv = { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "1".repeat(64), CODEX_OPENCODE_LOG_LEVEL: "warn" };
   await writeCodexConfig(codexConfig, { serverPath: newServer, env: codexEnv });
-  const oldEntry = { type: "stdio", command: process.execPath, args: [path.join(fixture, "server-daily-old", "server.js")], env: { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "2".repeat(64) } };
+  const claudeOnly = { localLabel: "keep this scalar", localSettings: { enabled: true, nested: { tags: ["keep", "these"] } } };
+  const oldEntry = { ...claudeOnly, type: "stdio", command: process.execPath, args: [path.join(fixture, "server-daily-old", "server.js")], env: { CODEX_OPENCODE_EXPECTED_SERVER_SHA256: "2".repeat(64), OLD_ONLY_ENV: "replace the whole environment" } };
+  const desiredEntry = { ...claudeOnly, type: "stdio", command: process.execPath, args: [newServer], env: codexEnv };
   const writeClaudeConfig = async (entry) => {
     await writeFile(claudeConfigPath, JSON.stringify({ numStartups: 3, mcpServers: entry ? { other: { type: "stdio", command: "x" }, opencode: entry } : {} }, null, 2), "utf8");
   };
   const readEntry = async () => JSON.parse(await readFile(claudeConfigPath, "utf8")).mcpServers.opencode;
+  const assertClaudeConfig = async (entry) => assert.deepEqual(JSON.parse(await readFile(claudeConfigPath, "utf8")), {
+    numStartups: 3, mcpServers: { other: { type: "stdio", command: "x" }, opencode: entry },
+  }, "Claude-only scalar/nested fields and unrelated configuration survive; only the four Codex fields are replaced");
   const calls = async () => (existsSync(logPath) ? (await readFile(logPath, "utf8")).split("\n").filter(Boolean).length : 0);
   const env = (extra = {}) => ({ ...process.env, FAKE_CLAUDE_CONFIG: claudeConfigPath, FAKE_CLAUDE_LOG: logPath, ...extra });
 
   await writeClaudeConfig(oldEntry);
   const updated = await syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env() });
   assert.deepEqual([updated.ok, updated.updated], [true, true], updated.message);
-  assert.deepEqual(await readEntry(), { type: "stdio", command: process.execPath, args: [newServer], env: codexEnv });
+  assert.deepEqual(await readEntry(), desiredEntry);
+  await assertClaudeConfig(desiredEntry);
 
   const callsBefore = await calls();
   const identical = await syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env() });
   assert.deepEqual([identical.ok, identical.updated], [true, false], identical.message);
   assert.equal(await calls(), callsBefore, "an identical entry is neither removed nor re-added");
+  await assertClaudeConfig(desiredEntry);
 
   await writeClaudeConfig(oldEntry);
   const failedAdd = await syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env({ FAKE_CLAUDE_FAIL_ADD: "server-daily-new" }) });
   assert.equal(failedAdd.ok, false);
   assert.match(failedAdd.message, /previous entry was restored/);
   assert.deepEqual(await readEntry(), oldEntry, "a failed add restores the previous entry instead of leaving none");
+  await assertClaudeConfig(oldEntry);
 
   await writeClaudeConfig(null);
   const missingEntry = await syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env() });
@@ -1551,7 +1795,6 @@ async function selfTestClaudeSync(fixture) {
   // then add. A crash in between left Claude Code with no entry, and the next run refused to
   // proceed ("register it once ..."). The previous entry is now saved first and the next run
   // restores it.
-  const desiredEntry = { type: "stdio", command: process.execPath, args: [newServer], env: codexEnv };
   const sync = (extra) => syncClaudeCodeEntry(codexConfig, { claude, claudeConfigPath, env: env(extra) });
   const recoveryPath = `${claudeConfigPath}.opencode-entry-recovery.json`;
   await writeClaudeConfig(oldEntry);
@@ -1571,6 +1814,7 @@ async function selfTestClaudeSync(fixture) {
   assert.deepEqual([afterCrash.ok, afterCrash.updated], [true, true], afterCrash.message);
   assert.match(afterCrash.message, /interrupted earlier update/);
   assert.deepEqual(await readEntry(), desiredEntry, "the next run restores the entry and brings it up to date");
+  await assertClaudeConfig(desiredEntry);
   assert.equal(existsSync(recoveryPath), false);
 
   // The add and the restore both fail: no entry, but the recovery file survives and a later
@@ -1580,6 +1824,7 @@ async function selfTestClaudeSync(fixture) {
   assert.equal(bothFail.ok, false);
   assert.match(bothFail.message, /NO opencode entry.*re-run this command/s);
   assert.equal(await readEntry(), undefined);
+  assert.deepEqual(JSON.parse(await readFile(recoveryPath, "utf8")), oldEntry, "double failure keeps the complete original entry for recovery");
   const stillBroken = await sync({ FAKE_CLAUDE_FAIL_ADD: "server.js" });
   assert.equal(stillBroken.ok, false);
   assert.match(stillBroken.message, /earlier update was interrupted/);
@@ -1587,6 +1832,7 @@ async function selfTestClaudeSync(fixture) {
   const healed = await sync();
   assert.deepEqual([healed.ok, healed.updated], [true, true], healed.message);
   assert.deepEqual(await readEntry(), desiredEntry);
+  await assertClaudeConfig(desiredEntry);
 
   // A remove that fails leaves the entry alone and no recovery file behind.
   await writeClaudeConfig(oldEntry);
@@ -1698,6 +1944,7 @@ async function selfTest() {
     await selfTestCheckedBuild(fixture);
     await selfTestClaudeSync(fixture);
     await selfTestReleaseGate(fixture);
+    await selfTestImmutableTransition(fixture);
   } finally {
     await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
@@ -1779,21 +2026,32 @@ async function main() {
     await writeFile(receiptCopy, `${JSON.stringify(gate.receipt, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
     process.stdout.write(`Gate receipt: ${receiptCopy}\n`);
 
-    const pluginManifestSha256 = await pluginManifestSha256For(activeEntry);
+    const originalConfig = await readFile(options.configPath, "utf8");
+    const originalEnv = parseTomlDocuments([originalConfig])[0]?.mcp_servers?.[SERVER_NAME]?.env || {};
+    const releaseRoot = path.resolve(destination);
+    const immutableReleaseEnv = String(originalEnv.CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256 || "").trim() ? {
+      CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256: built.releaseManifestSha256,
+      CODEX_OPENCODE_PLUGIN_MANIFEST_PATH: path.join(releaseRoot, "opencode", "plugin-integrity-manifest.json"),
+      CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256: await sha256File(path.join(releaseRoot, "opencode", "plugin-integrity-manifest.json")),
+      XDG_CONFIG_HOME: releaseRoot,
+      CODEX_OPENCODE_AGENT_DIR: path.join(releaseRoot, "opencode", "agents"),
+      CODEX_OPENCODE_SKILL_DIR: path.join(releaseRoot, "opencode", "skills"),
+    } : undefined;
+    const pluginManifestSha256 = immutableReleaseEnv?.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 ?? await pluginManifestSha256For(activeEntry);
     // B-092: the new release's lib/ is pinned with its server.js. A server-pinned (hybrid)
     // entry would refuse to start without it; a manifest-pinned one carries it as a second check.
     const libSha256 = await repinnableLibSha256(serverPath, {});
     process.stdout.write(`lib/ digest: ${libSha256 || "(no lib/)"}\n`);
-    const originalConfig = await readFile(options.configPath, "utf8");
-    const { text: candidateText, pluginManifestPinned } = rewriteConfig(originalConfig, { serverPath, serverSha256, pluginManifestSha256, libSha256, removeLibPin: !libSha256 });
+    const { text: candidateText, pluginManifestPinned } = rewriteConfig(originalConfig, { serverPath, serverSha256, pluginManifestSha256, libSha256, removeLibPin: !libSha256, immutableReleaseEnv });
     if (pluginManifestPinned) process.stdout.write(`plugin manifest SHA-256: ${pluginManifestSha256}\n`);
-    assertRewritePreservesConfig(originalConfig, candidateText);
+    assertRewritePreservesConfig(originalConfig, candidateText, { immutableReleaseEnv });
     await writeFile(candidateConfig, candidateText, "utf8");
     const candidateEntry = await loadMcpEntry(candidateConfig, SERVER_NAME);
     if (path.resolve(candidateEntry.args[0]) !== path.resolve(serverPath)
       || candidateEntry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256 !== serverSha256
       || (candidateEntry.env[LIB_PIN_ENV] || "") !== libSha256
-      || (pluginManifestPinned && candidateEntry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 !== pluginManifestSha256)) {
+      || (pluginManifestPinned && candidateEntry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 !== pluginManifestSha256)
+      || (immutableReleaseEnv && IMMUTABLE_RELEASE_ENV_KEYS.some((key) => candidateEntry.env[key] !== immutableReleaseEnv[key]))) {
       throw new Error("Candidate config did not parse back to the new release path and hashes.");
     }
 

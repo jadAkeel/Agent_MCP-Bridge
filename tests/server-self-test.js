@@ -1453,8 +1453,10 @@ async function runSelfTests() {
   );
   // A containment quarantine lifts only on proof: every recorded process gone.
   const deadPid = 2 ** 30 + 12345;
-  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid, deadPid + 1], complete: true })), false);
-  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [process.pid], complete: true })), true, "A live recorded process keeps the quarantine.");
+  const oldContainmentRecordedAt = Date.now() - CONFIG.containmentReleaseGraceMs - 1000;
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid, deadPid + 1], complete: true, recordedAt: oldContainmentRecordedAt })), false);
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [process.pid], complete: true, recordedAt: oldContainmentRecordedAt })), true, "A live recorded process keeps the quarantine.");
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid, deadPid + 1], complete: true })), true, "Complete evidence without a recorded time keeps the quarantine.");
   assert.equal(await containmentStillPossible("", process.pid), true, "A legacy record with a live owner keeps the quarantine.");
   assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: false }), process.pid), true, "An incomplete record needs more than dead supervisors.");
   assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: true, recordedAt: Date.now() })), true, "A fresh quarantine waits out the grace period for unrecorded children.");
@@ -1467,7 +1469,7 @@ async function runSelfTests() {
     treeParent.kill();
     try { process.kill(grandchildPid); } catch { /* already gone */ }
   }
-  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: true, recordedAt: Date.now() - 1000 * 60 * 11 })), false, "After the grace period dead recorded processes release it.");
+  assert.equal(await containmentStillPossible(JSON.stringify({ pids: [deadPid], complete: true, recordedAt: oldContainmentRecordedAt })), false, "After the grace period dead recorded processes release it.");
   const validationVersionProbe = await runValidationGate({ command: "git --version", cwd: process.cwd() });
   assert.equal(validationVersionProbe.status, "passed", JSON.stringify(validationVersionProbe));
   assert.equal((await runValidationGate({ command: '"unterminated', cwd: process.cwd() })).errorType, "validation_command_parse_error");

@@ -4,13 +4,14 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { symlinkSync } from "node:fs";
+import { existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { cleanupRunFixtures, copyIfPresent, createTestFixtureRoot, parseCommandChain, prepareTestEnvironment, runTestCommands, selectOwnWindowsProcesses, validateGateManifest } from "../bin/test-runner.js";
 import { finishSkips } from "./skip-gate.js";
+import { runReleaseGate } from "../bin/release-gate.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const scratch = await mkdtemp(path.join(tmpdir(), "review-test-runner-"));
@@ -37,8 +38,30 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.equal(packageJson.scripts.test, "node bin/test-runner.js");
   const commands = parseCommandChain(packageJson.scripts["test:commands"]);
   validateGateManifest(commands);
-  assert.equal(commands.length, 169);
-  const additions = ["tests/review-test-runner.js", "tests/review-mcp-robustness-isolation.js", "lib/result-text.js", "lib/tools-call-errors.js", "tests/review-postrun.js", "tests/review-f2-results.js", "tests/review-prespawn.js"];
+  assert.equal(commands.length, 181);
+  const precedingR06 = commands.filter(command => !command.argv.includes("tests/review-day5-pipeline-token.js"));
+  assert.equal(precedingR06.length, 180);
+  assert.equal(createHash("sha256").update(JSON.stringify(precedingR06.map(command => command.argv))).digest("hex"), "d521fd0bcf3f31382857204a8bd06057d4cafa5d435837fbfd51517a53124c56");
+  const predecessorCommands = precedingR06.filter(command => !command.argv.includes("tests/review-day5-worker-release.js"));
+  assert.equal(predecessorCommands.length, 179);
+  assert.equal(createHash("sha256").update(JSON.stringify(predecessorCommands.map(command => command.argv))).digest("hex"), "81f2392a8697758c775e656ab26a3f28a852e5bb2553c4cef38bcccb533fc05f");
+  const precedingR05 = predecessorCommands.filter(command => !command.argv.includes("tests/review-day5-state-key.js")).map(command => command.argv);
+  assert.equal(precedingR05.length, 178);
+  assert.equal(createHash("sha256").update(JSON.stringify(precedingR05)).digest("hex"), "21dd08efafe19fc5defd47dd79e20680d911677d4f4a91eec128fee968b3c656");
+  const precedingR01 = precedingR05.filter(argv => !argv.includes("tests/review-day5-validation.js"));
+  assert.equal(precedingR01.length, 177);
+  assert.equal(createHash("sha256").update(JSON.stringify(precedingR01)).digest("hex"), "3d032ab95c1baf66eabb91810d630dca6981e5380583f6906d07aa3954d245ae");
+  const baseline173 = precedingR01.filter(argv => !["tests/review-day5-quarantine.js", "tests/review-day5-finalizer-containment.js", "tests/review-day5-retry-intent.js", "tests/review-day5-serial.js"].some(file => argv.includes(file)));
+  assert.equal(baseline173.length, 173);
+  assert.equal(createHash("sha256").update(JSON.stringify(baseline173)).digest("hex"), "96536988d1d13a544ea49b9fe13345f8c982d6b57c7a1c11a65f10e2d02c237f");
+  const precedingR02 = predecessorCommands.filter(command => !command.argv.includes("tests/review-day5-serial.js") && !command.argv.includes("tests/review-day5-validation.js") && !command.argv.includes("tests/review-day5-state-key.js")).map(command => command.argv);
+  assert.equal(precedingR02.length, 176);
+  assert.equal(createHash("sha256").update(JSON.stringify(precedingR02)).digest("hex"), "200979b5ac292110c955b3367fa1d3a04ba10f76ee7748f655094889999027f2");
+  const preceding = predecessorCommands.filter(command => !command.argv.includes("tests/review-day5-retry-intent.js") && !command.argv.includes("tests/review-day5-serial.js") && !command.argv.includes("tests/review-day5-validation.js") && !command.argv.includes("tests/review-day5-state-key.js")).map(command => command.argv);
+  assert.equal(preceding.length, 175);
+  assert.equal(createHash("sha256").update(JSON.stringify(preceding)).digest("hex"), "828588f65b2d26402149e601680d1a15749fbe8dd15b2e21143fb384f047782a");
+  const additions = ["tests/review-test-runner.js", "tests/review-mcp-robustness-isolation.js", "lib/result-text.js", "lib/tools-call-errors.js", "tests/review-postrun.js", "tests/review-f2-results.js", "tests/review-prespawn.js", "tests/review-f6-finalize-snapshots.js", "tests/review-f8-diagnostics.js", "tests/review-f9-startup.js", "tests/review-f9-backfill.js", "tests/review-day5-quarantine.js", "tests/review-day5-finalizer-containment.js", "tests/review-day5-retry-intent.js", "tests/review-day5-serial.js", "tests/review-day5-validation.js", "tests/review-day5-state-key.js"];
+  additions.push("tests/review-day5-worker-release.js", "tests/review-day5-pipeline-token.js");
   const original = commands.filter(command => !command.argv.some(arg => additions.includes(arg))).map(command => command.argv);
   assert.equal(original.length, 162);
   assert.equal(createHash("sha256").update(JSON.stringify(original)).digest("hex"), "f8a95274918ebbe3953c2894b8d38e3a8772bf02e0a5d4de2276baefe931f36b");
@@ -46,7 +69,68 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.deepEqual(grouped.argv, ["--test", "bin/direct-run-audit.test.js", "bin/builder-model-fallback.test.js", "bin/main-module.test.js", "bin/daily-doctor.test.js", "bin/pipeline-admin.test.js"]);
   for (const file of ["review-provider-wait.js", "review-spawn.js", "review-provider-fallback.js", "review-queue-features.js", "review-round5.js", "review-friend-runtime.js", "review-flex-runners.js", "review-flex-rate-limit.js", "review-batch-race.js", "review-shared-attestation.js", "review-pause-precheck.js", "review-validation-tree.js", "review-test-runner.js", "review-flex-self-check.js", "review-flex-queue-worker.js"])
     assert.equal(commands.find(command => path.basename(command.file) === file && command.argv[0] !== "--check").lane, "exclusive", file);
-  assert.equal(commands.find(command => path.basename(command.file) === "review-flex-auto-integrate.js").lane, "parallel");
+  const autoIntegration = commands.find(command => path.basename(command.file) === "review-flex-auto-integrate.js" && command.argv[0] !== "--check");
+  assert.equal(autoIntegration.lane, "exclusive");
+  assert.equal(autoIntegration.timeoutMs, 900_000);
+  const autoSyntax = parseCommandChain("node --check tests/review-flex-auto-integrate.js")[0];
+  assert.equal(autoSyntax.lane, "syntax");
+  assert.equal(autoSyntax.timeoutMs, 900_000);
+  const finalizationSnapshots = commands.filter(command => JSON.stringify(command.argv) === JSON.stringify(["tests/review-f6-finalize-snapshots.js"]));
+  assert.equal(finalizationSnapshots.length, 1);
+  assert.equal(finalizationSnapshots[0].lane, "parallel");
+  const diagnostics = commands.filter(command => JSON.stringify(command.argv) === JSON.stringify(["tests/review-f8-diagnostics.js"]));
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].lane, "parallel");
+  const startupRecovery = commands.filter(command => JSON.stringify(command.argv) === JSON.stringify(["tests/review-f9-startup.js"]));
+  assert.equal(startupRecovery.length, 1);
+  assert.equal(startupRecovery[0].lane, "parallel");
+  const pipelineBackfill = commands.filter(command => JSON.stringify(command.argv) === JSON.stringify(["tests/review-f9-backfill.js"]));
+  assert.equal(pipelineBackfill.length, 1);
+  assert.equal(pipelineBackfill[0].lane, "parallel");
+  const quarantine = commands.filter(command => command.argv.includes("tests/review-day5-quarantine.js"));
+  assert.equal(quarantine.length, 1);
+  assert.deepEqual(quarantine[0].argv, ["tests/review-day5-quarantine.js"]);
+  assert.equal(quarantine[0].lane, "parallel");
+  assert.deepEqual(commands.at(-12).argv, ["tests/review-day5-quarantine.js"]);
+  const finalizerContainment = commands.filter(command => command.argv.includes("tests/review-day5-finalizer-containment.js"));
+  assert.equal(finalizerContainment.length, 1);
+  assert.deepEqual(finalizerContainment[0].argv, ["tests/review-day5-finalizer-containment.js"]);
+  assert.equal(finalizerContainment[0].lane, "parallel");
+  assert.deepEqual(commands.at(-11).argv, ["tests/review-day5-finalizer-containment.js"]);
+  const retryIntent = commands.filter(command => command.argv.includes("tests/review-day5-retry-intent.js"));
+  assert.equal(retryIntent.length, 1);
+  assert.deepEqual(retryIntent[0].argv, ["tests/review-day5-retry-intent.js"]);
+  assert.equal(retryIntent[0].lane, "parallel");
+  assert.deepEqual(commands.at(-10).argv, ["tests/review-day5-retry-intent.js"]);
+  const serialLiterals = commands.filter(command => command.argv.includes("tests/review-day5-serial.js"));
+  assert.equal(serialLiterals.length, 1);
+  assert.deepEqual(serialLiterals[0].argv, ["tests/review-day5-serial.js"]);
+  assert.equal(serialLiterals[0].lane, "parallel");
+  assert.deepEqual(commands.at(-9).argv, ["tests/review-day5-serial.js"]);
+  const validationGrammar = commands.filter(command => command.argv.includes("tests/review-day5-validation.js"));
+  assert.equal(validationGrammar.length, 1);
+  assert.deepEqual(validationGrammar[0].argv, ["tests/review-day5-validation.js"]);
+  assert.equal(validationGrammar[0].lane, "parallel");
+  assert.deepEqual(commands.at(-8).argv, ["tests/review-day5-validation.js"]);
+  const stateKeyPublication = commands.filter(command => command.argv.includes("tests/review-day5-state-key.js"));
+  assert.equal(stateKeyPublication.length, 1);
+  assert.deepEqual(stateKeyPublication[0].argv, ["tests/review-day5-state-key.js"]);
+  assert.equal(stateKeyPublication[0].lane, "parallel");
+  assert.deepEqual(commands.at(-7).argv, ["tests/review-day5-state-key.js"]);
+  const workerRelease = commands.filter(command => command.argv.includes("tests/review-day5-worker-release.js"));
+  assert.equal(workerRelease.length, 1);
+  assert.deepEqual(workerRelease[0].argv, ["tests/review-day5-worker-release.js"]);
+  assert.equal(workerRelease[0].lane, "parallel");
+  assert.deepEqual(commands.at(-6).argv, ["tests/review-day5-worker-release.js"]);
+  const pipelineToken = commands.filter(command => command.argv.includes("tests/review-day5-pipeline-token.js"));
+  assert.equal(pipelineToken.length, 1);
+  assert.deepEqual(pipelineToken[0].argv, ["tests/review-day5-pipeline-token.js"]);
+  assert.equal(pipelineToken[0].lane, "parallel");
+  assert.deepEqual(commands.at(-5).argv, ["tests/review-day5-pipeline-token.js"]);
+  assert.deepEqual(commands.at(-4).argv, ["tests/review-f9-backfill.js"]);
+  assert.deepEqual(commands.at(-3).argv, ["tests/review-f9-startup.js"]);
+  assert.deepEqual(commands.at(-2).argv, ["tests/review-f8-diagnostics.js"]);
+  assert.deepEqual(commands.at(-1).argv, ["tests/skip-gate.js", "--summary"]);
   assert.throws(() => parseCommandChain("node tests/x.js && powershell dangerous"), /plain Node argv/);
   assert.throws(() => validateGateManifest(parseCommandChain("node tests/x.js")), /skip-gate/);
 });
@@ -93,23 +177,34 @@ test("failure does not stop later commands; grouped argv, literal arguments, log
   assert.equal(JSON.parse(await readFile(path.join(logRoot, "manifest.json"), "utf8")).commands.length, 3);
 });
 
-test("actual skip-gate reset, reporting and final summary share direct-child PPID and temp; tools-list keeps its ledger row", async () => {
+test("actual skip-gate reset, reporting and final summary share direct-child PPID and temp; tools-list and F8 keep their ledger rows", async () => {
   const env = await environment("ledger-temp"), logRoot = path.join(scratch, "ledger-logs");
+  const ledger = path.join(env.TEMP, `codex-opencode-test-skips-${process.pid}.jsonl`);
   const gate = path.join(ROOT, "tests", "skip-gate.js"), reporter = path.join(scratch, "report-skips.mjs");
   await writeFile(reporter, `import {finishSkips} from ${JSON.stringify(pathToFileURL(gate).href)};
 finishSkips({file:process.argv[2],total:2,skips:process.argv[2]==='optional-fixture'?[{name:'fixture optional',reason:'deliberate optional ledger fixture',optional:true}]:[]});`);
   const commands = [command(0, [gate, "--self-test"], "prelude"), command(1, [gate, "--reset"], "prelude"),
     command(2, [reporter, "zero-fixture"]), command(3, [reporter, "optional-fixture"]),
-    command(4, [path.join(ROOT, "tests", "review-tools-list-budget.js")]), command(5, [gate, "--summary"], "final")];
-  const report = await runTestCommands({ commands, cwd: ROOT, env, logRoot, jobs: 2 });
+    command(4, [path.join(ROOT, "tests", "review-tools-list-budget.js")]),
+    command(5, [path.join(ROOT, "tests", "review-f8-diagnostics.js")]), command(6, [gate, "--summary"], "final")];
+  const report = await runTestCommands({ commands, cwd: ROOT, env, logRoot, jobs: 2,
+    environmentForCommand: async ({ lane }) => {
+      if (lane === "final") assert.deepEqual((await eventsOf(ledger)).filter(row => row.file === "tests/review-f8-diagnostics.js"), [
+        { file: "tests/review-f8-diagnostics.js", total: 10, skipped: 0, partial: 0, required: 0, failed: false },
+      ]);
+      return env;
+    } });
   assert.equal(report.failed, 0, JSON.stringify(report.results.filter(result => result.status !== "passed")));
   assert.match(await readFile(report.results[4].log, "utf8"), /All \d+ tools\/list budget tests passed\./);
-  assert.match(await readFile(report.results[5].log, "utf8"), /Total skipped: 1 across 3 reporting test file\(s\)/);
-  await assert.rejects(readFile(path.join(env.TEMP, `codex-opencode-test-skips-${process.pid}.jsonl`)), { code: "ENOENT" });
+  assert.match(await readFile(report.results[6].log, "utf8"), /Total skipped: 1 across 4 reporting test file\(s\)/);
+  await assert.rejects(readFile(ledger), { code: "ENOENT" });
 });
 
 test("at most two long suites overlap, medium/short work fills the third slot, and exclusive commands wait for all children", async () => {
   const events = path.join(scratch, "phase-events.jsonl"), logRoot = path.join(scratch, "phase-logs");
+  const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
+  const autoCommand = parseCommandChain(packageJson.scripts["test:commands"]).find(command =>
+    path.basename(command.file) === "review-flex-auto-integrate.js" && command.argv[0] !== "--check");
   const commands = [command(0, [script, events, "ordinary", "30"]),
     command(1, [script, events, "recovery", "200"], "parallel", { file: "review-integration-recovery.js" }),
     command(2, [script, events, "self-test", "200"], "parallel", { file: "server-self-test.js" }),
@@ -118,7 +213,7 @@ test("at most two long suites overlap, medium/short work fills the third slot, a
     command(5, [script, events, "continue", "200"], "parallel", { file: "review-continue-worktree.js" }),
     command(6, [script, events, "pipelines", "200"], "parallel", { file: "review-tools-pipelines.js" }),
     command(7, [script, events, "batch", "200"], "parallel", { file: "review-integration-batch.js" }),
-    command(8, [script, events, "auto", "200"], "parallel", { file: "review-flex-auto-integrate.js" }),
+    command(8, [script, events, "auto", "200"], autoCommand.lane, { file: autoCommand.file, timeoutMs: autoCommand.timeoutMs }),
     command(9, [script, events, "exclusive-a", "0"], "exclusive"), command(10, [script, events, "exclusive-b", "0"], "exclusive")];
   const starts = [], heavy = new Set(["self-test", "reuse", "batch", "auto"]);
   const medium = new Set(["recovery", "pipelines", "continue", "bytes"]);
@@ -134,6 +229,9 @@ test("at most two long suites overlap, medium/short work fills the third slot, a
       }
     } });
   assert.equal(report.failed, 0);
+  assert.equal(report.commandCount, commands.length);
+  assert.equal(report.passed, commands.length);
+  assert.deepEqual(report.results.map(result => result.argv), commands.map(command => command.argv));
   assert.equal(dispatchedHeavy, 0); assert.equal(peakDispatchedHeavy, 2);
   assert.deepEqual(starts.slice(0, 3), ["self-test", "reuse", "recovery"]);
   assert.deepEqual(starts.filter(label => heavy.has(label)), [...heavy]);
@@ -147,6 +245,10 @@ test("at most two long suites overlap, medium/short work fills the third slot, a
     assert.ok(activeHeavy >= 0 && activeHeavy <= 2, JSON.stringify(timeline));
   }
   assert.equal(activeHeavy, 0); assert.ok(peakHeavy >= 1);
+  assert.deepEqual(timeline.filter(event => event.stage === "end").map(event => event.label).sort(), commands.map(command => command.argv[2]).sort());
+  for (const entry of commands.filter(command => command.lane === "parallel"))
+    assert.ok(position(entry.argv[2], "end") < position("auto", "start"));
+  assert.ok(position("auto", "end") < position("exclusive-a", "start"));
   for (const label of ["ordinary", ...heavy, ...medium]) assert.ok(position(label, "end") < position("exclusive-a", "start"));
   assert.ok(position("exclusive-a", "end") < position("exclusive-b", "start"));
   assert.deepEqual(timeline.filter(event => event.stage === "start").map(event => event.ppid), Array(11).fill(process.pid));
@@ -344,6 +446,269 @@ test("a timed-out file records resource/tree evidence, kills its own descendant 
     clearTimeout(timer);
   }
 });
+
+const privateProcessAlive = pid => {
+  assert.ok(Number.isSafeInteger(pid) && pid > 4);
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (error.code === "ESRCH") return false; throw error; }
+};
+
+async function containmentFixture(name, { exitedParent = false } = {}) {
+  const root = path.join(scratch, name);
+  assert.equal(path.dirname(root), scratch);
+  await mkdir(root);
+  const alive = path.join(root, "owned-alive.json"), stopped = path.join(root, "owned-stopped.txt");
+  const stop = path.join(root, "stop-owned.txt"), drainRelease = path.join(root, "release-drain.txt");
+  const orphan = path.join(root, "owned.mjs"), hang = path.join(root, "hang.mjs");
+  const middle = path.join(root, "middle.mjs"), middlePid = path.join(root, "middle-pid.txt"), middleClosed = path.join(root, "middle-closed.txt");
+  await writeFile(orphan, `import fs from 'node:fs';
+    const exit=()=>{fs.writeFileSync(${JSON.stringify(stopped)},String(process.pid));process.exit(0);};
+    fs.writeFileSync(${JSON.stringify(alive)},JSON.stringify({pid:process.pid,startedAt:Date.now()}));
+    setInterval(()=>{if(fs.existsSync(${JSON.stringify(stop)}))exit();},50);
+    setTimeout(exit,25000);`);
+  if (exitedParent) await writeFile(middle, `import {spawn} from 'node:child_process'; import fs from 'node:fs';
+    fs.writeFileSync(${JSON.stringify(middlePid)},String(process.pid));
+    const child=spawn(process.execPath,[${JSON.stringify(orphan)}],{stdio:'inherit',detached:true,windowsHide:true});
+    child.unref();process.exit(0);`);
+  await writeFile(hang, `import {spawn} from 'node:child_process'; import fs from 'node:fs';
+    const child=spawn(process.execPath,[${JSON.stringify(exitedParent ? middle : orphan)}],
+      {stdio:${JSON.stringify(exitedParent ? "inherit" : "ignore")},detached:${!exitedParent},windowsHide:true});
+    ${exitedParent ? `child.once('close',()=>fs.writeFileSync(${JSON.stringify(middleClosed)},'closed'));` : "child.unref();"}
+    setInterval(()=>{},1000);setTimeout(()=>process.exit(0),25000);`);
+  return { root, alive, stopped, stop, drainRelease, hang, middlePid, middleClosed,
+    async cleanup() {
+      await writeFile(stop, "stop"); await writeFile(drainRelease, "release");
+      if (existsSync(alive)) {
+        const { pid } = JSON.parse(readFileSync(alive, "utf8"));
+        const deadline = Date.now() + 7000;
+        while (privateProcessAlive(pid) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+        assert.equal(privateProcessAlive(pid), false, "the private descendant must actually exit after its stop signal");
+        assert.equal(existsSync(stopped), true);
+      }
+    } };
+}
+
+function assertAbortedCommands(report, commands, statuses) {
+  assert.equal(report.commandCount, commands.length);
+  assert.equal(report.results.length, commands.length);
+  assert.deepEqual(report.results.map(result => result.index), commands.map(entry => entry.index));
+  assert.deepEqual(report.results.map(result => result.argv), commands.map(entry => entry.argv));
+  assert.deepEqual(report.results.map(result => result.status), statuses);
+  assert.equal(report.passed, statuses.filter(status => status === "passed").length);
+  assert.equal(report.failed, statuses.filter(status => status !== "passed").length);
+  for (const result of report.results.filter(result => result.status === "aborted")) {
+    assert.equal(result.pid, null); assert.equal(result.startedAt, null); assert.equal(result.durationMs, 0);
+    assert.equal(result.log, undefined);
+    assert.match(result.executionError, /Dispatch aborted: containment could not be confirmed for command 1/);
+  }
+}
+
+if (process.platform === "win32") test("a failed Windows snapshot stops queued and prepared dispatch while its private descendant is alive", async () => {
+  const fixture = await containmentFixture("failed-windows-containment");
+  const utility = path.join(fixture.root, "utility"); await mkdir(utility);
+  // The exact native Node binary rejects PowerShell flags. This affects the runner's utility, not only a suite's env.
+  await copyFile(process.execPath, path.join(utility, "powershell.exe"));
+  const pathKey = Object.keys(process.env).find(key => key.toUpperCase() === "PATH") || "PATH";
+  const previousPath = process.env[pathKey];
+  let releasePreparation;
+  const preparation = new Promise(resolve => { releasePreparation = resolve; });
+  const prepared = [], started = [], markers = [];
+  const commands = [command(0, [fixture.hang], "parallel", { timeoutMs: 4000 })];
+  for (const [index, lane] of [[1, "parallel"], [2, "parallel"], [3, "exclusive"], [4, "final"]]) {
+    const file = path.join(fixture.root, `later-${index}.mjs`), marker = path.join(fixture.root, `later-${index}.txt`);
+    await writeFile(file, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'started');`);
+    markers.push(marker); commands.push(command(index, [file], lane, { timeoutMs: 3000 }));
+  }
+  process.env[pathKey] = utility + path.delimiter + (previousPath || "");
+  try {
+    const env = await environment("failed-windows-containment-temp");
+    const report = await runTestCommands({ commands, cwd: fixture.root, env,
+      logRoot: path.join(fixture.root, "logs"), jobs: 2,
+      environmentForCommand: async entry => {
+        prepared.push(entry.index);
+        if (entry.index === 1) await preparation;
+        return env;
+      },
+      onProgress: event => {
+        if (event.event === "start") started.push(event.command.index);
+        if (event.event === "finish" && event.command.index === 0) releasePreparation();
+      } });
+    const timed = report.results[0], { pid } = JSON.parse(await readFile(fixture.alive, "utf8"));
+    assert.equal(timed.diagnostics.ok, false); assert.equal(timed.termination.ok, false);
+    assert.equal(timed.directChildClosed, true);
+    assert.equal(privateProcessAlive(pid), true, "the fixture must prove actual surviving work, not a stale marker");
+    assert.equal(existsSync(fixture.stopped), false);
+    assertAbortedCommands(report, commands, ["timeout", "aborted", "aborted", "aborted", "aborted"]);
+    assert.deepEqual(started, [0]); assert.deepEqual(prepared, [0, 1]);
+    for (const marker of markers) assert.equal(existsSync(marker), false, "no later child may start");
+    assert.deepEqual(JSON.parse(await readFile(path.join(fixture.root, "logs", "report.json"), "utf8")), report);
+    assert.match(await readFile(timed.log, "utf8"), /TIMEOUT DIAGNOSTICS:.*TIMEOUT TERMINATION:/s);
+  } finally {
+    releasePreparation();
+    try { await fixture.cleanup(); }
+    finally { if (previousPath === undefined) delete process.env[pathKey]; else process.env[pathKey] = previousPath; }
+  }
+});
+
+test("an unclosed direct child stops heavy waiters and exclusive/final dispatch while already-started work drains", async () => {
+  // The intermediate exits before the snapshot; its detached child retains the direct child's pipes.
+  // No diagnostic/termination hooks are injected: successful utility/group termination must still require close.
+  const fixture = await containmentFixture("unclosed-direct-child", { exitedParent: true });
+  const drainer = path.join(fixture.root, "drainer.mjs"), draining = path.join(fixture.root, "draining.json");
+  await writeFile(drainer, `import fs from 'node:fs';
+    fs.writeFileSync(${JSON.stringify(draining)},JSON.stringify({pid:process.pid}));
+    setInterval(()=>{if(fs.existsSync(${JSON.stringify(fixture.drainRelease)}))process.exit(0);},50);
+    setTimeout(()=>process.exit(9),25000);`);
+  const commands = [command(0, [fixture.hang], "parallel", { file: "server-self-test.js", timeoutMs: 6000 }),
+    command(1, [drainer], "parallel", { file: "review-integration-reuse.js", timeoutMs: 30000 })];
+  const markers = [], started = [], prepared = [];
+  for (const [index, lane, file] of [[2, "parallel", "review-integration-batch.js"], [3, "parallel", "review-flex-auto-integrate.js"],
+    [4, "exclusive", "exclusive.mjs"], [5, "final", "final.mjs"]]) {
+    const entry = path.join(fixture.root, `later-${index}.mjs`), marker = path.join(fixture.root, `later-${index}.txt`);
+    await writeFile(entry, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'started');`);
+    markers.push(marker); commands.push(command(index, [entry], lane, { file, timeoutMs: 3000 }));
+  }
+  let drainAliveAtTimeout = false;
+  try {
+    const env = await environment("unclosed-direct-child-temp");
+    const report = await runTestCommands({ commands, cwd: fixture.root, env,
+      logRoot: path.join(fixture.root, "logs"), jobs: 3,
+      environmentForCommand: entry => { prepared.push(entry.index); return env; },
+      onProgress: event => {
+        if (event.event === "start") started.push(event.command.index);
+        if (event.event === "finish" && event.command.index === 0) {
+          drainAliveAtTimeout = privateProcessAlive(JSON.parse(readFileSync(draining, "utf8")).pid);
+          writeFileSync(fixture.drainRelease, "release");
+        }
+      } });
+    const timed = report.results[0], { pid } = JSON.parse(await readFile(fixture.alive, "utf8"));
+    assert.equal(existsSync(fixture.middleClosed), true);
+    assert.equal(privateProcessAlive(Number(await readFile(fixture.middlePid, "utf8"))), false, "the intermediate exited before the snapshot");
+    assert.equal(timed.diagnostics.ok, true, JSON.stringify(timed.diagnostics));
+    assert.equal(timed.termination.ok, true, JSON.stringify(timed.termination));
+    assert.equal(timed.directChildClosed, false, "a real inherited pipe must keep the close event pending");
+    assert.equal(privateProcessAlive(pid), true); assert.equal(existsSync(fixture.stopped), false);
+    assert.equal(drainAliveAtTimeout, true, "already-started work must still be running when containment fails");
+    assertAbortedCommands(report, commands, ["timeout", "passed", "aborted", "aborted", "aborted", "aborted"]);
+    assert.ok(Date.parse(report.results[1].finishedAt) >= Date.parse(timed.finishedAt));
+    assert.equal(privateProcessAlive(JSON.parse(await readFile(draining, "utf8")).pid), false, "already-started work must be fully drained");
+    assert.deepEqual(started.sort((a, b) => a - b), [0, 1]); assert.deepEqual(prepared.sort((a, b) => a - b), [0, 1]);
+    for (const marker of markers) assert.equal(existsSync(marker), false, "a heavy waiter or later phase must not dispatch");
+    assert.deepEqual(JSON.parse(await readFile(path.join(fixture.root, "logs", "report.json"), "utf8")), report);
+    assert.match(await readFile(timed.log, "utf8"), /TIMEOUT DIAGNOSTICS:.*TIMEOUT TERMINATION:/s);
+  } finally { await fixture.cleanup(); }
+});
+
+test("skip capture uses the final child's temp and runner PPID rather than the default command env", async () => {
+  const first = await environment("skip-binding-first"), final = await environment("skip-binding-final");
+  const gate = path.join(ROOT, "tests", "skip-gate.js"), reporter = path.join(scratch, "skip-binding.mjs");
+  await writeFile(reporter, `import {finishSkips} from ${JSON.stringify(pathToFileURL(gate).href)};
+    if(finishSkips({file:process.argv[2],total:2,skips:[{name:process.argv[2],reason:'private temp binding',optional:true}]}))process.exitCode=1;`);
+  const report = await runTestCommands({ commands: [command(0, [gate, "--reset"], "prelude"), command(1, [gate, "--reset"], "prelude"),
+    command(2, [reporter, "default-temp"]), command(3, [reporter, "final-temp"]), command(4, [gate, "--summary"], "final")],
+    cwd: scratch, env: first, logRoot: path.join(scratch, "skip-binding-logs"), jobs: 2,
+    environmentForCommand: entry => [1, 3, 4].includes(entry.index) ? final : first });
+  assert.equal(report.failed, 0);
+  assert.equal(report.skipMetadata.runnerPid, process.pid);
+  assert.deepEqual(report.skipMetadata.rows.map(row => row.file), ["final-temp"]);
+  assert.equal(report.skipMetadata.rows[0].details[0].name, "final-temp");
+  assert.equal(existsSync(path.join(first.TEMP, `codex-opencode-test-skips-${process.pid}.jsonl`)), true);
+  assert.equal(existsSync(path.join(final.TEMP, `codex-opencode-test-skips-${process.pid}.jsonl`)), false);
+});
+
+async function skipReceiptFixture(spec) {
+  const root = path.join(scratch, `skip-receipt-${spec.name}`);
+  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills"]) await mkdir(path.join(root, directory), { recursive: true });
+  for (const file of ["bin/test-runner.js", "bin/main-module.js", "tests/skip-gate.js"]) await copyFile(path.join(ROOT, file), path.join(root, file));
+  const input = { file: `receipt-${spec.name}`, total: spec.total, skips: spec.skips || [], partial: spec.partial || [] };
+  await writeFile(path.join(root, "tests", "fixture.js"), `import {finishSkips} from './skip-gate.js';
+    import fs from 'node:fs';import path from 'node:path';import {tmpdir} from 'node:os';
+    if(finishSkips(${JSON.stringify(input)}))process.exitCode=1;
+    ${spec.noise ? "for(let i=0;i<40;i++)process.stdout.write('tail noise '+i+' '+'.'.repeat(1024)+'\\n');" : ""}
+    ${spec.ledger === "missing" ? "fs.rmSync(path.join(tmpdir(),`codex-opencode-test-skips-${process.ppid}.jsonl`));" : ""}
+    ${spec.ledger === "corrupt" ? "fs.appendFileSync(path.join(tmpdir(),`codex-opencode-test-skips-${process.ppid}.jsonl`),'{broken\\n');" : ""}`);
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ type: "module", scripts: {
+    "test:commands": "node tests/skip-gate.js --self-test && node tests/skip-gate.js --reset && node tests/fixture.js && node tests/skip-gate.js --summary" } }));
+  for (const [file, bytes] of Object.entries({ "server.js": "// scratch server\n", "package-lock.json": "{}\n", "lib/fixture.js": "// scratch lib\n",
+    "opencode/agents/fixture.md": "scratch agent\n", "opencode/.gitignore": "log/\n", "opencode/plugin-integrity-manifest.json": "{}\n" }))
+    await writeFile(path.join(root, file), bytes);
+  const env = await prepareTestEnvironment(path.join(scratch, `skip-receipt-parent-${spec.name}`), process.env, { copyProfiles: false });
+  if (spec.override === undefined) delete env.CODEX_TEST_ALLOW_REQUIRED_SKIPS;
+  else env.CODEX_TEST_ALLOW_REQUIRED_SKIPS = spec.override;
+  let report;
+  try {
+    const runner = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(root, "bin", "test-runner.js")], { cwd: root, env, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      for (const stream of [child.stdout, child.stderr]) stream.on("data", chunk => { output += String(chunk); });
+      const timer = setTimeout(() => { child.kill(); reject(new Error("Private skip receipt runner exceeded 30 seconds")); }, 30000);
+      child.once("error", error => { clearTimeout(timer); reject(error); });
+      child.once("close", code => { clearTimeout(timer); resolve({ code, output, pid: child.pid }); });
+    });
+    report = JSON.parse(await readFile(path.join(root, ".test-logs", "report.json"), "utf8"));
+    const steps = ["installed dependencies", "npm test", "test:concurrency", "npm audit", "live health smoke"]
+      .map(name => ({ name, command: "explicit scratch stub", ...(name === "test:concurrency" ? { requireCheckSummary: true } : {}) }));
+    const receipt = (await runReleaseGate({ sourceRoot: root, receiptPath: path.join(root, "scratch-receipt.json"), steps, log: () => {},
+      runStep: async step => ({ exitCode: step.name === "npm test" ? runner.code : 0,
+        output: step.name === "npm test" ? runner.output : step.name === "test:concurrency" ? "Checks: 1 passed, skipped: 0\n" : "explicit unused production-step stub\n" }) })).receipt;
+    assert.equal(runner.code, spec.failed ? 1 : 0, runner.output);
+    assert.equal(receipt.ok, !spec.failed, receipt.failure);
+    assert.equal(report.commandCount, 4); assert.equal(report.passed, spec.failed ? 3 : 4); assert.equal(report.failed, spec.failed ? 1 : 0);
+    if (spec.ledger) {
+      assert.equal(report.skipMetadata, undefined);
+      assert.match(report.skipMetadataError, /not captured/);
+      assert.equal(report.results[3].pid, undefined, "a missing/corrupt ledger must fail before the final child starts");
+      assert.match(report.results[3].executionError, spec.ledger === "missing" ? /ENOENT/ : /JSON|Unexpected/i);
+      assert.equal(receipt.steps[1].skipMetadataError, "test runner printed no structured skip metadata");
+      return;
+    }
+    const details = [...input.skips.map(skip => ({ name: skip.name, reason: skip.reason, optional: Boolean(skip.optional), partial: false })),
+      ...input.partial.map(skip => ({ name: skip.name, reason: skip.reason, optional: true, partial: true }))];
+    // This assertion exercises the old lost-disclosure behavior through existing APIs.
+    assert.deepEqual(receipt.skips, details.map(detail => ({ step: "npm test", file: input.file, ...detail })));
+    const counts = { files: 1, skipped: input.skips.length, partial: input.partial.length,
+      required: input.skips.filter(skip => !skip.optional).length, total: details.length };
+    assert.deepEqual(receipt.steps[1].skipCounts, counts);
+    assert.deepEqual(report.skipMetadata.counts, counts);
+    assert.equal(report.skipMetadata.runnerPid, runner.pid);
+    assert.equal(report.skipMetadata.allowRequiredSkips, spec.override === "1");
+    assert.deepEqual(report.skipMetadata.rows, [{ file: input.file, total: input.total, skipped: counts.skipped, partial: counts.partial,
+      required: counts.required, failed: Boolean(spec.failed), ...(details.length ? { details } : {}) }]);
+    const messages = runner.output.split(/\r?\n/).filter(line => line.startsWith("TEST_RUNNER_SKIP_METADATA: "));
+    assert.equal(messages.length, 1);
+    assert.deepEqual(JSON.parse(messages[0].slice("TEST_RUNNER_SKIP_METADATA: ".length)), report.skipMetadata);
+    assert.match(runner.output, new RegExp(`Total skipped: ${counts.total} across 1 reporting test file`));
+    const stored = JSON.parse(await readFile(path.join(report.logRoot, "report.json"), "utf8"));
+    assert.deepEqual(stored.skipMetadata, report.skipMetadata);
+    if (spec.noise) {
+      assert.ok(details.length > 15 && JSON.stringify(details).length > 16384);
+      assert.equal(report.results[2].summaryLines.some(line => line.includes(details[0].name)), false);
+      assert.match(await readFile(report.results[2].log, "utf8"), /optional-case-0/);
+    }
+  } finally {
+    if (report && !report.fixturesRemoved) {
+      assert.equal(path.dirname(path.resolve(report.fixtureRoot)), path.resolve(env.TEMP));
+      assert.match(path.basename(report.fixtureRoot), /^bridge-test-run-/);
+      await cleanupRunFixtures(report.fixtureRoot, { failed: 0 }); await rmdir(report.fixtureRoot);
+    }
+  }
+}
+
+const receiptCases = [
+  { name: "long-details", total: 100, noise: true,
+    skips: Array.from({ length: 40 }, (_, index) => ({ name: `optional-case-${index}`, reason: `optional reason ${index}: ${"r".repeat(700)}`, optional: true })),
+    partial: Array.from({ length: 20 }, (_, index) => ({ name: `passed-case-${index}`, reason: `partial reason ${index}: ${"p".repeat(700)}` })) },
+  { name: "zero", total: 3 },
+  { name: "required-fails", total: 2, failed: true, skips: [{ name: "required case", reason: "scratch prerequisite missing" }] },
+  { name: "required-nonliteral-override", total: 2, failed: true, override: "true", skips: [{ name: "required case", reason: "scratch prerequisite missing" }] },
+  { name: "required-explicit-override", total: 2, override: "1", skips: [{ name: "required case", reason: "scratch prerequisite missing" }] },
+  { name: "all-optional-fails", total: 1, failed: true, skips: [{ name: "only case", reason: "scratch platform unavailable", optional: true }] },
+  { name: "all-optional-override-fails", total: 1, failed: true, override: "1", skips: [{ name: "only case", reason: "scratch platform unavailable", optional: true }] },
+  { name: "all-required-override-fails", total: 1, failed: true, override: "1", skips: [{ name: "only case", reason: "scratch prerequisite missing" }] },
+  { name: "missing-ledger", total: 3, failed: true, ledger: "missing" },
+  { name: "corrupt-ledger", total: 3, failed: true, ledger: "corrupt" },
+];
+for (const spec of receiptCases) test(`actual runner-main to receipt preserves skip disclosure and policy: ${spec.name}`, () => skipReceiptFixture(spec));
 
 let failed = 0;
 try {

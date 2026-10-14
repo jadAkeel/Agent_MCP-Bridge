@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { readNonNegativeIntEnv } from "../lib/env.js";
 import { isMainModule } from "./main-module.js";
 import { resolveServerEntrypoint, serverChildEnvironment } from "./server-entry.js";
 
@@ -1126,12 +1127,13 @@ async function main() {
     // A containment quarantine whose recorded processes are all gone must free its slot;
     // before this it held capacity forever.
     const quarantineKey = "concurrency-quarantine-account";
+    const recordedAt = Date.now() - readNonNegativeIntEnv("CODEX_OPENCODE_CONTAINMENT_RELEASE_GRACE_MS", 600_000) - 60_000;
     withDatabase(path.join(stateDir, "provider-concurrency.sqlite"), (db) => {
       db.prepare("INSERT OR REPLACE INTO provider_capacities (provider_key, capacity, updated_at) VALUES (?, 1, ?)").run(quarantineKey, Date.now());
       db.prepare(`INSERT INTO provider_leases (lease_id, provider_key, owner_instance_id, owner_pid, created_at, heartbeat_at, expires_at, containment)
         VALUES ('stale-quarantine', ?, 'gone-instance', ?, ?, ?, ?, ?)`)
-        .run(quarantineKey, 2 ** 30 + 7, Date.now() - 60_000, Date.now() - 60_000, Number.MAX_SAFE_INTEGER,
-          JSON.stringify({ pids: [2 ** 30 + 8, 2 ** 30 + 9], complete: true }));
+        .run(quarantineKey, 2 ** 30 + 7, recordedAt, recordedAt, Number.MAX_SAFE_INTEGER,
+          JSON.stringify({ pids: [2 ** 30 + 8, 2 ** 30 + 9], complete: true, recordedAt }));
     });
     const reclaimWorker = await execFileAsync(process.execPath, [serverEntrypoint, "--provider-lease-worker", "100"], {
       cwd: process.cwd(), windowsHide: true, timeout: 30_000,

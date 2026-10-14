@@ -42,12 +42,14 @@ const VALIDATION = "node tools/check.cjs";
 const issues = () => { const file = path.join(fixture.stateDir, "logs", "issues.md"); return existsSync(file) ? readFileSync(file, "utf8") : ""; };
 
 let worktrees = 0;
+const worktreeBaseCommits = new Map();
 // What a builder leaves: a worktree of HEAD with its edits, uncommitted.
 async function builderWorktree(edits) {
   worktrees += 1;
   const dir = path.join(root, `wt-${worktrees}`);
   // Like a bridge writer worktree: its own branch, so cleanup can verify and remove it.
   await git(["worktree", "add", "-q", "-b", `agent/builder/wt-${worktrees}`, dir, "HEAD"]);
+  worktreeBaseCommits.set(dir, (await git(["rev-parse", "HEAD"], dir)).trim());
   for (const [relative, content] of Object.entries(edits)) {
     await mkdir(path.dirname(path.join(dir, ...relative.split("/"))), { recursive: true });
     await writeFile(path.join(dir, ...relative.split("/")), content, "utf8");
@@ -60,17 +62,26 @@ const job = (file, extra = {}) => ({
   scopeContract: { ...writeScope(file), validationCommand: VALIDATION }, autoIntegrate: true, ...extra,
 });
 const worktreeOf = new Map();
-hooks.queueJobExecutorTestHook = async (request) => {
+hooks.queueJobExecutorTestHook = async (request, { jobId }) => {
   const planned = worktreeOf.get(request.task);
+  if (planned.beforeFinish) await planned.beforeFinish(planned.dir);
+  const branch = (await git(["branch", "--show-current"], planned.dir)).trim();
+  const db = await internals.openLockDb(repo);
+  try {
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO worktree_artifacts (worktree_path, cwd, branch, job_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'retained', ?, ?)`).run(path.resolve(planned.dir), path.resolve(repo), branch, jobId, now, now);
+  } finally { internals.closeDb(db); }
   // B-114: like executeOpenCodeJob, the result carries the patch identity the job finished with.
-  const diff = await internals.collectWorktreeDiff({ path: planned.dir, baseCommit: "" });
+  const diff = await internals.collectWorktreeDiff({ path: planned.dir, baseCommit: worktreeBaseCommits.get(planned.dir) || "" });
+  assert.equal(diff.errorType, null, diff.error || "the fixture must capture a real complete source identity");
   // Something that changes the worktree after the job finished (a leftover process, a hand edit).
   if (planned.afterFinish) await planned.afterFinish(planned.dir);
   return {
     response: { content: [{ type: "text", text: "REPORT: wrote the batch." }] },
     result: { errorType: "", changedFiles: planned.changed, configuredProvider: "opencode", configuredModel: "muse-spark-1.3-contributor-free", worktree: { patchSha256: diff.patchSha256, sourceStateSha256: diff.sourceStateSha256 } },
     validation: { status: "passed" },
-    worktree: { path: planned.dir, branch: "", baseCommit: diff.sourceBaseCommit, baseTree: "" },
+    worktree: { path: planned.dir, branch, baseCommit: diff.sourceBaseCommit, baseTree: "" },
   };
 };
 async function runAutoJob(file, edits, extra = {}, afterFinish = null) {
@@ -198,10 +209,10 @@ test("Q-010 / Q-017 (e): with CODEX_OPENCODE_AUTO_INTEGRATION_BATCH=false jobs o
 // Q-017: a finished writer enqueued without the option (so nothing schedules it yet) and the
 // details the queue schedules for it; the tests schedule several in one tick, as jobs that
 // finished while the repository's chain was busy.
-async function finishedJob(file, edits, extra = {}) {
+async function finishedJob(file, edits, extra = {}, beforeFinish = null) {
   const dir = await builderWorktree(edits);
   const request = job(file, { lockedPaths: [file], autoIntegrate: undefined, ...extra });
-  worktreeOf.set(request.task, { dir, changed: Object.keys(edits) });
+  worktreeOf.set(request.task, { dir, changed: Object.keys(edits), beforeFinish });
   const enqueued = await enqueueQueueJob(request);
   assert.equal(enqueued.ok, true, `${enqueued.errorType}: ${enqueued.error}`);
   const jobId = enqueued.record.jobId;
@@ -586,7 +597,15 @@ test("Q-010: without autoIntegrate a finished writer is not touched", async () =
   const request = job("out/batch-007.json", { autoIntegrate: undefined });
   worktreeOf.set(request.task, { dir, changed: ["out/batch-007.json"] });
   const enqueued = await enqueueQueueJob(request);
-  assert.ok(await waitFor(async () => (await durable(enqueued.record.jobId))?.status === "completed"));
+  assert.ok(await waitFor(async () => (await durable(enqueued.record.jobId))?.status === "completed"), await (async () => {
+    const record = await durable(enqueued.record.jobId);
+    const bounded = (value, limit = 120) => String(value ?? "").slice(0, limit);
+    return `writer did not complete: ${JSON.stringify({
+      jobId: bounded(enqueued.record.jobId), status: bounded(record?.status), revision: bounded(record?.revision, 32),
+      errorType: bounded(record?.errorType), reason: bounded(record?.errorReason, 400),
+      createdAt: bounded(record?.createdAt, 64), startedAt: bounded(record?.startedAt, 64), finishedAt: bounded(record?.finishedAt, 64),
+    })}`;
+  })());
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(await head(), before);
   assert.equal((await durable(enqueued.record.jobId)).autoIntegration || null, null);
@@ -613,6 +632,270 @@ test("B-125: the commit uses the target's configured user.name/user.email, not t
     await git(["config", "--unset", "user.name"]);
     await git(["config", "--unset", "user.email"]);
   }
+});
+
+// Whole-week controls keep provider execution synthetic and use real terminal rows,
+// registered Git worktrees, serial leases, collection and shared cleanup.
+const withDb = async (operation, runtime = internals) => {
+  const db = await runtime.openLockDb(repo);
+  try { return await operation(db); } finally { runtime.closeDb(db); }
+};
+const artifactOf = entry => withDb(db => db.prepare("SELECT * FROM worktree_artifacts WHERE worktree_path = ?").get(path.resolve(entry.dir)));
+const sourceIdentityOf = record => ({ sourceBaseCommit: record.worktreeBaseCommit,
+  patchSha256: record.worktreePatchSha256, sourceStateSha256: record.worktreeSourceStateSha256 });
+const assertSourceRetained = async (entry, relative, content) => {
+  assert.equal(existsSync(entry.dir), true, "the original source directory must survive");
+  assert.equal(readFileSync(path.join(entry.dir, relative), "utf8"), content, "later source bytes must survive exactly");
+  assert.ok((await git(["worktree", "list", "--porcelain"])).includes(entry.dir.replace(/\\/g, "/")), "the worktree registration must survive");
+  assert.ok((await git(["show-ref", "--hash", "--verify", `refs/heads/${entry.details.sourceRecord.worktreeBranch}`])).trim(), "the source branch must survive");
+};
+const commitByHand = async entry => {
+  await mkdir(path.dirname(path.join(repo, entry.file)), { recursive: true });
+  await writeFile(path.join(repo, entry.file), readFileSync(path.join(entry.dir, entry.file)));
+  await git(["add", "--", entry.file]);
+  await git([...identity, "commit", "-q", "-m", `Land ${entry.file} by hand`]);
+  return await head();
+};
+const markLegacyCommitted = async (entry, commit, omitIdentity = false) => withDb(db => {
+  const row = db.prepare("SELECT record_json FROM opencode_jobs WHERE job_id = ?").get(entry.jobId);
+  const record = JSON.parse(row.record_json);
+  if (omitIdentity) delete record.worktreeSourceStateSha256;
+  record.autoIntegration = { status: "committed", commit, files: [entry.file], worktreeCleanup: "", worktreeSweepDone: false };
+  db.prepare("UPDATE opencode_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify(record), entry.jobId);
+});
+const sweep = runtime => withDb(db => runtime.sweepCommittedWorktrees(db), runtime);
+let restartedRuntimes = 0;
+const restartRuntime = async () => {
+  const restarted = (await import(`../server.js?ww-auto-cleanup-${++restartedRuntimes}`)).__selfTest;
+  restarted.hooks.stateDirectoryOverride = fixture.stateDir;
+  restarted.hooks.queueModeOverride = "sqlite";
+  restarted.internals.setDeferredCleanupSchedulingDisabled(true);
+  return restarted.internals;
+};
+
+for (const [kind, relative] of [["tracked", "src/a.txt"], ["untracked", "later-untracked.txt"]]) {
+  test(`WW-A2-001: already committed accounting retains later ${kind} source work`, async () => {
+    const entry = await finishedJob(`out/ww-already-${kind}.json`, { [`out/ww-already-${kind}.json`]: "original output\n" });
+    const commit = await commitByHand(entry);
+    const later = `later ${kind} bytes\n`;
+    await writeFile(path.join(entry.dir, relative), later);
+    const outcome = await autoIntegrateQueueJob(entry.details);
+    assert.equal(outcome.status, "already_committed", JSON.stringify(outcome));
+    assert.equal(outcome.commit, commit);
+    assert.deepEqual(outcome.files, [entry.file]);
+    await assertSourceRetained(entry, relative, later);
+    assert.equal(await head(), commit, "cleanup never creates another target commit");
+  });
+}
+
+test("WW-A2-001: an active continuation keeps its registered ownership and source", async () => {
+  const entry = await finishedJob("out/ww-continuation.json", { "out/ww-continuation.json": "continued output\n" });
+  const commit = await commitByHand(entry);
+  const executor = hooks.queueJobExecutorTestHook;
+  let signalStarted, finishContinuation, claimed = false, continuationId = "";
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  const finished = new Promise(resolve => { finishContinuation = resolve; });
+  hooks.queueJobExecutorTestHook = async (request, context) => {
+    if (request.task !== "WW active continuation") return executor(request, context);
+    continuationId = context.jobId;
+    const claim = await internals.attachRetainedWorktree({ cwd: repo, worktreePath: entry.dir, jobId: continuationId });
+    assert.equal(claim.ok, true, JSON.stringify(claim));
+    claimed = true;
+    signalStarted();
+    await finished;
+    return { response: { content: [{ type: "text", text: "REPORT: continuation finished." }] },
+      result: { errorType: "", changedFiles: [], noChanges: true }, validation: { status: "passed" }, worktree: null };
+  };
+  try {
+    const active = await enqueueQueueJob(job("out/ww-continuation.json", { task: "WW active continuation", continueWorktree: entry.dir, autoIntegrate: undefined }));
+    assert.equal(active.ok, true, active.error);
+    assert.equal(await Promise.race([started.then(() => true), fixture.sleep(15_000).then(() => false)]), true, "the real continuation claim must start");
+    assert.equal((await durable(active.record.jobId)).status, "running");
+    const outcome = await autoIntegrateQueueJob(entry.details);
+    assert.equal(outcome.status, "already_committed", JSON.stringify(outcome));
+    const artifact = await artifactOf(entry);
+    assert.equal(artifact.status, "in_use");
+    assert.equal(artifact.job_id, continuationId);
+    await assertSourceRetained(entry, entry.file, "continued output\n");
+    assert.equal(await head(), commit);
+  } finally {
+    if (claimed) await internals.releaseRetainedWorktreeClaim({ cwd: repo, worktreePath: entry.dir, jobId: continuationId });
+    finishContinuation();
+    hooks.queueJobExecutorTestHook = executor;
+    if (continuationId) assert.ok(await waitFor(async () => (await durable(continuationId))?.status !== "running", 15_000));
+  }
+});
+
+test("WW-A2-001: branch advance at the actual shared guard retains tip, bytes and registration", async () => {
+  const entry = await finishedJob("out/ww-branch.json", { "out/ww-branch.json": "original branch output\n" }, {}, async dir => {
+    await git(["add", "out/ww-branch.json"], dir);
+    await git([...identity, "commit", "-q", "-m", "Complete job on an advanced source tip"], dir);
+  });
+  const sourceTip = (await git(["rev-parse", "HEAD"], entry.dir)).trim();
+  assert.notEqual(sourceTip, entry.details.sourceRecord.worktreeBaseCommit, "the collected tip differs from the original base checkpoint");
+  const commit = await commitByHand(entry);
+  const { createIntegrationCleanupRuntime } = await import("../lib/integration-cleanup.js");
+  let guarded = false, movedTip = "";
+  const runtime = createIntegrationCleanupRuntime({ ...internals,
+    cleanupWorktree: async (worktree, ...args) => {
+      guarded = true;
+      assert.equal(worktree.expectedBranchOid, sourceTip, "the successful collection's final tip reaches shared cleanup");
+      await writeFile(path.join(entry.dir, "src/a.txt"), "branch advanced after collection\n");
+      await git(["add", "src/a.txt"], entry.dir);
+      await git([...identity, "commit", "-q", "-m", "Advance source before shared guard"], entry.dir);
+      movedTip = (await git(["rev-parse", "HEAD"], entry.dir)).trim();
+      return await internals.cleanupWorktree(worktree, ...args);
+    } });
+  const outcome = await runtime.cleanupCommittedWorktree({ cwd: repo, worktreePath: entry.dir, jobId: entry.jobId,
+    expectedSourceIdentity: sourceIdentityOf(entry.details.sourceRecord), committedCommit: commit });
+  assert.equal(guarded, true, "the actual guarded cleanup must execute");
+  assert.equal(outcome.cleanup, "retained_for_review", JSON.stringify(outcome));
+  assert.equal(outcome.reason, "source_branch_identity_changed");
+  await assertSourceRetained(entry, "src/a.txt", "branch advanced after collection\n");
+  assert.equal((await git(["rev-parse", `refs/heads/${entry.details.sourceRecord.worktreeBranch}`])).trim(), movedTip);
+  assert.equal((await artifactOf(entry)).status, "retained");
+});
+
+for (const count of [1, 2]) {
+  test(`WW-A2-001: ${count === 1 ? "single" : "batch"} fallback respects an actual engine retention decision and sweep`, async () => {
+    const entries = [];
+    for (let i = 0; i < count; i++) entries.push(await finishedJob(`out/ww-engine-${count}-${i}.json`, { [`out/ww-engine-${count}-${i}.json`]: "engine retained output\n" }));
+    const previous = hooks.autoIntegrationTestHooks.beforeUpdateRef;
+    let detached = false;
+    hooks.autoIntegrationTestHooks.beforeUpdateRef = async (...args) => {
+      if (previous) await previous(...args);
+      if (detached) return;
+      detached = true;
+      // The real engine refuses cleanup without its source's branch identity.
+      for (const entry of entries) await git(["checkout", "-q", "--detach", "HEAD"], entry.dir);
+    };
+    try { await scheduleTogether(entries); }
+    finally { hooks.autoIntegrationTestHooks.beforeUpdateRef = previous; }
+    assert.equal(detached, true);
+    for (const entry of entries) {
+      const record = await durable(entry.jobId);
+      assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+      assert.match(record.autoIntegration.worktreeCleanup, /retained_for_review \(source_branch_identity_unverified\)/);
+      await assertSourceRetained(entry, entry.file, "engine retained output\n");
+    }
+    const commit = await head();
+    await sweep(internals);
+    for (const entry of entries) await assertSourceRetained(entry, entry.file, "engine retained output\n");
+    assert.equal(await head(), commit);
+  });
+  test(`WW-A2-001: ${count === 1 ? "single" : "batch"} true-absence fallback cleans unchanged original sources`, async () => {
+    const entries = [];
+    for (let i = 0; i < count; i++) entries.push(await finishedJob(`out/ww-fallback-${count}-${i}.json`, { [`out/ww-fallback-${count}-${i}.json`]: "unchanged output\n" }));
+    const previous = hooks.autoIntegrationTestHooks.skipEngineCleanup;
+    hooks.autoIntegrationTestHooks.skipEngineCleanup = true;
+    try { await scheduleTogether(entries); }
+    finally { hooks.autoIntegrationTestHooks.skipEngineCleanup = previous; }
+    for (const entry of entries) {
+      const record = await durable(entry.jobId);
+      assert.equal(record.autoIntegration.status, "committed", JSON.stringify(record.autoIntegration));
+      assert.equal(existsSync(entry.dir), false, record.autoIntegration.worktreeCleanup);
+      assert.equal((await git(["branch", "--list", entry.details.sourceRecord.worktreeBranch])).trim(), "");
+      assert.equal(readFileSync(path.join(repo, entry.file), "utf8"), "unchanged output\n");
+    }
+  });
+}
+
+for (const mode of ["changed", "unchanged", "missing identity", "malformed identity"]) {
+  test(`WW-A2-001: fresh-runtime legacy sweep ${mode === "unchanged" ? "cleans unchanged source" : `retains ${mode} source`}`, async () => {
+    const file = `out/ww-restart-${mode.replace(/ /g, "-")}.json`;
+    const entry = await finishedJob(file, { [file]: "restart output\n" });
+    const commit = await commitByHand(entry);
+    await markLegacyCommitted(entry, commit, mode === "missing identity");
+    if (mode === "malformed identity") await withDb(db => {
+      const row = db.prepare("SELECT record_json FROM opencode_jobs WHERE job_id = ?").get(entry.jobId);
+      const record = JSON.parse(row.record_json);
+      record.worktreePatchSha256 = "not a complete source hash";
+      db.prepare("UPDATE opencode_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify(record), entry.jobId);
+    });
+    if (mode === "changed") await writeFile(path.join(entry.dir, "src/a.txt"), "later restart bytes\n");
+    const restarted = await restartRuntime();
+    await sweep(restarted);
+    const record = await durable(entry.jobId);
+    assert.equal(record.autoIntegration.status, "committed");
+    assert.equal(record.autoIntegration.commit, commit);
+    if (mode === "unchanged") {
+      assert.equal(existsSync(entry.dir), false, record.autoIntegration.worktreeCleanup);
+      assert.equal((await git(["branch", "--list", entry.details.sourceRecord.worktreeBranch])).trim(), "");
+    } else {
+      await assertSourceRetained(entry, mode === "changed" ? "src/a.txt" : entry.file, mode === "changed" ? "later restart bytes\n" : "restart output\n");
+      assert.match(record.autoIntegration.worktreeCleanup, mode === "changed" ? /committed_cleanup_identity_changed/ : /original_identity_missing/);
+    }
+    assert.equal(await head(), commit, "sweep never reapplies or commits the landed patch");
+  });
+}
+
+test("WW-A2-001: fresh-runtime sweep preserves an actual durable retained cleanup task", async () => {
+  const entry = await finishedJob("out/ww-durable-retain.json", { "out/ww-durable-retain.json": "durable output\n" });
+  internals.setDeferredCleanupSchedulingDisabled(true);
+  try {
+    const outcome = await autoIntegrateQueueJob(entry.details);
+    assert.equal(outcome.status, "committed", JSON.stringify(outcome));
+    const taskBefore = await withDb(db => db.prepare("SELECT * FROM integration_worktree_cleanup WHERE worktree_path = ?").get(path.resolve(entry.dir)));
+    assert.equal(taskBefore.status, "pending", "the actual integration engine must enqueue its validated result");
+    await writeFile(path.join(entry.dir, "src/a.txt"), "durable later bytes\n");
+    const outcomes = await internals.drainDeferredWorktreeCleanup(repo);
+    assert.equal(outcomes.find(item => item.path === entry.dir)?.cleanup, "retained_for_review", JSON.stringify(outcomes));
+    const retained = await withDb(db => db.prepare("SELECT * FROM integration_worktree_cleanup WHERE worktree_path = ?").get(path.resolve(entry.dir)));
+    assert.equal(retained.status, "retained");
+    await markLegacyCommitted(entry, outcome.commit);
+    await sweep(await restartRuntime());
+    assert.deepEqual(await withDb(db => db.prepare("SELECT * FROM integration_worktree_cleanup WHERE worktree_path = ?").get(path.resolve(entry.dir))), retained);
+    await assertSourceRetained(entry, "src/a.txt", "durable later bytes\n");
+  } finally { internals.setDeferredCleanupSchedulingDisabled(false); }
+});
+
+test("WW-A2-001: serial-lock contention retries cleanup after release without another commit", async () => {
+  const entry = await finishedJob("out/ww-cleanup-lock.json", { "out/ww-cleanup-lock.json": "locked output\n" });
+  const commit = await commitByHand(entry);
+  await markLegacyCommitted(entry, commit);
+  const restarted = await restartRuntime();
+  const blocker = await internals.acquireHardLock({ owner: "codex", agent: "merge_manager", task: "WW cleanup blocker",
+    cwd: repo, lockType: "serial_integration", repositoryScope: true, paths: ["."], ttlMs: 60_000 });
+  assert.equal(blocker.ok, true, blocker.error);
+  try {
+    await sweep(restarted);
+    assert.equal(existsSync(entry.dir), true);
+    assert.match((await durable(entry.jobId)).autoIntegration.worktreeCleanup, /pending/);
+  } finally { await internals.releaseHardLock(blocker.lock.id, blocker.lock.token, blocker.lock.paths, repo); }
+  await sweep(restarted);
+  assert.equal(existsSync(entry.dir), false, (await durable(entry.jobId)).autoIntegration.worktreeCleanup);
+  assert.equal((await git(["branch", "--list", entry.details.sourceRecord.worktreeBranch])).trim(), "");
+  assert.equal(await head(), commit);
+});
+
+test("WW-A2-001: original job and registry evidence cannot authorize a foreign repository source", async () => {
+  const foreign = path.join(root, "ww-foreign-repository");
+  await git(["clone", "-q", "--no-hardlinks", repo, foreign]);
+  await git(["checkout", "-q", "-b", "ww/foreign-source"], foreign);
+  worktreeBaseCommits.set(foreign, (await git(["rev-parse", "HEAD"], foreign)).trim());
+  const file = "out/ww-foreign.json";
+  await mkdir(path.join(foreign, "out"), { recursive: true });
+  await writeFile(path.join(foreign, file), "foreign source bytes\n");
+  const request = job(file, { autoIntegrate: undefined });
+  worktreeOf.set(request.task, { dir: foreign, changed: [file] });
+  const queued = await enqueueQueueJob(request);
+  assert.equal(queued.ok, true, queued.error);
+  assert.ok(await waitFor(async () => (await durable(queued.record.jobId))?.status === "completed", 30_000));
+  const record = await durable(queued.record.jobId);
+  const entry = { dir: foreign, file, jobId: queued.record.jobId };
+  const commit = await commitByHand(entry);
+  const { createIntegrationCleanupRuntime } = await import("../lib/integration-cleanup.js");
+  let sharedCleanupCalled = false;
+  const runtime = createIntegrationCleanupRuntime({ ...internals, cleanupWorktree: async (...args) => {
+    sharedCleanupCalled = true;
+    return await internals.cleanupWorktree(...args);
+  } });
+  const outcome = await runtime.cleanupCommittedWorktree({ cwd: repo, worktreePath: foreign, jobId: entry.jobId,
+    expectedSourceIdentity: sourceIdentityOf(record), committedCommit: commit });
+  assert.equal(outcome.cleanup, "retained_for_review", JSON.stringify(outcome));
+  assert.equal(sharedCleanupCalled, false, "repository provenance must fail before the shared remover is reached");
+  assert.equal(readFileSync(path.join(foreign, file), "utf8"), "foreign source bytes\n");
+  assert.equal((await git(["branch", "--show-current"], foreign)).trim(), "ww/foreign-source");
 });
 
 await runFlexTests({ isolatedStateDir, file: "tests/review-flex-auto-integrate.js", tests, cleanup: fixture.cleanup, finishSkips, label: "auto-integration" });

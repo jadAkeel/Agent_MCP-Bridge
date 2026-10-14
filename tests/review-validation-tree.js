@@ -120,6 +120,52 @@ try {
     assert.equal(launches, 0);
   });
 
+  const routingBin = path.join(fixture, "routing");
+  await mkdir(routingBin);
+  const routingCases = [["gitxexe", "supervised"], ["git-cmd", "supervised"],
+    ["git", "plain"], ["git.exe", "plain"], ["node", "supervised"]];
+  const routingPaths = routingCases.map(([name]) => path.join(routingBin, name));
+  for (const executable of routingPaths) await writeFile(executable, `synthetic routing fixture ${path.basename(executable)}`);
+  const dispatches = [];
+  const routingRuntime = createValidationRuntime({
+    CONFIG: { validationExecutableAllowlist: routingPaths, validationExecutableSha256Allowlist: [] },
+    buildValidationEnv: () => ({ PATH: routingBin }),
+    sha256File: async (file) => digest(await readFile(file)),
+    integrationTimed: (_phase, operation) => operation(), nowMs: Date.now, truncateText: (text) => text,
+    runCommand: async (...args) => { dispatches.push({ runner: "plain", args }); return { exitCode: 0, stdout: "plain" }; },
+    runSpawnCommand: async (...args) => {
+      dispatches.push({ runner: "supervised", args });
+      return { exitCode: 0, stdout: "supervised", payloadProcessId: 101, supervisorProcessId: 102 };
+    },
+  });
+  for (const [index, [name, runner]] of routingCases.entries()) {
+    await check(`D6-C3-002: approved ${name} uses the ${runner} runner`, async () => {
+      dispatches.length = 0;
+      const command = `${JSON.stringify(routingPaths[index])} --version`;
+      const approved = await routingRuntime.prepareValidationCommand(command);
+      assert.equal(approved.ok, true, JSON.stringify(approved));
+      const signal = new AbortController().signal;
+      const gate = await routingRuntime.runValidationGate({ command, cwd: fixture, timeoutMs: 1000, signal });
+      assert.equal(gate.status, "passed", JSON.stringify(gate));
+      assert.equal(dispatches.length, 1);
+      assert.equal(dispatches[0].runner, runner);
+      assert.equal(dispatches[0].args[0], approved.executablePath);
+      assert.deepEqual(dispatches[0].args[1], ["--version"]);
+      assert.equal(dispatches[0].args[5].signal, signal);
+    });
+  }
+  await check("D6-C3-002: unapproved near-match names still refuse without dispatch", async () => {
+    dispatches.length = 0;
+    for (const name of ["git-exe", "gitxbat"]) {
+      const executable = path.join(routingBin, name);
+      await writeFile(executable, "synthetic unapproved fixture");
+      const gate = await routingRuntime.runValidationGate({ command: `${JSON.stringify(executable)} --version`, cwd: fixture });
+      assert.equal(gate.errorType, "validation_command_untrusted");
+      assert.equal(gate.exitCode, "not_authorized");
+    }
+    assert.equal(dispatches.length, 0);
+  });
+
   await check("control: the plain runner's timeout leaves the grandchild running, and it writes", async () => {
     const script = await treeScript("control");
     const result = await runCommand(process.execPath, [script], fixture, 700);

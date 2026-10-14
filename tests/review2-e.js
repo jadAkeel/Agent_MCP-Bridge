@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { diffStatFromPatch, patchFileEntries } from "../lib/git-patch.js";
 
 const fixture = mkdtempSync(path.join(tmpdir(), "bridge-review2-e-"));
 const userGlobalConfig = path.join(fixture, "user-global.gitconfig");
@@ -51,6 +52,17 @@ function repoWithFeatureBranch(name) {
   git(root, "commit", "-qam", "feature");
   git(root, "checkout", "-q", "main");
   return root;
+}
+
+function textWorktree(root, name, files) {
+  const worktree = path.join(fixture, name);
+  git(root, "worktree", "add", "-q", "--detach", worktree, "HEAD");
+  for (const [relative, content] of Object.entries(files)) {
+    const target = path.join(worktree, relative);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  }
+  return worktree;
 }
 
 const failures = [];
@@ -211,6 +223,120 @@ try {
     assert.deepEqual(binaryTextFilesInPatch(`diff --git "a/img/l\\303\\263go.png" "b/img/l\\303\\263go.png"\n${binary}`), []);
     // A header that cannot be read must not lend its hunk the previous file's known-binary name.
     assert.equal(binaryTextFilesInPatch(`diff --git a/logo.png b/logo.png\n${binary}diff --git "a/broken.png b/broken.png\n${binary}`).length, 1);
+  });
+
+  await test("F5 decoded preview paths preserve text hunk counts and stat format", () => {
+    const cases = [
+      ["diff --git a/src/plain.txt b/src/plain.txt", "src/plain.txt"],
+      ["diff --git a/my dir/my file.py b/my dir/my file.py", "my dir/my file.py"],
+      ['diff --git "a/we\\"ird\\\\name.py" "b/we\\"ird\\\\name.py"', 'we"ird\\name.py'],
+      ['diff --git "a/control\\a\\b\\t\\n\\v\\f\\r.txt" "b/control\\a\\b\\t\\n\\v\\f\\r.txt"', "control\x07\b\t\n\v\f\r.txt"],
+      ['diff --git "a/src/caf\\303\\251.py" "b/src/caf\\303\\251.py"', "src/café.py"],
+      ['diff --git a/old.py "b/new\\303\\251.py"', "newé.py"],
+      ['diff --git "a/old\\303\\251.py" b/new.py', "new.py"],
+    ];
+    for (const [header, file] of cases) {
+      const patch = [header, "index 1111111..2222222 100644", "--- a/old", "+++ b/new",
+        "@@ -1,3 +1,3 @@", " context", "-old", "+new", "--- removed content", "+++ added content",
+        "@@ -9 +9 @@", "-later", "+later", "\\ No newline at end of file", ""].join("\n");
+      assert.deepEqual(patchFileEntries(patch), [{ path: file, added: 3, removed: 3, binary: false, created: false, deleted: false, inHunk: true }], header);
+      assert.equal(diffStatFromPatch(patch), ` ${file} | +3 -3\n 1 file changed, 3 insertions(+), 3 deletions(-)`, header);
+    }
+    assert.deepEqual(patchFileEntries(""), []);
+    assert.equal(diffStatFromPatch(""), "");
+  });
+
+  await test("F5 decoded creation, deletion and binary metadata retain the stat contract", () => {
+    const patch = [
+      'diff --git "a/new\\tfile.txt" "b/new\\tfile.txt"', "new file mode 100644", "--- /dev/null", '+++ "b/new\\tfile.txt"',
+      "@@ -0,0 +1,2 @@", "+first", "+++ content",
+      'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"', "deleted file mode 100644", '--- "a/caf\\303\\251.txt"', "+++ /dev/null",
+      "@@ -1,2 +0,0 @@", "-first", "--- content",
+      'diff --git "a/im\\"age.png" "b/im\\"age.png"', "new file mode 100644", "GIT binary patch", "literal 1", "x",
+      "diff --git a/gone.pdf b/gone.pdf", "deleted file mode 100644", "Binary files a/gone.pdf and /dev/null differ", "",
+    ].join("\n");
+    assert.deepEqual(patchFileEntries(patch), [
+      { path: "new\tfile.txt", added: 2, removed: 0, binary: false, created: true, deleted: false, inHunk: true },
+      { path: "café.txt", added: 0, removed: 2, binary: false, created: false, deleted: true, inHunk: true },
+      { path: 'im"age.png', added: 0, removed: 0, binary: true, created: true, deleted: false, inHunk: false },
+      { path: "gone.pdf", added: 0, removed: 0, binary: true, created: false, deleted: true, inHunk: false },
+    ]);
+    assert.equal(diffStatFromPatch(patch), [
+      " new\tfile.txt | +2 -0 (new)",
+      " café.txt     | +0 -2 (deleted)",
+      ' im"age.png   | binary (new)',
+      " gone.pdf     | binary (deleted)",
+      " 4 files changed (2 new), 2 insertions(+), 2 deletions(-)",
+    ].join("\n"));
+    assert.deepEqual(binaryTextFilesInPatch(patch), [], "decoded known binary paths remain accepted");
+  });
+
+  await test("F5 malformed headers cannot borrow the preceding file's metadata or hunk counts", () => {
+    const malformedHeaders = [
+      'diff --git "a/broken.png b/broken.png',
+      "diff --git a/broken.png b/",
+      'diff --git "a/broken.png" "b/broken.png" trailing',
+      "diff --git a/broken.png c/broken.png",
+    ];
+    for (const header of malformedHeaders) {
+      const tail = [header, "new file mode 100644", "deleted file mode 100644", "GIT binary patch", "@@ -1 +1 @@", "-unattributed", "+unattributed", ""].join("\n");
+      const beforeHunk = `diff --git a/logo.png b/logo.png\nindex 1111111..2222222 100644\n${tail}`;
+      assert.deepEqual(patchFileEntries(beforeHunk), [{ path: "logo.png", added: 0, removed: 0, binary: false, created: false, deleted: false, inHunk: false }], header);
+      assert.deepEqual(binaryTextFilesInPatch(beforeHunk), [`${header} (unparsed diff header)`], "unresolved binary attribution fails closed");
+      const afterHunk = `diff --git a/file.txt b/file.txt\n@@ -1 +1 @@\n-before\n+after\n${tail}diff --git a/next.txt b/next.txt\nnew file mode 100644\n@@ -0,0 +1 @@\n+next\n`;
+      assert.deepEqual(patchFileEntries(afterHunk), [
+        { path: "file.txt", added: 1, removed: 1, binary: false, created: false, deleted: false, inHunk: true },
+        { path: "next.txt", added: 1, removed: 0, binary: false, created: true, deleted: false, inHunk: true },
+      ], header);
+    }
+  });
+
+  await test("F5 text preview metadata matches authoritative changedFiles for quoted paths", async () => {
+    if (process.platform === "win32") throw new SkipTest("Git for Windows refuses quotes and control characters in paths", { optional: true });
+    const root = repo("f5-text-preview");
+    const files = ['out/new "café".txt', "out/tab\tfile.txt"];
+    const worktreePath = textWorktree(root, "f5-text-source", Object.fromEntries(files.map((file) => [file, "preview text\n"])));
+    const head = git(root, "rev-parse", "HEAD");
+    const preview = await integratePatchSerially({ cwd: root, worktreePath, allowedEdits: ["out"], validationCommand: "git diff --check", cleanupAfterSuccess: false, dryRun: true });
+    assert.equal(preview.ok, true, JSON.stringify(preview));
+    assert.deepEqual(preview.changedFiles, files);
+    assert.deepEqual(preview.patchFiles.map((file) => file.path), preview.changedFiles);
+    assert.deepEqual(preview.patchFiles, files.map((file) => ({ path: file, created: true, deleted: false, binary: false })));
+    assert.match(preview.patchPreview, /^diff --git "a\//m, "the fixture must produce quoted text headers");
+    assert.equal(preview.patchStat, diffStatFromPatch(preview.patchPreview));
+    assert.equal(preview.previewReceipt.patchSha256, preview.patchSha256);
+    assert.equal(git(root, "rev-parse", "HEAD"), head);
+    assert.equal(git(root, "status", "--porcelain"), "");
+    for (const file of files) assert.equal(existsSync(path.join(root, file)), false, "preview applies nothing");
+  });
+
+  await test("F5 two-item text preview metadata retains authoritative item attribution", async () => {
+    if (process.platform === "win32") throw new SkipTest("Git for Windows refuses quotes and control characters in paths", { optional: true });
+    const root = repo("f5-batch-preview");
+    const files = ['out/alpha/new "café".txt', "out/beta/tab\tfile.txt"];
+    const items = files.map((file, index) => ({
+      worktreePath: textWorktree(root, `f5-batch-source-${index + 1}`, { [file]: "batch text\n" }),
+      allowedEdits: [index === 0 ? "out/alpha" : "out/beta"],
+    }));
+    const head = git(root, "rev-parse", "HEAD");
+    const preview = await integratePatchSerially({ cwd: root, batch: { items }, allowedEdits: ["out/alpha", "out/beta"], validationCommand: "git diff --check", dryRun: true });
+    assert.equal(preview.ok, true, JSON.stringify(preview));
+    assert.equal(preview.sourceType, "batch");
+    assert.deepEqual(preview.changedFiles, files);
+    assert.deepEqual(preview.patchFiles.map((file) => file.path).sort(), preview.changedFiles);
+    assert.deepEqual(preview.patchFiles, files.map((file) => ({ path: file, created: true, deleted: false, binary: false })));
+    assert.deepEqual(preview.batchItems.map((item) => [item.index, item.changedFiles]), [[1, [files[0]]], [2, [files[1]]]]);
+    const lines = preview.patchPreview.split("\n");
+    for (const item of preview.batchItems) {
+      const itemPatch = lines.slice(item.patchLineStart - 1, item.patchLineStart - 1 + item.patchLineCount).join("\n");
+      assert.deepEqual(patchFileEntries(itemPatch).map((file) => file.path), item.changedFiles);
+      assert.deepEqual(preview.patchFiles.filter((file) => item.changedFiles.includes(file.path)).map((file) => file.path), item.changedFiles);
+    }
+    assert.equal(preview.patchStat, diffStatFromPatch(preview.patchPreview));
+    assert.equal(preview.previewReceipt.patchSha256, preview.patchSha256);
+    assert.equal(git(root, "rev-parse", "HEAD"), head);
+    assert.equal(git(root, "status", "--porcelain"), "");
+    for (const file of files) assert.equal(existsSync(path.join(root, file)), false, "preview applies nothing");
   });
 
   await test("R-154 a binary hunk for a quoted path is rejected in the integration preview", async () => {
