@@ -1,0 +1,29 @@
+name: Windows process probe
+on:
+  push:
+    branches: [bridge/marketplace-update-2026-10-18]
+    paths:
+      - tests/ci-process-probe.js
+      - .github/workflows/windows-process-probe.yml
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Ambient runner process inspection
+        run: node tests/ci-process-probe.js
+      - name: Disposable environment process inspection
+        run: node bin/verify-isolated.js --node tests/ci-process-probe.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-process-probe
+          path: .test-logs/
+          include-hidden-files: true

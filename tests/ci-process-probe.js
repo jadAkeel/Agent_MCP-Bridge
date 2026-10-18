@@ -3,16 +3,19 @@
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import path from "node:path";
+import { hostname, userInfo } from "node:os";
 
 if (process.platform === "win32") {
   for (const [probe, env] of [
     ["isolated", process.env],
     ["system-modules", { ...process.env, PSModulePath: path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules") }],
+    ["computer-name", { ...process.env, COMPUTERNAME: hostname() }],
+    ["host-identity", { ...process.env, COMPUTERNAME: hostname(), USERNAME: userInfo().username, USERDOMAIN: hostname() }],
   ]) {
     const started = performance.now();
-    const script = `[Console]::Out.WriteLine('powershell-ready'); $ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() }`;
+    const script = `[Console]::Out.WriteLine('powershell-ready'); $ErrorActionPreference='Stop'; Import-Module CimCmdlets; [Console]::Out.WriteLine('cim-module-ready'); Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() }`;
     const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      env, encoding: "utf8", timeout: 30_000, windowsHide: true,
+      env, encoding: "utf8", timeout: 10_000, windowsHide: true,
     });
     const evidence = JSON.stringify({ probe, durationMs: Math.round(performance.now() - started), status: result.status,
       signal: result.signal, error: result.error?.code || "", stdout: result.stdout, stderr: result.stderr });
