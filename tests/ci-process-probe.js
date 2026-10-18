@@ -19,13 +19,16 @@ if (process.platform === "win32") {
     const root = await mkdtemp(path.join(tmpdir(), "native-environment-"));
     const isolated = await prepareTestEnvironment(root, basic, { copyProfiles: false });
     const restore = names => ({ ...isolated, ...Object.fromEntries(Object.entries(process.env).filter(([key]) => names.some(name => name.toLowerCase() === key.toLowerCase()))) });
+    const machine = ["COMPUTERNAME", "USERNAME", "USERDOMAIN", "USERDOMAIN_ROAMINGPROFILE", "LOGONSERVER", "OS", "PUBLIC", "ALLUSERSPROFILE"];
+    const shell = ["PSModulePath", "PSExecutionPolicyPreference", "__PSLockDownPolicy"];
+    const programs = ["CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "ProgramW6432"];
+    const processor = ["PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION"];
     cases = [
       ["ambient", process.env], ["minimal", isolated],
-      ["native-localappdata", restore(["LOCALAPPDATA"])],
-      ["native-appdata", restore(["APPDATA"])],
-      ["native-home", restore(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"])],
-      ["native-temp", restore(["TEMP", "TMP", "TMPDIR"])],
-      ["host-policy", restore(["PSExecutionPolicyPreference"])],
+      ["prepared-ambient", await prepareTestEnvironment(path.join(root, "ambient"), process.env, { copyProfiles: false })],
+      ["native-system", restore([...machine, ...shell, ...programs, ...processor])],
+      ["native-machine", restore(machine)], ["native-shell", restore(shell)],
+      ["native-programs", restore(programs)], ["native-processor", restore(processor)],
     ];
   }
   for (const [probe, env] of cases) {
