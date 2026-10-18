@@ -15,7 +15,9 @@ if (args[0] !== "--node" || !args[1] || args[1].startsWith("-")) throw new Error
 // Keep native Git worktree metadata below Windows' path-length boundary even
 // when the real runner creates its own nested disposable fixtures.
 const root = await realpath(await mkdtemp(path.join(process.platform === "win32" ? homedir() : tmpdir(), "brv-")));
-const basic = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:PATH|PATHEXT|SYSTEMROOT|WINDIR|SYSTEMDRIVE|COMSPEC|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS|PROGRAMFILES|PROGRAMFILES\(X86\)|PROGRAMDATA)$/i.test(key)));
+// Keep the host's native PowerShell modules, like PATH. Dropping PSModulePath
+// makes CimCmdlets import hang on hosted Windows runners; profiles/auth stay isolated.
+const basic = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(?:PATH|PATHEXT|PSMODULEPATH|SYSTEMROOT|WINDIR|SYSTEMDRIVE|COMSPEC|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS|PROGRAMFILES|PROGRAMFILES\(X86\)|PROGRAMDATA)$/i.test(key)));
 const env = await prepareTestEnvironment(path.join(root, "environment"), { ...basic, HOME: root, USERPROFILE: root }, { copyProfiles: false });
 // Explicit CI prerequisite policy is preserved; skip-gate still records and
 // classifies every unavailable native/live prerequisite in its normal ledger.

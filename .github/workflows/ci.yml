@@ -46,7 +46,7 @@ jobs:
 
       - run: npm run test:platform
 
-      - name: Diagnose isolated Windows process inspection
+      - name: Verify isolated Windows process inspection
         if: runner.os == 'Windows'
         run: node bin/verify-isolated.js --node tests/ci-process-probe.js
 
