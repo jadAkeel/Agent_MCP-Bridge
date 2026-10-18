@@ -2,13 +2,21 @@
 // Record the shell's raw exit status as loader failures may produce no stderr.
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import path from "node:path";
 
 if (process.platform === "win32") {
-  const started = performance.now();
-  const script = `[Console]::Out.WriteLine('powershell-ready'); $ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() }`;
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    env: process.env, encoding: "utf8", timeout: 30_000, windowsHide: true,
-  });
-  console.log(JSON.stringify({ durationMs: Math.round(performance.now() - started), status: result.status,
-    signal: result.signal, error: result.error?.code || "", stdout: result.stdout, stderr: result.stderr }));
+  for (const [probe, env] of [
+    ["isolated", process.env],
+    ["system-modules", { ...process.env, PSModulePath: path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules") }],
+  ]) {
+    const started = performance.now();
+    const script = `[Console]::Out.WriteLine('powershell-ready'); $ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() }`;
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      env, encoding: "utf8", timeout: 30_000, windowsHide: true,
+    });
+    const evidence = JSON.stringify({ probe, durationMs: Math.round(performance.now() - started), status: result.status,
+      signal: result.signal, error: result.error?.code || "", stdout: result.stdout, stderr: result.stderr });
+    // Check annotations can be read while the long native suite is still running.
+    console.log(`::notice title=Isolated PowerShell probe::${evidence.replaceAll("%", "%25")}`);
+  }
 }
