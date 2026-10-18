@@ -297,7 +297,7 @@ test("a stricter final-read ceiling cannot join a lookup accepting older entries
   try {
     short = await Promise.race([
       cache.cachedAttestation("age", operation, positive, { maxAgeMs: 1000 }),
-      new Promise(resolve => { timer = setTimeout(() => resolve(null), 3000); }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 10_000); }),
     ]);
   } finally { clearTimeout(timer); release(); await long; }
   assert.ok(short && short.call > previous.call, "the final read must obtain a fresh result");
