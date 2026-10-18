@@ -54,6 +54,11 @@ const writeWork = () => { if (control.writeFile) fs.writeFileSync(path.join(proc
     out({ type: "thread.started", thread_id: "t-1" });
     out({ type: "item.completed", item: { id: "item_0", type: "error", message: "Ignoring malformed agent role definition" } });
     out({ type: "turn.started" });
+    if (mode === "hang") {
+      const descendant = require("child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      fs.writeFileSync(control.pidFile, String(descendant.pid));
+      await sleep(60000);
+    }
     if (mode === "usage-limit") {
       out({ type: "error", message: "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 5 minutes." });
       await sleep(30000);
@@ -116,6 +121,7 @@ const fakeAgy = installFake("agy");
 const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
 
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
+process.env.CODEX_OPENCODE_SOURCE_DIRT_POLICY = "unrelated_ok";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
 process.env.CODEX_OPENCODE_OPS_LOG = "off";
 process.env.CODEX_OPENCODE_OPENCODE_LOG_PATH = "off";
@@ -401,6 +407,65 @@ test("Q-012: a codex reader runs in the checkout with the read-only sandbox", as
   assert.equal(record.args[record.args.indexOf("-s") + 1], "read-only");
   assert.equal(record.args.some((arg) => arg.startsWith("model_reasoning_effort=")), false, "no variant, no effort override");
   assert.equal(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase());
+});
+
+test("Light: isolated writes preserve target edits, capture exact result/session and retain review output", async () => {
+  clearRecords();
+  const head = await git(["rev-parse", "HEAD"]);
+  writeFileSync(nodePath.join(repo, "notes.txt"), "user edit\n");
+  try {
+    writeControl({ writeFile: "src/a.txt", content: "light output\n" });
+    const text = await run(runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light" }));
+    assert.equal(errorTypeOf(text), "none", text);
+    assert.equal(records("codex").length, 1);
+    assert.notEqual(nodePath.resolve(records("codex")[0].cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase());
+    assert.equal(readFileSync(nodePath.join(repo, "src", "a.txt"), "utf8"), "a\n");
+    assert.equal(readFileSync(nodePath.join(repo, "notes.txt"), "utf8"), "user edit\n");
+    assert.equal(await git(["rev-parse", "HEAD"]), head);
+    assert.match(text, /Runner session \(diagnostic only; no implicit resume\): t-1/);
+    assert.match(text, /REPORT: done by fake codex \(last message\)/);
+    const runId = /^Run id: (\S+)/m.exec(text)?.[1] || /^Direct run audit: ([^;]+)/m.exec(text)?.[1];
+    assert.ok(runId, text);
+    const stored = textOf(await callTool("get_opencode_job", { cwd: repo, jobId: runId, detail: true }));
+    assert.match(stored, /t-1/);
+    assert.match(stored, /light output/);
+  } finally { rmSync(nodePath.join(repo, "notes.txt")); }
+});
+
+test("Light: unmanaged writers, bypass routes, unsupported delegates, scope escapes and commits fail closed", async () => {
+  const { lightModeError } = await import("../lib/light-mode.js");
+  assert.equal(lightModeError({ ...writeJob(), executionMode: "light" }, { ...CONFIG, worktreeMode: "off" }).errorType, "light_mode_rejected");
+  clearRecords();
+  for (const extra of [{ allowFallbackToBuild: true }, { subagentStrategy: "proxy" }, { autoIntegrate: true }]) {
+    assert.equal(errorTypeOf(await run(runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light", ...extra }))), "light_mode_rejected");
+  }
+  assert.equal(errorTypeOf(await run(runnerWriteJob(requirement("agy", "default"), "src/a.txt", { executionMode: "light" }))), "light_mode_rejected");
+  assert.equal(records("codex").length + records("agy").length, 0, "no refused route starts a runner");
+  writeControl({ writeFile: "src/b.txt" });
+  const scopeEscape = await run(runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light" }));
+  assert.match(scopeEscape, /^errorType: worktree_changed_file_validation_error$/m);
+  writeControl({ writeFile: "src/.env", content: "fixture-only\n" });
+  const sensitive = await run(runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light" }));
+  assert.match(sensitive, /^errorType: worktree_changed_file_validation_error$/m);
+  writeControl({ codex: "commit", writeFile: "src/a.txt" });
+  assert.equal(errorTypeOf(await run(runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light" }))), "repository_head_changed_during_execution");
+});
+
+test("Light: request cancellation stops the owned descendant and releases capacity", async () => {
+  clearRecords();
+  const pidFile = nodePath.join(scratch, "light-descendant.pid");
+  writeControl({ codex: "hang", pidFile });
+  const controller = new AbortController();
+  const pending = internals.server._registeredTools.run_opencode_agent.handler(
+    runnerWriteJob(requirement("codex", "gpt-test"), "src/a.txt", { executionMode: "light" }), { signal: controller.signal });
+  assert.equal(await fixture.waitFor(() => { try { return Boolean(readFileSync(pidFile, "utf8")); } catch { return false; } }, 30000), true);
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  controller.abort();
+  const text = textOf(await pending);
+  assert.match(text, /cancelled/);
+  assert.equal(await fixture.waitFor(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 15000), true, "owned descendant exited");
+  const capacity = await providerCapacitySnapshot();
+  assert.equal((capacity.leases || []).filter(lease => lease.providerKey === `${KEY}:codex`).length, 0);
 });
 
 test("B-147: a codex reader's own edit of the checkout fails the reader instead of passing as another client's", async () => {

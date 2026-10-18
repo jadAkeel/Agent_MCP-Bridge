@@ -72,8 +72,8 @@ async function check(name, fn) {
   }
 }
 
-function git(args, { cwd = SOURCE_ROOT } = {}) {
-  return spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+function git(args, { cwd = SOURCE_ROOT, env = process.env } = {}) {
+  return spawnSync("git", ["-C", cwd, ...args], { env, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
 }
 
 // Every string in a JSON document that is an absolute path on any platform.
@@ -94,14 +94,21 @@ try {
   // ---------------------------------------------------------------------------------------
   const cloneRoot = path.join(scratch, "elsewhere", "alice", "bridge");
   let cloneReady = false;
-  await check("(a) the committed tree, checked out at another path with core.autocrlf=true, builds a release", async () => {
+  await check("(a) the candidate tree, checked out from a private index with core.autocrlf=true, builds a release", async () => {
     const inside = git(["rev-parse", "--is-inside-work-tree"]);
     if (inside.status !== 0 || inside.stdout.trim() !== "true") {
       throw new SkipTest(`${SOURCE_ROOT} is not a Git checkout, so the committed tree cannot be checked out`);
     }
     await mkdir(cloneRoot, { recursive: true });
     const prefix = `${cloneRoot.replace(/\\/g, "/")}/`;
-    const checkout = git(["-c", "core.autocrlf=true", "checkout-index", "--all", "--force", `--prefix=${prefix}`]);
+    // Include uncommitted release entries without staging the operator's index
+    // or committing. The checkout still exercises real Git attributes/CRLF.
+    const indexEnv = { ...process.env, GIT_INDEX_FILE: path.join(scratch, "candidate.index") };
+    const seeded = git(["read-tree", "HEAD"], { env: indexEnv });
+    assert.equal(seeded.status, 0, seeded.stderr);
+    const captured = git(["add", "--", ".gitattributes", ...LEGACY_PUBLISH_ENTRIES.filter(entry => entry !== "node_modules")], { env: indexEnv });
+    assert.equal(captured.status, 0, captured.stderr);
+    const checkout = git(["-c", "core.autocrlf=true", "checkout-index", "--all", "--force", `--prefix=${prefix}`], { env: indexEnv });
     assert.equal(checkout.status, 0, checkout.stderr);
     const tracked = git(["ls-files", "--", "opencode/.gitignore"]);
     assert.equal(tracked.stdout.trim(), "opencode/.gitignore", "opencode/.gitignore must be tracked: the release copies it");

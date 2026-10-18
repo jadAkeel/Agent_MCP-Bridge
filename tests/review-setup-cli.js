@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { findCommand, parseArguments, preflight, runSetup } from "../bin/setup.js";
 import { loadMcpEntry } from "../bin/fresh-healthcheck.js";
 import { libDigest } from "../bin/lib-digest.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const scratch = await realpath(await mkdtemp(path.join(tmpdir(), "review-setup-cli-")));
@@ -78,6 +80,141 @@ try {
     "--yes", "--codex-home", options.codexHome, "--claude-config", options.claudeConfigPath, ...flags],
   { cwd: ROOT, env, encoding: "utf8", windowsHide: true, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
   const fresh = optionsFor("fresh", ["--provider-limit", "3"]);
+
+  const cursorOptions = (name, flags = []) => optionsFor(name, ["--client", "cursor", "--cursor-config", path.join(scratch, name, "project", ".cursor", "mcp.json"), ...flags]);
+  const cursor = cursorOptions("cursor-only");
+
+  await check("Cursor selection needs no client CLI, probes no client auth, and keeps auto/both semantics", async () => {
+    const calls = [];
+    const checked = preflight(cursor, { env: process.env, log: () => {}, commands: {
+      git: { command: "git", args: [] }, opencode: { command: "opencode", args: [] }, codex: null, claude: null,
+    }, run: (command, args) => { calls.push([command?.command, ...args]); return { status: 0, stdout: "1.18.32" }; } });
+    assert.equal(checked.ok, true);
+    assert.deepEqual(checked.clients, { codex: false, claude: false, cursor: true });
+    assert.deepEqual(calls, [["git", "--version"], ["opencode", "--version"], ["opencode", "auth", "list"]]);
+    assert.equal(parseArguments(["--client", "cursor"]).cursorConfigPath, path.join(process.env.HOME, ".cursor", "mcp.json"));
+    assert.throws(() => parseArguments(["--cursor-config", "mcp.json"]), /requires --client cursor/);
+    assert.throws(() => parseArguments(["--client", "cursor", "--skip-claude-code"]), /means --client codex/);
+    assert.equal(preflight({ ...cursor, client: "both" }, { env: process.env, log: () => {}, commands: { codex: null, claude: null },
+      run: (command) => ({ status: command ? 0 : 1, stdout: "1.18.32" }) }).ok, false);
+  });
+
+  await check("Cursor-only apply preserves unselected Claude config and writes the canonical safety-pinned stdio entry", async () => {
+    await mkdir(path.dirname(cursor.claudeConfigPath), { recursive: true });
+    const claudeBytes = '{"mcpServers":{"opencode":{"command":"leave alone"}},"keep":true}\n';
+    await writeFile(cursor.claudeConfigPath, claudeBytes);
+    output.length = 0;
+    assert.equal(await apply(cursor, { commands: { codex: null, claude: null } }), 0, output.join("\n"));
+    const entry = await loadMcpEntry(cursor.configPath);
+    assert.deepEqual(JSON.parse(await readFile(cursor.cursorConfigPath, "utf8")).mcpServers.opencode, { type: "stdio", ...entry });
+    assert.equal(entry.command, process.execPath);
+    assert.deepEqual(entry.args, [path.join(ROOT, "server.js")]);
+    assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_SERVER_SHA256, hash(await readFile(entry.args[0])));
+    assert.equal(entry.env.CODEX_OPENCODE_EXPECTED_LIB_SHA256, (await libDigest(ROOT)).sha256);
+    for (const [key, value] of Object.entries({ CODEX_OPENCODE_WORKTREE_MODE: "write", CODEX_OPENCODE_WORKTREE_ROOT: "global", CODEX_OPENCODE_QUEUE_MODE: "sqlite",
+      CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS: "false", CODEX_OPENCODE_SOURCE_DIRT_POLICY: "unrelated_ok", CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST: "git" })) assert.equal(entry.env[key], value);
+    assert.equal(await readFile(cursor.claudeConfigPath, "utf8"), claudeBytes);
+    assert.match(output.join("\n"), /Setup verified[\s\S]*Restart Cursor/);
+    assert.doesNotMatch(output.join("\n"), /Restart Codex|Restart Claude Code/);
+  });
+
+  await check("generated Cursor JSON connects to the real bridge over stdio and exposes workflow and delegation/monitor/review tools", async () => {
+    const entry = JSON.parse(await readFile(cursor.cursorConfigPath, "utf8")).mcpServers.opencode;
+    const client = new Client({ name: "cursor-config-fixture", version: "1.0.0" });
+    const transport = new StdioClientTransport({ command: entry.command, args: entry.args, env: { ...process.env, ...entry.env }, cwd: ROOT, stderr: "pipe" });
+    let stderr = "";
+    transport.stderr?.on("data", (data) => { stderr += data; });
+    try {
+      await client.connect(transport, { timeout: 120_000 });
+      assert.match(client.getInstructions(), /only integrator[\s\S]*previewReceipt/);
+      const names = (await client.listTools()).tools.map((tool) => tool.name);
+      for (const name of ["validate_delegation_plan", "enqueue_opencode_job", "get_opencode_job", "list_opencode_jobs", "run_opencode_agent", "integrate_opencode_worktree"]) assert.ok(names.includes(name), name);
+      const status = await client.callTool({ name: "get_opencode_bridge_status", arguments: { cwd: ROOT } }, undefined, { timeout: 120_000 });
+      assert.ok(!status.isError, JSON.stringify(status) + stderr);
+    } finally { await client.close(); }
+  });
+
+  await check("Cursor re-run is byte-identical; changed JSON keeps other servers/settings and an exact backup", async () => {
+    const before = await saved(path.dirname(cursor.codexHome));
+    assert.equal(await apply(cursor), 0);
+    assert.deepEqual(await saved(path.dirname(cursor.codexHome)), before);
+    const document = JSON.parse(await readFile(cursor.cursorConfigPath, "utf8"));
+    document.keep = { nested: [true, "unchanged"] };
+    document.mcpServers.other = { url: "https://example.invalid/mcp", headers: { keep: "fixture" } };
+    Object.assign(document.mcpServers.opencode, { command: "stale", url: "https://example.invalid/old", headers: { old: "fixture" }, auth: { old: "fixture" }, customSetting: true });
+    const original = JSON.stringify(document) + "\r\n";
+    await writeFile(cursor.cursorConfigPath, original);
+    assert.equal(await apply(cursor), 0);
+    const updated = JSON.parse(await readFile(cursor.cursorConfigPath, "utf8"));
+    assert.deepEqual(updated.keep, document.keep);
+    assert.deepEqual(updated.mcpServers.other, document.mcpServers.other);
+    assert.equal(updated.mcpServers.opencode.customSetting, true);
+    for (const key of ["url", "headers", "auth"]) assert.equal(updated.mcpServers.opencode[key], undefined);
+    const backups = (await readdir(path.dirname(cursor.cursorConfigPath))).filter((name) => name.startsWith("mcp.json.setup-backup-"));
+    assert.equal(backups.length, 1);
+    assert.equal(await readFile(path.join(path.dirname(cursor.cursorConfigPath), backups[0]), "utf8"), original);
+    const after = await saved(path.dirname(cursor.codexHome));
+    assert.equal(await apply(cursor), 0);
+    assert.deepEqual(await saved(path.dirname(cursor.codexHome)), after);
+  });
+
+  await check("Cursor dry-run and refused approval write nothing, including canonical runtime and backups", async () => {
+    const dry = cursorOptions("cursor-dry", ["--dry-run"]);
+    assert.equal(await apply(dry), 0);
+    assert.equal(existsSync(path.dirname(dry.codexHome)), false);
+    const result = cli(dry, ["--client", "cursor", "--cursor-config", dry.cursorConfigPath, "--dry-run"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /clients: cursor \(configuration only; desktop connection not checked\)/);
+    assert.match(result.stdout, /CREATE .*mcp\.json/);
+    assert.doesNotMatch(result.stdout, /^codex:|^claude:/m);
+    assert.equal(existsSync(path.dirname(dry.codexHome)), false);
+    const document = JSON.parse(await readFile(cursor.cursorConfigPath, "utf8"));
+    document.mcpServers.opencode.command = "stale";
+    await writeFile(cursor.cursorConfigPath, JSON.stringify(document));
+    const before = await saved(path.dirname(cursor.codexHome));
+    assert.equal(await apply({ ...cursor, dryRun: true }), 0);
+    assert.deepEqual(await saved(path.dirname(cursor.codexHome)), before);
+    const refused = cursorOptions("cursor-refused");
+    assert.equal(await apply({ ...refused, yes: false }, { confirm: async () => false }), 2);
+    assert.equal(existsSync(path.dirname(refused.codexHome)), false);
+  });
+
+  await check("malformed Cursor JSON and container shapes are refused before any setup write", async () => {
+    const invalidTexts = ["{broken", "[]", "null", '{"mcpServers":[]}', '{"mcpServers":null}', '{"mcpServers":"bad"}', '{"mcpServers":{"opencode":null}}', '{"mcpServers":{"opencode":[]}}'];
+    for (const [index, text] of invalidTexts.entries()) {
+      const options = cursorOptions(`cursor-invalid-${index}`);
+      await mkdir(path.dirname(options.cursorConfigPath), { recursive: true });
+      await writeFile(options.cursorConfigPath, text);
+      const before = await saved(path.dirname(options.codexHome));
+      await assert.rejects(apply(options));
+      assert.deepEqual(await saved(path.dirname(options.codexHome)), before);
+      assert.equal(existsSync(options.runtimeDir), false);
+    }
+  });
+
+  await check("Cursor concurrent edits and linked destinations are refused without overwriting content", async () => {
+    const options = cursorOptions("cursor-concurrent");
+    const edited = '{"mcpServers":{"other":{"command":"user edit"}}}\n';
+    await assert.rejects(apply({ ...options, yes: false }, { confirm: async () => {
+      await mkdir(path.dirname(options.cursorConfigPath), { recursive: true });
+      await writeFile(options.cursorConfigPath, edited);
+      return true;
+    } }), /Concurrent edit/);
+    assert.equal(await readFile(options.cursorConfigPath, "utf8"), edited);
+    assert.equal(existsSync(options.configPath), false);
+    assert.equal(existsSync(options.runtimeDir), false);
+    const linked = cursorOptions("cursor-linked");
+    const target = path.join(scratch, "cursor-link-target");
+    await mkdir(target);
+    await writeFile(path.join(target, "mcp.json"), edited);
+    await mkdir(path.dirname(path.dirname(linked.cursorConfigPath)), { recursive: true });
+    await symlink(target, path.dirname(linked.cursorConfigPath), process.platform === "win32" ? "junction" : "dir");
+    await assert.rejects(apply(linked), /link|junction/i);
+    assert.equal(await readFile(path.join(target, "mcp.json"), "utf8"), edited);
+    assert.equal(existsSync(linked.configPath), false);
+    assert.equal(existsSync(linked.runtimeDir), false);
+    await unlink(path.dirname(linked.cursorConfigPath));
+  });
 
   await check("Node 22.12 is refused before writing; Node 22.13 is accepted without writing", async () => {
     const commands = Object.fromEntries(["git", "opencode", "claude"].map((name) => [name, { command: name, args: [] }]));
@@ -333,7 +470,7 @@ try {
     assert.equal(await apply(optionsFor("want-codex", ["--client", "codex"]), { commands: { codex: null } }), 1);
     assert.match(output.join("\n"), /clients: missing; --client codex needs codex on PATH\./);
     assert.equal(parseArguments(["--skip-claude-code"]).client, "codex");
-    assert.throws(() => parseArguments(["--client", "other"]), /auto, codex, claude or both/);
+    assert.throws(() => parseArguments(["--client", "other"]), /auto, codex, claude, both, cursor, all/);
     assert.throws(() => parseArguments(["--client", "claude", "--skip-claude-code"]), /--skip-claude-code means --client codex/);
   });
 
@@ -386,12 +523,290 @@ try {
     assert.deepEqual(findCommand("claude", { PATH: prefix }), { command: path.join(packageDir, "bin", "claude.exe"), args: [] });
   });
 
-  await check("standalone health smoke uses the written scratch entry", async () => {
-    const result = spawnSync(process.execPath, [path.join(ROOT, "bin", "live-smoke.js"), "--health-only", "--config", fresh.configPath],
+  await check("standalone pinned health smoke uses the written scratch entry", async () => {
+    const result = spawnSync(process.execPath, [path.join(ROOT, "bin", "live-smoke.js"), "--health-only", "--require-pins", "--config", fresh.configPath],
       { cwd: ROOT, env: { ...process.env, CODEX_HOME: fresh.codexHome, CLAUDE_CONFIG_DIR: path.dirname(fresh.claudeConfigPath) }, encoding: "utf8", windowsHide: true, timeout: 180_000 });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /Live smoke: passed/);
     assert.match(result.stdout, /Missing required agents: none/);
+    assert.match(result.stdout, /candidate integrity: server-pinned/);
+  });
+
+  const { runInstall } = await import("../bin/install.js");
+  const { renderSkills, selectStandaloneDelegates } = await import("../bin/skill-package.js");
+  const packageOptions = (name, client = "both") => optionsFor(name, ["--skills", "--client", client,
+    "--host-home", path.join(scratch, name, "host home"), "--claude-home", path.join(scratch, name, "claude home"), "--delegates", "opencode,codex"]);
+  let packaged;
+  await check("interactive Cursor/Pi selection installs the chosen guides and keeps denied Pi inactive", async () => {
+    const options = packageOptions("menu-cursor-pi");
+    const cursorHome = path.join(scratch, "menu-cursor-pi", "cursor home");
+    const answers = ["cursor", "pi", "pi", "none", "", "yes"];
+    const prompts = [];
+    assert.equal(await runInstall(["--interactive", "--host-home", options.hostHome, "--claude-home", options.claudeHome,
+      "--cursor-home", cursorHome, "--codex-home", options.codexHome, "--claude-config", options.claudeConfigPath,
+      "--runtime-dir", options.runtimeDir, "--state-dir", options.stateDir], {
+      log: line => output.push(line), isTTY: false,
+      ask: async question => { prompts.push(question); assert.ok(answers.length, question); return answers.shift(); },
+    }), 0, output.join("\n"));
+    assert.equal(answers.length, 0);
+    assert.equal(prompts.filter(question => /Apply the displayed/.test(question)).length, 1);
+    assert.ok(existsSync(path.join(cursorHome, "skills", "bridge-plan", "SKILL.md")));
+    assert.ok(existsSync(path.join(cursorHome, "skills", "bridge-delegate-pi", "SKILL.md")));
+    assert.equal(existsSync(path.join(options.hostHome, ".agents", "skills")), false);
+    assert.equal(existsSync(options.claudeConfigPath), false);
+    const entry = await loadMcpEntry(options.configPath);
+    assert.equal(entry.env.CODEX_OPENCODE_EXTERNAL_RUNNERS, "pi");
+    assert.equal(entry.env.CODEX_OPENCODE_PI_SAFETY, "deny");
+    assert.equal(entry.env.CODEX_OPENCODE_MODEL_ALLOWLIST, undefined);
+    assert.deepEqual(JSON.parse(await readFile(path.join(cursorHome, "mcp.json"), "utf8")).mcpServers.opencode, { type: "stdio", ...entry });
+    assert.equal(existsSync(path.join(options.codexHome, "codex-background")), false);
+  });
+  await check("all clients share one Codex/Cursor skill root and explicit worker choices survive a byte-stable reinstall", async () => {
+    const options = optionsFor("menu-all", ["--skills", "--client", "all", "--workers", "opencode,codex,pi",
+      "--pi-safety", "unsandboxed-worktree", "--standalone-delegates", "all",
+      "--host-home", path.join(scratch, "menu-all", "host"), "--claude-home", path.join(scratch, "menu-all", "claude"),
+      "--cursor-home", path.join(scratch, "menu-all", "cursor")]);
+    assert.equal(await apply(options), 0);
+    const entry = await loadMcpEntry(options.configPath);
+    assert.equal(entry.env.CODEX_OPENCODE_EXTERNAL_RUNNERS, "codex,pi");
+    assert.equal(entry.env.CODEX_OPENCODE_PI_SAFETY, "unsandboxed-worktree");
+    assert.equal(entry.env.CODEX_OPENCODE_MODEL_ALLOWLIST, undefined, "installation never chooses a model");
+    assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-delegate-pi", "SKILL.md")));
+    assert.ok(existsSync(path.join(options.claudeHome, "skills", "pi-delegate", "scripts", "relay.mjs")));
+    assert.equal(existsSync(path.join(options.cursorHome, "skills")), false, "Cursor discovers the shared .agents root without duplicate files");
+    assert.deepEqual(JSON.parse(await readFile(options.cursorConfigPath, "utf8")).mcpServers.opencode, { type: "stdio", ...entry });
+    const manifestFile = path.join(options.stateDir, "installation-manifest.json");
+    const before = await readFile(manifestFile, "utf8");
+    assert.ok(JSON.parse(before).files.length < 1024);
+    assert.equal(await apply(options), 0);
+    assert.equal(await readFile(manifestFile, "utf8"), before);
+    const failed = { ...options, stateDir: path.join(scratch, "menu-rollback", "state"),
+      codexHome: path.join(scratch, "menu-rollback", "codex"), configPath: path.join(scratch, "menu-rollback", "codex", "config.toml"),
+      cursorConfigPath: path.join(scratch, "menu-rollback", "cursor", "mcp.json"), cursorHome: path.join(scratch, "menu-rollback", "cursor"),
+      hostHome: path.join(scratch, "menu-rollback", "host"), claudeHome: path.join(scratch, "menu-rollback", "claude"),
+      claudeConfigPath: path.join(scratch, "menu-rollback", "claude.json"), runtimeDir: path.join(scratch, "menu-rollback", "runtime") };
+    await assert.rejects(apply(failed, { healthRun: () => ({ status: 1, stdout: "fixture all-client verification failed" }) }), /rolled back safely/);
+    for (const file of [failed.configPath, failed.cursorConfigPath, failed.claudeConfigPath, manifestFile.replace(options.stateDir, failed.stateDir)]) assert.equal(existsSync(file), false, file);
+  });
+  await check("refused installer confirmation and unattended selection never start an implicit question loop", async () => {
+    const options = packageOptions("menu-refused", "codex");
+    const flags = ["--client", "codex", "--host-home", options.hostHome, "--codex-home", options.codexHome,
+      "--claude-config", options.claudeConfigPath, "--runtime-dir", options.runtimeDir, "--state-dir", options.stateDir];
+    assert.equal(await runInstall(flags, { isTTY: false, log: () => {} }), 2);
+    assert.equal(existsSync(options.configPath), false);
+    const answers = ["opencode", "opencode", "none", "no"];
+    assert.equal(await runInstall(["--interactive", ...flags], { isTTY: false, log: () => {}, ask: async () => answers.shift() }), 2);
+    assert.equal(existsSync(options.configPath), false);
+  });
+  await check("independent selection is explicit, validates keys and never enables a bridge external runner", async () => {
+    assert.deepEqual(optionsFor("default-independent").standaloneDelegates, []);
+    assert.equal(optionsFor("all-independent", ["--standalone-delegates", "all"]).standaloneDelegates.length, 20);
+    assert.deepEqual(optionsFor("some-independent", ["--standalone-delegates", "kimi,claude,kimi"]).standaloneDelegates, ["kimi", "claude"]);
+    assert.throws(() => optionsFor("bad-independent", ["--standalone-delegates", "../../codex"]), /standalone-delegates/);
+    const options = packageOptions("independent-unavailable-cli", "codex");
+    options.standaloneDelegates = ["claude", "kimi"];
+    const commands = { git: { command: "git", args: [] }, opencode: { command: "opencode", args: [] }, codex: { command: "codex", args: [] }, claude: null };
+    const checked = preflight({ ...options, dryRun: true }, { commands, run: command => command ? { status: 0, stdout: "1.18.32" } : { status: 127 }, env: process.env, log: () => {} });
+    assert.equal(checked.ok, true, "copying original guides does not require all their CLIs installed");
+  });
+  await check("all original independent skills install in disposable homes, preserve exact scripts, and never bootstrap services", async () => {
+    const options = packageOptions("independent-all");
+    options.standaloneDelegates = selectStandaloneDelegates("all");
+    const probes = [];
+    assert.equal(await runInstall(["--yes", "--client", "both", "--delegates", "opencode,codex", "--standalone-delegates", "all",
+      "--host-home", options.hostHome, "--claude-home", options.claudeHome, "--codex-home", options.codexHome,
+      "--claude-config", options.claudeConfigPath, "--runtime-dir", options.runtimeDir, "--state-dir", options.stateDir], {
+      log: line => output.push(line), run: (command, args, env) => {
+        probes.push(args);
+        return spawnSync(command.command, [...command.args, ...args], { env, encoding: "utf8", windowsHide: true });
+      },
+    }), 0, output.join("\n"));
+    assert.ok(probes.every(args => args.join(" ") === "--version"));
+    const expected = await renderSkills({ delegates: options.delegates, standaloneDelegates: options.standaloneDelegates });
+    for (const root of [path.join(options.hostHome, ".agents", "skills"), path.join(options.claudeHome, "skills")]) {
+      for (const [file, content] of expected) assert.equal(await readFile(path.join(root, file), "utf8"), content);
+    }
+    const config = await readFile(options.configPath, "utf8");
+    assert.doesNotMatch(config, /codex-background|delegate_run|EXTERNAL_RUNNER|ALLOW_EXTERNAL_RUNNERS/);
+    assert.equal(existsSync(path.join(options.codexHome, "codex-background")), false);
+    const manifestPath = path.join(options.stateDir, "installation-manifest.json");
+    const before = await readFile(manifestPath, "utf8");
+    const manifest = JSON.parse(before);
+    assert.deepEqual(manifest.standaloneDelegates, options.standaloneDelegates);
+    assert.ok(manifest.files.length < 1024, "the all/both-client transaction remains bounded");
+    assert.equal(await apply(options), 0);
+    assert.equal(await readFile(manifestPath, "utf8"), before, "reinstall must not rewrite the manifest");
+    for (const entry of manifest.files) assert.equal(hash(await readFile(entry.file)), entry.sha256);
+    const originalRelay = path.join(options.hostHome, ".agents", "skills", "codex-delegate", "scripts", "relay.mjs");
+    const original = await readFile(originalRelay, "utf8");
+    await writeFile(originalRelay, original + "\n// personal customization\n");
+    await assert.rejects(apply(options), /User-modified or unowned installation conflict/);
+    assert.equal(await readFile(originalRelay, "utf8"), original + "\n// personal customization\n");
+    assert.equal(await readFile(options.configPath, "utf8"), config);
+  });
+  await check("independent dry-run and personal-skill conflicts write no config; failed verification rolls back original relays", async () => {
+    const dry = packageOptions("independent-dry-run");
+    dry.standaloneDelegates = selectStandaloneDelegates("all");
+    dry.dryRun = true;
+    assert.equal(await apply(dry), 0);
+    assert.equal(existsSync(dry.configPath), false);
+    assert.equal(existsSync(dry.hostHome), false);
+    const conflict = packageOptions("independent-personal");
+    conflict.standaloneDelegates = ["codex"];
+    const personal = path.join(conflict.hostHome, ".agents", "skills", "codex-delegate", "SKILL.md");
+    await mkdir(path.dirname(personal), { recursive: true });
+    await writeFile(personal, "personal codex skill\n");
+    await assert.rejects(apply(conflict), /unowned installation conflict/);
+    assert.equal(await readFile(personal, "utf8"), "personal codex skill\n");
+    assert.equal(existsSync(conflict.configPath), false);
+    const failed = packageOptions("independent-health-failure");
+    failed.standaloneDelegates = selectStandaloneDelegates("all");
+    await assert.rejects(apply(failed, { healthRun: () => ({ status: 1, stdout: "independent fixture health refused" }) }), /verification failed.*rolled back safely/);
+    assert.equal(existsSync(failed.configPath), false);
+    assert.equal(existsSync(path.join(failed.hostHome, ".agents", "skills", "codex-delegate", "scripts", "relay.mjs")), false);
+    assert.equal(existsSync(path.join(failed.stateDir, "installation-pending.json")), false);
+  });
+  await check("package installer: Codex-only, Claude-only and both use standalone host skills and a bounded manifest", async () => {
+    for (const client of ["codex", "claude", "both"]) {
+      const options = packageOptions(`package-${client}`, client);
+      assert.equal(await apply(options), 0, output.join("\n"));
+      const codexSkill = path.join(options.hostHome, ".agents", "skills", "bridge-plan", "SKILL.md");
+      const claudeSkill = path.join(options.claudeHome, "skills", "bridge-plan", "SKILL.md");
+      assert.equal(existsSync(codexSkill), client !== "claude");
+      assert.equal(existsSync(claudeSkill), client !== "codex");
+      const root = client === "claude" ? path.dirname(claudeSkill) : path.dirname(codexSkill);
+      assert.match(await readFile(path.join(root, "references", "contracts.md"), "utf8"), /one executor/);
+      assert.doesNotMatch(await readFile(path.join(root, "SKILL.md"), "utf8"), /\]\(\.\.\//);
+      const manifest = JSON.parse(await readFile(path.join(options.stateDir, "installation-manifest.json"), "utf8"));
+      assert.equal(manifest.version, 1);
+      assert.deepEqual(manifest.delegates, ["opencode", "codex"]);
+      assert.ok(manifest.files.every(entry => /^[a-f0-9]{64}$/.test(entry.sha256)));
+      assert.ok(manifest.files.length < 1024);
+      assert.equal(existsSync(path.join(options.stateDir, "installation-pending.json")), false);
+      if (client === "both") packaged = options;
+    }
+  });
+  await check("package reinstall is byte-identical, preserves unrelated entries and user modifications are refused", async () => {
+    const manifestPath = path.join(packaged.stateDir, "installation-manifest.json");
+    const beforeManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const before = Object.fromEntries(await Promise.all(beforeManifest.files.map(async entry => [entry.file, hash(await readFile(entry.file))])));
+    assert.equal(await apply(packaged), 0);
+    const afterManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.deepEqual(afterManifest, beforeManifest, "the installation inventory is byte-stable; health caches are operational state");
+    assert.deepEqual(Object.fromEntries(await Promise.all(afterManifest.files.map(async entry => [entry.file, hash(await readFile(entry.file))]))), before);
+    const file = path.join(packaged.hostHome, ".agents", "skills", "bridge-plan", "SKILL.md");
+    const original = await readFile(file, "utf8");
+    await writeFile(file, original + "\nuser customization\n");
+    const config = await readFile(packaged.configPath, "utf8");
+    await assert.rejects(apply(packaged), /User-modified or unowned installation conflict/);
+    assert.equal(await readFile(file, "utf8"), original + "\nuser customization\n");
+    assert.equal(await readFile(packaged.configPath, "utf8"), config);
+    await writeFile(file, original);
+    const conflict = packageOptions("package-unowned");
+    const target = path.join(conflict.claudeHome, "skills", "bridge-plan", "SKILL.md");
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, "personal skill\n");
+    await assert.rejects(apply(conflict), /unowned installation conflict/);
+    assert.equal(existsSync(conflict.configPath), false);
+  });
+  await check("package partial write failure and failed health roll back only owned changes", async () => {
+    const fail = packageOptions("package-write-failure");
+    await assert.rejects(apply(fail, { beforeWrite: async (_, index) => { if (index === 1) throw new Error("fixture write failure"); } }), /fixture write failure.*rolled back safely/);
+    assert.equal(existsSync(fail.configPath), false);
+    assert.equal(existsSync(path.join(fail.runtimeDir, "opencode", "opencode.jsonc")), false);
+    const health = packageOptions("package-health-failure");
+    await assert.rejects(apply(health, { healthRun: () => ({ status: 1, stdout: "fixture health refused" }) }), /verification failed.*rolled back safely/);
+    assert.equal(existsSync(health.configPath), false);
+    assert.equal(existsSync(path.join(health.stateDir, "installation-pending.json")), false);
+  });
+  await check("package concurrent edit is preserved with pending recovery evidence; interrupted retry refuses", async () => {
+    const options = packageOptions("package-concurrent");
+    let first;
+    await assert.rejects(apply(options, { beforeWrite: async (file, index) => {
+      if (index === 0) first = file.file;
+      if (index === 1) { await writeFile(first, "concurrent edit\n"); throw new Error("fixture interruption"); }
+    } }), /concurrent\/unrestorable paths/);
+    assert.equal(await readFile(first, "utf8"), "concurrent edit\n");
+    const pending = path.join(options.stateDir, "installation-pending.json");
+    assert.ok(existsSync(pending));
+    const before = await readFile(pending, "utf8");
+    await assert.rejects(apply(options), /Interrupted installation requires review/);
+    assert.equal(await readFile(pending, "utf8"), before);
+  });
+  await check("B-rollback-1: legacy setup refuses an unresolved pending journal in dry-run and write mode before any write", async () => {
+    const options = optionsFor("legacy-pending");
+    await mkdir(options.stateDir, { recursive: true });
+    const journal = path.join(options.stateDir, "installation-pending.json");
+    const pendingBytes = '{"version":1,"fixture":"unresolved interrupted install"}\n';
+    await writeFile(journal, pendingBytes);
+    const checked = { ok: true, needsAuth: false, clients: { codex: true, claude: false, cursor: false }, commands: {} };
+    let confirmCalls = 0;
+    const confirm = async () => { confirmCalls += 1; return true; };
+    const before = await saved(options.codexHome);
+    await assert.rejects(apply({ ...options, dryRun: true }, { checked, confirm }), /Interrupted installation requires review/);
+    assert.equal(confirmCalls, 0);
+    assert.equal(existsSync(options.configPath), false);
+    assert.equal(existsSync(options.runtimeDir), false);
+    assert.equal(existsSync(options.claudeConfigPath), false);
+    assert.deepEqual(await saved(options.codexHome), before);
+    assert.equal(await readFile(journal, "utf8"), pendingBytes);
+    await assert.rejects(apply(options, { checked, confirm }), /Interrupted installation requires review/);
+    assert.equal(confirmCalls, 0, "write-mode refusal happens before previews or the confirmation prompt");
+    assert.equal(existsSync(options.runtimeDir), false);
+    assert.equal(existsSync(options.configPath), false);
+    assert.deepEqual(await saved(options.codexHome), before);
+    assert.equal(await readFile(journal, "utf8"), pendingBytes);
+  });
+  await check("B-rollback-2: published new-file rollback survives staged cleanup EPERM; unresolved destination keeps the journal", async () => {
+    for (const faults of ["cleanup", "cleanup,rollback"]) {
+      const result = spawnSync(process.execPath, [path.join(ROOT, "tests", "setup-transaction-faults.mjs"), faults],
+        { cwd: ROOT, env: process.env, encoding: "utf8", windowsHide: true, timeout: 60_000 });
+      assert.equal(result.status, 0, `${faults}: ${result.stdout}${result.stderr}`);
+      assert.match(result.stdout, new RegExp(`injected scenario "${faults}" passed`));
+    }
+  });
+  await check("package preflight pins OpenCode compatibility and bootstrap failure never writes client config", async () => {
+    const options = packageOptions("package-version", "codex");
+    const commands = { git: { command: "git", args: [] }, opencode: { command: "opencode", args: [] }, codex: { command: "codex", args: [] }, claude: null };
+    const run = () => ({ status: 0, stdout: "2.0.11" });
+    assert.equal(preflight({ ...options, dryRun: true }, { commands, run, env: process.env, log: () => {} }).ok, false);
+    const args = ["--yes", "--client", "codex", "--codex-home", options.codexHome, "--claude-config", options.claudeConfigPath, "--host-home", options.hostHome];
+    await assert.rejects(runInstall(args, { log: () => {}, dependencyMismatches: async () => ["fixture absent"], installDependencies: () => ({ status: 7, stderr: "fixture offline" }) }), /Dependency bootstrap failed/);
+    assert.equal(existsSync(options.configPath), false);
+    assert.equal(await runInstall([...args, "--dry-run"], { log: () => {}, dependencyMismatches: async () => ["fixture absent"] }), 0);
+    assert.equal(existsSync(options.configPath), false);
+    await assert.rejects(runInstall(args, { platform: "freebsd", log: () => {} }), /operating system is unsupported/);
+  });
+  await check("one-command installer reuses existing setup and performs only version and health probes", async () => {
+    const options = packageOptions("one-command", "codex");
+    const probes = [];
+    const realRun = (command, args, env) => {
+      probes.push(args);
+      return spawnSync(command.command, [...command.args, ...args], { env, encoding: "utf8", windowsHide: true });
+    };
+    assert.equal(await runInstall(["--yes", "--client", "codex", "--codex-home", options.codexHome,
+      "--claude-config", options.claudeConfigPath, "--host-home", options.hostHome], { run: realRun, log: line => output.push(line) }), 0);
+    assert.ok(probes.every(args => args.join(" ") === "--version"), JSON.stringify(probes));
+    assert.ok(output.some(line => /Status: needs-auth; needs-restart/.test(line)));
+    assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-execute", "SKILL.md")));
+  });
+  await check("fresh disposable package bootstraps its actual lockfile dependencies then installs without provider inference", async () => {
+    const source = path.join(scratch, "fresh package with spaces");
+    await mkdir(source);
+    for (const entry of ["bin", "lib", "tests", "server.js", "package.json", "package-lock.json", "opencode", "skills", "vendor", "skill-package-manifest.json"]) {
+      await cp(path.join(ROOT, entry), path.join(source, entry), { recursive: true, filter: file => !file.split(path.sep).includes("node_modules") });
+    }
+    assert.equal(existsSync(path.join(source, "node_modules")), false);
+    assert.equal(existsSync(path.join(source, ".git")), false, "a downloaded package is not a Git checkout");
+    const options = packageOptions("fresh-bootstrap", "codex");
+    const result = spawnSync(process.execPath, [path.join(source, "bin", "install.js"), "--yes", "--client", "codex", "--codex-home", options.codexHome,
+      "--claude-config", options.claudeConfigPath, "--host-home", options.hostHome],
+    { cwd: source, env: process.env, encoding: "utf8", windowsHide: true, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /npm ci --ignore-scripts --no-audit --no-fund/);
+    assert.match(result.stdout, /Setup verified\. Status: needs-auth; needs-restart/);
+    assert.ok(existsSync(path.join(source, "node_modules", "smol-toml", "package.json")));
+    assert.equal(existsSync(path.join(source, ".git")), false, "installation must not initialize or modify the package repository");
   });
   process.stdout.write(`Setup CLI review: ${checks} checks passed; skipped: 0.\n`);
 } finally {

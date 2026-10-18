@@ -166,21 +166,29 @@ test("opt-in reuses the ordinary Map with independent parity and unchanged defau
 
 test("exactly two standalone passes disappear; all three boundary captures and concurrent gates remain", async () => withFixture(async fixture => {
   const { runtime: capture, snapshots } = captureRuntime();
-  let release, bothStarted;
+  let release, firstStarted, bothStarted;
   const held = new Promise(resolve => { release = resolve; });
+  const entered = new Promise(resolve => { firstStarted = resolve; });
   const ready = new Promise(resolve => { bothStarted = resolve; });
   let started = 0;
   await runFinalizer(fixture, { capture: capture.captureIntegrationTargetState, gate: async job => {
     assert.equal(job.cwd, fixture.cwd); assert.equal(job.noWorktree, true); assert.equal(job.write, false);
     assert.deepEqual(job.allowedEdits, []);
-    if (++started === 2) bothStarted();
+    if (++started === 1) firstStarted();
+    if (started === 2) bothStarted();
     await held;
     return {};
   } }, async context => {
     const pending = context.runtime.finalizePipelineRecordWhileLocked(context.record);
+    const finishedEarly = pending.then(() => { throw new Error("finalization finished before both gates started"); });
     let timer;
     try {
-      await Promise.race([ready, pending.then(() => { throw new Error("finalization finished before both gates started"); }), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("gates did not start concurrently")), 3000); })]);
+      // Git boundary captures are preparation, not gate concurrency. Start the
+      // unchanged overlap deadline only once a gate has actually entered. A
+      // serial executor still blocks on held and fails the three-second check.
+      await Promise.race([entered, finishedEarly, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("gate preparation did not finish")), 60000); })]);
+      clearTimeout(timer);
+      await Promise.race([ready, finishedEarly, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("gates did not start concurrently")), 3000); })]);
       release();
       const result = await pending;
       assert.equal(result.ok, true, result.error); assert.equal(context.record.status, "completed");

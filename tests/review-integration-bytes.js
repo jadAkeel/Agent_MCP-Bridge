@@ -10,7 +10,7 @@ import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge read
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -168,6 +168,7 @@ try {
   await check(1, "a patch to a 100755 file integrates and its fingerprint mode is the exec-bit rule", async () => {
     const repo = await makeRepo("exec-bit", [["core.autocrlf", "false"]]);
     await writeFile(path.join(repo, "run.sh"), "#!/bin/sh\necho one\n");
+    if (process.platform !== "win32") await chmod(path.join(repo, "run.sh"), 0o755);
     await userGit(repo, "add", "run.sh");
     await userGit(repo, "update-index", "--chmod=+x", "run.sh");
     await userGit(repo, "commit", "-q", "-m", "exec");
@@ -188,7 +189,9 @@ try {
   });
 
   await check(1, "a patch to a 120000 entry integrates (plain file when core.symlinks is false)", async () => {
-    const repo = await makeRepo("symlink-entry");
+    // This regression covers Git's plain-file representation of a 120000 entry,
+    // not following an actual filesystem link (which scope admission refuses).
+    const repo = await makeRepo("symlink-entry", [["core.symlinks", "false"]]);
     await writeFile(path.join(repo, "keep.txt"), "keep\n");
     await userGit(repo, "add", "keep.txt");
     await writeFile(path.join(fixtureRoot, "link-target-a"), "keep.txt");

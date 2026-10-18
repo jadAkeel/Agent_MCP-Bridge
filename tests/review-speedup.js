@@ -102,6 +102,10 @@ test("1: assume-unchanged or skip-worktree entries fall back to the fresh index"
 test("1: the accepted trade-off: a rewrite that keeps size and mtime is only seen by the fresh index", async () => {
   const { repo, head } = await makeRepo({ "a.txt": "aaaa\n" });
   repos.push(repo);
+  // Model the stat-only trade-off explicitly: Unix Git otherwise observes the
+  // changed ctime and nanoseconds even when Node restores the Date-valued mtime.
+  await git(["config", "core.trustctime", "false"], repo);
+  await git(["config", "core.checkStat", "minimal"], repo);
   const file = path.join(repo, "a.txt");
   const before = await stat(file);
   await new Promise((resolve) => setTimeout(resolve, 1100));

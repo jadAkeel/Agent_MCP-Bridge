@@ -34,23 +34,33 @@ function childFixture(script) {
   const child = spawn(process.execPath, ["-e", script], {
     cwd: scratch, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true,
   });
+  const stdinErrors = [];
+  // Exit and pipe closure race on Windows. Observe errors until stdio has closed;
+  // stopChild still rejects every unexpected error and callers verify the exit code.
+  child.stdin.on("error", error => stdinErrors.push(error));
   const exited = new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.once("close", (code, signal) => resolve({ code, signal }));
   });
-  return { child, exited };
+  return { child, exited, stdinErrors };
 }
-async function stopChild({ child, exited }) {
-  if (child.exitCode === null && child.signalCode === null) child.stdin.end("stop\n");
-  try { return await bounded(exited, 3000, "fixture child did not stop cooperatively"); }
+async function stopChild({ child, exited, stdinErrors }) {
+  if (child.exitCode === null && child.signalCode === null && !child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end("stop\n");
+  let result;
+  try { result = await bounded(exited, 3000, "fixture child did not stop cooperatively"); }
   catch (error) {
     child.kill(); // Only this suite's own harmless child, never an inventoried process.
     await bounded(exited, 12000, "fixture child did not exit within its own lifetime bound");
     throw error;
   }
+  const unexpected = stdinErrors.find(error => error.code !== "EPIPE");
+  if (unexpected) throw unexpected;
+  return result;
 }
 async function withValidator(fn) {
-  const fixture = childFixture("setTimeout(() => process.exit(0), 10000); process.stdin.on('data', () => process.exit(0)); process.stdin.on('end', () => process.exit(0)); process.stdout.write('ready\\n');");
+  // This test models a live validator. Keep it alive until explicit cleanup or
+  // parent pipe closure, rather than expiring while synchronous SQLite work runs.
+  const fixture = childFixture("process.stdin.on('data', () => process.exit(0)); process.stdin.on('end', () => process.exit(0)); process.stdout.write('ready\\n');");
   const ready = new Promise((resolve, reject) => {
     fixture.child.stdout.once("data", data => data.toString().includes("ready") ? resolve() : reject(new Error("unexpected child output")));
     fixture.exited.then(() => reject(new Error("validator child exited before observation")), reject);

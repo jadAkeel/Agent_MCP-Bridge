@@ -2,17 +2,19 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
-import { recordCliFailure } from "./ops-log.js";
+import { recordCliFailure, redactCliText } from "./ops-log.js";
+import { renderSkills, hashContent, SKILL_PACKAGE_VERSION, selectStandaloneDelegates } from "./skill-package.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--provider-limit N] [--self-test]";
+const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both|cursor|<comma-separated clients>] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--cursor-config <file>] [--cursor-home <dir>] [--provider-limit N] [--skills] [--workers opencode,codex,pi] [--pi-safety deny|unsandboxed-worktree] [--delegates opencode,codex,pi|none] [--standalone-delegates all|<keys>|none] [--self-test]";
 requireSelfTestRun(import.meta.url);
 // The OpenCode version the managed profiles were reviewed and tested on (the Gemini
 // profile's plugin manifest pins exactly this one).
@@ -20,7 +22,7 @@ const OPENCODE_PINNED_VERSION = "1.18.32";
 
 function parseArguments(argv, env = process.env) {
   const options = { yes: false, dryRun: false, skipClaudeCode: false, client: "auto", profile: "pure", providerLimit: 2, selfTest: false };
-  const valued = { "--client": "client", "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--provider-limit": "providerLimit" };
+  const valued = { "--client": "client", "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--cursor-config": "cursorConfigPath", "--cursor-home": "cursorHome", "--provider-limit": "providerLimit", "--host-home": "hostHome", "--claude-home": "claudeHome", "--delegates": "delegates", "--standalone-delegates": "standaloneDelegates", "--workers": "workers", "--pi-safety": "piSafety" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (valued[arg]) {
@@ -30,34 +32,58 @@ function parseArguments(argv, env = process.env) {
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--skip-claude-code") options.skipClaudeCode = true;
     else if (arg === "--self-test") options.selfTest = true;
+    else if (arg === "--skills") options.packageSkills = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!["pure", "gemini"].includes(options.profile)) throw new Error("--profile must be pure or gemini.");
-  if (!["auto", "codex", "claude", "both"].includes(options.client)) throw new Error("--client must be auto, codex, claude or both.");
+  if (!["auto", "both", "all"].includes(options.client) && options.client.split(",").some(name => !["codex", "claude", "cursor"].includes(name))) throw new Error("--client supports auto, codex, claude, both, cursor, all or comma-separated client names.");
+  if (options.cursorConfigPath && options.client !== "all" && !options.client.split(",").includes("cursor")) throw new Error("--cursor-config requires --client cursor (alone or in a client list).");
   if (options.skipClaudeCode) {
     if (!["auto", "codex"].includes(options.client)) throw new Error("--skip-claude-code means --client codex.");
     options.client = "codex";
   }
   options.providerLimit = Number(options.providerLimit);
   if (!Number.isSafeInteger(options.providerLimit) || options.providerLimit < 1 || options.providerLimit > 32) throw new Error("--provider-limit must be an integer from 1 to 32.");
-  options.codexHome = path.resolve(options.codexHome || env.CODEX_HOME || path.join(homedir(), ".codex"));
+  const home = (process.platform === "win32" ? env.USERPROFILE || env.HOME : env.HOME) || homedir();
+  options.codexHome = path.resolve(options.codexHome || env.CODEX_HOME || path.join(home, ".codex"));
   options.runtimeDir = path.resolve(options.runtimeDir || path.join(options.codexHome, "opencode-bridge-runtime"));
   options.stateDir = path.resolve(options.stateDir || path.join(options.codexHome, "codex-opencode-mcp"));
-  options.claudeConfigPath = path.resolve(options.claudeConfigPath || path.join(env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json"));
+  options.claudeConfigPath = path.resolve(options.claudeConfigPath || path.join(env.CLAUDE_CONFIG_DIR || home, ".claude.json"));
   options.configPath = path.join(options.codexHome, "config.toml");
+  options.hostHome = path.resolve(options.hostHome || home);
+  options.claudeHome = path.resolve(options.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(options.hostHome, ".claude"));
+  options.cursorHome = path.resolve(options.cursorHome || path.join(options.hostHome, ".cursor"));
+  options.cursorConfigPath = path.resolve(options.cursorConfigPath || path.join(options.cursorHome, "mcp.json"));
+  // OpenCode remains the required discovery/admission runtime even with another worker.
+  options.workers = [...new Set(["opencode", ...String(options.workers || "opencode").split(",")])];
+  if (options.workers.some(name => !["opencode", "codex", "pi"].includes(name))) throw new Error("--workers supports opencode,codex,pi only.");
+  options.piSafety ||= "deny";
+  if (!["deny", "unsandboxed-worktree"].includes(options.piSafety) || (options.piSafety !== "deny" && !options.workers.includes("pi"))) throw new Error("--pi-safety supports deny or unsandboxed-worktree with --workers pi.");
+  options.delegates = options.delegates === "none" ? [] : [...new Set(String(options.delegates || "opencode").split(","))];
+  if (options.delegates.some(name => !["opencode", "codex", "pi"].includes(name))) throw new Error("--delegates supports opencode,codex,pi or none only.");
+  if (!argv.includes("--delegates")) for (const worker of options.workers) if (!options.delegates.includes(worker)) options.delegates.push(worker);
+  options.standaloneDelegates = selectStandaloneDelegates(options.standaloneDelegates);
+  if (options.standaloneDelegates.length) options.packageSkills = true;
   return options;
 }
 
 // Never feed JSON/paths through a command shell. Resolve Windows npm shims to
 // their package bin instead; POSIX executables and native Windows EXEs run directly.
 function findCommand(name, env = process.env) {
-  if (path.isAbsolute(name) && existsSync(name)) return { command: name, args: [] };
+  const executable = candidate => {
+    try {
+      if (!statSync(candidate).isFile()) return false;
+      accessSync(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+      return true;
+    } catch { return false; }
+  };
+  if (path.isAbsolute(name)) return executable(name) ? { command: name, args: [] } : null;
   const pathValue = Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] || "";
   for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
     for (const extension of process.platform === "win32" ? [".exe", ".cmd", ""] : [""]) {
       const candidate = path.join(directory.replace(/^"|"$/g, ""), name + extension);
-      if (!existsSync(candidate)) continue;
+      if (!executable(candidate)) continue;
       if (extension === ".cmd") {
         const packageName = { codex: "@openai/codex", claude: "@anthropic-ai/claude-code", opencode: "opencode-ai" }[name];
         if (!packageName) continue;
@@ -97,8 +123,9 @@ function selectClients(choice, found) {
     if (codex || claude) return { codex, claude };
     return { codex: false, claude: false, error: "clients: missing; install Codex CLI (npm install -g @openai/codex) or Claude Code (https://code.claude.com/docs/en/setup): the bridge needs one MCP client, not both." };
   }
-  const wanted = { codex: choice !== "claude", claude: choice !== "codex" };
-  const absent = Object.keys(wanted).filter((name) => wanted[name] && !found[name]);
+  const names = choice === "both" ? ["codex", "claude"] : choice === "all" ? ["codex", "claude", "cursor"] : choice.split(",");
+  const wanted = Object.fromEntries(["codex", "claude", "cursor"].map(name => [name, names.includes(name)]));
+  const absent = Object.keys(wanted).filter((name) => wanted[name] && name !== "cursor" && !found[name]);
   if (absent.length) return { codex: false, claude: false, error: `clients: missing; --client ${choice} needs ${absent.join(" and ")} on PATH.` };
   return wanted;
 }
@@ -107,12 +134,15 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
   let ok = versionAtLeast(nodeVersion, [22, 13, 0]);
   log(`node: ${ok ? "ok" : "wrong version"} (${nodeVersion}); required >=22.13.0${ok ? "" : "; install: https://nodejs.org/"}`);
   const found = {};
+  const exactOpenCode = options.profile === "gemini" || options.packageSkills;
   const openCodeHint = options.profile === "gemini"
     ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the Gemini profile's plugin manifest pins it): https://opencode.ai/docs/`
-    : `OpenCode ${OPENCODE_PINNED_VERSION} or newer: https://opencode.ai/docs/`;
+    : options.packageSkills
+      ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the packaged Skills are qualified on this version): https://opencode.ai/docs/`
+      : `OpenCode ${OPENCODE_PINNED_VERSION} or newer: https://opencode.ai/docs/`;
   const hints = { git: "https://git-scm.com/downloads", opencode: openCodeHint, codex: "npm install -g @openai/codex", claude: "https://code.claude.com/docs/en/setup" };
   // B-176: no Python: the TOML entry is read in-process (bin/fresh-healthcheck.js).
-  for (const name of ["git", "opencode", "codex", "claude"]) {
+  for (const name of ["git", "opencode", ...(options.client !== "cursor" || options.workers?.includes("codex") || options.delegates?.includes("codex") ? ["codex", "claude"] : [])]) {
     found[name] = Object.hasOwn(commands, name) ? commands[name] : findCommand(name, env);
     // OpenCode eagerly mkdirs <XDG_CONFIG_HOME>/opencode even for --version.
     // In a dry run use the checkout's already-existing opencode directory, so
@@ -129,7 +159,7 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
     // A version that does not parse, or a 0.0.0 development build, is not judged old.
     const openCodeTooOld = name === "opencode" && Boolean(version) && !version.startsWith("0.0.0")
       && !versionAtLeast(version, OPENCODE_PINNED_VERSION.split(".").map(Number));
-    const wrong = !missing && name === "opencode" && (options.profile === "gemini" ? openCodeNotPinned : openCodeTooOld);
+    const wrong = !missing && name === "opencode" && (exactOpenCode ? openCodeNotPinned : openCodeTooOld);
     log(`${name}: ${missing ? "missing" : wrong ? "wrong version" : "ok"}${version ? ` (${version})` : ""}${missing || wrong ? `; install: ${hints[name]}` : ""}`);
     if (missing) found[name] = null;
     if ((missing && !["codex", "claude"].includes(name)) || wrong) ok = false;
@@ -140,22 +170,46 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
     }
   }
   const clients = selectClients(options.client, found);
+  if ((options.workers?.includes("codex") || options.packageSkills && options.delegates.includes("codex")) && !found.codex) {
+    log("delegates: missing; --delegates codex requires the Codex CLI on PATH.");
+    ok = false;
+  }
   if (clients.error) {
     log(clients.error);
     ok = false;
   } else {
-    log(`clients: ${[clients.codex && "codex", clients.claude && "claude"].filter(Boolean).join(" + ")}${options.client === "auto" ? " (detected)" : ""}`);
+    log(`clients: ${[clients.codex && "codex", clients.claude && "claude", clients.cursor && "cursor (configuration only; desktop connection not checked)"].filter(Boolean).join(" + ")}${options.client === "auto" ? " (detected)" : ""}`);
   }
   // Auth commands may refresh local credentials. A dry run never runs them.
+  let needsAuth = false;
   if (ok) for (const [name, args] of [["codex", ["login", "status"]], ["opencode", ["auth", "list"]], ["claude", ["auth", "status"]]]) {
     if (!found[name] || (name !== "opencode" && !clients[name])) continue;
     if (options.dryRun) { log(`Would check sign-in: ${name} ${args.join(" ")} (not run in dry-run)`); continue; }
     const result = run(found[name], args, env);
     const text = `${result.stdout || ""}${result.stderr || ""}`;
     const authMissing = result.error || result.status !== 0 || /not (?:logged|signed) in|0 credentials|no credentials|"loggedIn"\s*:\s*false/i.test(text);
+    needsAuth ||= Boolean(authMissing);
     log(`${name} sign-in: ${authMissing ? "Warning: sign in before a live model smoke" : "check ok (provider readiness still needs smoke:live)"}`);
   }
-  return { ok, commands: found, clients: { codex: Boolean(clients.codex), claude: Boolean(clients.claude) } };
+  return { ok, needsAuth, commands: found, clients: { codex: Boolean(clients.codex), claude: Boolean(clients.claude), cursor: Boolean(clients.cursor) } };
+}
+
+// Cursor uses the same stdio entry as Claude, but rejects malformed containers
+// rather than replacing user data. Keep unrelated servers and per-entry settings.
+function rewriteCursorConfig(text, entry) {
+  const document = text === null ? {} : JSON.parse(text);
+  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(document) || (Object.hasOwn(document, "mcpServers") && !object(document.mcpServers))) {
+    throw new Error("Cursor config must be a JSON object with an object mcpServers.");
+  }
+  const current = document.mcpServers?.opencode;
+  if (current !== undefined && !object(current)) throw new Error("Cursor mcpServers.opencode must be a JSON object.");
+  const desired = { ...current, type: "stdio", command: entry.command, args: entry.args, env: entry.env };
+  // These remote-transport fields cannot accompany the local bridge entry.
+  for (const key of ["url", "headers", "auth"]) delete desired[key];
+  if (isDeepStrictEqual(current, desired)) return text;
+  document.mcpServers = { ...document.mcpServers, opencode: desired };
+  return `${JSON.stringify(document, null, 2)}\n`;
 }
 
 async function optionalText(file) {
@@ -180,8 +234,12 @@ async function confirm() {
 async function runSetup(options, dependencies = {}) {
   const log = dependencies.log || ((line) => process.stdout.write(`${line}\n`));
   const env = { ...(dependencies.env || process.env), CODEX_HOME: options.codexHome, CLAUDE_CONFIG_DIR: path.dirname(options.claudeConfigPath), XDG_CONFIG_HOME: options.runtimeDir };
-  const checked = preflight(options, { ...dependencies, env, log });
+  const checked = dependencies.checked || preflight(options, { ...dependencies, env, log });
   if (!checked.ok) return 1;
+  const { assertNoPendingSetup, applySetupChanges } = await import("./setup-transaction.js");
+  // Both setup paths refuse an unresolved recovery journal before planning or
+  // writing anything, not only the public --skills installer.
+  await assertNoPendingSetup(options.stateDir);
   const { clientToolTimeoutSeconds, rewriteCodexConfig, rewriteClaudeConfig, repinnableLibSha256, repinnableServerSha256, syncClaudeCodeEntry, replaceConfigAtomically } = await import("./release-activate.js");
   const { runSync, assertNoLinkedComponents } = await import("./sync-managed-runtime.js");
   const { resolvePluginManifestEntryPath } = await import("./plugin-manifest-paths.js");
@@ -208,8 +266,22 @@ async function runSetup(options, dependencies = {}) {
     CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE: "false",
     CODEX_OPENCODE_EXPECTED_SERVER_SHA256: await repinnableServerSha256(path.join(ROOT, "server.js")),
     ...(libSha256 ? { CODEX_OPENCODE_EXPECTED_LIB_SHA256: libSha256 } : {}),
+    ...(options.workers?.some(name => name !== "opencode") ? {
+      CODEX_OPENCODE_EXTERNAL_RUNNERS: options.workers.filter(name => name !== "opencode").join(","),
+    } : {}),
+    ...(options.workers?.includes("pi") ? { CODEX_OPENCODE_PI_SAFETY: options.piSafety } : {}),
   };
   const files = [];
+  const manifestPath = path.join(options.stateDir, "installation-manifest.json");
+  let previousManifest = null;
+  if (options.packageSkills) {
+    await assertNoLinkedComponents(manifestPath);
+    const text = await optionalText(manifestPath);
+    if (text !== null) {
+      previousManifest = JSON.parse(text);
+      if (previousManifest.version !== 1 || !Array.isArray(previousManifest.files)) throw new Error(`Invalid installation manifest: ${manifestPath}`);
+    }
+  }
   const planned = new Map();
   const addFile = async (file, content, kind = "runtime") => {
     const key = process.platform === "win32" ? file.toLowerCase() : file;
@@ -218,9 +290,13 @@ async function runSetup(options, dependencies = {}) {
       if (previous.content !== content || previous.kind !== kind) throw new Error(`Setup destinations overlap: ${file}`);
       return;
     }
-    planned.set(key, { content, kind });
+    planned.set(key, { file, content, kind });
     await assertNoLinkedComponents(file);
     const before = await optionalText(file);
+    if (options.packageSkills && !["codex", "claude", "cursor", "manifest"].includes(kind) && before !== null && before !== content) {
+      const owned = previousManifest?.files.find(entry => entry.file === file);
+      if (!owned || owned.sha256 !== hashContent(before)) throw new Error(`User-modified or unowned installation conflict: ${file}; preserve it and choose a separate destination or review it manually.`);
+    }
     if (before !== content) files.push({ file, before, content, kind });
   };
   await addFile(path.join(runtime, "opencode.jsonc"), await readFile(path.join(source, "opencode.jsonc"), "utf8"));
@@ -252,7 +328,7 @@ async function runSetup(options, dependencies = {}) {
   const original = await optionalText(options.configPath);
   const rewritten = rewriteCodexConfig(original || "", entryText);
   await addFile(options.configPath, rewritten.text, "codex");
-  const { codex: useCodex, claude: useClaude } = checked.clients;
+  const { codex: useCodex, claude: useClaude, cursor: useCursor } = checked.clients;
   // The TOML entry is the bridge's canonical MCP entry: the doctor, the health smoke and
   // `release:activate --sync-clients` read it and rebuild the Claude Code entry from it. It is
   // written even when Codex is not installed; Codex uses it as soon as it is.
@@ -260,24 +336,67 @@ async function runSetup(options, dependencies = {}) {
   const claudeOriginal = useClaude ? await optionalText(options.claudeConfigPath) : null;
   if (useClaude) await addFile(options.claudeConfigPath, rewriteClaudeConfig(claudeOriginal, rewritten.entry), "claude");
   else log(`Claude Code registration skipped (${options.client === "codex" ? "--client codex" : "claude missing"}).`);
-  const restartSteps = [...[useCodex && "Restart Codex.", useClaude && "Restart Claude Code."].filter(Boolean), "Run npm run smoke:live once."].map((step, index) => `${index + 1}. ${step}`).join("\n");
+  if (useCursor) {
+    await assertNoLinkedComponents(options.cursorConfigPath);
+    await addFile(options.cursorConfigPath, rewriteCursorConfig(await optionalText(options.cursorConfigPath), rewritten.entry), "cursor");
+  }
+  const restartSteps = [...[useCodex && "Restart Codex.", useClaude && "Restart Claude Code.", useCursor && "Restart Cursor, enable opencode in MCP settings and check get_opencode_bridge_status."].filter(Boolean), "Run npm run smoke:live once."].map((step, index) => `${index + 1}. ${step}`).join("\n");
   const syncOptions = { source, agentDir: bridgeEnv.CODEX_OPENCODE_AGENT_DIR, skillDir: bridgeEnv.CODEX_OPENCODE_SKILL_DIR, apply: false, removeStale: false };
   const sync = await runSync(syncOptions);
   for (const plan of sync.plans) for (const action of plan.actions.filter((item) => item.action !== "stale")) {
     await addFile(path.join(plan.targetRoot, action.relative), await readFile(path.join(plan.sourceRoot, action.relative), "utf8"), "managed");
   }
+  if (options.packageSkills) {
+    const skills = await renderSkills({ delegates: options.delegates, standaloneDelegates: options.standaloneDelegates });
+    // Cursor also discovers ~/.agents/skills: use one common root when both clients are selected.
+    const roots = [...(useCodex ? [path.join(options.hostHome, ".agents", "skills")] : useCursor ? [path.join(options.cursorHome, "skills")] : []), ...(useClaude ? [path.join(options.claudeHome, "skills")] : [])];
+    for (const root of roots) for (const [relative, content] of skills) await addFile(path.join(root, relative), content, "skill");
+    const inventory = new Map((previousManifest?.files || []).map(item => [item.file, item]));
+    for (const item of planned.values()) inventory.set(item.file, { file: item.file, sha256: hashContent(item.content), component: item.kind });
+    await addFile(manifestPath, JSON.stringify({ version: 1, packageVersion: SKILL_PACKAGE_VERSION, delegates: options.delegates,
+      standaloneDelegates: options.standaloneDelegates,
+      client: options.client, workers: options.workers, piSafety: options.piSafety,
+      files: [...inventory.values()].sort((a, b) => a.file.localeCompare(b.file)), backups: previousManifest?.backups || [] }, null, 2) + "\n", "manifest");
+    log(`Public host skills: ${roots.join(", ")}; delegates: ${options.delegates.join(", ") || "none"}. Worker skills remain separate.`);
+    if (options.standaloneDelegates?.length) log(`Independent upstream skills: ${options.standaloneDelegates.join(", ")}. Their relays run outside bridge locks/scope/worktrees/receipts. CLIs/auth, fleet configuration and codex-background bootstrap are NOT installed or run by setup; authorize those separately before use.`);
+  }
   if (files.length) for (const file of files) {
-    log(preview(file.file, file.before, file.content));
-    if (["codex", "claude"].includes(file.kind) && file.before !== null) log(`Backup: ${file.file}.setup-backup-<time> (original bytes)`);
+    log(redactCliText(preview(file.file, file.before, file.content)));
+    if (["codex", "claude", "cursor"].includes(file.kind) && file.before !== null) log(`Backup: ${file.file}.setup-backup-<time> (original bytes)`);
   }
   else log("Setup already complete; nothing to change.");
   if (options.dryRun) { log(`Dry-run: ${files.length} file(s) would be written. No files written; doctor and health smoke run only after apply.`); return 0; }
-  if (!files.length) { log(restartSteps); return 0; }
+  if (!files.length && !options.packageSkills) { log(restartSteps); return 0; }
   if (files.length && !options.yes && !await (dependencies.confirm || confirm)()) { log("Setup write refused. Re-run with --yes to accept the displayed changes."); return 2; }
   // Recheck the complete preview before the first write, not only per config.
   for (const file of files) {
     await assertNoLinkedComponents(file.file);
     if (await optionalText(file.file) !== file.before) throw new Error(`Concurrent edit: ${file.file}; refusing to overwrite it.`);
+  }
+  if (options.packageSkills) {
+    const verify = async () => {
+      const { runDailyDoctor, formatReport } = await import("./daily-doctor.js");
+      // A downloaded/portable package need not itself be a Git checkout. Probe
+      // Git in an owned disposable repository; actual job repositories still
+      // go through the normal executor's repository checks.
+      const doctorRepo = await mkdtemp(path.join(tmpdir(), "bridge-install-git-"));
+      let report;
+      try {
+        const initialized = spawnSync(checked.commands.git.command, [...checked.commands.git.args, "init", "-q", doctorRepo],
+          { env, encoding: "utf8", windowsHide: true, timeout: 30_000 });
+        if (initialized.error || initialized.status !== 0) throw new Error(`Setup Git verification failed: ${initialized.stderr || initialized.error?.message || initialized.status}`);
+        report = await runDailyDoctor({ configPath: options.configPath, cwd: doctorRepo, stateDir: options.stateDir, claudeConfigPath: options.claudeConfigPath, skipClaudeCode: !useClaude });
+        log(formatReport(report));
+      } finally { await rm(doctorRepo, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+      const smoke = (dependencies.healthRun || runCommand)({ command: process.execPath, args: [] }, [path.join(ROOT, "bin", "live-smoke.js"), "--health-only", "--config", options.configPath], env);
+      log(`${smoke.stdout || ""}${smoke.stderr || ""}`.trim());
+      if (!report.ok || smoke.error || smoke.status !== 0) throw new Error("Setup verification failed; inspect doctor/health evidence.");
+    };
+    if (files.length) await applySetupChanges(files, { stateDir: options.stateDir, log, verify, beforeWrite: dependencies.beforeWrite });
+    else await verify();
+    log(`Setup verified. Status: ${checked.needsAuth ? "needs-auth" : "ready"}; needs-restart. Manifest: ${manifestPath}. Diagnostics: ${path.join(options.stateDir, "logs")}\n${restartSteps}`);
+    if (options.workers?.includes("pi")) log(`Pi worker: safety ${options.piSafety}; ${options.piSafety === "deny" ? "execution disabled until explicitly accepted" : "no OS sandbox; trusted inputs only"}. Pi CLI/auth and an exact model allowlist must be configured separately; see docs/pi-worker.md. Light mode does not support Pi.`);
+    return 0;
   }
   const stamp = `${new Date().toISOString().replace(/[^0-9]/g, "")}-${process.pid}`;
   for (const file of files.filter((item) => !["managed", "claude"].includes(item.kind))) {
@@ -286,7 +405,7 @@ async function runSetup(options, dependencies = {}) {
     await mkdir(path.dirname(file.file), { recursive: true });
     if (file.before === null) await writeFile(file.file, file.content, { flag: "wx", mode: 0o600 });
     else {
-      if (file.kind === "codex") {
+      if (["codex", "cursor"].includes(file.kind)) {
         const backup = `${file.file}.setup-backup-${stamp}`;
         await writeFile(backup, file.before, { flag: "wx", mode: 0o600 });
         log(`Backup written: ${backup}`);

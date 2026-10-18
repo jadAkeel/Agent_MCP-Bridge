@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "mutate": ["lib/queue/leases.js:213:0-249:0", "lib/queue/leases.js:278:0-300:0", "lib/queue/leases.js:308:0-334:0", "lib/queue/leases.js:402:0-408:0"],
+  "testRunner": "command",
+  "commandRunner": { "command": "node --test tests/property-queue-leases.js" },
+  "coverageAnalysis": "off",
+  "concurrency": 2,
+  "timeoutMS": 5000,
+  "timeoutFactor": 1.5,
+  "reporters": ["progress", "clear-text", "html", "json"],
+  "clearTextReporter": { "reportMutants": false, "reportTests": false, "reportScoreTable": true },
+  "htmlReporter": { "fileName": "reports/mutation/queue-leases.html" },
+  "jsonReporter": { "fileName": "reports/mutation/queue-leases.json" },
+  "tempDirName": ".test-logs/quality-round-2026-10-16/root/stryker-lease-tmp",
+  "ignorePatterns": [".test-logs", ".release-gate", "reports", "tmp", "temp", ".codex-worktrees"]
+}

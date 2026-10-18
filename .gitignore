@@ -31,3 +31,10 @@ Thumbs.db
 
 # Per-command test output and duration reports
 .test-logs/
+
+# Local mutation-testing sandboxes and generated reports
+.stryker-tmp/
+reports/mutation/
+
+# Local browser captures may contain private account or message content.
+.playwright-mcp/

@@ -175,6 +175,59 @@ test("preclaim alias releases the current claim, preserving inherited B-083", ()
   const root = fixture("alias"), api = runtime(root), alias = api.queueWorkerFiles(root); claim(api, root);
   api.writeQueueWorkerStop(root); assert.equal(api.releaseQueueWorkerPresence(alias).released, true); absent(alias.stop); absent(alias.presence);
 });
+test("complete handle identities support missing Windows pathname volume metadata", () => {
+  const root = fixture("pathname-volume"), api = runtime(root);
+  let qualifications = 0;
+  seams({ lstatSync: (...args) => {
+    const entry = native.lstatSync(...args);
+    if (process.platform !== "win32" || !entry.isFile()) return entry;
+    qualifications++;
+    return Object.assign(Object.create(entry), { dev: 0 });
+  } }, () => {
+    const files = claim(api, root);
+    assert.equal(api.refreshQueueWorkerPresence(files).ok, true);
+    api.writeQueueWorkerStop(root);
+    assert.equal(api.readQueueWorkerStop(files).now, false);
+    assert.equal(api.releaseQueueWorkerPresence(files).released, true);
+    absent(files.presence); absent(files.stop); absent(paths(root).owner);
+  });
+  assert.equal(qualifications > 0, process.platform === "win32");
+});
+test("pathname qualification never ignores differing complete descriptor devices", () => {
+  const root = fixture("descriptor-device", true), api = runtime(root), before = snapshot(paths(root).directory);
+  let observations = 0;
+  seams({
+    lstatSync: (...args) => { const entry = native.lstatSync(...args); return process.platform === "win32" && entry.isFile() ? Object.assign(Object.create(entry), { dev: 0 }) : entry; },
+    fstatSync: (...args) => { const entry = native.fstatSync(...args); return Object.assign(Object.create(entry), { dev: entry.dev + ++observations }); },
+  }, () => {
+    const result = api.claimQueueWorkerPresence(root);
+    assert.equal(result.ok, false); assert.match(result.error, /identity changed/);
+    assert.throws(() => api.writeQueueWorkerStop(root), /identity changed/);
+  });
+  assert.ok(observations >= 2);
+  assert.deepEqual(snapshot(paths(root).directory), before);
+});
+for (const change of ["inode", "symlink"]) test(`pathname qualification refuses ${change} drift without changing evidence`, () => {
+  const root = fixture(`pathname-${change}`, true), api = runtime(root), { anchor } = paths(root), before = snapshot(paths(root).directory);
+  let observations = 0;
+  seams({ lstatSync: (...args) => {
+    const entry = native.lstatSync(...args);
+    if (args[0] !== anchor) return entry;
+    const fields = process.platform === "win32" ? { dev: 0 } : {};
+    if (++observations % 2 === 0) {
+      const differentInode = entry.ino === 0 ? 1 : 0;
+      assert.notEqual(differentInode, entry.ino);
+      Object.assign(fields, change === "inode" ? { ino: differentInode } : { isFile: () => false, isSymbolicLink: () => true });
+    }
+    return Object.assign(Object.create(entry), fields);
+  } }, () => {
+    const result = api.claimQueueWorkerPresence(root);
+    assert.equal(result.ok, false); assert.match(result.error, /identity changed/);
+    assert.throws(() => api.writeQueueWorkerStop(root), /identity changed/);
+  });
+  assert.ok(observations >= 4);
+  assert.deepEqual(snapshot(paths(root).directory), before);
+});
 test("losing first anchor creator loads the complete native exclusive winner", () => {
   const root = fixture("anchor-winner"), api = runtime(root), { anchor } = paths(root); let collided = false;
   seams({ linkSync: (from, to) => {
@@ -517,6 +570,24 @@ test("native kernel-only owner crash releases the mutex without manufacturing ev
   const root = fixture("kernel-crash", true), holder = child(root, "kernel", "holder");
   try { await ready(holder); const api = runtime(root); assert.throws(() => api.writeQueueWorkerStop(root), error => error.errcode === 5); await stop(holder); claim(api, root); }
   finally { await stop(holder); }
+});
+test("held anchor transaction retains POSIX lock against a concurrent contender", async () => {
+  const root = fixture("held-lock", true), owned = child(root, "after-owner", "holder");
+  try {
+    await ready(owned);
+    // The holder is paused inside owner publication while its SQLite BEGIN
+    // IMMEDIATE transaction is still open. A concurrent contender must observe
+    // SQLITE_BUSY: the held-anchor recheck opens no anchor descriptor, so on
+    // POSIX no close could have released the process fcntl lock. Windows
+    // qualification/rejection stays covered by the four pathname controls above.
+    const contender = new DatabaseSync(paths(root).anchor);
+    try {
+      contender.exec("PRAGMA busy_timeout = 25;");
+      assert.throws(() => contender.exec("BEGIN IMMEDIATE"), error => error.errcode === 5);
+    } finally { contender.close(); }
+    assert.equal((await resume(owned)).ok, true);
+    absent(paths(root).owner);
+  } finally { await stop(owned); }
 });
 
 let failed = 0;

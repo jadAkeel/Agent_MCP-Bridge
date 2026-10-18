@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "mutate": ["lib/provider-wait.js", "lib/queue/scheduler.js"],
+  "testRunner": "command",
+  "commandRunner": { "command": "node --test tests/property-provider-wait.js tests/property-queue-scheduler.js" },
+  "coverageAnalysis": "off",
+  "concurrency": 2,
+  "timeoutMS": 10000,
+  "reporters": ["progress", "clear-text", "html", "json"],
+  "clearTextReporter": { "reportMutants": false, "reportTests": false, "reportScoreTable": true },
+  "htmlReporter": { "fileName": "reports/mutation/bridge-core.html" },
+  "jsonReporter": { "fileName": "reports/mutation/bridge-core.json" },
+  "tempDirName": ".stryker-tmp",
+  "ignorePatterns": [".test-logs", ".release-gate", "reports", "tmp", "temp", ".codex-worktrees"]
+}

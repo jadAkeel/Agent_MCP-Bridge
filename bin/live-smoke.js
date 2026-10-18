@@ -4,20 +4,22 @@
 // same environment from ~/.codex/config.toml), checks health, and runs one tiny
 // read-only agent job in a throwaway Git repository. It reports the configured
 // versus runtime-observed model so the operator can see whether the daily
-// profile really works end to end. One small model request is made.
+// profile responds. --read-file additionally checks a fresh file fact under installed pins;
+// neither mode is writer/integration or real-client acceptance. One job is submitted;
+// file tools and provider retries can require multiple inference requests.
 
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, realpathSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { loadMcpEntry } from "./fresh-healthcheck.js";
+import { loadMcpEntry, validateCandidateReleaseEntry } from "./fresh-healthcheck.js";
 import { recordCliFailure } from "./ops-log.js";
 
 const execFileAsync = promisify(execFile);
@@ -31,6 +33,8 @@ function parseArguments(argv) {
     timeoutMs: 1000 * 60 * 5,
     json: false,
     healthOnly: false,
+    readFile: false,
+    requirePins: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -43,16 +47,24 @@ function parseArguments(argv) {
       if (argument === "--model") options.model = value;
       index += 1;
     } else if (argument === "--timeout-ms") {
-      options.timeoutMs = Number.parseInt(String(argv[index + 1] || ""), 10);
+      options.timeoutMs = Number(argv[index + 1]);
       if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1000) throw new Error("--timeout-ms must be an integer >= 1000.");
       index += 1;
     } else if (argument === "--json") options.json = true;
     else if (argument === "--health-only") options.healthOnly = true;
+    else if (argument === "--read-file") options.readFile = true;
+    else if (argument === "--require-pins") options.requirePins = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node bin/live-smoke.js [--config <config.toml>] [--server <server.js>] [--agent planner] [--model provider/model[@variant]] [--timeout-ms 300000] [--health-only] [--json]\n");
+      process.stdout.write("Usage: node bin/live-smoke.js [--config <config.toml>] [--server <server.js>] [--agent planner] [--model provider/model[@variant]] [--timeout-ms 300000] [--health-only | --read-file] [--require-pins] [--json]\n--read-file requires an explicit --model and installed integrity pins; --server is incompatible with pin-required checks.\n");
       process.exit(0);
     } else throw new Error(`Unknown argument: ${argument}`);
   }
+  if (options.readFile) {
+    if (options.healthOnly) throw new Error("--read-file and --health-only are alternatives.");
+    if (!options.model) throw new Error("--read-file requires an explicitly selected --model provider/model[@variant].");
+    options.requirePins = true;
+  }
+  if (options.requirePins && options.serverPath) throw new Error("--server removes integrity pins and cannot be used with --require-pins or --read-file; use a pinned --config entry for the candidate.");
   return options;
 }
 
@@ -66,7 +78,8 @@ function field(text, label) {
 }
 
 async function git(cwd, args) {
-  await execFileAsync("git", args, { cwd, windowsHide: true });
+  const result = await execFileAsync("git", args, { cwd, windowsHide: true });
+  return result.stdout;
 }
 
 function processIsRunning(pid) {
@@ -151,6 +164,7 @@ async function removeSmokeProjectDatabase(stateDir, repo) {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const entry = await loadMcpEntry(options.configPath);
+  const pinnedCandidate = options.requirePins ? await validateCandidateReleaseEntry(entry) : null;
   const serverPath = path.resolve(options.serverPath || entry.args[0] || "");
   const env = { ...process.env, ...entry.env };
   // A --server override means "test this candidate", so the production hash pins
@@ -170,16 +184,22 @@ async function main() {
     const spec = at > 0 ? options.model.slice(0, at) : options.model;
     const variant = at > 0 ? options.model.slice(at + 1) : "";
     const slash = spec.indexOf("/");
-    if (slash <= 0 || slash === spec.length - 1) throw new Error("--model must look like provider/model or provider/model@variant.");
+    if (slash <= 0 || slash === spec.length - 1 || (at > 0 && !variant) || /[\s@]/.test(spec) || /[\s@]/.test(variant)) {
+      throw new Error("--model must look like provider/model or provider/model@variant.");
+    }
     modelRequirement = { provider: spec.slice(0, slash), model: spec.slice(slash + 1), ...(variant ? { variant } : {}) };
   }
   const fixture = await mkdtemp(path.join(tmpdir(), "bridge-live-smoke-"));
   const repo = path.join(fixture, "repo");
+  const expectedReply = options.readFile ? `BRIDGE_READ_${randomBytes(24).toString("hex")}` : "LIVE_SMOKE_OK";
   const report = {
     serverPath,
     agent: options.agent,
     startedAt: new Date().toISOString(),
     candidateUnpinned,
+    check: options.healthOnly ? "health-only" : options.readFile ? "file-read" : "literal-response",
+    integrityMode: pinnedCandidate?.integrityMode || "not-prevalidated",
+    requestedModel: options.model || "managed-profile",
     health: {},
     run: {},
     ok: false,
@@ -188,9 +208,11 @@ async function main() {
   try {
     await mkdir(repo, { recursive: true });
     await writeFile(path.join(repo, "README.md"), "# live smoke\n\nSay OK.\n", "utf8");
+    if (options.readFile) await writeFile(path.join(repo, "SMOKE_FACT.txt"), `${expectedReply}\n`, "utf8");
     await git(repo, ["init", "-q", "-b", "main"]);
-    await git(repo, ["-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", "add", "README.md"]);
+    await git(repo, ["-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", "add", "README.md", ...(options.readFile ? ["SMOKE_FACT.txt"] : [])]);
     await git(repo, ["-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", "commit", "-q", "-m", "init"]);
+    const initialHead = options.readFile ? (await git(repo, ["rev-parse", "HEAD"])).trim() : "";
 
     client = new Client({ name: "bridge-live-smoke", version: "1.0.0" });
     const transport = new StdioClientTransport({
@@ -214,31 +236,39 @@ async function main() {
     }
     report.health.connectMs = Date.now() - startedAt;
     const healthStarted = Date.now();
-    const health = resultText(await client.callTool({ name: "get_opencode_bridge_status", arguments: { cwd: repo } }, undefined, { timeout: 1000 * 120 }));
+    const healthResult = await client.callTool({ name: "get_opencode_bridge_status", arguments: { cwd: repo } }, undefined, { timeout: 1000 * 120 });
+    const health = resultText(healthResult);
     report.health.durationMs = Date.now() - healthStarted;
-    report.health.status = field(health, "OpenCode MCP bridge status") || (/status: healthy/i.test(health) ? "healthy" : "unknown");
+    report.health.status = field(health, "OpenCode MCP bridge status") || "unknown";
+    report.health.isError = Boolean(healthResult.isError);
+    report.health.ok = !report.health.isError && /^healthy\.?$/i.test(report.health.status);
     report.health.integrity = field(health, "Integrity");
     report.health.externalPlugins = field(health, "External plugins");
     report.health.missingAgents = field(health, "Missing required managed agents");
     report.health.text = health;
-    if (options.healthOnly) {
-      report.ok = /healthy/i.test(report.health.status);
+    if (options.healthOnly || !report.health.ok) {
+      report.ok = report.health.ok;
+      if (!options.healthOnly) report.run = { skipped: true, reason: "bridge_health_not_accepted" };
     } else {
       const runStarted = Date.now();
-      const run = resultText(await client.callTool({
+      const runResult = await client.callTool({
         name: "run_opencode_agent",
         arguments: {
           agent: options.agent,
           detail: true,
-          task: "Reply with exactly the single word LIVE_SMOKE_OK and nothing else. Do not use tools.",
+          task: options.readFile
+            ? "Read SMOKE_FACT.txt using an allowed file-reading tool. Reply with exactly the single token stored in that file and nothing else. Do not modify files."
+            : "Reply with exactly the single word LIVE_SMOKE_OK and nothing else. Do not use tools.",
           cwd: repo,
           write: false,
           lockMode: "off",
           timeoutMs: options.timeoutMs,
-          scopeContract: { mode: "read", read: ["README.md"], ...(modelRequirement ? { modelRequirement } : {}) },
+          scopeContract: { mode: "read", read: [options.readFile ? "SMOKE_FACT.txt" : "README.md"], ...(modelRequirement ? { modelRequirement } : {}) },
         },
-      }, undefined, { timeout: options.timeoutMs + 1000 * 60, maxTotalTimeout: options.timeoutMs + 1000 * 60 }));
+      }, undefined, { timeout: options.timeoutMs + 1000 * 60, maxTotalTimeout: options.timeoutMs + 1000 * 60 });
+      const run = resultText(runResult);
       report.run.durationMs = Date.now() - runStarted;
+      report.run.isError = Boolean(runResult.isError);
       report.run.errorType = /^Status: \S+; error type: (\S+)/mi.exec(run)?.[1] || field(run, "Error type") || "none";
       report.run.actualAgent = field(run, "Actual agent used");
       report.run.configuredProvider = field(run, "Configured provider");
@@ -246,11 +276,19 @@ async function main() {
       report.run.configuredVariant = field(run, "Configured variant");
       report.run.runtimeProvider = field(run, "Runtime-observed provider") || field(run, "Actual provider");
       report.run.runtimeModel = field(run, "Runtime-observed model") || field(run, "Actual model");
-      report.run.modelEvidence = field(run, "Model evidence") || field(run, "Runtime model evidence");
+      report.run.modelEvidence = field(run, "Actual model evidence") || field(run, "Model evidence") || field(run, "Runtime model evidence");
       report.run.modelSelection = field(run, "Model selection");
-      report.run.responded = /LIVE_SMOKE_OK/.test(run);
+      const finalResponse = /^Assistant final response:\r?\n([\s\S]*?)\r?\n\r?\nSTDERR summary:/m.exec(run)?.[1] || "";
+      report.run.responded = finalResponse.trim() === expectedReply;
+      if (options.readFile) {
+        const fact = await readFile(path.join(repo, "SMOKE_FACT.txt"), "utf8").catch(() => null);
+        const status = await git(repo, ["status", "--porcelain", "--untracked-files=all"]);
+        const head = (await git(repo, ["rev-parse", "HEAD"])).trim();
+        report.run.fixtureUnchanged = fact === `${expectedReply}\n` && status.trim() === "" && head === initialHead;
+      }
       report.run.text = run;
-      report.ok = /healthy/i.test(report.health.status) && report.run.responded && report.run.errorType.toLowerCase() === "none";
+      report.ok = report.health.ok && !report.run.isError && report.run.responded && report.run.errorType.toLowerCase() === "none"
+        && (!options.readFile || report.run.fixtureUnchanged);
     }
   } finally {
     if (client) await client.close().catch(() => {});
@@ -264,15 +302,18 @@ async function main() {
     const lines = [
       `Live smoke: ${report.ok ? "passed" : "FAILED"}`,
       `Server: ${report.serverPath}`,
+      `Check: ${report.check}; candidate integrity: ${report.integrityMode}`,
       ...(report.candidateUnpinned ? ["Pins: production server/lib/release hash pins removed because --server names a candidate"] : []),
-      `Health: ${report.health.status} (connect ${report.health.connectMs} ms, status ${report.health.durationMs} ms)${report.health.integrity ? `; integrity ${report.health.integrity}` : ""}${report.health.externalPlugins ? `; external plugins ${report.health.externalPlugins}` : ""}`,
+      `Health: ${report.health.status}${report.health.isError ? " (tool error)" : ""} (connect ${report.health.connectMs} ms, status ${report.health.durationMs} ms)${report.health.integrity ? `; integrity ${report.health.integrity}` : ""}${report.health.externalPlugins ? `; external plugins ${report.health.externalPlugins}` : ""}`,
     ];
     lines.push(`Cleanup: smoke project database ${report.cleanup?.removed ? "removed" : `kept (${report.cleanup?.reason || "unknown"})`}`);
     if (report.health.missingAgents) lines.push(`Missing required agents: ${report.health.missingAgents}`);
-    if (!options.healthOnly) {
+    if (report.run.skipped) lines.push(`Run: skipped (${report.run.reason})`);
+    else if (!options.healthOnly) {
       lines.push(`Run: agent ${report.run.actualAgent || options.agent}, ${report.run.durationMs} ms, error type ${report.run.errorType}, responded ${report.run.responded ? "yes" : "no"}`);
       lines.push(`Model: configured ${report.run.configuredProvider}/${report.run.configuredModel} (${report.run.configuredVariant || "default variant"}); runtime-observed ${report.run.runtimeProvider || "?"}/${report.run.runtimeModel || "?"}${report.run.modelEvidence ? `; evidence ${report.run.modelEvidence}` : ""}`);
       if (report.run.modelSelection) lines.push(`Model selection: ${report.run.modelSelection}`);
+      if (options.readFile) lines.push(`Read fixture unchanged: ${report.run.fixtureUnchanged ? "yes" : "no"}`);
     }
     if (!report.ok) {
       lines.push("");
@@ -287,8 +328,8 @@ async function main() {
   }
   if (!report.ok) {
     // B-058: a failed smoke goes to the operations log of the bridge it started.
-    const failedPart = /healthy/i.test(report.health.status || "")
-      ? `agent run error type ${report.run?.errorType || "unknown"}, responded ${report.run?.responded ? "yes" : "no"}`
+    const failedPart = report.health.ok
+      ? `agent run error type ${report.run?.errorType || "unknown"}, responded ${report.run?.responded ? "yes" : "no"}${report.run?.isError ? "; MCP tool error" : ""}${options.readFile && !report.run?.fixtureUnchanged ? "; read fixture changed" : ""}`
       : `health ${report.health.status || "unknown"}`;
     const missing = report.health.missingAgents && report.health.missingAgents !== "none" ? `; missing agents ${report.health.missingAgents}` : "";
     const stateDir = path.resolve(String(entry.env.CODEX_OPENCODE_STATE_DIR || path.join(homedir(), ".codex", "codex-opencode-mcp")));

@@ -33,6 +33,9 @@ cp.execFile[Symbol.for("nodejs.util.promisify.custom")] = (command, args, option
   });
 });
 syncBuiltinESMExports();
+// All agent operations are hooked below; only the native executable fingerprint
+// is needed for cache reuse. Never depend on a personal OpenCode installation.
+process.env.CODEX_OPENCODE_EXECUTABLE = process.execPath;
 const { __selfTest: { internals: I, hooks } } = await import("../server.js");
 const scratch = await mkdtemp(path.join(tmpdir(), "pre-"));
 const repo = path.join(scratch, "repo");

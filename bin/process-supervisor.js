@@ -44,6 +44,10 @@ function safeInteger(value, fallback = 0, { minimum = 0, maximum = MAX_TIMER_MS 
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : null;
 }
 
+function launchAuthorityExpired(deadlineAt, now = Date.now()) {
+  return deadlineAt > 0 && deadlineAt <= now;
+}
+
 function safeReason(value, fallback) {
   const reason = String(value || "").trim();
   return /^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(reason) ? reason : fallback;
@@ -684,12 +688,17 @@ function createSupervisor({ supervisorIdentity = "", identityValid = true } = {}
   };
 
   const launchPayload = (message) => {
-    launchAttempted = true;
     const timeoutMs = safeInteger(message.timeoutMs, 0);
     watchdogMs = safeInteger(message.watchdogMs ?? message.watchdogTimeoutMs, 0);
     watchdogDeadlineAt = safeInteger(message.watchdogDeadlineAt, 0, { minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
     killGraceMs = safeInteger(message.killGraceMs, DEFAULT_KILL_GRACE_MS);
     terminationConfirmMs = safeInteger(message.terminationConfirmMs, DEFAULT_TERMINATION_CONFIRM_MS, { minimum: 1 });
+    // Authority may expire while the launch message waits in the pipe or this process stalls.
+    if (launchAuthorityExpired(watchdogDeadlineAt)) {
+      complete({ reason: "launch_gate_expired", errorType: "durable_launch_authority_expired", containmentGuarantee: "no_payload_started" });
+      return;
+    }
+    launchAttempted = true;
     try {
       payload = spawn(message.command, message.args, {
         cwd: message.cwd || process.cwd(),
@@ -1037,6 +1046,10 @@ function selfTestPidAlive(pid) {
 async function runSelfTest() {
   selfTestTerminationVerdicts();
   selfTestDescendantSelection();
+  assert.equal(launchAuthorityExpired(1_000, 1_000), true, "Authority expires at equality.");
+  assert.equal(launchAuthorityExpired(999, 1_000), true);
+  assert.equal(launchAuthorityExpired(1_001, 1_000), false);
+  assert.equal(launchAuthorityExpired(0, 1_000), false, "An omitted deadline retains legacy relative-watchdog behavior.");
   const tempRoot = await mkdtemp(path.join(tmpdir(), "codex-opencode-process-supervisor-"));
   const resolvedTempRoot = path.resolve(tempRoot);
   const resolvedTempBase = path.resolve(tmpdir());
@@ -1056,6 +1069,58 @@ async function runSelfTest() {
     assert.equal(noLaunchExit.supervisorIdentity, noLaunchHarness.supervisorIdentity);
     await waitForChildExit(noLaunchHarness.child);
     assert.deepEqual(await readdir(tempRoot), [], "A supervisor without a launch message created a payload artifact.");
+
+    for (const testCase of [
+      { name: "expired", options: { watchdogMs: 5_000, watchdogDeadlineAt: 1 }, expired: true },
+      { name: "expired-without-relative-watchdog", options: { watchdogDeadlineAt: 1 }, expired: true },
+      { name: "future", options: { watchdogMs: 5_000 }, future: true },
+      { name: "legacy-relative-watchdog", options: { watchdogTimeoutMs: 5_000 } },
+      { name: "legacy-no-deadline", options: {} },
+    ]) {
+      const harness = createHarness();
+      const marker = path.join(tempRoot, `authority-${testCase.name}.txt`);
+      try {
+        await waitForEvent(harness, "ready");
+        harness.send({
+          type: "launch",
+          command: process.execPath,
+          args: ["-e", "require('node:fs').writeFileSync(process.argv[1], 'ran');", marker],
+          cwd: tempRoot,
+          timeoutMs: 5_000,
+          ...testCase.options,
+          ...(testCase.future ? { watchdogDeadlineAt: Date.now() + 5_000 } : {}),
+        });
+        const exit = await waitForEvent(harness, "exit");
+        await waitForChildExit(harness.child);
+        assert.equal(exit.supervisorIdentity, harness.supervisorIdentity, testCase.name);
+        assert.equal(harness.events.some((event) => event.type === "protocol_error"), false, testCase.name);
+        assert.equal(harness.events.some((event) => event.type === "launched"), !testCase.expired, testCase.name);
+        assert.equal(exit.launched, !testCase.expired, testCase.name);
+        assert.equal(exit.launchAttempted, !testCase.expired, testCase.name);
+        assert.equal(await fileExists(marker), !testCase.expired, testCase.name);
+        if (testCase.expired) {
+          assert.equal(exit.reason, "launch_gate_expired");
+          assert.equal(exit.errorType, "durable_launch_authority_expired");
+          assert.equal(exit.containmentGuarantee, "no_payload_started");
+          assert.equal(exit.payloadPid, 0);
+          assert.equal(exit.payloadStartedAt, "");
+          assert.equal(exit.payloadExitCode, null);
+          assert.equal(exit.terminationRequested, false);
+          assert.equal(exit.treeTerminationConfirmed, false);
+          assert.equal(exit.terminationBestEffortSucceeded, false);
+          assert.equal(exit.supervisorExitCode, 1);
+          assert.equal(harness.child.exitCode, 1);
+        } else {
+          assert.ok(exit.payloadPid > 0, testCase.name);
+          assert.equal(exit.reason, "payload_closed", testCase.name);
+          assert.equal(exit.payloadExitCode, 0, testCase.name);
+          assert.equal(exit.supervisorExitCode, 0, testCase.name);
+          assert.equal(harness.child.exitCode, 0, testCase.name);
+        }
+      } finally {
+        await stopHarness(harness);
+      }
+    }
 
     const startedMarker = path.join(tempRoot, "payload-started.txt");
     const heartbeatMarker = path.join(tempRoot, "payload-survived-heartbeats.txt");

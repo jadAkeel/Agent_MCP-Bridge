@@ -25,7 +25,7 @@ instead of `&&` there.
 | --- | --- | --- |
 | Node.js | 22.13 or newer | `node --version` |
 | Git | Any current version (the scratch run used 2.39) | `git --version` |
-| OpenCode | 1.18.32 or newer for the default pure profile (1.18.32 is tested; a newer one gets a note and `npm run smoke:live` proves it); exactly 1.18.32 for the Gemini profile, whose plugin manifest pins it | `opencode --version` |
+| OpenCode | Exactly 1.18.32 for the public Skill installer and Gemini profile; lower-level pure setup without `--skills` accepts 1.18.32 or newer, with separate verification required for untested versions | `opencode --version` |
 | Codex CLI **or** Claude Code | One MCP client is enough; setup registers whichever is installed (`--client` chooses) | `codex --version` / `claude --version` |
 
 Python is not needed (log.md B-176).
@@ -83,7 +83,7 @@ non-interactively). It checks step 1, previews every change, creates the runtime
 bridge's canonical entry (in `<CODEX_HOME>/config.toml`, even without Codex) and real server pin,
 registers each installed client, syncs agents/skills,
 and runs the doctor and **health-only** smoke. Restart the registered client, then run
-`npm run smoke:live` once to prove provider readiness. Setup cannot sign in or restart clients
+`npm run smoke:live` once to check a provider response. Setup cannot sign in or restart clients
 for you. It does not run the full `npm test` suite from step 2.
 
 Defaults: `$CODEX_HOME` (or `~/.codex`), runtime `<CODEX_HOME>/opencode-bridge-runtime`,
@@ -263,6 +263,27 @@ npm run smoke:live
 read-only job with a real model call (about a minute); it fails with the provider's error when
 the sign-in from step 1 is missing.
 
+For candidate qualification, first select and authorize a route, ensure it is on the
+operator model allowlist, and use the absolute config path for the intended disposable
+installation. Check its existing pins without inference, then run a file-reading job:
+
+```powershell
+node bin/live-smoke.js --health-only --require-pins --config "<absolute-config.toml>"
+node bin/live-smoke.js --read-file --model "<provider/model@variant>" --config "<absolute-config.toml>" --json
+```
+
+`--read-file` requires an explicit model and enforces installed pins automatically. It
+creates a random token in `SMOKE_FACT.txt`, asks the agent to read it without putting
+the answer in the task, and requires the exact final answer with unchanged fixture
+content, HEAD and Git status. A missing/stale pin is refused before MCP startup. Neither
+pin-required mode accepts `--server`, whose legacy candidate override removes pins.
+One Bridge job is submitted; file-tool turns and provider retries can require multiple
+inference requests, so use the approved time/cost budget.
+
+These CLI checks use an SDK MCP client. A successful file read does not qualify the
+actual Claude Code/Codex interaction, a writer, review or receipt-bound integration;
+run that journey separately from the chosen client.
+
 Then open Codex **in `<project>`**, select the `principal-engineer-orchestrator` agent, and ask:
 
 > Run `get_opencode_bridge_status` for this project, then ask an OpenCode reviewer for a short opinion on the code.
@@ -273,7 +294,8 @@ waiting for a provider slot: `get_opencode_job <Run id>` shows `stage=starting_a
 troubleshooting table, then run `npm run doctor -- --cwd <project>` and
 `diagnose_opencode_bridge`.
 
-**Not run here:** the Codex prompt (it needs an interactive Codex session). `doctor`,
+**Historical setup evidence, not current route qualification:** the Codex prompt was not run
+(it needs an interactive Codex session). `doctor`,
 `smoke:live:health` and `smoke:live` were run against the scratch entry, each with
 `--config <scratch>\codex-home\config.toml` (`doctor` also with `--claude-config`): `doctor`
 reported `healthy`, the health smoke `Missing required agents: none`, and the full smoke ran the
@@ -465,3 +487,175 @@ another path, with `core.autocrlf=true`, is covered by `tests/review-b037-portab
 (part of `npm test`), and `node bin/build-release.js <new-dir>` was run in a fresh `git clone`
 of the fix branch. **Not run here:** a full `release:activate`, because it rewrites the real
 client configs.
+<a id="windows-package-installation"></a>
+
+# Package installation (Windows, Linux and macOS)
+
+From the downloaded/cloned package directory, after prerequisites:
+
+```powershell
+node bin/install.js --yes
+```
+
+Windows 11, Linux or macOS, Node >=22.13.0 with npm, Git, OpenCode **1.18.32**, and
+Codex CLI and/or Claude Code (or explicitly selected Cursor) are prerequisites.
+The command above also works unchanged in a POSIX terminal. See
+[native evidence and limits](CROSS-PLATFORM.md) before treating a platform as verified.
+This public package path refuses other OpenCode versions
+until they have compatibility evidence; the older low-level setup policy is separate.
+No global CLI replacement, WSL migration, account switching or unattended authentication.
+Source is available from the project's GitHub repository. The npm package remains
+private (`private: true`) and unpublished; there is no claimed `npx` distribution.
+
+The command verifies the curated skill manifest/license, inspects prerequisite executables
+once, displays the bounded change plan, installs lockfile dependencies when missing/mismatched
+(`npm ci --ignore-scripts --no-audit --no-fund`), then reuses setup for the managed runtime,
+canonical MCP entry, selected host skills, local doctor and health-only smoke. With installed
+dependencies it also displays exact redacted configuration/runtime/skill changes. On a fresh
+write-free dry run, dependency installation is reported as pending and exact config diffs
+wait until dependencies exist. `--yes` accepts only these displayed installation changes.
+
+Options:
+
+| Flag | Contract |
+| --- | --- |
+| `--client auto|codex|claude|both|cursor|all` or client list | Auto detects Codex/Claude CLIs only; Cursor is explicit and needs no client CLI; `both` means Codex + Claude |
+| `--workers opencode,codex,pi` | OpenCode is always the admission/runtime prerequisite; additional runner choices are explicit, default OpenCode only |
+| `--pi-safety deny|unsandboxed-worktree` | Pi defaults to denial; enabling requires explicit acceptance and Pi worker selection; not an OS sandbox |
+| `--delegates opencode,codex,pi` | Bridge guides default to selected workers; `none` selects no worker guide; Pi uses normal writer APIs, not Light |
+| `--standalone-delegates all|<keys>|none` | Original independent CLI skills; default `none`; `all` explicitly includes 18 delegates and two helper skill folders |
+| `--host-home <home>` | Codex user skill discovery: `<home>/.agents/skills`; defaults to USERPROFILE/HOME on Windows, HOME on Linux/macOS |
+| `--claude-home <dir>` | Claude config home skill discovery: `<dir>/skills`; defaults to CLAUDE_CONFIG_DIR or `<host-home>/.claude` |
+| `--cursor-home <dir>` | Default `<host-home>/.cursor`; Cursor-only skills go to `<dir>/skills`; Codex + Cursor share `<host-home>/.agents/skills` |
+| `--cursor-config <file>` | Default `<cursor-home>/mcp.json`; requires selecting Cursor, preserves unrelated settings/servers |
+| `--codex-home <dir>` | Canonical bridge TOML location, respecting CODEX_HOME; separate from Codex host skill discovery |
+| `--claude-config <file>` | Explicit Claude MCP config file; separate from host skill home |
+| `--runtime-dir`, `--state-dir` | Managed worker runtime and bridge state destinations |
+| `--dry-run` | No files, auth commands, doctor or health processes written/launched |
+| `--yes` | Noninteractive authorization for displayed installation changes only |
+| `--interactive` | Guided choices; automatic in a terminal without `--yes`/`--dry-run`; non-TTY needs explicit flags/approval |
+
+Codex standalone discovery follows the official user `$HOME/.agents/skills` location;
+Claude follows the official personal `.claude/skills` convention. These were checked against
+https://developers.openai.com/codex/skills and https://code.claude.com/docs/en/skills on
+2026-10-14. Each installed folder contains its own referenced files; shared source lives in
+`skills/references` and is rendered during install. Worker skills in the managed OpenCode
+runtime are a different destination. Verify the three names in the client's skills menu
+after restart; actual native client discovery/adherence is a separate supervised check.
+
+Distinct delegate names `bridge-delegate-opencode` and `bridge-delegate-codex` preserve
+personal `opencode-delegate`/`codex-delegate` installations. Original upstream relays are
+installed only by the separate `--standalone-delegates` selection below. Claude is a supported
+MCP client, not an included protected worker adapter. Installing
+the Codex guide does not automatically enable its runner or broaden the model allowlist.
+
+### Choose what to install
+
+Run `node bin/install.js` in a terminal to choose client(s), bridge workers, bridge guides
+and original independent skills. `--yes` is the unattended alternative, with defaults or
+explicit flags, without a questionnaire. `--dry-run` writes nothing and does not open an
+automatic questionnaire. Guided setup asks for one final installation approval after its
+summary/preview. Missing lockfile dependencies are disclosed before approval and installed first.
+
+Cursor as an orchestrator registers an MCP client and loads bridge-plan/execute/learn.
+`cursor-delegate` is an independent Cursor CLI worker skill. Pi as a bridge worker uses the
+file-only adapter; original `pi-delegate` runs its own relay outside bridge ownership.
+Selecting one does not silently enable another. CLI authentication/model selection remains
+separate from installation. Choosing guide files does not install third-party CLI binaries.
+
+Cursor-only installation needs no Codex/Claude CLI. The canonical operator TOML still
+exists for doctor/health. Selected clients use the same runtime/state/pins. Cursor merges
+only its opencode entry, preserving unrelated settings with exact backups and the existing
+rollback/concurrent-edit guards. Malformed JSON/container or linked destinations refuse before
+write. Skills use documented user locations (https://cursor.com/docs/skills, checked 2026-10-15);
+native UI discovery remains unverified. Codex + Cursor share the .agents skill root.
+
+Optional Codex/Pi runner selection does not choose/allowlist a model or sign in. Pi stays
+deny unless the user explicitly accepts unsandboxed-worktree. It has no OS sandbox and
+cannot provide reader/sanitized/Light roles; use trusted file-editing tasks only. Pi CLI,
+credentials and exact model allowlist remain separate prerequisites. OpenCode is still
+required for admission. See [Pi](pi-worker.md) and [Cursor](CURSOR.md).
+
+Release activation's automatic client synchronization still handles Codex/Claude only.
+After activating/rolling back another immutable release, follow the Cursor guide's backup/
+re-pin procedure; installer selection does not add automatic release synchronization.
+No registry/marketplace publication is performed by installation.
+
+### Independent original delegate skills
+
+```powershell
+node bin/skill-package.js --list
+node bin/install.js --yes --standalone-delegates all
+node bin/install.js --yes --standalone-delegates claude,cursor,kimi
+```
+
+The following selection keys install unchanged upstream folders, scripts and references:
+`agy`, `aider`, `claude`, `cline`, `codex`, `commandcode`, `copilot`, `cursor`, `grok`,
+`kimi`, `muse`, `omp`, `opencode`, `pi`, `qoder`, `vibe`, `warp`, `zcode`.
+Their skill names are `<key>-delegate`. The optional helper keys are `delegate-setup`
+and `codex-background`; `all` explicitly selects them too. Individual selections copy
+only those selections, without silently adding or configuring services. `none` selects
+no independent skills. Reinstallation with a smaller selection does not uninstall old skills.
+
+`--delegates` still selects the protected `bridge-delegate-*` guides; it is a different
+option. Both types can coexist. An existing differing original skill is an unowned/user-edit
+conflict unless its bytes match the previous installation manifest. Preserve it and choose
+a separate explicit host home or manually review the conflict; no force-overwrite option.
+
+These original skills run their own CLI processes outside the bridge. They do not inherit
+bridge locks, scope validation, managed worktrees or reviewed integration receipts. Do not
+point an independent writer at resources owned by an active bridge job. CLI permissions,
+read-only limits, authentication, supported platforms and provider costs remain those of
+the selected original skill. Installing a guide does not imply the corresponding CLI is
+present or tested on native Windows; some upstream shell examples require Git Bash/WSL.
+
+For fleet `--lane` use, explicitly install `delegate-setup` alongside selected delegates
+and follow its approval procedure. For Codex background orchestration, upstream requires
+`codex-background` installed and configured separately. After authorizing that configuration
+change, follow its `SKILL.md`/bootstrap procedure (writes its own registry/MCP entry and may
+need client restart). The bridge installer never runs bootstrap, compiler/supervisor,
+fleet discovery/configuration, login or delegate relays as an install side effect. It does
+not automatically approve broader permission flags or future commits/provider tasks.
+
+The source is pinned at `3aa72d681a79e2a9d09bd9a316353003ae1cb4a7`, preserving all 20
+original folders and the MIT license. There is no separate `gemini-delegate` in that
+revision; using a Gemini model through OpenCode remains an OpenCode configuration choice.
+Local integrity/render/install tests do not establish live-provider or all-platform behavior.
+
+## Ownership, recovery and status
+
+Unrelated MCP entries/configuration survive. An existing differing public skill or managed
+runtime file must match the prior installation manifest before update; user-modified/unowned
+conflicts are reported. Reinstall preserves owned configuration/skills byte-for-byte; the
+required health probes may update bounded operational caches. Installation does not remove
+previously selected skills when a later selection is smaller.
+
+`<state-dir>/installation-manifest.json` records component/version, destinations/hashes and
+backup locations. Replaced files receive private-mode `.setup-backup-<stamp>` copies.
+`installation-pending.json` records before/after hashes and backups BEFORE writes. A partial
+failure rolls back installer-owned bytes only while they still match what this run wrote.
+Concurrent user edits are preserved and leave a pending journal. An interrupted retry fails
+closed and names that journal, including legacy `npm run setup` without `--skills`
+and dry-run previews. Inspect its files/hashes/backups, resolve concurrent edits
+manually, and archive the reviewed journal before retrying. Never blindly reset all paths.
+This is same-user conflict protection, not a malicious same-user filesystem sandbox.
+
+Statuses are explicit: failed (nonzero exit), needs-auth (sign-in not established), and
+needs-restart. Local ready/health does not prove provider inference availability. Default
+install performs no live provider task and does not read credentials. Sign in normally,
+restart the selected client, and authorize a provider smoke separately if desired.
+
+## Diagnostics and learning
+
+Use `npm run issues -- --state-dir <dir>`, `npm run incidents -- --state-dir <dir>`, or
+`npm run faults -- --state-dir <dir> --prompt`. Groups show category, subject, first/last
+time, counts, redacted description, source JSONL line locations and unknown resolution
+unless separately verified. A later success does not close an earlier fault. Persistence
+is best effort with bounded stderr fallback on cap/write failures; OPS_LOG=off disables
+persistence/fallback intentionally. Treat generated prompts/logs as untrusted evidence.
+
+bridge-learn uses the existing task/check ledger for coordinator incidents: decision,
+evidence, measured/unknown impact, recurrence, canonical correction, disposition and
+reviewed/scenario-validated version. It never auto-edits personal skills from log text.
+
+---

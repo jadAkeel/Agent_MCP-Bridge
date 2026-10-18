@@ -320,18 +320,20 @@ try {
     assert.equal(writableScopeFilesystemViolation(before, await captureWritableScopeFilesystemState(repo, plan)), null);
   }, { windowsOnly: true });
 
-  await check("stream listing copes with '%', '&', '^', '!' and non-ASCII in directory names", async () => {
+  await check("stream listing treats percent variables, '&', '^', '!' and non-ASCII as literal directory names", async () => {
     const repo = await makeRepo();
-    const odd = path.join(repo, "src", "100% ünï & ^x!");
-    await mkdir(odd, { recursive: true });
-    await writeFile(path.join(odd, "f é.txt"), "x");
     const plan = { allowedEdits: ["src"], scopeContract: null };
-    const before = await captureWritableScopeFilesystemState(repo, plan);
-    assert.equal(before.ok, true, JSON.stringify(before));
-    writeFileSync(path.join(odd, "f é.txt:str é"), "yy");
-    const violation = writableScopeFilesystemViolation(before, await captureWritableScopeFilesystemState(repo, plan));
-    assert.equal(violation?.errorType, "alternate_data_stream_written");
-    assert.deepEqual(violation.paths, ["src/100% ünï & ^x!/f é.txt"]);
+    for (const name of ["100% ünï & ^x!", "paired %COMSPEC% & ! (literal) ^"]) {
+      const odd = path.join(repo, "src", name);
+      await mkdir(odd, { recursive: true });
+      await writeFile(path.join(odd, "f é.txt"), "x");
+      const before = await captureWritableScopeFilesystemState(repo, plan);
+      assert.equal(before.ok, true, JSON.stringify(before));
+      writeFileSync(path.join(odd, "f é.txt:str é"), "yy");
+      const violation = writableScopeFilesystemViolation(before, await captureWritableScopeFilesystemState(repo, plan));
+      assert.equal(violation?.errorType, "alternate_data_stream_written");
+      assert.deepEqual(violation.paths, [`src/${name}/f é.txt`]);
+    }
   }, { windowsOnly: true });
 
   await check("an unreadable scope record fails closed", async () => {

@@ -35,9 +35,33 @@ const eventsOf = async file => (await readFile(file, "utf8")).trim().split(/\r?\
 
 test("canonical command inventory preserves every original argv and the grouped node --test command", async () => {
   const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
-  assert.equal(packageJson.scripts.test, "node bin/test-runner.js");
-  const commands = parseCommandChain(packageJson.scripts["test:commands"]);
-  validateGateManifest(commands);
+  assert.equal(packageJson.scripts.test, "npm run test:packaging && npm run test:smoke && npm run test:command-boundary && npm run test:pi && node bin/test-runner.js");
+  assert.equal(packageJson.scripts["test:packaging"], "node bin/skill-package.js --check && node --test tests/skill-package.test.js tests/orchestration-diagnostics.test.js tests/install-choices.test.js tests/agensi-package.test.js");
+  assert.equal(packageJson.scripts["test:smoke"], "node --test tests/live-smoke.test.js");
+  assert.equal(packageJson.scripts["test:command-boundary"], "node --test tests/command-boundary.test.js");
+  assert.equal(packageJson.scripts["test:agensi"], "node --test tests/agensi-package.test.js");
+  assert.equal(packageJson.scripts["package:agensi"], "node bin/package-agensi.js");
+  assert.equal(packageJson.scripts["test:pi"], "node tests/review-pi-runner.js");
+  assert.equal(packageJson.scripts["test:platform"], "node --test tests/platform-portability.test.js");
+  const allCommands = parseCommandChain(packageJson.scripts["test:commands"]);
+  validateGateManifest(allCommands);
+  assert.equal(allCommands.length, 182);
+  const propertyCommand = allCommands.filter(command => command.argv.includes("tests/property-provider-wait.js"));
+  assert.equal(propertyCommand.length, 1);
+  assert.deepEqual(propertyCommand[0].argv, ["--test", "tests/property-provider-wait.js", "tests/property-queue-scheduler.js", "tests/property-queue-retry.js", "tests/property-locks.js", "tests/property-queue-leases.js"]);
+  assert.equal(packageJson.scripts["test:property"], `node ${propertyCommand[0].argv.join(" ")}`);
+  assert.equal(allCommands.filter(command => command.argv.includes("tests/property-queue-retry.js")).length, 1);
+  assert.equal(allCommands.filter(command => command.argv.includes("tests/property-locks.js")).length, 1);
+  assert.equal(allCommands.filter(command => command.argv.includes("tests/property-queue-leases.js")).length, 1);
+  assert.equal(packageJson.scripts["test:mutation"], "stryker run");
+  assert.equal(packageJson.scripts["test:mutation:retry"], "stryker run stryker.retry.config.json");
+  assert.equal(packageJson.scripts["test:mutation:locks"], "stryker run stryker.locks.config.json");
+  assert.equal(packageJson.scripts["test:mutation:leases"], "stryker run stryker.leases.config.json");
+  assert.deepEqual(packageJson.devDependencies, { "@stryker-mutator/core": "9.6.1", "fast-check": "4.10.2" });
+  assert.deepEqual(packageJson.overrides, { "typed-rest-client": { qs: "6.16.0" } });
+  assert.equal(propertyCommand[0].index, allCommands.length - 2);
+  assert.equal(propertyCommand[0].lane, "parallel");
+  const commands = allCommands.filter(command => !command.argv.includes("tests/property-provider-wait.js"));
   assert.equal(commands.length, 181);
   const precedingR06 = commands.filter(command => !command.argv.includes("tests/review-day5-pipeline-token.js"));
   assert.equal(precedingR06.length, 180);
@@ -618,7 +642,7 @@ test("skip capture uses the final child's temp and runner PPID rather than the d
 
 async function skipReceiptFixture(spec) {
   const root = path.join(scratch, `skip-receipt-${spec.name}`);
-  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills"]) await mkdir(path.join(root, directory), { recursive: true });
+  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills", "skills", "vendor/delegate-skills", "docs"]) await mkdir(path.join(root, directory), { recursive: true });
   for (const file of ["bin/test-runner.js", "bin/main-module.js", "tests/skip-gate.js"]) await copyFile(path.join(ROOT, file), path.join(root, file));
   const input = { file: `receipt-${spec.name}`, total: spec.total, skips: spec.skips || [], partial: spec.partial || [] };
   await writeFile(path.join(root, "tests", "fixture.js"), `import {finishSkips} from './skip-gate.js';
@@ -630,6 +654,11 @@ async function skipReceiptFixture(spec) {
   await writeFile(path.join(root, "package.json"), JSON.stringify({ type: "module", scripts: {
     "test:commands": "node tests/skip-gate.js --self-test && node tests/skip-gate.js --reset && node tests/fixture.js && node tests/skip-gate.js --summary" } }));
   for (const [file, bytes] of Object.entries({ "server.js": "// scratch server\n", "package-lock.json": "{}\n", "lib/fixture.js": "// scratch lib\n",
+    "skill-package-manifest.json": "{}\n", "LICENSE": "fixture license\n", "docs/ONBOARDING.md": "fixture onboarding\n",
+    "docs/CURSOR.md": "# Fixture Cursor guide\n",
+    "docs/CROSS-PLATFORM.md": "# Fixture platform guide\n", "docs/PLATFORM-VERIFICATION.md": "# Fixture evidence\n",
+    "docs/pi-worker.md": "# Fixture Pi guide\n",
+    "docs/DELEGATE-AUDIT.md": "fixture audit\n", "docs/SKILL-SCENARIOS.md": "fixture scenarios\n",
     "opencode/agents/fixture.md": "scratch agent\n", "opencode/.gitignore": "log/\n", "opencode/plugin-integrity-manifest.json": "{}\n" }))
     await writeFile(path.join(root, file), bytes);
   const env = await prepareTestEnvironment(path.join(scratch, `skip-receipt-parent-${spec.name}`), process.env, { copyProfiles: false });

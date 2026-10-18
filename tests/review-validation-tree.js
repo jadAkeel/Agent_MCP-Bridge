@@ -23,15 +23,16 @@ const { runCommand, runValidationGate } = __selfTest.internals;
 const fixture = await mkdtemp(path.join(tmpdir(), "codex-validation-tree-"));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// The parent never exits on its own. Its child is detached with stdio ignored, the way a Python
-// runner (pytest workers) or any spawner outside Node's kill-on-close job object leaves it, and
-// writes a file after a delay.
+// The parent never exits on its own. Windows needs a detached child to break out
+// of Node's kill-on-close job. POSIX children keep the owned process group, as
+// ordinary test-runner workers do. A new POSIX session is a sandbox escape, not
+// an ordinary descendant in that group (the bridge is not an OS sandbox).
 async function treeScript(marker) {
   const script = path.join(fixture, `tree-${marker}.js`);
   await writeFile(script, [
     "const { spawn } = require('node:child_process');",
     `const target = ${JSON.stringify(path.join(fixture, `${marker}.late`))};`,
-    "spawn(process.execPath, ['-e', `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(target)}, 'late'), 2500)`], { stdio: 'ignore', detached: true }).unref();",
+    "spawn(process.execPath, ['-e', `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(target)}, 'late'), 2500)`], { stdio: 'ignore', detached: process.platform === 'win32' }).unref();",
     "setTimeout(() => {}, 60000);",
   ].join("\n"));
   return script;

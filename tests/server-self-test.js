@@ -8,6 +8,10 @@
 // its test-mode guards (background timers, attestation cache TTL) on that flag.
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
+// Cache tests need a fingerprintable native binary, not an installed provider
+// CLI. Agent execution in this suite is synthetic/hooked; Node cannot perform
+// provider inference. Native OpenCode compatibility is a separate live check.
+process.env.CODEX_OPENCODE_EXECUTABLE = process.execPath;
 const { __selfTest } = await import("../server.js");
 const selfTestHooks = __selfTest.hooks;
 const {

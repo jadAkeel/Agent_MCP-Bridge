@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { resolvePluginManifestEntryPath } from "./plugin-manifest-paths.js";
 import { recordCliFailure } from "./ops-log.js";
+import { resolveNpmCli } from "./npm-cli.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
@@ -19,6 +20,17 @@ const LEGACY_PUBLISH_ENTRIES = Object.freeze([
   "server.js",
   "package.json",
   "package-lock.json",
+  "skills",
+  "vendor/delegate-skills",
+  "skill-package-manifest.json",
+  "LICENSE",
+  "docs/ONBOARDING.md",
+  "docs/CROSS-PLATFORM.md",
+  "docs/PLATFORM-VERIFICATION.md",
+  "docs/DELEGATE-AUDIT.md",
+  "docs/SKILL-SCENARIOS.md",
+  "docs/CURSOR.md",
+  "docs/pi-worker.md",
   "bin",
   "lib",
   "tests",
@@ -147,7 +159,7 @@ async function stageReleaseOpenCodeConfig({ sourceRoot, staging, destination }) 
   ];
   for (const { entry, basename, label } of sources) {
     if (path.basename(String(entry?.path || "")).toLowerCase() !== basename.toLowerCase()) {
-      throw new Error(`${label} must use the canonical filename ${basename}.`);
+      throw new Error(`${label} must use the canonical source-tree file (canonical filename ${basename}).`);
     }
     // B-037: the committed manifest names the file repository-relative (`opencode/<basename>`),
     // resolved against this source tree, so a clone at any path builds; an absolute path must be
@@ -198,18 +210,6 @@ function normalizePublishEntries(entries) {
 // disagrees with package.json, and lifecycle scripts stay off, so no dependency code runs
 // during a build. npm is started as `node npm-cli.js`: npm.cmd needs a shell on Windows, and
 // a shell would re-parse the arguments.
-function resolveNpmCli({ env = process.env, execPath = process.execPath, exists = existsSync } = {}) {
-  const candidates = [];
-  const viaNpm = String(env.npm_execpath || "");
-  if (path.basename(viaNpm).toLowerCase() === "npm-cli.js") candidates.push(viaNpm);
-  const nodeDirectory = path.dirname(execPath);
-  candidates.push(
-    path.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
-    path.join(nodeDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-  );
-  return candidates.find((candidate) => exists(candidate)) || null;
-}
-
 async function installProductionDependencies(directory, { env = process.env, npmCli = resolveNpmCli({ env }) } = {}) {
   if (!npmCli) {
     throw new Error("Could not find npm-cli.js next to this Node.js install; the release needs npm to install node_modules from package-lock.json.");
@@ -337,6 +337,17 @@ async function runSelfTest() {
       "server.js",
       "package.json",
       "package-lock.json",
+      "skills/bridge-plan/SKILL.md",
+      "vendor/delegate-skills/LICENSE",
+      "skill-package-manifest.json",
+      "LICENSE",
+      "docs/ONBOARDING.md",
+      "docs/CROSS-PLATFORM.md",
+      "docs/PLATFORM-VERIFICATION.md",
+      "docs/DELEGATE-AUDIT.md",
+      "docs/SKILL-SCENARIOS.md",
+      "docs/CURSOR.md",
+      "docs/pi-worker.md",
       "bin/process-supervisor.js",
       "bin/tui.js",
       "bin/e2e.js",

@@ -15,8 +15,13 @@ concurrency:
 
 jobs:
   test:
-    # The bridge is developed and run on Windows; the suites carry Windows-specific cases.
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        # Minimum supported SQLite API plus maintained Node LTS lines.
+        node: [22.13.0, 22.x, 24.x]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
       # The runner has no OpenCode CLI, no Codex config and no live bridge: cases that need
@@ -27,7 +32,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
 
       # Several suites create commits in temporary repositories.
@@ -37,6 +42,18 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global core.autocrlf false
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - run: npm test
+      - run: npm run test:platform
+
+      # No installed providers, personal profiles, credentials or inference. The
+      # wrapper canonicalizes macOS /var temporary aliases rather than relaxing
+      # installer/release link checks. npm test keeps its existing skip ledger.
+      - run: node bin/verify-isolated.js --node tests/platform-suite.js
+
+      - name: Preserve native verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-node-${{ matrix.node }}
+          path: .test-logs/

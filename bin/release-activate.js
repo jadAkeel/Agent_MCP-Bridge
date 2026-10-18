@@ -1638,6 +1638,17 @@ async function selfTestCheckedBuild(fixture) {
   await write("server.js", "committed\n");
   await write("package.json", "{}\n");
   await write("package-lock.json", "{}\n");
+  await write("skills/bridge-plan/SKILL.md", "fixture public skill\n");
+  await write("vendor/delegate-skills/LICENSE", "fixture delegate license\n");
+  await write("skill-package-manifest.json", "{}\n");
+  await write("docs/CURSOR.md", "# Fixture Cursor guide\n");
+  await write("docs/pi-worker.md", "# Fixture Pi guide\n");
+  await write("docs/CROSS-PLATFORM.md", "# Fixture platform guide\n");
+  await write("docs/PLATFORM-VERIFICATION.md", "# Fixture evidence\n");
+  await write("LICENSE", "fixture license\n");
+  await write("docs/ONBOARDING.md", "fixture onboarding\n");
+  await write("docs/DELEGATE-AUDIT.md", "fixture audit\n");
+  await write("docs/SKILL-SCENARIOS.md", "fixture scenarios\n");
   await write("bin/tool.js", "committed\n");
   await write("lib/redaction.js", "module\n");
   await write("lib/git-patch.js", "module\n");

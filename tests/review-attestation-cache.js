@@ -18,6 +18,9 @@ delete process.env.CODEX_OPENCODE_ATTESTATION_TIMEOUT_MS;
 // Never the operator's ~/.codex/codex-opencode-mcp.
 const { isolateBridgeStateDir, removeIsolatedStateDir } = await import("./flex-fixture.js");
 const isolatedStateDir = isolateBridgeStateDir("review-attestation-cache");
+// Operations below are synthetic; fingerprint a real native binary without
+// depending on an installed OpenCode CLI or changing fail-closed cache policy.
+process.env.CODEX_OPENCODE_EXECUTABLE = process.execPath;
 const { __selfTest } = await import("../server.js");
 const { strict: assert } = await import("node:assert");
 const { execFileSync } = await import("node:child_process");

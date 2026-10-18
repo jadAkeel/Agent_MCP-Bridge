@@ -386,11 +386,19 @@ function parseArguments(argv) {
 // node_modules). lib/ is one since the server.js split; a fixture without it failed the
 // digest with ENOENT before any assertion ran.
 async function writeSourceFixture(root) {
-  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills"]) await mkdir(path.join(root, directory), { recursive: true });
+  for (const directory of ["bin", "lib", "tests", "opencode/agents", "opencode/skills", "skills", "vendor/delegate-skills", "docs"]) await mkdir(path.join(root, directory), { recursive: true });
   for (const [file, text] of Object.entries({
     "server.js": "// server\n",
     "package.json": "{}\n",
     "package-lock.json": "{}\n",
+    "skill-package-manifest.json": "{}\n",
+    "docs/CURSOR.md": "# Fixture Cursor guide\n",
+    "docs/pi-worker.md": "# Fixture Pi guide\n",
+    "docs/CROSS-PLATFORM.md": "# Fixture platform guide\n", "docs/PLATFORM-VERIFICATION.md": "# Fixture evidence\n",
+    "LICENSE": "fixture license\n",
+    "docs/ONBOARDING.md": "fixture onboarding\n",
+    "docs/DELEGATE-AUDIT.md": "fixture audit\n",
+    "docs/SKILL-SCENARIOS.md": "fixture scenarios\n",
     "bin/tool.js": "// tool\n",
     "lib/module.js": "// module\n",
     "tests/case.js": "// case\n",

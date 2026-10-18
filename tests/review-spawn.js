@@ -20,7 +20,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 const execFileAsync = promisify(execFileCallback);
-const scratch = await mkdtemp(path.join(tmpdir(), "codex-opencode-review-spawn-"));
+// Git for Windows also budgets the linked worktree's metadata path. Keep this
+// owned prefix short; mkdtemp still supplies a unique root for every test file.
+const scratch = await mkdtemp(path.join(tmpdir(), "spawn-"));
 
 // Environment the module reads once at import time.
 const fakeOpenCodeDir = path.join(scratch, "fake-opencode");

@@ -35,6 +35,9 @@ const { existsSync, readFileSync, readdirSync, rmSync } = await import("node:fs"
 
 const fixture = await makeFlexFixture(__selfTest, "review-batch-race");
 const { root, repo, git, identity, waitFor, durable, writeScope, execution, writeJob } = fixture;
+// These cases assert foreground cleanup or invoke the recovery sweep themselves.
+// Drive durable cleanup explicitly so a previous case's timer cannot hold its lease.
+internals.setDeferredCleanupSchedulingDisabled(true);
 await mkdir(path.join(repo, "tools"), { recursive: true });
 await writeFile(path.join(repo, "tools", "check.cjs"), "process.exit(0);\n", "utf8");
 await git(["add", "."]);
@@ -107,6 +110,12 @@ async function runAutoJob(file, edits, extra = {}, afterFinish = null) {
     const record = await durable(jobId);
     assert.fail(`the auto-integration of ${file} did not finish: status=${record?.status} error=${record?.errorType} autoIntegration=${JSON.stringify(record?.autoIntegration)}`);
   }
+  // A durable terminal status precedes the chain's completion. Await its actual
+  // completion, then finish queued engine cleanup before the next case can start.
+  await Promise.all([...internals.AUTO_INTEGRATION_CHAINS.values()]);
+  const cleanup = await internals.drainDeferredWorktreeCleanup(repo);
+  assert.ok(cleanup.every(item => !["pending", "failed", "partial"].includes(item.cleanup)),
+    `fixture cleanup must settle before the next case: ${JSON.stringify(cleanup)}`);
   return { jobId, dir, record: await durable(jobId) };
 }
 
@@ -506,4 +515,7 @@ test("B-158: a row taken by another owner while still active is a real ownership
   QUEUE_JOBS.delete(jobId);
 });
 
-await runFlexTests({ isolatedStateDir, file: "tests/review-batch-race.js", tests, cleanup: fixture.cleanup, finishSkips, label: "batch-race" });
+await runFlexTests({ isolatedStateDir, file: "tests/review-batch-race.js", tests, cleanup: async () => {
+  try { await fixture.cleanup(); }
+  finally { internals.setDeferredCleanupSchedulingDisabled(false); }
+}, finishSkips, label: "batch-race" });

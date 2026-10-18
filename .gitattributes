@@ -7,3 +7,6 @@ opencode/opencode.jsonc -text
 opencode/antigravity.json -text
 opencode/plugin-integrity-manifest.json -text
 opencode/cortexkit-server-package.json -text
+skills/** text eol=lf
+vendor/delegate-skills/** text eol=lf
+skill-package-manifest.json text eol=lf
