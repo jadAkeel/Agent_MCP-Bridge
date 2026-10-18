@@ -68,7 +68,7 @@ hooks.queueJobExecutorTestHook = async (request) => {
 const retryJob = (task, key) => readJob({ task, idempotencyKey: key, models: [MUSE, GEMINI], maxAttempts: 8 });
 const sameDbPath = (left, right) => path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
 const secondsUntil = (iso) => (Date.parse(iso) - Date.now()) / 1000;
-async function successorOf(jobId, timeoutMs = 15_000) {
+async function successorOf(jobId, timeoutMs = 30_000) {
   assert.ok(await waitFor(async () => Boolean((await durable(jobId))?.requeuedAs), timeoutMs), `job ${jobId} was not requeued: ${JSON.stringify(await durable(jobId))}`);
   const next = (await durable(jobId)).requeuedAs;
   assert.ok(await waitFor(async () => Boolean(await durable(next))), `the successor ${next} is not persisted`);

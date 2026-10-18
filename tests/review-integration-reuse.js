@@ -207,7 +207,8 @@ test("an in_use source is never removed by deferred cleanup", async () => {
   assert.equal(results[0].reason, "worktree_in_use");
   assert.equal(existsSync(f.worktreePath), true);
   await database(f.cwd, db => db.prepare("UPDATE worktree_artifacts SET status = 'cleanup_pending' WHERE worktree_path = ?").run(f.worktreePath));
-  assert.equal((await I.drainDeferredWorktreeCleanup(f.cwd))[0].cleanup, "success");
+  const releasedCleanup = (await I.drainDeferredWorktreeCleanup(f.cwd))[0];
+  assert.equal(releasedCleanup.cleanup, "success", JSON.stringify(releasedCleanup));
 });
 test("two successive applies keep separate deferred source identities", async () => {
   const f = await fixture();

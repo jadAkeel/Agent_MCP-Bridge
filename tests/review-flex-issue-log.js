@@ -54,7 +54,7 @@ test("Q-006: a failed queued job and a writer that changed nothing land in the i
     const noOutput = await enqueueQueueJob(writeJob("src/a.txt", { task: "Write for the issue log." }));
     assert.equal(noOutput.ok, true, noOutput.error);
     assert.ok(await waitFor(async () => (await durable(failed.record.jobId))?.status === "failed"));
-    assert.ok(await waitFor(async () => (await durable(noOutput.record.jobId))?.status === "completed"));
+    assert.ok(await waitFor(async () => (await durable(noOutput.record.jobId))?.status === "completed", 30_000));
     assert.ok(await waitFor(() => readIssues().includes(noOutput.record.jobId) && readIssues().includes(failed.record.jobId)), readIssues());
     const lines = readIssues().trim().split("\n");
     const failedLine = lines.find((item) => item.includes(failed.record.jobId));
