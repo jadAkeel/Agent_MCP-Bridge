@@ -533,9 +533,10 @@ test("wait handle closes on grant, pause, cancellation, query failure and thrown
     const timer = outcome === "cancel" ? setTimeout(() => controller.abort(), 100) : null;
     profile.enabled = true;
     try {
+      // Grant verifies handle ownership, not sub-second database initialization.
       const promise = runtime.providerSlotWaitStorage.run({ jobId: "profile-" + outcome, onWait: () => {
         if (outcome === "progress") throw new Error("fixture progress fault");
-      } }, () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: outcome === "reclaim" ? 1000 : 400, signal: controller.signal }));
+      } }, () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: ["grant", "reclaim"].includes(outcome) ? 5000 : 400, signal: controller.signal }));
       if (outcome === "progress" || outcome === "reclaim") await assert.rejects(promise, new RegExp("fixture " + outcome + " fault"));
       else {
         const result = await promise;
