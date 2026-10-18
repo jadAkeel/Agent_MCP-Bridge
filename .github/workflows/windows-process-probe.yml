@@ -17,10 +17,8 @@ jobs:
         with:
           node-version: 24.x
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Ambient runner process inspection
-        run: node tests/ci-process-probe.js
-      - name: Disposable environment process inspection
-        run: node bin/verify-isolated.js --node tests/ci-process-probe.js
+      - name: Compare native process inspection environments
+        run: node tests/ci-process-probe.js --compare-native
       - uses: actions/upload-artifact@v4
         if: always()
         with:
