@@ -17,6 +17,7 @@ const EXCLUSIVE_FILES = new Set([
   "review-provider-wait.js", "review-spawn.js", "review-provider-fallback.js", "review-queue-features.js",
   "review-round5.js", "review-friend-runtime.js", "review-flex-runners.js", "review-flex-rate-limit.js",
   "review-batch-race.js", "review-shared-attestation.js", "review-pause-precheck.js", "review-validation-tree.js",
+  "review-flex-fallback.js",
   "review-test-runner.js", "review-flex-auto-integrate.js",
   "review-flex-self-check.js", "review-flex-queue-worker.js",
 ]);

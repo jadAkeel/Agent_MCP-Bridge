@@ -296,7 +296,7 @@ test("B-078: a slot refused for a paused model is not an attempt, so the job doe
   };
   const first = await enqueueQueueJob(readJob({ task: "refused at the slot", models: [MUSE, GEMINI], maxAttempts: 2 }));
   assert.equal(first.ok, true, first.error);
-  const { records, last } = await chain(first.record.jobId);
+  const { records, last } = await chain(first.record.jobId, 60_000);
   assert.deepEqual(calls.map((call) => call.model), ["opencode/muse-spark-1.3-contributor-free", "google/antigravity-gemini-3.8-flash", "opencode/muse-spark-1.3-contributor-free"]);
   assert.equal(records[1].providerRefusedUntil, until, "the refusal is recorded as one");
   assert.equal(last.status, "completed", "with maxAttempts 2 the job still got its second real run (before: gave_up after the refusal)");

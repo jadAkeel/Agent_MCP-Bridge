@@ -146,7 +146,7 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
     const { __selfTest } = await import(${JSON.stringify(pathToFileURL(path.resolve("server.js")).href)});
     const I = __selfTest.internals;
     __selfTest.hooks.stateDirectoryOverride = ${JSON.stringify(scratch)};
-    const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: 1000 });
+    const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: ${holdersSetupTimeoutMs} });
     if (!result.ok) throw new Error(JSON.stringify(result));
     process.send({ lease: result.lease, pid: process.pid });
     process.on("disconnect", () => process.exit(0));
@@ -157,11 +157,13 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
   for (let index = 0; index < 2; index++) {
     const child = fork(workerPath, [], { env: holderEnv, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     workerProcesses.push(child);
+    let stderr = "";
+    child.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-2048); });
     const identity = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Slot holder startup timed out")), 10000);
       child.once("message", value => { clearTimeout(timer); resolve(value); });
       child.once("error", error => { clearTimeout(timer); reject(error); });
-      child.once("exit", code => { clearTimeout(timer); reject(new Error("Slot holder exited: " + code)); });
+      child.once("exit", code => { clearTimeout(timer); reject(new Error(`Slot holder exited: ${code}; stderr: ${stderr.trim() || "<empty>"}`)); });
     });
     identities.push(identity);
   }
