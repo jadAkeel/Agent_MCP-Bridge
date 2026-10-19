@@ -387,8 +387,10 @@ test("D3 findQueueWriteConflict reports an unresolved integration operation as i
 test("D3 a lock refusal after the claim names the real lock, keeps its errorType and backs off", async () => {
   const record = await persistedRecord({ mode: "write", status: "planned" });
   let lock = null;
+  let refusalAt = 0;
   selfTestHooks.queueJobExecutorTestHook = async () => {
     lock = await acquireHardLock({ owner: "codex", agent: "builder", origin: "manual", cwd: repo, lockType: "write", paths: ["src/a.txt"] });
+    refusalAt = Date.now();
     return lockRefusedExecution("queue_lock_conflict");
   };
   try {
@@ -396,7 +398,12 @@ test("D3 a lock refusal after the claim names the real lock, keeps its errorType
     assert.equal(record.status, "blocked");
     assert.equal(record.errorType, "queue_lock_conflict");
     assert.match(record.errorReason, new RegExp(lock.lock.id), "the blocked reason names the lock that refused the job");
-    assert.ok(Number(record.queueBlockedRetryAt) > Date.now(), "a blocked re-claim is backed off");
+    // The first block stamps queueBlockedRetryAt = stamp + queueBlockedPollMs while the refusal is
+    // persisted; CI legs can stall seconds between that stamp and this assert, so the bound is
+    // pinned to the refusal it stamps from, not the assert-time clock. A probe (the one write
+    // conflict lookup between refusal and stamp) normally takes far under half the backoff, so a
+    // delay-less stamp still trips here.
+    assert.ok(Number(record.queueBlockedRetryAt) > refusalAt + CONFIG.queueBlockedPollMs / 2, "a blocked re-claim is backed off");
     assert.equal(record.queueBlockedCount, 1);
     assert.ok(nextQueueScheduleDelay([{ status: "blocked", queueBlockedRetryAt: Date.now() + 30000 }], true) > CONFIG.queueBlockedPollMs * 5,
       "the scheduler waits for the backoff instead of polling every few seconds");

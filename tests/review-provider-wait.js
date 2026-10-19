@@ -29,10 +29,15 @@ const key = "review-provider-wait";
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function db(fn) { const handle = await I.openProviderLeaseDb(); try { return fn(handle); } finally { I.closeDb(handle); } }
 async function reset() { await db(handle => { handle.exec("DELETE FROM provider_leases; DELETE FROM provider_capacities; DELETE FROM provider_cooldowns; DELETE FROM runtime_settings;"); }); }
+// Setup only: holders() takes the two slots every test then rewrites or clears, so its budget
+// covers CI contention, not a tested wait; the assertions still reject a failed acquisition and
+// now say why (the acquire result).
+const holdersSetupTimeoutMs = 5000;
 async function holders(providerKey = key) {
-  const a = await I.acquireProviderLease({ providerKey, timeoutMs: 1000 });
-  const b = await I.acquireProviderLease({ providerKey, timeoutMs: 1000 });
-  assert.equal(a.ok, true); assert.equal(b.ok, true);
+  const a = await I.acquireProviderLease({ providerKey, timeoutMs: holdersSetupTimeoutMs });
+  assert.equal(a.ok, true, JSON.stringify(a));
+  const b = await I.acquireProviderLease({ providerKey, timeoutMs: holdersSetupTimeoutMs });
+  assert.equal(b.ok, true, JSON.stringify(b));
   const now = Date.now();
   await db(handle => {
     handle.prepare("UPDATE provider_leases SET owner_instance_id = ?, created_at = ?, expires_at = ? WHERE lease_id = ?").run("bridge-A", now - 10000, now + 60000, a.lease.id);
