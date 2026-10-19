@@ -67,13 +67,22 @@ const childScript = path.join(scratch, "child.mjs");
 await writeFile(childScript, `
 const [mode, arg] = process.argv.slice(2);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const line = (model = ${JSON.stringify(MUSE)}) => \`timestamp=\${new Date().toISOString()} level=ERROR run=r1 message="stream error" providerID=opencode modelID=\${model} session.id=ses_A small=false agent=builder mode=all error.error="AI_APICallError: Rate limit exceeded. Please retry after a brief wait."\\n\`;
+const line = (model = ${JSON.stringify(MUSE)}, session = "ses_A") => \`timestamp=\${new Date().toISOString()} level=ERROR run=r1 message="stream error" providerID=opencode modelID=\${model} session.id=\${session} small=false agent=builder mode=all error.error="AI_APICallError: Rate limit exceeded. Please retry after a brief wait."\\n\`;
 if (mode === "silent-hits") { for (let i = 0; i < 6; i += 1) { process.stderr.write(line()); await sleep(150); } await sleep(20000); }
 if (mode === "progress") { for (let i = 0; i < 3; i += 1) { process.stderr.write(line()); await sleep(120); process.stdout.write(JSON.stringify({ type: "step_finish", sessionID: "ses_A" }) + "\\n"); await sleep(120); } }
 if (mode === "other-model") { for (let i = 0; i < 4; i += 1) { process.stderr.write(line("antigravity-gemini-3.8-flash")); await sleep(120); } }
 if (mode === "silent") { await sleep(Number(arg) || 4000); }
 if (mode === "burst") { for (let i = 0; i < 6; i += 1) process.stderr.write(line()); await sleep(1500); }
-if (mode === "session") { process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "ses_MINE" }) + "\\n"); await sleep(Number(arg) || 8000); }
+if (mode === "session") {
+  const { appendFile } = await import("node:fs/promises");
+  await new Promise(resolve => process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "ses_MINE" }) + "\\n", resolve));
+  await sleep(300);
+  for (const session of ["ses_OTHER", "ses_OTHER", "ses_MINE", "ses_MINE"]) {
+    await appendFile(arg, line(${JSON.stringify(MUSE)}, session));
+    await sleep(150);
+  }
+  await sleep(8000);
+}
 `, "utf8");
 
 // minSpreadMs 100: the children print their lines 150 ms apart (the bridge default is 5 s, B-070).
@@ -189,17 +198,10 @@ test("L-2-F7-1: stderr lines with no model and no session never join the streak;
 
 test("B-061: once the run's session is known only that session's lines count", async () => {
   await writeFile(logPath, "", "utf8");
-  const running = spawnChild("session", 8000, { rateLimitWatch: watch({ logPath }) });
-  await sleep(700);
-  await appendFile(logPath, `${logLine({ session: "ses_OTHER" })}\n`, "utf8");
-  await sleep(150);
-  await appendFile(logPath, `${logLine({ session: "ses_OTHER" })}\n`, "utf8");
-  await sleep(700);
-  await appendFile(logPath, `${logLine({ session: "ses_MINE" })}\n`, "utf8");
-  await sleep(150);
-  await appendFile(logPath, `${logLine({ session: "ses_MINE" })}\n`, "utf8");
-  const result = await running;
-  assert.equal(result.rateLimited, true);
+  // The payload writes only after announcing its session. File polls may batch both hits;
+  // this case tests session filtering, while the spread requirement is covered above.
+  const result = await spawnChild("session", logPath, { rateLimitWatch: watch({ logPath, minSpreadMs: 0 }) });
+  assert.equal(result.rateLimited, true, JSON.stringify(result));
   assert.equal(result.rateLimitEvidence.sessionId, "ses_MINE", "another job's session never counted");
   assert.equal(result.rateLimitHits, 2);
 });
