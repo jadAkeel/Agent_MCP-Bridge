@@ -310,7 +310,8 @@ test("a crash after directory removal preserves pending evidence until the branc
   await git(f.cwd, "worktree", "remove", "--force", f.worktreePath);
   await I.reconcileWorktreeArtifactRegistry(f.cwd);
   assert.equal((await artifact(f)).status, "cleanup_pending");
-  assert.equal((await I.drainDeferredWorktreeCleanup(f.cwd))[0].cleanup, "success");
+  const cleanup = await I.drainDeferredWorktreeCleanup(f.cwd);
+  assert.equal(cleanup[0].cleanup, "success", JSON.stringify(cleanup[0]));
   assert.equal((await git(f.cwd, "branch", "--list", f.branch)).trim(), "");
   assert.equal(await pending(f), undefined);
   assert.equal(await artifact(f), undefined);

@@ -449,6 +449,37 @@ test("D4 cancellation during a lock refusal ends cancelled, not running without 
   assert.equal(record.status, "cancelled", `the in-memory record must not stay ${record.status}`);
 });
 
+test("D4 a local cancellation retries after a concurrent blocked-record update", async () => {
+  const record = await persistedRecord({ mode: "write", status: "blocked", errorType: "worktree_capacity_exceeded" });
+  QUEUE_JOBS.set(record.jobId, record);
+  let advanced = false;
+  selfTestHooks.queuePersistTestHook = async (candidate) => {
+    if (advanced || candidate.jobId !== record.jobId || candidate.status !== "cancelled") return;
+    advanced = true;
+    await withDb((db) => {
+      const current = db.prepare("SELECT revision, record_json FROM opencode_jobs WHERE job_id = ?").get(record.jobId);
+      const summary = JSON.parse(current.record_json || "{}");
+      summary.queueWorkspaceWaits = Number(summary.queueWorkspaceWaits || 0) + 1;
+      summary.revision = Number(current.revision || 0) + 1;
+      const changed = db.prepare("UPDATE opencode_jobs SET record_json = ?, revision = revision + 1, updated_at = ? WHERE job_id = ? AND revision = ?")
+        .run(JSON.stringify(summary), new Date().toISOString(), record.jobId, Number(current.revision || 0));
+      assert.equal(changed.changes, 1, "the blocked row advances after the optimistic cancel read");
+    });
+  };
+  try {
+    const response = await server._registeredTools.cancel_opencode_job.handler({ jobId: record.jobId, cwd: repo }, {});
+    const text = (response.content || []).map((item) => item.text || "").join("\n");
+    assert.equal(advanced, true, "the test creates a concurrent revision change");
+    assert.match(text, /cancelled atomically before execution/);
+    assert.equal((await jobRow(record.jobId)).status, "cancelled");
+    assert.equal(record.status, "cancelled");
+    assert.equal(record.cancellationRequested, true);
+  } finally {
+    selfTestHooks.queuePersistTestHook = null;
+    QUEUE_JOBS.delete(record.jobId);
+  }
+});
+
 // ---- Defect 5: a transient terminal-write error keeps the result ----
 
 test("D5 a transient error on the terminal write is retried and the job stays completed with its result", async () => {
