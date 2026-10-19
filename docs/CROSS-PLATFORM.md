@@ -87,11 +87,17 @@ node bin/verify-isolated.js --node tests/platform-suite.js
 
 The last command runs the actual `npm test` entry. Every isolated receipt includes
 the exact Node argv, platform/release/architecture, Node version, exit code,
-output path and before/after source digests. The normal 181-command runner also
+output path and before/after source digests. The normal 182-command runner also
 records individual exits, durations and its skip ledger under `.test-logs/`.
 CI retains those artifacts even on failure. Its existing
 `CODEX_TEST_ALLOW_REQUIRED_SKIPS=1` policy permits unavailable prerequisites, with
 every skip still reported by skip-gate; it does not certify those missing checks.
+
+On Windows, the wrapper retains the native `PSModulePath` alongside `PATH` so
+PowerShell process inspection can load its installed modules. Homes, client
+configuration, state and credentials remain isolated. CI verifies the current
+process's PID, parent PID and creation time before running the full suite; an
+import timeout or failed inspection fails that check.
 
 See [PLATFORM-VERIFICATION](PLATFORM-VERIFICATION.md) for the actual candidate run
 record, including failures and unavailable native checks. A Windows execution of

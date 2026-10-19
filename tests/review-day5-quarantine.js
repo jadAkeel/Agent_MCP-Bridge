@@ -231,7 +231,10 @@ test("native lock/provider reclaimers retain unknown records while the unrecorde
   const unknown = unknownRecords();
   assert.equal(await r.openCodeProcessRunning(), false);
   assert.equal(r.containmentProcessExists(validatorPid), true);
-  await withReclaimers(r, [...unknown, ["known-gone", evidence()]], async ({ db, reclaimProvenGoneLockQuarantines, reclaimProvenGoneProviderQuarantines }) => {
+  // Windows may reuse the exited fixture's PID between the two reclaim passes.
+  // Its recorded creation identity remains gone even when that PID is live again.
+  const knownGone = evidence({ processes: [{ pid: exitedPid, createdAt: "1" }] });
+  await withReclaimers(r, [...unknown, ["known-gone", knownGone]], async ({ db, reclaimProvenGoneLockQuarantines, reclaimProvenGoneProviderQuarantines }) => {
     assert.equal(await reclaimProvenGoneLockQuarantines(db), 1);
     assert.equal(r.containmentProcessExists(validatorPid), true, "validator alive after lock reclaim");
     assert.equal(await reclaimProvenGoneProviderQuarantines({ force: true }), 1);

@@ -395,7 +395,13 @@ test("L-1-F1b-8: a structured 429 exiting before the grace records the model pau
   const started = Date.now();
   const result = await runOpenCode(fixtureAgentName, "B096_QUICK task", workCwd, false, 120_000, { agentMetadata: fixtureMetadata() });
   const elapsed = Date.now() - started;
-  assert.ok(elapsed < 3000, `quick 429 took ${elapsed} ms`);
+  const childElapsed = result.childFinishedAtMs - result.childStartedAtMs;
+  assert.ok(result.childStartedAtMs > 0 && childElapsed >= 0 && childElapsed < 3000,
+    `quick 429 child took ${childElapsed} ms: ${JSON.stringify(result.runPhaseTimings)}`);
+  assert.ok(elapsed < 15_000, `quick 429 setup and persistence took ${elapsed} ms`);
+  assert.notEqual(result.rateLimited, true, "the payload exits on its own before the watcher's grace trip");
+  assert.equal(result.exitCode, 1, "the payload's own exit code is preserved");
+  assert.equal(result.timedOut, false);
   assert.equal(result.errorType, "opencode_rate_limited");
   assert.equal(result.rateLimitPause?.pauseKey, pauseKey);
   assert.equal(result.rateLimitPause?.strikes, 1);
@@ -403,7 +409,7 @@ test("L-1-F1b-8: a structured 429 exiting before the grace records the model pau
   const handle = await openProviderLeaseDb();
   try { assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM provider_leases").get().n, 0); }
   finally { internals.closeDb(handle); }
-  console.log(`Quick structured 429: ${elapsed} ms; pause ${result.providerCooldownUntil}`);
+  console.log(`Quick structured 429: child ${childElapsed} ms, total ${elapsed} ms; pause ${result.providerCooldownUntil}`);
   await clearPause();
 });
 

@@ -102,7 +102,20 @@ async function runAutoJob(file, edits, extra = {}, afterFinish = null) {
 const head = async () => (await git(["rev-parse", "HEAD"])).trim();
 
 const tests = [];
-const test = (name, fn) => tests.push({ name, fn });
+async function settleBackgroundCleanup() {
+  // A committed queue row precedes deferred source removal. This suite reuses one
+  // repository: finish the previous case's real cleanup before manually taking
+  // its serial lease or asserting the next case's guard/recovery outcome.
+  assert.ok(await waitFor(async () => {
+    await Promise.all([...AUTO_INTEGRATION_CHAINS.values()]);
+    const outcomes = await internals.drainDeferredWorktreeCleanup(repo);
+    return !AUTO_INTEGRATION_CHAINS.size && !outcomes.some(item => ["pending", "failed", "partial"].includes(item.cleanup));
+  }, 120_000), "previous integration cleanup must settle before the next case");
+}
+const test = (name, fn) => tests.push({ name, fn: async () => {
+  await settleBackgroundCleanup();
+  await fn();
+} });
 
 test("Q-010: the option is checked at enqueue and refused where it cannot work", async () => {
   assert.equal(autoIntegrateJobError({ autoIntegrate: false }, {}), null);

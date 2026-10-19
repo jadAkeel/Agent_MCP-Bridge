@@ -522,7 +522,7 @@ test("wait handle closes on grant, pause, cancellation, query failure and thrown
   for (const outcome of ["grant", "pause", "cancel", "query", "progress", "busy", "reclaim"]) {
     const { runtime, profile, setFault } = await measuredLeaseRuntime();
     if (outcome !== "grant") {
-      const held = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 1000 });
+      const held = await runtime.acquireProviderLease({ providerKey: key, timeoutMs: 5000 });
       assert.equal(held.ok, true);
     }
     if (outcome === "pause") await runtime.recordProviderCooldown({ providerKey: key, durationMs: 60000, errorType: "opencode_quota_exhausted", reason: "fixture" });
@@ -533,9 +533,10 @@ test("wait handle closes on grant, pause, cancellation, query failure and thrown
     const timer = outcome === "cancel" ? setTimeout(() => controller.abort(), 100) : null;
     profile.enabled = true;
     try {
+      // Grant verifies handle ownership, not sub-second database initialization.
       const promise = runtime.providerSlotWaitStorage.run({ jobId: "profile-" + outcome, onWait: () => {
         if (outcome === "progress") throw new Error("fixture progress fault");
-      } }, () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: outcome === "reclaim" ? 1000 : 400, signal: controller.signal }));
+      } }, () => runtime.acquireProviderLease({ providerKey: key, timeoutMs: ["grant", "reclaim"].includes(outcome) ? 5000 : 400, signal: controller.signal }));
       if (outcome === "progress" || outcome === "reclaim") await assert.rejects(promise, new RegExp("fixture " + outcome + " fault"));
       else {
         const result = await promise;

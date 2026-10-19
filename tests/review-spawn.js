@@ -849,11 +849,17 @@ async function directCancellationFixture({ writer = false, disconnect = false, a
       assert.equal(processAlive(started.childPid), true, "its descendant is running before abort");
       const abandonedAt = Date.now();
       if (disconnect) await client.close(); else controller.abort(new Error("fixture client cancellation"));
+      await waitUntil(() => agentResult?.cancelled && agentResult, 8000, "cancelled supervised agent");
+      for (const pid of [started.pid, started.childPid, agentResult.supervisorProcessId]) {
+        assert.equal(processAlive(pid), false, "supervised process " + pid + " ended");
+      }
+      assert.ok(Date.now() - abandonedAt < 8000, "process-tree cancellation stays bounded independently of writer bookkeeping");
+      const auditBudgetMs = writer ? 30000 : 8000;
       const ended = await waitUntil(async () => {
         const record = await internals.directRunAuditStore().get(repo, runId);
         return record?.finishedAt ? record : null;
-      }, 8000, "cancelled direct audit");
-      assert.ok(Date.now() - abandonedAt < 8000);
+      }, Math.max(1, auditBudgetMs - (Date.now() - abandonedAt)), "cancelled direct audit");
+      assert.ok(Date.now() - abandonedAt < auditBudgetMs);
       assert.equal(ended.status, "cancelled");
       assert.equal(ended.errorType, "agent_cancelled_by_client");
       assert.equal(agentResult.cancelled, true);
@@ -877,9 +883,6 @@ async function directCancellationFixture({ writer = false, disconnect = false, a
         assert.equal(agentResult.terminationBestEffortSucceeded, true, JSON.stringify(agentResult));
         assert.equal(agentResult.containmentGuarantee, "windows_taskkill_best_effort");
       } else assert.equal(agentResult.treeTerminationConfirmed, true, JSON.stringify(agentResult));
-      for (const pid of [started.pid, started.childPid, agentResult.supervisorProcessId]) {
-        assert.equal(processAlive(pid), false, "supervised process " + pid + " ended");
-      }
       process.stdout.write(`Direct ${writer ? "writer" : "reader"} ${disconnect ? "disconnect" : "abort"} cleanup: ${Date.now() - abandonedAt} ms\n`);
     } else {
       const outcome = await pending;

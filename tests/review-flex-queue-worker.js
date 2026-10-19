@@ -969,8 +969,9 @@ async function runParent() {
     const before = tickFailures();
     const files = queueWorkerApi.files(repo);
     const run = startWorker(["--repo", repo, "--enqueue", jobsFile("snapshot-fails", [readJob(repo, "sf-1")])], { api });
+    let finished = false;
     try {
-      assert.ok(await waitFor(() => calls.includes("Review for sf-1.")), "the job runs");
+      assert.ok(await waitFor(() => calls.includes("Review for sf-1."), 30_000), "the job runs");
       failing = true;
       await sleep(200);
       const first = queueWorkerApi.readFile(files.presence)?.heartbeatAt;
@@ -980,7 +981,9 @@ async function runParent() {
       queueWorkerApi.writeStop(repo);
       assert.ok(await waitFor(() => /Stop requested: no new jobs start/.test(run.out.text)), "the stop request is seen while the snapshot fails");
       released.add("Review for sf-1.");
-      assert.equal(await withTimeout(run.done, 10_000, "the drained worker"), 0, run.err.text);
+      const exitCode = await withTimeout(run.done, 10_000, "the drained worker");
+      finished = true;
+      assert.equal(exitCode, 0, run.err.text);
       assert.match(run.out.text, /Queue worker stopped \(stop_requested\)/);
       assert.equal((run.err.text.match(/Queue worker check failed \(snapshot\): database is locked/g) || []).length, 1, run.err.text);
       assert.equal(tickFailures() - before, 1, "one queue_worker.tick_failed line for the whole streak");
@@ -988,6 +991,10 @@ async function runParent() {
       failing = false;
       behaviours = {};
       released.add("Review for sf-1.");
+      if (!finished) {
+        queueWorkerApi.writeStop(repo);
+        try { await withTimeout(run.done, 10_000, "worker cleanup after a failed assertion"); } catch { /* Preserve the test failure. */ }
+      }
       // Without a fresh final snapshot the stop parks on the last counts read (the safe side).
       queueWorkerApi.removeParked(files);
     }

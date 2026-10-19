@@ -11,6 +11,9 @@ if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node";
 process.env.CODEX_OPENCODE_LOG_LEVEL = "off";
+// These cases exercise per-provider and queue limits, including three held slots.
+// The unrelated CPU-derived global cap is only two on small CI runners.
+process.env.CODEX_OPENCODE_GLOBAL_WORKER_LIMIT = "0";
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT;
 delete process.env.CODEX_OPENCODE_QUEUE_PARALLEL_LIMIT;

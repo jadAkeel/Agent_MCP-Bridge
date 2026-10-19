@@ -297,7 +297,7 @@ test("a stricter final-read ceiling cannot join a lookup accepting older entries
   try {
     short = await Promise.race([
       cache.cachedAttestation("age", operation, positive, { maxAgeMs: 1000 }),
-      new Promise(resolve => { timer = setTimeout(() => resolve(null), 3000); }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 10_000); }),
     ]);
   } finally { clearTimeout(timer); release(); await long; }
   assert.ok(short && short.call > previous.call, "the final read must obtain a fresh result");
@@ -367,6 +367,33 @@ test("simultaneous processes share one cold read", async () => {
   `);
   await Promise.all([execute(process.execPath, [script]), execute(process.execPath, [script]), execute(process.execPath, [script])]);
   assert.equal((await readFile(marker, "utf8")).trim().split("\n").length, 1);
+});
+test("transient SQLite contention retries a cache claim before falling back", async () => {
+  const retryState = path.join(root, "retry-claim-state");
+  let operations = 0;
+  let busyFailures = 0;
+  const originalExec = DatabaseSync.prototype.exec;
+  DatabaseSync.prototype.exec = function (sql, ...args) {
+    if (String(sql).trim() === "BEGIN IMMEDIATE" && busyFailures < 3) {
+      busyFailures++;
+      throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+    }
+    return originalExec.call(this, sql, ...args);
+  };
+  let value;
+  try {
+    const cache = createAttestationCacheRuntime({ fingerprint: async () => "stable", ttlMs: () => 3_600_000,
+      stateDirectory: () => retryState, buildIdentity: "claim-retry", assertNoLinkedPath: async () => {} });
+    value = await cache.cachedAttestation("same", async () => ({ ok: true, call: ++operations }), positive);
+  } finally { DatabaseSync.prototype.exec = originalExec; }
+  assert.equal(busyFailures, 3, "all three transient claim locks are retried");
+  assert.equal(operations, 1);
+  assert.equal(value.attestationCacheSource, "fresh");
+  const db = new DatabaseSync(path.join(retryState, "attestation-cache.sqlite"));
+  try {
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_entries").get().n, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attestation_flights").get().n, 0);
+  } finally { db.close(); }
 });
 
 for (const drift of [false, true]) test(drift

@@ -10,6 +10,7 @@ import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { finishSkips } from "./skip-gate.js";
+import { createIntegrationApplyRuntime } from "../lib/integration-apply.js";
 
 process.argv.push("--self-test");
 const execute = promisify(execFile);
@@ -57,6 +58,24 @@ const artifact = (f) => database(f.cwd, db => db.prepare("SELECT * FROM worktree
 const cases = [];
 const test = (name, run) => cases.push({ name, run });
 
+test("a fast target mismatch is rechecked with a fresh index before retaining the source", async () => {
+  const expected = "a".repeat(64);
+  const observations = [
+    { ok: true, trackedStateSha256: "b".repeat(64), targetStateSha256: "b".repeat(64) },
+    { ok: true, trackedStateSha256: expected, targetStateSha256: expected },
+  ];
+  const options = [];
+  const runtime = createIntegrationApplyRuntime({
+    captureIntegrationTargetState: async (_cwd, captureOptions) => {
+      options.push(captureOptions);
+      return observations.shift();
+    },
+  });
+  assert.equal(await runtime.integrationCleanupTargetStateError("fixture", expected, expected), "");
+  assert.equal(options.length, 2);
+  assert.deepEqual(options[1], { trustIndexStat: false });
+});
+
 test("unchanged apply collects no second patch and leaves durable cleanup before replying", async () => {
   const f = await fixture();
   const started = Date.now();
@@ -75,8 +94,11 @@ test("unchanged apply collects no second patch and leaves durable cleanup before
   assert.equal(existsSync(f.worktreePath), true);
   assert.equal((await artifact(f)).status, "cleanup_pending");
   assert.equal((await pending(f)).status, "pending");
+  const targetBeforeCleanup = await I.captureIntegrationTargetState(f.cwd);
   const clean = await I.drainDeferredWorktreeCleanup(f.cwd);
-  assert.equal(clean[0].cleanup, "success", JSON.stringify(clean));
+  assert.equal(clean[0].cleanup, "success", JSON.stringify({ cleanup: clean[0], expected: result.integratedTrackedStateSha256, targetBeforeCleanup,
+    targetAfterFailure: clean[0].cleanup === "success" ? null : await I.captureIntegrationTargetState(f.cwd),
+    targetText: clean[0].cleanup === "success" ? "" : await readFile(path.join(f.cwd, "a.txt"), "utf8") }));
   assert.equal(existsSync(f.worktreePath), false);
   assert.equal((await git(f.cwd, "branch", "--list", f.branch)).trim(), "");
   assert.equal(await artifact(f), undefined);
@@ -201,13 +223,18 @@ test("a newly validated integration replaces a prior retained cleanup task", asy
 });
 test("an in_use source is never removed by deferred cleanup", async () => {
   const f = await fixture(), p = await preview(f);
-  assert.equal((await apply(f, p)).ok, true);
+  const applied = await apply(f, p);
+  assert.equal(applied.ok, true);
   await database(f.cwd, db => db.prepare("UPDATE worktree_artifacts SET status = 'in_use' WHERE worktree_path = ?").run(f.worktreePath));
   const results = await I.drainDeferredWorktreeCleanup(f.cwd);
   assert.equal(results[0].reason, "worktree_in_use");
   assert.equal(existsSync(f.worktreePath), true);
   await database(f.cwd, db => db.prepare("UPDATE worktree_artifacts SET status = 'cleanup_pending' WHERE worktree_path = ?").run(f.worktreePath));
-  assert.equal((await I.drainDeferredWorktreeCleanup(f.cwd))[0].cleanup, "success");
+  const targetBeforeRelease = await I.captureIntegrationTargetState(f.cwd);
+  const releasedCleanup = (await I.drainDeferredWorktreeCleanup(f.cwd))[0];
+  assert.equal(releasedCleanup.cleanup, "success", JSON.stringify({ cleanup: releasedCleanup, expected: applied.integratedTrackedStateSha256,
+    targetBeforeRelease, targetAfterFailure: releasedCleanup.cleanup === "success" ? null : await I.captureIntegrationTargetState(f.cwd),
+    targetText: releasedCleanup.cleanup === "success" ? "" : await readFile(path.join(f.cwd, "a.txt"), "utf8") }));
 });
 test("two successive applies keep separate deferred source identities", async () => {
   const f = await fixture();
