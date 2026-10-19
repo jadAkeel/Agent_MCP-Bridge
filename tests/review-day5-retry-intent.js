@@ -38,7 +38,7 @@ if (childMode) {
   const repo = process.env.RETRY_FIXTURE_REPO;
   const read = id => {
     const db = new I.DatabaseSync(I.stateDbPath(repo));
-    try { db.exec("PRAGMA busy_timeout = 250");
+    try { db.exec("PRAGMA busy_timeout = 5000");
       const row = db.prepare("SELECT status, record_json FROM opencode_jobs WHERE job_id = ?").get(id);
       return row && { ...JSON.parse(row.record_json), status: row.status }; } finally { I.closeDb(db); }
   };
