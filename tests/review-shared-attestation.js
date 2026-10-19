@@ -428,9 +428,19 @@ for (const drift of [false, true]) test(drift
     await new Promise(resolve => setTimeout(resolve, drift ? 300 : 15_000));
     if (drift) await writeFile(path.join(fixture, "drift"), "change only the follower's environment");
     await writeFile(path.join(fixture, "owner-release"), "publish");
-    assert.equal(JSON.parse((await owner).stdout).source, "fresh");
+    const ownerResult = JSON.parse((await owner).stdout);
+    assert.equal(ownerResult.source, "fresh");
     const results = (await Promise.all(followers)).map(child => JSON.parse(child.stdout));
-    console.log("Follower measurements: " + JSON.stringify({ waitMs: drift ? 300 : 15_000, results }));
+    const db = new DatabaseSync(path.join(fixture, "state", "attestation-cache.sqlite"));
+    let cacheState;
+    try {
+      const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'attestation_entries'").get();
+      cacheState = table ? {
+        entries: db.prepare("SELECT COUNT(*) AS n FROM attestation_entries").get().n,
+        flights: db.prepare("SELECT COUNT(*) AS n FROM attestation_flights").get().n,
+      } : { entries: 0, flights: 0 };
+    } finally { db.close(); }
+    console.log("Follower measurements: " + JSON.stringify({ waitMs: drift ? 300 : 15_000, ownerResult, results, cacheState }));
     if (drift) {
       assert.equal(results[0].source, "fresh");
       assert.equal(results[0].producedBy, "follower-0");
@@ -440,7 +450,7 @@ for (const drift of [false, true]) test(drift
       finally { db.close(); }
     } else {
       for (const result of results) {
-        assert.equal(result.source, "shared");
+        assert.equal(result.source, "shared", JSON.stringify({ ownerResult, result, cacheState }));
         assert.equal(result.producedBy, "owner");
         assert.equal(result.fingerprints, 2, "entry and independent acceptance proof only");
         assert.ok(result.databaseLooks > 20, "the child actually polled the owner's claim");

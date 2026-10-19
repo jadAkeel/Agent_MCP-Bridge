@@ -305,13 +305,19 @@ test("automatic removal finishes after the reply within a bounded time", async (
 });
 test("a crash after directory removal preserves pending evidence until the branch is removed", async () => {
   const f = await fixture(), p = await preview(f);
-  assert.equal((await apply(f, p)).ok, true);
+  const applied = await apply(f, p);
+  assert.equal(applied.ok, true);
   assert.ok(f.worktreePath.startsWith(root + path.sep));
   await git(f.cwd, "worktree", "remove", "--force", f.worktreePath);
   await I.reconcileWorktreeArtifactRegistry(f.cwd);
   assert.equal((await artifact(f)).status, "cleanup_pending");
+  const targetBeforeCleanup = await I.captureIntegrationTargetState(f.cwd);
+  const branchBeforeCleanup = (await git(f.cwd, "show-ref", "--hash", "--verify", `refs/heads/${f.branch}`)).trim();
   const cleanup = await I.drainDeferredWorktreeCleanup(f.cwd);
-  assert.equal(cleanup[0].cleanup, "success", JSON.stringify(cleanup[0]));
+  assert.equal(cleanup[0].cleanup, "success", JSON.stringify({ cleanup: cleanup[0], expectedTrackedStateSha256: applied.integratedTrackedStateSha256,
+    targetBeforeCleanup: { ok: targetBeforeCleanup.ok, trackedStateSha256: targetBeforeCleanup.trackedStateSha256,
+      targetHead: targetBeforeCleanup.targetHead, targetTree: targetBeforeCleanup.targetTree, statusSha256: targetBeforeCleanup.statusSha256 },
+    expectedSourceHead: applied.sourceHead, branchBeforeCleanup }));
   assert.equal((await git(f.cwd, "branch", "--list", f.branch)).trim(), "");
   assert.equal(await pending(f), undefined);
   assert.equal(await artifact(f), undefined);
