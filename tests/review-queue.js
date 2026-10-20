@@ -474,6 +474,8 @@ test("D4 a local cancellation retries after a concurrent blocked-record update",
     assert.equal((await jobRow(record.jobId)).status, "cancelled");
     assert.equal(record.status, "cancelled");
     assert.equal(record.cancellationRequested, true);
+    assert.equal(Object.hasOwn(record, "task"), false, "terminal cancellation releases the task details from memory");
+    assert.equal(Object.hasOwn(record, "request"), false, "terminal cancellation releases the request details from memory");
   } finally {
     selfTestHooks.queuePersistTestHook = null;
     QUEUE_JOBS.delete(record.jobId);
