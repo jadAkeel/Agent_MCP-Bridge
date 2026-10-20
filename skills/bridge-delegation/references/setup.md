@@ -27,6 +27,13 @@ not automatically the same candidate as this Skill package. If a matching runtim
 artifact or download location has not been supplied, request it before installation.
 There is no published npm installation command claimed by this submission candidate.
 
+The RC.2 review package pairs this Skill with runtime candidate **1.0.0-beta.1**.
+Use the companion `ARTIFACTS.json` and `SHA256SUMS` supplied with that candidate for
+its source commit, runtime ZIP SHA-256 and release-manifest SHA-256. The application
+package.json remains 1.0.0; the candidate identifier distinguishes the tested bytes.
+Public download publication is owner-controlled and remains pending until explicitly
+approved. A proposed release URL is not proof that a download exists.
+
 ## Preview and install
 
 Run commands from the obtained runtime package directory. For a Claude Code client

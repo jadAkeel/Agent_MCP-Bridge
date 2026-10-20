@@ -482,6 +482,36 @@ test("D4 a local cancellation retries after a concurrent blocked-record update",
   }
 });
 
+test("D4 an active cancellation retries when the worker becomes blocked before persistence", async () => {
+  const record = await persistedRecord({ mode: "write", status: "running" });
+  QUEUE_JOBS.set(record.jobId, record);
+  const controller = new AbortController();
+  record.abortController = controller;
+  let advanced = false;
+  selfTestHooks.queuePersistTestHook = async (candidate) => {
+    if (advanced || candidate.jobId !== record.jobId || !candidate.cancellationRequested) return;
+    advanced = true;
+    await withDb((db) => {
+      const current = db.prepare("SELECT revision, record_json FROM opencode_jobs WHERE job_id = ?").get(record.jobId);
+      const summary = { ...JSON.parse(current.record_json), status: "blocked", errorType: "worktree_capacity_exceeded", revision: current.revision + 1 };
+      assert.equal(db.prepare("UPDATE opencode_jobs SET status = 'blocked', record_json = ?, revision = revision + 1 WHERE job_id = ? AND revision = ?")
+        .run(JSON.stringify(summary), record.jobId, current.revision).changes, 1);
+    });
+  };
+  try {
+    const response = await server._registeredTools.cancel_opencode_job.handler({ jobId: record.jobId, cwd: repo }, {});
+    assert.equal(advanced, true, "the worker blocks after the active cancellation read");
+    const row = await jobRow(record.jobId);
+    assert.equal(row.status, "cancelled", "a claimed cancellation must not leave a retryable blocked row");
+    assert.ok(row.cancellation_requested_at);
+    assert.equal(record.status, "cancelled");
+    assert.match(response.content[0].text, /cancelled atomically before execution/);
+  } finally {
+    selfTestHooks.queuePersistTestHook = null;
+    QUEUE_JOBS.delete(record.jobId);
+  }
+});
+
 test("D4 cancellation takes the latest blocked revision after concurrent scheduler updates", async () => {
   const record = await persistedRecord({ mode: "write", status: "blocked", errorType: "worktree_capacity_exceeded" });
   let revisionsAdvanced = 0;

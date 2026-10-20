@@ -1,6 +1,6 @@
 # Compatibility and acceptance boundaries
 
-This is marketplace submission candidate **0.1.0-rc.1**, assembled from the repository's
+This is marketplace submission candidate **0.1.0-rc.2**, assembled from the repository's
 Skill bundle **1.2.0**. The application's package version is a separate version layer.
 The generated package manifest records the exact submission files and their SHA-256
 hashes. It does not identify or qualify an independently obtained runtime artifact.
@@ -10,8 +10,8 @@ hashes. It does not identify or qualify an independently obtained runtime artifa
 | Skill/reference packaging | The export command verifies source pins, local Markdown link targets, licenses and packaged bytes. Local archive extraction is separately verifiable. |
 | Bridge runtime | Substantial local fixture coverage exists. Marketplace packaging does not rerun or replace runtime release gates. |
 | Windows | Strongest local acceptance lane. Real-client/provider and independent fresh-user acceptance for the final distributed candidate remain separate checks. |
-| Linux | Prior native-binary testing in WSL2 exists; it does not establish every Linux distribution or client setup. |
-| macOS | An installer target; native acceptance is not established for this candidate. |
+| Linux | Native Ubuntu CI fixture coverage and prior WSL2 checks exist; they do not establish real-client/provider or fresh-user acceptance. Consult the matching candidate's CI record. |
+| macOS | Native macOS CI fixture coverage exists; real-client/provider and fresh-user acceptance remain unverified. Consult the matching candidate's CI record. |
 | Claude Code / Codex | Installer/client integrations exist. A real end-to-end task for the distributed candidate still needs acceptance. |
 | Cursor | Registration and local setup paths exist; desktop discovery/approval behavior remains unverified. |
 | Other client names | A matching original delegate name is not proof that the client can host Bridge or that a native workflow passed. |

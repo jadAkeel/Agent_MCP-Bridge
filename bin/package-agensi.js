@@ -12,7 +12,7 @@ import {
 } from "./skill-package.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const SUBMISSION_VERSION = "0.1.0-rc.1";
+export const SUBMISSION_VERSION = "0.1.0-rc.2";
 const BASENAME = `agent-mcp-bridge-${SUBMISSION_VERSION}`;
 
 function safeEntry(name) {
