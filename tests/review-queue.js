@@ -482,6 +482,34 @@ test("D4 a local cancellation retries after a concurrent blocked-record update",
   }
 });
 
+test("D4 cancellation takes the latest blocked revision after concurrent scheduler updates", async () => {
+  const record = await persistedRecord({ mode: "write", status: "blocked", errorType: "worktree_capacity_exceeded" });
+  let revisionsAdvanced = 0;
+  selfTestHooks.queueCancellationTestHook = async ({ row }) => {
+    await withDb((db) => {
+      const current = db.prepare("SELECT revision, record_json FROM opencode_jobs WHERE job_id = ?").get(record.jobId);
+      const summary = JSON.parse(current.record_json || "{}");
+      summary.queueWorkspaceWaits = Number(summary.queueWorkspaceWaits || 0) + 1;
+      summary.revision = Number(current.revision || 0) + 1;
+      const changed = db.prepare("UPDATE opencode_jobs SET record_json = ?, revision = revision + 1, updated_at = ? WHERE job_id = ? AND revision = ?")
+        .run(JSON.stringify(summary), new Date().toISOString(), record.jobId, Number(row.revision || 0));
+      assert.equal(changed.changes, 1, "the scheduler advances the blocked row after cancellation reads it");
+      revisionsAdvanced += 1;
+    });
+  };
+  const db = await openLockDb(repo);
+  let cancelled;
+  try {
+    cancelled = await cancelPersistedQueueJob(db, record.jobId);
+  } finally {
+    closeDb(db);
+    selfTestHooks.queueCancellationTestHook = null;
+  }
+  assert.equal(revisionsAdvanced, 1, "the transactional cancellation uses the latest revision without spinning");
+  assert.equal(cancelled.outcome, "cancelled");
+  assert.equal((await jobRow(record.jobId)).status, "cancelled");
+});
+
 // ---- Defect 5: a transient terminal-write error keeps the result ----
 
 test("D5 a transient error on the terminal write is retried and the job stays completed with its result", async () => {
