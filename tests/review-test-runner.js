@@ -46,6 +46,8 @@ test("canonical command inventory preserves every original argv and the grouped 
   const allCommands = parseCommandChain(packageJson.scripts["test:commands"]);
   validateGateManifest(allCommands);
   assert.equal(allCommands.length, 182);
+  const flexFallbackCommand = allCommands.find(command => command.argv.includes("tests/review-flex-fallback.js"));
+  assert.equal(flexFallbackCommand?.lane, "exclusive");
   const propertyCommand = allCommands.filter(command => command.argv.includes("tests/property-provider-wait.js"));
   assert.equal(propertyCommand.length, 1);
   assert.deepEqual(propertyCommand[0].argv, ["--test", "tests/property-provider-wait.js", "tests/property-queue-scheduler.js", "tests/property-queue-retry.js", "tests/property-locks.js", "tests/property-queue-leases.js"]);

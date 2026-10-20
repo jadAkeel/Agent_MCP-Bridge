@@ -2886,6 +2886,7 @@ const { enqueueIntegrationCleanup, cleanupCommittedWorktree, drainDeferredWorktr
   CONFIG, openLockDb, closeDb, assertIntegrationLockOwned, acquireHardLock: (...args) => acquireHardLock(...args),
   releaseHardLock: (...args) => releaseHardLock(...args), startHardLockHeartbeat: (...args) => startHardLockHeartbeat(...args),
   cleanupIntegratedWorktreeWhileLocked, runCommand, captureIntegrationTargetState,
+  integrationCleanupTargetStateError,
   exactIntegrationFileSnapshot, snapshotIdentitySha256, logEvent,
   foregroundIntegrationActive: cwd => AUTO_INTEGRATION_CHAINS.has(RepositoryRootSet.key(cwd)),
   collectIntegrationPatch, cleanupWorktree,

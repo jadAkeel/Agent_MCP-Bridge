@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
-import { buildSubmission, collectSubmission, submissionZip, validateSubmission } from "../bin/package-agensi.js";
+import { ARCHIVE_ROOT, buildSubmission, collectSubmission, submissionZip, validateSubmission } from "../bin/package-agensi.js";
 import { STANDALONE_SKILLS, hashContent, verifySkillPackage } from "../bin/skill-package.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -100,8 +100,12 @@ test("build creates a complete new output and refuses to overwrite existing evid
     const archive = await readFile(path.join(destination, report.archive));
     assert.equal(hashContent(archive), report.archiveSha256);
     assert.equal(unzip(archive).size, report.fileCount);
+    assert.equal(report.archiveRoot, ARCHIVE_ROOT);
+    assert.equal(unzip(archive).has(`${ARCHIVE_ROOT}/SKILL.md`), true);
+    assert.equal(unzip(archive).has("SKILL.md"), false, "Agensi requires a containing skill folder");
     for (const [file, content] of unzip(archive)) {
-      assert.equal(await readFile(path.join(destination, "submission", ...file.split("/")), "utf8"), content);
+      assert.ok(file.startsWith(`${ARCHIVE_ROOT}/`), "every entry is under the single top-level folder");
+      assert.equal(await readFile(path.join(destination, "submission", ...file.split("/").slice(1)), "utf8"), content);
     }
     assert.equal(await readFile(path.join(destination, "SHA256SUMS"), "utf8"), `${report.archiveSha256}  ${report.archive}\n`);
     assert.deepEqual(JSON.parse(await readFile(path.join(destination, "BUILD-REPORT.json"), "utf8")).files, report.files);

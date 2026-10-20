@@ -2,10 +2,10 @@
   "version": "1.2.0",
   "files": {
     "skills/bridge-delegation/NOTICE.md": "b53d0f9b82323f3aff1ec0b12d8d41a3ab0ff4fbaba4ddb19db0445a3346f6bc",
-    "skills/bridge-delegation/SKILL.md": "c74c9e28aa2dd7d8ed9308935754c0cc911663f25ff2ed9807a4ec00086aedfb",
-    "skills/bridge-delegation/references/compatibility.md": "9d23d355e485accac79d705dfc8710e68b3b9ce1b57fb1e676cba4273704b41f",
+    "skills/bridge-delegation/SKILL.md": "0ba1b3d27a00cc04a736af3a2b74238f6e5e63d7c0f02aea3b8242d021a59fd9",
+    "skills/bridge-delegation/references/compatibility.md": "d848c28706ef56feecdc9047145db3036fc389995554234995f903b6baacb72e",
     "skills/bridge-delegation/references/modes.md": "b3e12c282724cdae4be47889c242fa5f4932093671378c539a40a307e7917c0a",
-    "skills/bridge-delegation/references/setup.md": "a6ea963f7fb0d7d80b57b8bc5338f2da7cea08e88c360c9d3eaa74081a1e52fc",
+    "skills/bridge-delegation/references/setup.md": "8f5b85a982636629254d2385c5e0f4c711e1c583f68a160026f1abe2002fa28e",
     "skills/bridge-execute/SKILL.md": "59bbbc9ed052fd464eb276454ceca865b06be892b2bbd4f8575cf920ad4db59c",
     "skills/bridge-learn/SKILL.md": "f85f9cd66cbedd98101958bb401c5b10cca525fc99581dbf9b0f232eb641b6a0",
     "skills/bridge-plan/SKILL.md": "1ab8473aa5a1231158796dc17c8903cfcace20cf582543517f9e67e9a9dd3afa",

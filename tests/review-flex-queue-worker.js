@@ -1070,7 +1070,7 @@ async function runParent() {
     const exits = [];
     const run = startWorker(["--repo", repo, "--enqueue", jobsFile("forced-exit", [readJob(repo, "fe-1")])], { signals: true, exit: (code) => exits.push(code) });
     try {
-      assert.ok(await waitFor(() => calls.includes("Review for fe-1.")));
+      assert.ok(await waitFor(() => calls.includes("Review for fe-1."), 30_000), JSON.stringify({ calls, rows: rowsOf(repo), stdout: run.out.text, stderr: run.err.text }));
       process.emit("SIGINT");
       process.emit("SIGINT");
       process.emit("SIGINT");

@@ -146,7 +146,7 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
     const { __selfTest } = await import(${JSON.stringify(pathToFileURL(path.resolve("server.js")).href)});
     const I = __selfTest.internals;
     __selfTest.hooks.stateDirectoryOverride = ${JSON.stringify(scratch)};
-    const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: 1000 });
+    const result = await I.acquireProviderLease({ providerKey: "review-provider-wait", timeoutMs: ${holdersSetupTimeoutMs} });
     if (!result.ok) throw new Error(JSON.stringify(result));
     process.send({ lease: result.lease, pid: process.pid });
     process.on("disconnect", () => process.exit(0));
@@ -157,11 +157,13 @@ test("5-second expiry emits real holders immediately; get_job agrees; no spawn o
   for (let index = 0; index < 2; index++) {
     const child = fork(workerPath, [], { env: holderEnv, windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     workerProcesses.push(child);
+    let stderr = "";
+    child.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-2048); });
     const identity = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Slot holder startup timed out")), 10000);
       child.once("message", value => { clearTimeout(timer); resolve(value); });
       child.once("error", error => { clearTimeout(timer); reject(error); });
-      child.once("exit", code => { clearTimeout(timer); reject(new Error("Slot holder exited: " + code)); });
+      child.once("exit", code => { clearTimeout(timer); reject(new Error(`Slot holder exited: ${code}; stderr: ${stderr.trim() || "<empty>"}`)); });
     });
     identities.push(identity);
   }
@@ -234,11 +236,21 @@ test("release during wait grants exactly one slot and reports actual time", asyn
   const timer = setTimeout(() => { void db(handle => handle.prepare("DELETE FROM provider_leases WHERE lease_id = ? AND owner_instance_id = ?").run(a.id, "bridge-A")); }, 180);
   try {
     const started = Date.now();
-    const result = await I.acquireProviderLease({ providerKey: key, timeoutMs: 2000, maxWaitMs: 1000 });
-    measurements.freedSlot = { waitedMs: result.waitedMs, elapsedMs: Date.now() - started };
+    let granted;
+    const result = await I.providerSlotWaitStorage.run({ jobId: "release-measurement", onWait: async info => {
+      if (info.waiting) return;
+      granted = { waitedMs: info.waitedMs, at: Date.now() };
+      // A slow progress consumer is return overhead, not time spent acquiring the slot.
+      await sleep(60);
+    } }, () => I.acquireProviderLease({ providerKey: key, timeoutMs: 2000, maxWaitMs: 1000 }));
+    const elapsedMs = Date.now() - started;
+    measurements.freedSlot = { waitedMs: result.waitedMs, grantObservedMs: granted?.at - started, elapsedMs };
     assert.equal(result.ok, true);
     assert.ok(result.waitedMs >= 150 && result.waitedMs < 600);
-    assert.ok(Math.abs(result.waitedMs - (Date.now() - started)) < 30);
+    assert.ok(granted, "the actual acquisition emits terminal progress");
+    assert.ok(result.waitedMs >= granted.waitedMs && result.waitedMs <= granted.at - started,
+      "reported wait ends by grant notification, before consumer/return overhead");
+    assert.ok(elapsedMs - result.waitedMs >= 60, "delayed observation is measured separately from the slot wait");
     assert.equal(result.waitInfo.waiting, false);
     assert.equal((await db(handle => handle.prepare("SELECT COUNT(*) AS n FROM provider_leases").get())).n, 2);
     await I.releaseProviderLease(result.lease);

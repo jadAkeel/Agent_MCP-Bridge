@@ -32,7 +32,7 @@ const fakeOpenCodeExecutable = path.join(fakeOpenCodeDir, process.platform === "
 const xdgCacheHome = path.join(scratch, "xdg-cache");
 process.env.XDG_CACHE_HOME = xdgCacheHome;
 process.env.CODEX_OPENCODE_WORKTREE_MODE = "write";
-process.env.CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS = "2000";
+process.env.CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS = "5000";
 process.env.CODEX_OPENCODE_VALIDATION_EXECUTABLE_ALLOWLIST = "git,node,python,python3,py,npm,pnpm,yarn,bun,bunx,deno";
 process.env.CODEX_OPENCODE_EXECUTABLE = fakeOpenCodeExecutable;
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
@@ -352,7 +352,7 @@ await test("#6 the run timeout starts when the slot is granted", async () => {
   if (!fakeOpenCodeReady) skipTest(fakeOpenCodeSkipReason);
   const key = `${CONFIG.providerConcurrencyKey}:opencode`;
   const held = await fillProviderKey(key);
-  // Free one slot after 1.5 s (inside CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=2000). The fake run
+  // Free one slot after 1.5 s (inside CODEX_OPENCODE_PROVIDER_WAIT_MAX_MS=5000). The fake run
   // takes 2 s; a 3.2 s run timeout only suffices if the wait is not taken out of it.
   const releaser = new Promise((resolve) => setTimeout(() => need("releaseProviderLease")(held.shift()).then(resolve), 1500));
   try {

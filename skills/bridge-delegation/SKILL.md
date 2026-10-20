@@ -4,7 +4,7 @@ description: "Choose and coordinate flexible coding delegation with Agent MCP Br
 license: ISC AND MIT
 compatibility: Requires a local Agent MCP Bridge installation for managed execution, Node.js >=22.13.0, Git, OpenCode 1.18.32, an MCP-capable client, and authorized provider access. Independent delegates require their own installed CLIs and prerequisites.
 metadata:
-  version: "0.1.0-rc.1"
+  version: "0.1.0-rc.2"
 ---
 
 # Agent MCP Bridge: Flexible Delegation
