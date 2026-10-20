@@ -153,7 +153,11 @@ test("memory-mode heartbeats do not steal pipeline ownership", async () => {
 test("a continued memory job retains its live claim while waiting for an occupied provider slot", async () => {
   hooks.queueModeOverride = "memory";
   const providerKey = "friend-memory-wait";
-  const held = await I.acquireProviderLease({ providerKey, timeoutMs: 3000 });
+  // Keep cold provider-database creation outside the short lease setup budget; this case tests
+  // the continued job's live claim while waiting, not first-open latency on a slow runner.
+  const providerDb = await I.openProviderLeaseDb();
+  I.closeDb(providerDb);
+  const held = await I.acquireProviderLease({ providerKey, timeoutMs: 10_000 });
   assert.equal(held.ok, true, held.error);
   const stopProviderHeartbeat = I.startProviderLeaseHeartbeat(held.lease);
   const record = memoryRecord();
