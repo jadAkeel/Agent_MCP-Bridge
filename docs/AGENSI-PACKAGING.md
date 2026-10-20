@@ -13,7 +13,7 @@ node bin/package-agensi.js
 ```
 
 The default output is a new directory at
-`dist/agensi/agent-mcp-bridge-0.1.0-rc.1/`. To use a different new directory:
+`dist/agensi/agent-mcp-bridge-0.1.0-rc.2/`. To use a different new directory:
 
 ```text
 node bin/package-agensi.js --output-dir "<new-output-directory>"
@@ -24,13 +24,16 @@ The exporter uses Node.js built-ins, with no archive dependency or provider call
 
 ## Output
 
-- `agent-mcp-bridge-0.1.0-rc.1.zip`: the seller upload artifact, with SKILL.md at its root.
+- `agent-mcp-bridge-0.1.0-rc.2.zip`: the seller upload artifact, with one containing
+  `agent-mcp-bridge/` folder and `SKILL.md` at that folder's root.
 - `submission/`: the exact unarchived payload for local inspection.
 - `SHA256SUMS`: archive digest.
 - `BUILD-REPORT.json`: file inventory, hashes, component/source manifest identity and ZIP
   digest. It describes local packaging, not a runtime release or marketplace acceptance.
 
-The ZIP has a single root marketplace Skill and `library/` containing the three existing
+The ZIP has a single top-level `agent-mcp-bridge/` directory, as required by the
+[official creator checklist](https://www.agensi.io/learn/skill-md-creator-checklist)
+(checked October 20, 2026). Inside it are one marketplace Skill and `library/` containing the three existing
 orchestration guides, three managed worker guides, 18 unchanged independent delegate
 folders, and two unchanged helper folders. Managed references are rendered into their
 own folders. Sibling helper paths in the original library remain intact.

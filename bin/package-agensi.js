@@ -14,6 +14,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const SUBMISSION_VERSION = "0.1.0-rc.2";
 const BASENAME = `agent-mcp-bridge-${SUBMISSION_VERSION}`;
+export const ARCHIVE_ROOT = "agent-mcp-bridge";
 
 function safeEntry(name) {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(name)
@@ -169,7 +170,9 @@ async function ensurePlainDirectory(directory) {
 
 export async function buildSubmission({ root = ROOT, outputDir = path.join(ROOT, "dist", "agensi", BASENAME) } = {}) {
   const { files, manifest } = await collectSubmission({ root });
-  const archive = submissionZip(files);
+  // Agensi's creator checklist requires exactly one containing skill folder.
+  // Manifest paths remain relative to that folder, as for local inspection.
+  const archive = submissionZip(new Map([...files].map(([name, content]) => [`${ARCHIVE_ROOT}/${name}`, content])));
   const destination = path.resolve(outputDir);
   // Only generated dist output may be created inside the working source tree.
   const relative = path.relative(root, destination);
@@ -189,7 +192,7 @@ export async function buildSubmission({ root = ROOT, outputDir = path.join(ROOT,
   const archiveSha256 = hashContent(archive);
   await writeFile(path.join(destination, archiveName), archive, { flag: "wx" });
   await writeFile(path.join(destination, "SHA256SUMS"), `${archiveSha256}  ${archiveName}\n`, { flag: "wx" });
-  const report = { ...manifest, fileCount: files.size, archive: archiveName, archiveSha256,
+  const report = { ...manifest, fileCount: files.size, archiveRoot: ARCHIVE_ROOT, archive: archiveName, archiveSha256,
     archiveBytes: archive.length, verification: "local source integrity and link checks only; external acceptance pending" };
   await writeFile(path.join(destination, "BUILD-REPORT.json"), JSON.stringify(report, null, 2) + "\n", { flag: "wx" });
   return { destination, ...report };
