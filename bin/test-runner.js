@@ -20,6 +20,9 @@ const EXCLUSIVE_FILES = new Set([
   "review-flex-fallback.js",
   "review-test-runner.js", "review-flex-auto-integrate.js",
   "review-flex-self-check.js", "review-flex-queue-worker.js",
+  // Native process snapshots and containment deadlines must not compete with
+  // the runner's parallel Git/worker fixtures. Keep the supervisor's budgets intact.
+  "process-supervisor.js",
 ]);
 const PRIORITY_FILES = ["server-self-test.js", "review-integration-reuse.js", "review-integration-recovery.js",
   "review-integration-batch.js", "review-flex-auto-integrate.js", "review-tools-pipelines.js", "review-continue-worktree.js", "review-integration-bytes.js"];

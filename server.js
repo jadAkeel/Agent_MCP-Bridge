@@ -3562,6 +3562,11 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   }
   if (persistence.deduplicated) {
     const existing = await readPersistedQueueRecord(persistence.jobId, normalizedJob.cwd);
+    if (recordFields?.requeuedFrom && (existing?.requeuedFrom !== recordFields.requeuedFrom || existing?.requeueSequence !== recordFields.requeueSequence)) {
+      return { ok: false, errorType: "queue_idempotency_conflict",
+        error: `Idempotency key already belongs to job ${persistence.jobId} outside this retry attempt.`,
+        suggestedFix: "Use a new idempotencyKey for a distinct logical request." };
+    }
     return { ok: true, record: existing, deduplicated: true };
   }
   if (!persistence.persisted) {
