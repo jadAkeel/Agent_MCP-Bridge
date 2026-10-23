@@ -396,6 +396,72 @@ test("transient SQLite contention retries a cache claim before falling back", as
   } finally { db.close(); }
 });
 
+for (const scenario of ["success", "refusal", "throw", "drift", "persistent-lock", "wait-expired"]) test(`BR-003: late contention with ${scenario}`, async () => {
+  const shared = path.join(root, `late-contention-${scenario}`);
+  let release, entered;
+  const pending = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const options = { fingerprint: async () => "stable", ttlMs: () => 3_600_000,
+    stateDirectory: () => shared, buildIdentity: "late-contention", assertNoLinkedPath: async () => {} };
+  let ownerCalls = 0, followerCalls = 0, looks = 0, injected = 0, clockOffset = 0;
+  const originalNow = Date.now;
+  const originalExec = DatabaseSync.prototype.exec;
+  const owner = createAttestationCacheRuntime(options).cachedAttestation("same", async () => {
+    ownerCalls++; entered(); await pending;
+    if (scenario === "throw") throw new Error("owner failed");
+    return { ok: scenario !== "refusal", producedBy: "owner" };
+  }, positive);
+  owner.catch(() => {});
+  await ready;
+  let follower;
+  try {
+    Date.now = () => originalNow() + clockOffset;
+    const cache = createAttestationCacheRuntime({ ...options,
+      fingerprint: async () => scenario === "drift" && injected ? "changed" : "stable",
+      flightLeaseMs: scenario === "wait-expired" ? 6000 : 600_000,
+      assertNoLinkedPath: async () => {
+        looks++;
+        if (looks === 2) clockOffset = 5200;
+        if (scenario === "wait-expired" && looks >= 3) clockOffset = 6100;
+        if (scenario === "wait-expired" && looks === 4) release(); // Baseline escape hatch; still fails the bound below.
+      },
+    });
+    DatabaseSync.prototype.exec = function (sql, ...args) {
+      if (sql.startsWith("PRAGMA busy_timeout") && looks >= 2 && (!injected || scenario === "persistent-lock")) {
+        injected++;
+        if (scenario === "persistent-lock" && injected > 1) clockOffset += 1000;
+        // Let the follower handle the failure before the owner publishes.
+        if (!["persistent-lock", "wait-expired"].includes(scenario)) setImmediate(release);
+        throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+      }
+      return originalExec.call(this, sql, ...args);
+    };
+    const followerOperation = cache.cachedAttestation("same", async () => {
+      followerCalls++;
+      return { ok: true, producedBy: "follower" };
+    }, positive);
+    follower = await followerOperation;
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    Date.now = originalNow;
+    release();
+    await Promise.allSettled([owner]);
+  }
+  assert.equal(ownerCalls, 1);
+  assert.ok(injected >= 1, "lock occurs only after a successful owner poll and >5s virtual elapsed time");
+  if (scenario === "success") {
+    assert.equal(follower.attestationCacheSource, "shared");
+    assert.equal(follower.producedBy, "owner");
+    assert.equal(followerCalls, 0, "late contention must not cause duplicate attestation");
+  } else {
+    assert.equal(follower.attestationCacheSource, "fresh");
+    assert.equal(follower.producedBy, "follower");
+    assert.equal(followerCalls, 1);
+  }
+  if (scenario === "persistent-lock") assert.ok(injected > 1 && injected <= 7, `bounded retries: ${injected}`);
+  if (scenario === "wait-expired") assert.ok(looks <= 3, `bounded owner wait: ${looks}`);
+});
+
 for (const drift of [false, true]) test(drift
   ? "a waiting follower refuses a stale shared publication after its environment changes"
   : "three followers waiting 15 seconds fingerprint only at entry and shared acceptance", async () => {

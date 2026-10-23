@@ -16,7 +16,7 @@ delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT;
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 import { strict as assert } from "node:assert";
 import { existsSync, writeFileSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile, readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -319,6 +319,31 @@ try {
     await writeFile(path.join(repo, "src", "sub", "b.txt"), "edited\n");
     assert.equal(writableScopeFilesystemViolation(before, await captureWritableScopeFilesystemState(repo, plan)), null);
   }, { windowsOnly: true });
+
+  for (const change of ["unchanged", "create", "same-size rewrite", "delete"]) {
+    await check(`BR-002: real ADS ${change}`, async () => {
+      const repo = await makeRepo();
+      const plan = { allowedEdits: ["src"], scopeContract: null };
+      const stream = path.join(repo, "src", "a.txt:RegressionStream");
+      if (change !== "create") await writeFile(stream, "AAAA");
+      const before = await captureWritableScopeFilesystemState(repo, plan);
+      assert.equal(before.ok, true, JSON.stringify(before));
+      assert.equal(before.streams.size, change === "create" ? 0 : 1, "native filesystem must enumerate the stream");
+      if (change === "create" || change === "same-size rewrite") {
+        await writeFile(stream, "BBBB");
+        assert.equal(await readFile(stream, "utf8"), "BBBB");
+      } else if (change === "delete") await unlink(stream);
+      const after = await captureWritableScopeFilesystemState(repo, plan);
+      assert.equal(after.ok, true, JSON.stringify(after));
+      assert.equal(after.streams.size, change === "delete" ? 0 : 1);
+      const violation = writableScopeFilesystemViolation(before, after);
+      if (change === "unchanged") assert.equal(violation, null);
+      else {
+        assert.equal(violation?.errorType, "alternate_data_stream_written", JSON.stringify(violation));
+        assert.deepEqual(violation.paths, ["src/a.txt"]);
+      }
+    }, { windowsOnly: true });
+  }
 
   await check("stream listing treats percent variables, '&', '^', '!' and non-ASCII as literal directory names", async () => {
     const repo = await makeRepo();
