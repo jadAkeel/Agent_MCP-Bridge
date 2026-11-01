@@ -1,14 +1,20 @@
 # OpenCode delegation (MCP server `opencode`)
 
-The `opencode` MCP server is a bridge to OpenCode agents. Use it to hand bounded, cheap work to a Gemini-backed agent and keep your own context small. You stay the planner, reviewer, and the only one who integrates changes.
+The `opencode` MCP server is a bridge to OpenCode agents. Use the authorized model for eligible bounded work when delegation is worthwhile. You stay the planner, implementer of core work, reviewer, and the only one who integrates changes.
 
 ## When to delegate
 Related or sequential steps continue the previous job's worktree with `continueWorktree` and integrate once at the end; `run_opencode_parallel` only for independent, non-overlapping scopes.
-1. Tiny or obvious change: do it yourself.
-2. Second opinion, exploration, review, or a plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester).
-3. One bounded fix or feature: one `builder` or `debugger` via `run_opencode_agent` with a write Scope Contract.
-4. Two or more independent scopes: `validate_delegation_plan`, then `run_opencode_parallel` with at most as many real (non-dry-run) jobs per call as the provider slot limit (the configured `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` per provider, or a `set_opencode_concurrency` override; `get_opencode_bridge_status` prints the current value as `Provider/account concurrency limit`) (parallel writers always lock in `strict` mode; each job prints a `Run id`, not a queue id: its block is compact (`detail: true` adds the bridge preamble) and its result text is stored, so `get_opencode_job <Run id>` returns it again if the response is lost); queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
+1. Small/simple task: implement it yourself when briefing and synchronization cost more than the work.
+2. Retain implementation needing the full project context or tightly coupled decisions, and sensitive/critical/high-impact work, including the shared foundation and architectural decisions.
+3. Medium tasks and independent difficult tasks can qualify when bounded, non-critical, based on stable inputs and verifiable without repeating the implementation, with benefit exceeding handoff, synchronization, integration and review costs. Difficulty alone neither requires nor forbids delegation. If you cannot brief or verify it without redoing it, keep it direct or refine its scope. Honor explicit task-specific user exceptions and required independent review.
+4. An eligible second opinion, exploration, review or plan: one read-only agent via `run_opencode_agent` (explore, planner, architect, reviewer, tester). An eligible bounded implementation: one `builder` or `debugger` with a write Scope Contract.
+5. Two or more independent eligible tasks: `validate_delegation_plan`, then `run_opencode_parallel` with at most as many real (non-dry-run) jobs per call as the provider slot limit (the configured `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT` per provider, or a `set_opencode_concurrency` override; `get_opencode_bridge_status` prints the current value as `Provider/account concurrency limit`) (parallel writers always lock in `strict` mode; each job prints a `Run id`, not a queue id: its block is compact (`detail: true` adds the bridge preamble) and its result text is stored, so `get_opencode_job <Run id>` returns it again if the response is lost); queue more with `enqueue_opencode_job`. Scopes must not overlap. Package manifests, lockfiles, schemas, migrations, and shared config are always serial.
 Do not call the OpenCode orchestrator unless the user names it. Do not call `acquire_agent_lock`/`release_agent_lock`; the bridge manages locks.
+
+Before fan-out, implement and review the shared foundation or reuse an accepted one.
+Own DAG joins: review and combine predecessor changes, resolve merge/interface conflicts,
+and verify the combined candidate before releasing dependent work. Individual job success
+alone does not release a stage; workers receive the actual reviewed predecessor files.
 
 ## Job shape
 For a follow-up writer, add `continueWorktree: "<previous Worktree path>"` to the normal write job shape. Its own edits are checked against its own scope; the final integration's `allowedEdits` covers all steps' changes.

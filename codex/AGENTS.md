@@ -15,6 +15,13 @@
 - Summarize unknowns and assumptions clearly.
 - Before finishing, summarize files changed, commands run, results, and remaining risks.
 
+## Execution Ownership
+
+- The orchestrator implements small/simple tasks directly when delegation and synchronization cost more than the work.
+- It retains implementation needing the full project context or tightly coupled decisions, and sensitive/critical/high-impact work, including the shared foundation and architectural decisions.
+- Medium tasks and independent difficult tasks can qualify for delegation when bounded, non-critical, based on stable inputs and verifiable without repeating the implementation, with benefit exceeding briefing, synchronization, integration and review costs. Difficulty alone neither requires nor forbids delegation. If a task cannot be briefed or reviewed without redoing it, keep it direct or refine its scope. Explicit task-specific user exceptions and required independent review still apply.
+- Before branching, the orchestrator implements and reviews the shared foundation or reuses an accepted baseline. It owns DAG joins, branch integration, conflict resolution and combined verification before dependent work starts. Workers receive actual reviewed predecessor files; passing individual jobs alone does not release a stage.
+
 ## Global Skills
 
 Skills live in `~/.codex/skills` and should be used when helpful, not for tiny obvious edits.

@@ -12,16 +12,23 @@ Output: selected path with rationale, bounded deliverables, real dependencies, o
 and acceptance concerns. The coordinator owns the completed result.
 
 Read relevant instructions, current changes and real check commands once. Use
-`get_opencode_bridge_status` before first dispatch; refresh when state/configuration changes.
-Follow [coordination](../references/coordination.md). Load transport details only for
-the selected route, not every skill and reference on every job.
+the execution-ownership policy in [coordination](../references/coordination.md) before
+choosing a route. Small/simple work stays direct when delegation costs more; work needing
+the whole-project context, tightly coupled decisions, and sensitive/critical/high-impact
+implementation stays with the orchestrator. Medium tasks and independent difficult tasks
+may qualify when bounded, non-critical and verifiable without repeating the work, with
+benefit exceeding coordination costs. Difficulty and task count alone do not select a
+mode. For managed work, use `get_opencode_bridge_status` before
+first dispatch; refresh when state/configuration changes. Load transport details only
+for the selected route, not every skill and reference on every job.
 
 | Concern | Smallest useful path |
 | --- | --- |
-| Tiny obvious edit | Direct execution with meaningful project checks |
-| One bounded implementation or investigation | Light: one sequential managed `run_opencode_agent` job |
-| Independent modules with compatible contracts/resources | `validate_delegation_plan`, then `run_opencode_parallel` |
-| Durable batch | Existing queue/pipeline tools where their actual final gates fit |
+| Small/simple task | Orchestrator executes directly with meaningful project checks |
+| Work needing the full context, coupled decisions, or sensitive/critical/high-impact implementation | Orchestrator implements directly and owns the foundation and decisions |
+| One eligible bounded task, medium or difficult, selected for managed execution | Light: one sequential managed `run_opencode_agent` job |
+| Multiple eligible tasks with independent contracts/resources | `validate_delegation_plan`, then `run_opencode_parallel` |
+| Eligible jobs needing durable scheduling | Existing queue/pipeline tools where their actual final gates fit |
 
 Light uses `executionMode: "light"` and one supported delegate: managed OpenCode or
 explicitly enabled/allowlisted Codex. Load the selected bridge-delegate skill. No raw

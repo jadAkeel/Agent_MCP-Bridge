@@ -117,9 +117,16 @@ The `agent-mcp-bridge` bin entry is ready for a future `npx` release; this packa
 2. Nothing to copy: the bridge sends its delegation workflow to the client in the MCP handshake (log.md B-177). Optional, for more detail: the Codex agent `principal-engineer-orchestrator` (`codex/agents/`), or the owner's fuller Claude Code rules in [claude/CLAUDE.md](claude/CLAUDE.md), which you can add to `~/.claude/CLAUDE.md`.
 3. Ask: *"Run get_opencode_bridge_status for this project, then ask an OpenCode reviewer for a short opinion on the code."*
 
-The public skills choose **direct** work for tiny tasks, **Light** for one bounded sequential
-managed delegate (`run_opencode_agent`, `executionMode: "light"`), or the existing protected
-parallel path. Light retains normal locks, scopes, writer worktrees, cancellation, result
+The public skills keep small/simple work direct when handoff costs more, and retain work
+needing the full project context or tightly coupled decisions, plus sensitive/critical/
+high-impact implementation, with the orchestrator. Medium tasks and independent difficult
+tasks can qualify when bounded, non-critical and verifiable without repeating the work,
+and when useful work outweighs coordination costs. Difficulty alone does not decide
+delegation. For eligible
+managed work, choose **Light** for one sequential delegate (`run_opencode_agent`,
+`executionMode: "light"`) or the protected parallel path for independent tasks. The
+orchestrator implements the shared foundation and reviews, combines and verifies branch
+outputs before releasing the next dependent DAG stage. Light retains normal locks, scopes, writer worktrees, cancellation, result
 receipts and reviewed integration. It disables automatic rerouting/retry orchestration.
 The [delegate audit](docs/DELEGATE-AUDIT.md) records the pinned upstream review and limits.
 Skills guide model decisions; they do not prove model adherence or create an OS sandbox.
