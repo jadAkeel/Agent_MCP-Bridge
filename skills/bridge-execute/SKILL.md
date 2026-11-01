@@ -13,9 +13,11 @@ reviewed combined candidate and honest acceptance state. Use
 [task/check ledger](../references/contracts.md); load
 [verification](../references/verification.md) when assigning checks or deciding reruns.
 
-Apply the execution-ownership policy before dispatch. The orchestrator implements simple
-work and difficult/complex, sensitive, critical or high-impact work itself. Delegate only
-eligible medium tasks with a clear scope and worthwhile coordination cost. Establish and
+Apply the execution-ownership policy before dispatch. Keep simple work direct when handoff
+costs more, and retain work needing the whole-project context, tightly coupled decisions,
+or sensitive/critical/high-impact implementation. A medium or difficult task may be delegated
+when independent, bounded, non-critical and verifiable without redoing it, with a benefit
+that outweighs coordination costs. Difficulty alone does not decide ownership. Establish and
 review the shared foundation before branching; the orchestrator combines predecessor
 outputs, resolves conflicts and verifies the integrated result before the next DAG stage.
 Keep required independent review; workers' success reports alone never release a stage.

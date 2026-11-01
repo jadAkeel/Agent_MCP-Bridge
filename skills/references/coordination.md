@@ -10,18 +10,20 @@ This policy guides coordinator decisions; it does not add an automatic risk clas
 or a general DAG scheduler.
 
 The orchestrator executes small/simple tasks directly when delegation and synchronization
-would cost more than the work. It also directly owns and implements difficult, complex,
-ambiguous, tightly coupled, sensitive, critical or high-impact work. This includes the
-shared foundation, architectural decisions and integration. One task, a bounded scope,
-or high difficulty alone never makes work eligible for delegation.
+would cost more than the work. It retains implementation that needs the whole-project
+context or tightly coupled decisions, and sensitive, critical or high-impact work. This
+includes the shared foundation, architectural decisions and integration.
 
-Only medium-complexity, clearly scoped, non-sensitive, non-critical deliverables are
-eligible for delegation, after comparing the benefit with briefing, synchronization,
-integration and review costs. A larger project may contain such tasks around a core the
-orchestrator implements. Choose an original delegate or a managed Bridge mode only after
-this assessment. An explicit task-specific user exception takes precedence; available
-workers, a queue, or parallel capacity do not imply an exception. Required independent
-review can inspect critical work without transferring its implementation ownership.
+Clearly scoped medium tasks are the usual delegation candidates. A difficult task can
+also qualify when it is independent, non-critical, has stable inputs and clear boundaries,
+and its result can be verified without repeating the implementation. Difficulty alone
+neither requires nor forbids delegation. Compare the benefit with briefing, synchronization,
+integration and review costs. If the orchestrator cannot provide a self-contained brief
+or assess the result without redoing the work, keep it direct or refine its scope first.
+Choose an original delegate or a managed Bridge mode only after this assessment. An
+explicit task-specific user exception takes precedence; available workers, a queue, or
+parallel capacity do not imply an exception. Required independent review can inspect
+critical work without transferring its implementation ownership.
 
 For dependent branches, the orchestrator implements and reviews the common foundation
 before fan-out, or reuses an already accepted foundation. Give workers bounded eligible
