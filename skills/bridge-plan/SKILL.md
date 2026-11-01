@@ -33,6 +33,9 @@ edits only; the coordinator owns shell/tests. Load bridge-delegate-pi only when 
 If the user selects an installed original `*-delegate` skill, classify it as independent
 delegation and follow that skill's prerequisites/relay workflow. It is not protected
 Light/Parallel: do not promise bridge locks, scope, isolation or integration receipts.
+An original skill selection takes precedence over the managed mode table above. Keep
+its upstream entrypoint, relay and support-tool procedure unchanged; do not redirect it
+to Light or prepend Bridge health/worktree/integration steps because Bridge is available.
 Assign an exclusive approved workspace/resource set, never overlapping an active bridge
 writer. Read only the selected skill; installing it does not authorize its provider,
 fleet configuration or background-service bootstrap.
