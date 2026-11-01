@@ -4,13 +4,20 @@ Mode describes how work is arranged. Worker describes which CLI/provider execute
 Choose these separately; a catalog of CLI Skills does not make every CLI a managed
 Bridge worker.
 
+Assess ownership before selecting a mode: the orchestrator executes small/simple work
+and difficult, complex, sensitive, critical or high-impact work directly. Delegate only
+medium-complexity, well-defined, non-critical tasks when the useful work outweighs the
+handoff and synchronization cost. A task's count or difficulty alone does not justify a
+worker. The orchestrator implements/reviews the shared foundation, integrates branch
+outputs and verifies the combined state before releasing a dependent DAG stage.
+
 | Mode | Good fit | Execution and review |
 | --- | --- | --- |
-| Direct | Small, obvious change with little delegation benefit | Current client does the work under project instructions. This is not a delegated job. |
-| Managed Light | One bounded implementation or investigation | One sequential `run_opencode_agent` call with `executionMode: "light"`; managed OpenCode or explicitly enabled Codex. |
-| Managed Parallel | Independent deliverables with compatible, disjoint file/resource ownership | Validate the delegation plan, then use `run_opencode_parallel`; inspect individual results and combined behavior. |
-| Durable Queue / Pipeline | Jobs requiring scheduling, persisted state, dependencies or staged completion | Use the registered queue/pipeline schemas and their actual final gates. Queueing is distinct from simply launching more parallel calls. |
-| Independent delegate | The user chooses an original CLI-specific workflow | Use its locally installed relay/helper and review procedure in an exclusive approved workspace. |
+| Direct | Small/simple tasks; difficult/complex work; sensitive, critical or high-impact work | Orchestrator implements directly under project instructions and owns integration. |
+| Managed Light | One eligible medium task with worthwhile delegation benefit | One sequential `run_opencode_agent` call with `executionMode: "light"`; managed OpenCode or explicitly enabled Codex. |
+| Managed Parallel | Eligible medium deliverables with compatible, disjoint file/resource ownership | Validate the delegation plan, then use `run_opencode_parallel`; inspect individual results and combined behavior. |
+| Durable Queue / Pipeline | Eligible medium jobs requiring scheduling, persisted state or staged completion | Use the registered queue/pipeline schemas and their actual final gates. The orchestrator owns cross-stage dependencies. |
+| Independent delegate | An eligible task with a user-selected original CLI workflow | Use its unchanged locally installed relay/helper and review procedure in an exclusive approved workspace. |
 
 ## Managed worker choices
 

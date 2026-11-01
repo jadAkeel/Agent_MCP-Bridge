@@ -13,6 +13,13 @@ reviewed combined candidate and honest acceptance state. Use
 [task/check ledger](../references/contracts.md); load
 [verification](../references/verification.md) when assigning checks or deciding reruns.
 
+Apply the execution-ownership policy before dispatch. The orchestrator implements simple
+work and difficult/complex, sensitive, critical or high-impact work itself. Delegate only
+eligible medium tasks with a clear scope and worthwhile coordination cost. Establish and
+review the shared foundation before branching; the orchestrator combines predecessor
+outputs, resolves conflicts and verifies the integrated result before the next DAG stage.
+Keep required independent review; workers' success reports alone never release a stage.
+
 1. Start only runnable priorities. Give each worker goal/acceptance, reviewed input and
    predecessor decisions, exact read/write ownership, forbidden paths, interfaces and
    shared resources, actual commands and check owners, stop conditions and report contract.

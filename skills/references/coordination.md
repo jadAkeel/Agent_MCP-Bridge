@@ -4,6 +4,37 @@ Maintained source adapted from the agent-mcp-bridge orchestration draft and the 
 Day4/Day5 and Public Menu lessons. The three entrypoints split decisions, execution and
 learning; this reference owns their common invariants.
 
+## Execution ownership before mode selection
+
+This policy guides coordinator decisions; it does not add an automatic risk classifier
+or a general DAG scheduler.
+
+The orchestrator executes small/simple tasks directly when delegation and synchronization
+would cost more than the work. It also directly owns and implements difficult, complex,
+ambiguous, tightly coupled, sensitive, critical or high-impact work. This includes the
+shared foundation, architectural decisions and integration. One task, a bounded scope,
+or high difficulty alone never makes work eligible for delegation.
+
+Only medium-complexity, clearly scoped, non-sensitive, non-critical deliverables are
+eligible for delegation, after comparing the benefit with briefing, synchronization,
+integration and review costs. A larger project may contain such tasks around a core the
+orchestrator implements. Choose an original delegate or a managed Bridge mode only after
+this assessment. An explicit task-specific user exception takes precedence; available
+workers, a queue, or parallel capacity do not imply an exception. Required independent
+review can inspect critical work without transferring its implementation ownership.
+
+For dependent branches, the orchestrator implements and reviews the common foundation
+before fan-out, or reuses an already accepted foundation. Give workers bounded eligible
+tasks from that baseline. The orchestrator owns DAG stage transitions: review and combine
+predecessor changes, resolve merge and interface conflicts, and verify the combined result
+before releasing dependent tasks. Passing individual jobs alone does not release a stage.
+Workers receive the actual reviewed file state and do not merge other branches or launch
+the next stage unless explicitly assigned. Model dependencies in the existing plan; do
+not invent a general DAG scheduler or unsupported tool fields. A small single task needs
+neither a new DAG nor a compulsory worktree.
+
+## Shared invariants
+
 - User authorization and project instructions bound all routes. Delegation does not
   authorize committing, merging, publishing, paid calls or more workers.
 - The bridge owns jobs, locks, scopes, writer worktrees, slots and integration receipts.

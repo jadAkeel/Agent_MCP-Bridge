@@ -28,16 +28,23 @@ before parallel dispatch.
 
 ## 2. Choose the smallest useful execution mode
 
+First choose execution ownership. The orchestrator implements small/simple tasks and
+difficult, complex, sensitive, critical or high-impact work directly. It establishes the
+shared foundation and owns branch integration and DAG stage transitions. Only clearly
+scoped, non-sensitive, non-critical medium tasks qualify for delegation, when their
+benefit exceeds handoff, synchronization and review costs. A single task is not a reason
+to delegate. Release dependent work only from the reviewed combined predecessor state.
+
 Read the [mode guide](references/modes.md), then use
 [Bridge planning](library/bridge-plan/SKILL.md) to define ownership and acceptance.
 
 | Task shape | Route |
 | --- | --- |
-| Tiny obvious change | Work directly in the current client |
-| One bounded task | Sequential managed Light execution |
-| Independent tasks with disjoint resources | Validated managed parallel execution |
-| Work requiring durable scheduling or stages | Bridge queue/pipeline tools |
-| A user-selected independent CLI workflow | The corresponding original delegate |
+| Small/simple task, or difficult/complex or sensitive/critical/high-impact work | Orchestrator executes directly |
+| One eligible medium task selected for managed execution | Sequential managed Light execution |
+| Independent eligible medium tasks with disjoint resources | Validated managed parallel execution |
+| Eligible medium jobs requiring durable scheduling | Bridge queue/pipeline tools |
+| An eligible task with a user-selected independent CLI workflow | The corresponding original delegate |
 
 Use the [delegate catalog](references/catalog.md) to load only the selected guide.
 Independent delegates use their own relays and permissions. Managed Bridge routes use
