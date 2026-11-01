@@ -42,6 +42,9 @@ Read the [mode guide](references/modes.md), then use
 Use the [delegate catalog](references/catalog.md) to load only the selected guide.
 Independent delegates use their own relays and permissions. Managed Bridge routes use
 Bridge MCP tools. Keep their workspaces and resource ownership distinct.
+When an original delegate skill is selected, follow its upstream workflow unchanged,
+including its own support utilities. Do not translate it into managed Light or inject
+Bridge prerequisites. The managed mode table applies when a Bridge route is selected.
 
 ## 3. Execute the agreed work
 

@@ -88,6 +88,12 @@ CLIs or run a provider task. Read the selected skill's own platform/permission c
 Codex background use needs separate authorized `codex-background` setup. Existing differing
 personal skills are refused, never silently replaced. [Selection and boundaries](docs/ONBOARDING.md#independent-original-delegate-skills).
 
+Original names such as `opencode-delegate` retain the author's own workflow. Selecting
+one does not select managed Light, require a Bridge status check, or impose a Bridge
+worktree. Do not inject a preference for Bridge into an original skill just because
+Bridge is installed. The separately named `bridge-delegate-*` guides apply to managed
+Bridge work. See the [upstream preservation policy](docs/DELEGATE-UPSTREAM.md).
+
 The installer checks versions and local doctor/health, never reads sign-in credentials or
 launches inference. It reports sign-in as unknown/needs-auth and requests a client restart.
 Sign in through the normal client/provider flow. Live inference smoke is a separate action.
