@@ -1,4 +1,4 @@
-# Codex OpenCode MCP Bridge
+#Agent MCP Bridge
 
 An MCP server that lets Codex and Claude Code hand bounded tasks to OpenCode agents, such as a reviewer, a builder, or a debugger, while the client stays the planner, reviewer, and only integrator. Both clients can use the same bridge on the same repository at the same time: locks and the provider limit are shared.
 
