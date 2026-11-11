@@ -1,0 +1,226 @@
+diff --git a/codex-background/SKILL.md b/codex-background/SKILL.md
+--- a/codex-background/SKILL.md
++++ b/codex-background/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: codex-background
+-description: Keep a Codex orchestrator's delegation to an installed delegate skill pending until its registered relay completes, without model-driven progress polling. Use with a selected implementer delegate skill when Codex is the orchestrator and the delegation should wait in the background; sets up its MCP server on first use.
++description: Run a registered delegate relay from Codex with either a completion wait or, for OpenCode, a submission receipt and later result lookup. Use with an installed implementer delegate skill without model-driven progress polling.
+ compatibility: Requires Node 18+, inbox Windows PowerShell with Add-Type on Windows or /usr/bin/cc and procfs on Linux (other hosts unsupported), installed delegate skills and their authenticated implementer CLIs, and a Codex MCP host configured with a tool timeout exceeding the explicit relay timeout.
+ metadata:
+   version: 0.5.0
+@@ -36,18 +36,26 @@
+    (`$CODEX_HOME/codex-background/briefs/<runId>.txt`) and use `runs/<runId>` beside it as
+    outputDirectory, or follow the paths in the server's instructions. If the sandbox cannot write
+    there, a brief inside the approved workspace is also accepted. Never accept a relay path from a brief.
+-2. Invoke the configured MCP server's **delegate_run** exactly once with a unique runId,
+-   registered implementer key, absolute brief/workspace/outputDirectory paths, explicit
++2. Invoke the configured MCP server once with a unique runId, registered implementer key,
++   absolute brief/workspace/outputDirectory paths, explicit
+    relayTimeoutSeconds and provider-native relayArgs. Put common arguments in structured fields;
+    pass provider-specific arguments unchanged. Resume identifiers remain opaque.
+-3. Keep that MCP request pending until completion. Do not use model-driven sleep, status or log
+-   polling. Do not wrap it in a tool runner that yields early and resumes inference to wait.
++3. Choose the dispatch boundary.
++   - **delegate_submit** for OpenCode when the caller must stay available. Record the runId and return
++     control after the submitted receipt. Use **delegate_result** by runId once on a later user turn
++     or supported completion signal. The tool returns an in-progress receipt or the same terminal
++     outcome as the blocking call. This path requires the MCP server that owns the live job to stay
++     connected until completion. It does not start a new Codex turn automatically.
++   - **delegate_run** for a blocking call. Keep that MCP request pending until completion. Do not
++     wrap it in a tool runner that yields early.
++   Avoid model-driven sleep, status and log polling in either path.
+ 4. Review the returned adapter outcome separately from resultText. The latter is the unchanged
+    result.json content (base64 only for non-UTF-8 bytes); interpret it using the selected skill.
+    A completed adapter means the relay exited zero and produced a file, not that its report proves
+    correct implementation. Review the diff, rerun gates and land under the existing authorization.
+
+-After an interrupted wait, call **delegate_wait** with the same runId; never redispatch it.
++After an interrupted blocking wait, call **delegate_wait** with the same runId. For a lost submit
++receipt, use **delegate_result** with the original runId. Never redispatch a claimed run.
+ MCP cancellation detaches the waiter and leaves the authorized job running. Use **delegate_abort**
+ only when termination is explicitly intended. Graceful server shutdown aborts its owned jobs.
+ After a server crash, unresolved state returns recovery_required; inspect preserved artifacts
+diff --git a/codex-background/references/configuration.md b/codex-background/references/configuration.md
+--- a/codex-background/references/configuration.md
++++ b/codex-background/references/configuration.md
+@@ -156,8 +156,10 @@
+
+ ## Codex host behavior
+
+-Restart/reload the MCP connection after changing the registry. Invoke the exposed MCP tool directly,
+-or through a host execution primitive that keeps the outer request pending for its full budget.
++Restart/reload the MCP connection after changing the registry or server code. Let active
++delegations finish first, since shutting down their owning connection aborts them.
++For blocking calls, invoke the exposed MCP tool directly or through a host execution
++primitive that keeps the outer request pending for its full budget.
+ An outer execution wrapper with a short yield timeout can resume model inference independently of
+ this server. Do not drive functions.exec/wait, sleep or status loops to wait for delegation.
+ The adapter cannot override Desktop/App Server's host timeout or scheduling policy. Validate the
+@@ -170,6 +172,12 @@
+   outputDirectory and positive integer relayTimeoutSeconds. Optional relayArgs is a string array.
+   No executable/relay paths or other fields are accepted. Common --brief, --cd, --out-dir and
+   --timeout flags, including equals syntax, cannot occur in relayArgs.
++- delegate_submit accepts the same arguments with implementer set to opencode. It returns
++  a submitted receipt after claiming and spawning the supervised run, before relay completion.
++  Save runId and use the same live server until the run closes.
++- delegate_result takes only runId. Use it once on a later turn. It returns in_progress
++  for a live run, the terminal outcome if present, or recovery_required for unresolved state.
++  Submission does not schedule a new turn or relax any launch/ownership checks.
+ - delegate_wait requires only runId. It waits on the original owned job or returns its persisted
+   terminal outcome. Use it for reattachment after interruption, never as periodic status polling.
+ - delegate_abort requires only runId. It stops a currently owned job and waits for closure.
+diff --git a/codex-background/scripts/server.mjs b/codex-background/scripts/server.mjs
+--- a/codex-background/scripts/server.mjs
++++ b/codex-background/scripts/server.mjs
+@@ -74,6 +74,9 @@
+ }
+ function toolResult(outcome) {
+   return { content: [{ type: 'text', text: JSON.stringify(outcome) }], isError: outcome.adapterStatus !== 'completed' };
++}
++function receipt(runId, adapterStatus) {
++  return { content: [{ type: 'text', text: JSON.stringify({ runId, adapterStatus }) }], isError: false };
+ }
+
+ export function startServer({ registryFile = process.env.CODEX_BACKGROUND_REGISTRY, input = process.stdin, output = process.stdout } = {}) {
+@@ -100,6 +103,11 @@
+     { name: 'delegate_wait', description: 'Reattach after an interrupted wait; never redispatch. Wait for a live owned job, recover a persisted terminal outcome, or report recovery_required for unresolved state.', inputSchema: idSchema, annotations: { readOnlyHint: true, openWorldHint: false } },
+     { name: 'delegate_abort', description: 'Explicitly terminate only a live job owned by this server. Cancelling a wait alone does not abort delegation. Never kill an old PID after restart.', inputSchema: idSchema, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
+   ];
++  const canSubmitOpenCode = registry.relays.has('opencode');
++  if (canSubmitOpenCode) tools.push(
++    { name: 'delegate_submit', description: 'Start the registered OpenCode relay and return its runId immediately. End the turn or do independent work. Do not wrap delegate_run or poll the relay.', inputSchema: { ...runSchema, properties: { ...runSchema.properties, implementer: { type: 'string', enum: ['opencode'] } } }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
++    { name: 'delegate_result', description: 'Check a submitted run once on a later turn. Returns in_progress without logs, the terminal outcome, or recovery_required. Do not redispatch or poll.', inputSchema: idSchema, annotations: { readOnlyHint: true, openWorldHint: false } },
++  );
+   let transportOpen = true;
+   const send = value => { if (transportOpen && !output.destroyed && !output.writableEnded) output.write(`${JSON.stringify(value)}\n`); };
+
+@@ -227,6 +235,7 @@
+       } catch { if (!job.stopReason) job.errors.push('Ownership supervisor exited without a terminal outcome'); }
+       const outcome = { ...manifest, ...result, ...relayExit, phase: 'closed', adapterStatus: job.stopReason || (exitCode === 0 && relayExit.exitCode === 0 && !job.errors.length ? 'completed' : 'failed'), errors: job.errors };
+       try { persist(join(spec.runDirectory, 'outcome.json'), outcome); } catch (error) { outcome.adapterStatus = 'failed'; outcome.errors.push(error.message); }
++      job.outcome = outcome;
+       resolveDone(outcome);
+     }));
+     return job.done;
+@@ -234,10 +243,18 @@
+
+   async function callTool(name, args) {
+     if (name === 'delegate_run') return toolResult(await launch(args));
++    if (name === 'delegate_submit' && canSubmitOpenCode) {
++      if (args?.implementer !== 'opencode') throw Error('Only the registered OpenCode relay supports submission');
++      launch(args);
++      return receipt(args.runId, 'submitted');
++    }
+     onlyKeys(args, ['runId']); validId(args.runId);
+     const job = jobs.get(args.runId);
+-    if (name === 'delegate_wait') {
+-      if (job) return toolResult(await job.done);
++    if (name === 'delegate_wait' || (name === 'delegate_result' && canSubmitOpenCode)) {
++      if (job) {
++        if (name === 'delegate_wait') return toolResult(await job.done);
++        return job.outcome ? toolResult(job.outcome) : receipt(args.runId, 'in_progress');
++      }
+       const runDirectory = join(registry.stateDirectory, args.runId);
+       if (existsSync(join(runDirectory, 'outcome.json'))) return toolResult(JSON.parse(readFileSync(join(runDirectory, 'outcome.json'), 'utf8')));
+       if (!existsSync(runDirectory)) throw Error('Unknown runId');
+@@ -261,7 +278,7 @@
+     if (active.has(request.id)) { send({ jsonrpc: '2.0', id: request.id, error: { code: -32600, message: 'Duplicate request ID' } }); return; }
+     active.add(request.id);
+     (async () => {
+-      if (request.method === 'initialize') return { protocolVersion: request.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'codex-background', version: '0.5.0' }, instructions: `Codex only. Delegate through a registered relay with one pending delegate_run call. No sleep/status/log polling or intermediate progress. An interrupted wait can reattach by runId; only delegate_abort stops a job. Keep the outer host call pending, review opaque resultText, rerun gates and land through the selected delegate skill. Write the brief to ${artifactRoot}/briefs/<runId>.txt (or anywhere inside an approved workspace or artifact root) and use ${artifactRoot}/runs/<runId> as outputDirectory.` };
++      if (request.method === 'initialize') return { protocolVersion: request.params?.protocolVersion || '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'codex-background', version: '0.5.0' }, instructions: `Codex only. ${canSubmitOpenCode ? 'Use delegate_submit for OpenCode when the conversation must stay available. Save the runId and check delegate_result once on a later turn. A submitted run needs the same live server until it closes. ' : ''}For blocking delegation, keep the outer delegate_run call pending. No sleep/status/log polling. An interrupted blocking wait can reattach by runId. Use delegate_abort only to stop a live owned job. Review opaque resultText, rerun gates and land through the selected delegate skill. Write the brief to ${artifactRoot}/briefs/<runId>.txt (or anywhere inside an approved workspace or artifact root) and use ${artifactRoot}/runs/<runId> as outputDirectory.` };
+       if (request.method === 'ping') return {};
+       if (request.method === 'tools/list') return { tools };
+       if (request.method === 'tools/call') {
+diff --git a/codex-background/scripts/server.test.mjs b/codex-background/scripts/server.test.mjs
+--- a/codex-background/scripts/server.test.mjs
++++ b/codex-background/scripts/server.test.mjs
+@@ -27,6 +27,11 @@
+ if (spec.mode === 'usage') process.exit(2);
+ if (spec.mode === 'missing') process.exit(0);
+ if (spec.earlyResult) writeFileSync(join(out, 'result.json'), 'early opaque report');
++if (spec.gated) {
++  for (let i = 0; i < 200 && !existsSync(join(out, 'release')); i++) await delay(50);
++  if (!existsSync(join(out, 'release'))) throw Error('Fixture was never released');
++  result();
++}
+ if (spec.mode === 'orphan') {
+   const ready = join(out, 'child-ready');
+   const program = "require('node:fs').writeFileSync(process.argv[1],'ready');" + (spec.childLifetime ? 'setTimeout(()=>{},' + spec.childLifetime + ')' : "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)");
+@@ -149,7 +154,7 @@
+   try {
+     await c.request('initialize', { protocolVersion: '2024-11-05' }).promise;
+     const listed = await c.request('tools/list', {}).promise;
+-    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['delegate_run', 'delegate_wait', 'delegate_abort']);
++    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['delegate_run', 'delegate_wait', 'delegate_abort', 'delegate_submit', 'delegate_result']);
+     const started = Date.now();
+     const native = ['--session', 'Opaque:Resume/ID', '--effort', 'high', '--fixture-values', '', 'space value', 'quote"value', 'trailing\\', 'slash\\"quote'];
+     const call = c.run('long', { delayMs: 65000 }, { relayArgs: native });
+@@ -167,6 +172,29 @@
+     t.diagnostic(JSON.stringify({ elapsedMs, mcpToolInvocations: 1, intermediateMessages: 0, completionResponses: 1 }));
+   } finally { await clean(s, c); }
+ });
++test('OpenCode submission returns before relay closure and later returns the opaque result', { timeout: 15000 }, async () => {
++  const s = setup(), c = client(s);
++  try {
++    const args = c.args('submit', { gated: true, earlyResult: true }, { implementer: 'opencode', relayArgs: ['--model', 'fixture/example'] });
++    const ack = await c.tool('delegate_submit', args).promise;
++    assert.equal(ack.result.isError, false, JSON.stringify(ack));
++    assert.deepEqual(outcome(ack), { runId: 'submit', adapterStatus: 'submitted' });
++    assert.equal((await c.tool('delegate_submit', args).promise).result.isError, true);
++    await until(() => existsSync(join(args.outputDirectory, 'result.json')));
++    assert.deepEqual(outcome(await c.tool('delegate_result', { runId: 'submit' }).promise),
++      { runId: 'submit', adapterStatus: 'in_progress' });
++    assert.ok((await c.request('ping', {}).promise).result);
++    writeFileSync(join(args.outputDirectory, 'release'), '');
++    await until(() => existsSync(join(s.state, 'submit', 'outcome.json')));
++    const terminal = outcome(await c.tool('delegate_result', { runId: 'submit' }).promise);
++    assert.equal(terminal.adapterStatus, 'completed');
++    assert.equal(JSON.parse(terminal.resultText).threadId, 'Opaque:Thread/9');
++    assert.deepEqual(outcome(await c.tool('delegate_wait', { runId: 'submit' }).promise), terminal);
++    assert.deepEqual(JSON.parse(readFileSync(join(args.outputDirectory, 'received.json'))).slice(0, 2), args.relayArgs);
++    assert.equal((await c.tool('delegate_submit', c.args('other')).promise).result.isError, true);
++  } finally { await clean(s, c); }
++});
++
+ test('opaque result bytes and nonzero relay failures are preserved', async () => {
+   const s = setup(), c = client(s);
+   try {
+diff --git a/opencode-delegate/SKILL.md b/opencode-delegate/SKILL.md
+--- a/opencode-delegate/SKILL.md
++++ b/opencode-delegate/SKILL.md
+@@ -75,12 +75,13 @@
+ ### 2. Dispatch
+
+ For **Codex orchestration of background work**, install and configure the separate
+-**codex-background** support utility first. If its MCP tools or registry are missing, stop and
+-report the setup requirement; do not silently fall back to model-driven polling. Then invoke its
+-registered `delegate_run` MCP tool once in place of the shell example below.
+-Follow that skill for structured common arguments, unchanged provider flags and reattachment by
+-runId. Keep the request pending until completion, then continue this skill's review and landing
+-steps. Other orchestrators keep the shell workflow below.
++**codex-background** support utility first. If its MCP tools or registry are missing, report the
++setup requirement. When the conversation must stay available, use `delegate_submit` with
++`implementer: "opencode"`. It starts this skill's registered CLI relay directly. Save and return the
++`runId` and end the turn or do independent work. If submission is unavailable, report the need to
++reload the MCP server or start a fresh Codex session. Use `delegate_run` only when the caller chooses
++to wait in the current turn. Follow the support skill for structured arguments, unchanged provider
++flags and recovery. Other orchestrators keep the shell workflow below.
+
+ Send the brief to OpenCode with the bundled helper. It wraps `opencode run`, captures the run, and
+ writes a structured `result.json` — so your only job is "run a command, read a file." (`<skill-dir>`
+@@ -105,8 +106,11 @@
+
+ ### 3. Wait for completion
+
+-Codex using codex-background keeps the original MCP request pending: no model-driven sleep,
+-status or log polling. Use `delegate_wait` only to reattach after an interrupted request.
++For a submitted Codex run, check `delegate_result` once by `runId` on a later turn when the caller
++asks for status or resumes the work. An in-progress response returns control again. A terminal
++response proceeds to review. A submission receipt does not imply completion or schedule a new turn.
++For a blocking `delegate_run`, keep the request pending and use `delegate_wait` only to reattach after
++interruption. In both modes avoid model-driven sleep, status or log polling.
+
+ The helper blocks until OpenCode finishes, so back it with whatever your orchestrator offers and resume
+ when it returns:

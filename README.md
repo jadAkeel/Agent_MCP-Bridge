@@ -212,6 +212,7 @@ A bridge lives only as long as its MCP client, so a batch of hundreds of queued 
 - [docs/ONBOARDING.md](docs/ONBOARDING.md): a new operator's setup, from prerequisites to a first reviewed change, restarts and rollback.
 - [docs/USER_GUIDE.md](docs/USER_GUIDE.md): how it works, daily use, troubleshooting, releases.
 - [docs/REFERENCE.md](docs/REFERENCE.md): Scope Contract rules, tool behavior, and every configuration variable.
+- [docs/ORCHESTRATOR-DAG.md](docs/ORCHESTRATOR-DAG.md): Beads dependencies, verified joins, and standalone OpenCode Light.
 - [log.md](log.md): every problem found in real use, with its cause and fix.
 - [docs/archive/](docs/archive/): historical audits and design notes. They are not current.
 

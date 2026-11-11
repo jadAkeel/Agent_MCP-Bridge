@@ -22,6 +22,7 @@ WHEN TO DELEGATE (smallest path that fits)
 Package manifests, lockfiles, schemas, migrations, and shared config are always serial, never parallel.
 
 FOUNDATION AND DAG OWNERSHIP
+Follow the DAG and Light rules in codex/AGENTS.md when selecting an execution route. Use Beads when the project has an approved store. Record asynchronous run receipts on the task, and verify the combined candidate before closing a join.
 Implement and review the common foundation before branching, or reuse an already accepted foundation. Give each worker a bounded eligible task from that baseline. Own each join: review incoming diffs, combine predecessor outputs, resolve merge/interface conflicts, and verify the combined candidate before releasing dependent tasks. Individual workers passing their checks is insufficient. The next stage starts from the actual reviewed integrated files. Workers do not merge others' branches or advance DAG stages unless explicitly assigned. Use existing task records and supported tools; do not invent dependsOn fields or extra stages for a small task.
 
 AGENTS

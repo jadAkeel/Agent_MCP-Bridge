@@ -24,6 +24,14 @@
 
 ## Global Skills
 
+### DAGs and OpenCode Light
+
+- When the user requests a DAG and the project has an approved Beads workspace, follow `docs/ORCHESTRATOR-DAG.md` in the Bridge checkout. Use Beads for task status and dependencies. Keep the approved plan as the specification and retain review, tests, integration, and dependency release with the orchestrator.
+- Interpret unqualified OpenCode Light as a single eligible task using the standalone `opencode-delegate` skill with the optional submission adapter documented in `adapters/codex-background-submit/README.md`. Return the run ID after dispatch and use it on a later turn. Use an approved exclusive workspace. Interpret explicit Bridge Light or `executionMode: "light"` as managed Bridge execution. For eligible managed work where the conversation must stay available, use the Bridge queue when it fits the authorized scope, model, and permissions.
+- Keep optional helper services disabled while idle. Start only the helper needed for authorized work. Track its owner, live jobs, pending calls, and uncollected results. After the last caller finishes, verify the instance is idle, stop the owned helper, and restore temporary configuration. Keep a shared instance running while another caller still needs it or ownership remains uncertain.
+
+### Available skills
+
 Skills live in `~/.codex/skills` and should be used when helpful, not for tiny obvious edits.
 
 - `repo-onboarding`: analyze a repository, identify stack, structure, commands, risks, conventions, and next steps.
