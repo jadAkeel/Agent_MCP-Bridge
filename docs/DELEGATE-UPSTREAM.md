@@ -10,8 +10,9 @@ Selecting an original skill such as `opencode-delegate` selects the author's wor
 prepare a bounded brief, invoke its relay or required support tool, interpret its result,
 and review the actual changes. Its selected workspace and permissions govern execution.
 Agent MCP Bridge does not add a mandatory worktree, locks or integration receipts to it.
-For Codex background orchestration, the author's `codex-background` utility remains the
-required waiting mechanism; short foreground runs follow its documented exception.
+For Codex background orchestration, the author's `codex-background` utility provides
+the original completion wait. The optional [OpenCode submission adapter](../adapters/codex-background-submit/README.md)
+adds an immediate receipt and later result lookup to a local copy of those skills.
 
 The `bridge-delegate-*` guides are separately named adaptations. Their managed Light
 and parallel execution keep Bridge's existing worktrees, locks and reviewed integration.
