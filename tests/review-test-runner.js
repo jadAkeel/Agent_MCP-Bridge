@@ -161,6 +161,32 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.throws(() => validateGateManifest(parseCommandChain("node tests/x.js")), /skip-gate/);
 });
 
+test("the canonical supervisor self-test runs after parallel children close with its original timeout", async () => {
+  const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
+  const supervisor = parseCommandChain(packageJson.scripts["test:commands"])
+    .find(entry => entry.argv[0] === "bin/process-supervisor.js" && entry.argv.includes("--self-test"));
+  assert.ok(supervisor);
+  assert.equal(supervisor.lane, "exclusive", "The native process snapshot must not compete with parallel test processes.");
+  assert.equal(supervisor.timeoutMs, 900_000);
+  assert.equal(parseCommandChain("node --check bin/process-supervisor.js")[0].lane, "syntax");
+  const events = path.join(scratch, "supervisor-events.jsonl");
+  const commands = [
+    { ...supervisor, index: 0 },
+    command(1, [script, events, "parallel-a", "200"]),
+    command(2, [script, events, "parallel-b", "200"]),
+    command(3, [script, events, "after-supervisor", "0"], "exclusive"),
+  ];
+  const report = await runTestCommands({ commands, cwd: ROOT, env: await environment("supervisor-temp"),
+    logRoot: path.join(scratch, "supervisor-logs"), jobs: 2 });
+  assert.equal(report.failed, 0, JSON.stringify(report.results.filter(entry => entry.status !== "passed")));
+  assert.equal(report.passed, 4);
+  const [supervisorResult, first, second, following] = report.results;
+  for (const parallel of [first, second])
+    assert.ok(Date.parse(parallel.finishedAt) <= Date.parse(supervisorResult.startedAt), "A parallel child overlapped the supervisor self-test.");
+  assert.ok(Date.parse(supervisorResult.finishedAt) <= Date.parse(following.startedAt));
+  assert.match(await readFile(supervisorResult.log, "utf8"), /Process supervisor self-test passed\./);
+});
+
 test("run-owned TEMP and native profiles stay outside Git while log reports remain in the checkout", async () => {
   const root = await createTestFixtureRoot();
   try {

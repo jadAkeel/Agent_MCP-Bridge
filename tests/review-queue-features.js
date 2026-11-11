@@ -324,7 +324,9 @@ async function patchSummary(jobId, patch) {
 test("Q-001: the derived idempotency key is stable, bounded and does not grow down a chain", () => {
   const { requeueIdempotencyKey } = __selfTest.internals;
   assert.equal(requeueIdempotencyKey({ idempotencyKey: "batch-7", jobId: "j1" }, 1), "batch-7:requeue:1");
-  assert.equal(requeueIdempotencyKey({ idempotencyKey: "batch-7:requeue:1", jobId: "j2" }, 2), "batch-7:requeue:2");
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "batch-7:requeue:1", jobId: "j2", requeuedFrom: "j1", requeueSequence: 1 }, 2), "batch-7:requeue:2");
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "user:requeue:1", jobId: "j1" }, 1), "user:requeue:1:requeue:1");
+  assert.equal(requeueIdempotencyKey({ idempotencyKey: "user:requeue:1:requeue:1", jobId: "j2", requeuedFrom: "j1", requeueSequence: 1 }, 2), "user:requeue:1:requeue:2");
   assert.equal(requeueIdempotencyKey({ idempotencyKey: "", jobId: "builder-1-ab" }, 1), "builder-1-ab:requeue:1");
   const long = requeueIdempotencyKey({ idempotencyKey: "k".repeat(200), jobId: "j" }, 12);
   assert.ok(long.length <= 200 && long.endsWith(":requeue:12"), long);
@@ -372,6 +374,64 @@ test("Q-001: a failed writer is requeued as a new job with the stored request, l
   const view = JSON.parse(textOf(await callTool("get_opencode_job", { cwd: repo, jobId: created })));
   assert.equal(view.requeuedFrom, original);
 });
+
+test("BR-001: a retry cannot reuse an unrelated job with identical request content", async () => {
+  const original = await runToEnd(readJob({ idempotencyKey: "br001-occupied" }), failedExecution());
+  const unrelated = await runToEnd(readJob({ idempotencyKey: "br001-occupied:requeue:1" }), failedExecution());
+  const outcome = await __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: original });
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.errorType, "queue_idempotency_conflict");
+  assert.equal((await durable(original)).requeuedAs || "", "");
+  assert.equal((await durable(unrelated)).requeuedFrom || "", "");
+  assert.equal((await __selfTest.internals.markQueueJobRequeued(repo, original, original)).marked, false);
+});
+
+test("BR-001: automatic same-model retries preserve a suffix-bearing root and stop at maxAttempts", async () => {
+  let executions = 0;
+  let current = await runToEnd(readJob({ idempotencyKey: "br001-auto:requeue:1", maxAttempts: 3 }), () => { executions++; return failedExecution(); });
+  for (let attempt = 2; attempt <= 3; attempt++) {
+    assert.ok(await waitFor(async () => Boolean((await durable(current))?.requeuedAs)));
+    const next = (await durable(current)).requeuedAs;
+    assert.notEqual(next, current);
+    current = next;
+    assert.ok(await waitFor(async () => (await durable(current))?.status === "failed"));
+    assert.equal((await durable(current)).retryAttempt, attempt);
+  }
+  assert.ok(await waitFor(async () => (await durable(current))?.completionOutcome === "gave_up"));
+  assert.equal((await durable(current)).requeuedAs || "", "");
+  assert.equal(executions, 3);
+});
+
+for (const key of ["br001-ordinary", "br001-suffix:requeue:1", "br001-nested:requeue:1:requeue:2"]) {
+  test(`BR-001: ${key} has distinct, deduplicated successive retries`, async () => {
+    let executions = 0;
+    const original = await runToEnd(readJob({ idempotencyKey: key }), () => { executions++; return failedExecution(); });
+    let predecessor = original;
+    for (let sequence = 1; sequence <= 3; sequence++) {
+      const outcomes = await Promise.all([1, 2].map(() => __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: predecessor })));
+      const accepted = outcomes.filter((value) => value.ok);
+      assert.ok(accepted.length, JSON.stringify(outcomes));
+      const successor = accepted[0].record.jobId;
+      assert.notEqual(successor, predecessor, "a retry must never deduplicate to its predecessor");
+      for (const value of accepted) assert.equal(value.record.jobId, successor, "concurrent callers share one successor");
+      for (const value of outcomes.filter((value) => !value.ok)) assert.equal(value.errorType, "requeue_already_requeued");
+      assert.ok(await waitFor(async () => (await durable(successor))?.status === "failed"));
+      assert.equal((await durable(predecessor)).requeuedAs, successor);
+      assert.equal((await durable(successor)).requeuedFrom, predecessor);
+      assert.equal((await durable(successor)).requeueSequence, sequence);
+      assert.equal((await durable(successor)).idempotencyKey, `${key}:requeue:${sequence}`, "preserve the entire user root key");
+      assert.equal(executions, sequence + 1, "one execution per distinct attempt");
+      // Model a retry after admission succeeded but the predecessor receipt was lost.
+      await patchSummary(predecessor, { requeuedAs: "", retryDecisionOutcome: "" });
+      const repeated = await __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: predecessor });
+      assert.equal(repeated.ok, true, JSON.stringify(repeated));
+      assert.equal(repeated.deduplicated, true);
+      assert.equal(repeated.record.jobId, successor);
+      assert.equal((await __selfTest.internals.requeueQueueJob({ cwd: repo, jobId: predecessor })).errorType, "requeue_already_requeued");
+      predecessor = successor;
+    }
+  });
+}
 
 test("Q-001: model and timeout overrides pass through, everything else is replayed", async () => {
   selfTestHooks.selfTestModelOverrideAllowlist = ["fixture/model-b@high", "fixture/model-c"];
