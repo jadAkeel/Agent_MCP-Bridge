@@ -719,6 +719,7 @@ const jobInputShape = {
   autoIntegrate: z.boolean().optional().describe("enqueue_opencode_job only, write jobs with a validationCommand. When the finished job only ADDED new files and its validation passed, the bridge integrates them (the same dry run, receipt, validation and rollback as integrate_opencode_worktree) and commits exactly those files with the target repository's last commit identity. Any other patch keeps the normal reviewed flow."),
   dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
   scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
+  codexProfile: z.string().optional().describe("Operator-registered Codex account ID. Requires an allowlisted codex model. Omit to inherit the Bridge's default Codex home."),
   allowFallbackToBuild: z.boolean().optional(),
   subagentStrategy: z.enum(["proxy", "reject"]).optional(),
   proxyAgent: z.string().optional(),
@@ -3035,6 +3036,7 @@ const { continueWorktreeJobError, normalizeLockType, normalizeLockMode, createLo
   orchestratorPolicyError,
   validationCommandTrustError,
   providerLimitForKey,
+  externalRunnerSelection,
 });
 
 const { sanitizedDiscoveryContext, verifySanitizedJobsBeforeDiscovery, parallelProviderKeys, jobAgentRuntime, getAgentRuntimeTestHook, setAgentRuntimeTestHook } = createJobDiscoveryRuntime({ allowlistedModelOverride, applyModelOverrideToMetadata, providerKeyForMetadata, readAgentDebugMetadata, resolveAgent, runOpenCodeWithPolicy, verifySanitizedWorkspace });
@@ -3482,6 +3484,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     requestFingerprint,
     mode: lockPlan.lockType === "read" ? "read" : "write",
     scopeContract: lockPlan.scopeContract || null,
+    ...(lockPlan.codexProfile === undefined ? {} : { codexProfile: lockPlan.codexProfile }),
     sanitizedWorkspace: normalizedJob.sanitizedWorkspace || null,
     sanitizedWorkspaceVerification: null,
     lockMode: lockPlan.lockMode,

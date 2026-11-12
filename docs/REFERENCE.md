@@ -205,9 +205,40 @@ What stays the same: the OpenCode role is still resolved and attested (the lock 
 - agy: `-p <prompt> --dangerously-skip-permissions --sandbox --disable-slash-commands --output-format stream-json --print-timeout <budget - 60 s> --log-file <sidecar>/agy.log [--model <model>] [--effort <variant>]`, where the budget is what is left of the job timeout when agy starts (the margin is a tenth of a budget under 10 minutes, at least 1 s; B-148), for worktree writers only: a reader is refused (`external_runner_read_unsupported`, nothing keeps agy read-only) and so is a writer without a worktree (`external_runner_worktree_required`). The report and usage come from the stream's `result` event. The idle watchdog is off (the job timeout is the only bound) unless `CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_BY_MODEL` names `agy/<model>`. A quota refusal is detected after the exit (`rate-limited`, `Quota resets in`, `usage limit`, `insufficient_quota`, `RESOURCE_EXHAUSTED`, `429`, or an unexplained exit 3 within 5 minutes) and pauses `agy/<model>`: agy's Gemini and Claude models have separate quotas. The target-checkout guard records the target checkout's `git status`, every ref (`git for-each-ref`; a commit, `branch -f` or a tag leaves `git status` clean), HEAD, and the bytes of every `allowedEdits` file before and after the run; a change fails the job as `external_runner_wrote_outside_worktree` and pauses `agy` for an hour (`resume_opencode_provider agy` ends it). Worktree branches of other bridge jobs (`refs/heads/<CODEX_OPENCODE_WORKTREE_BRANCH_PREFIX>/...`) that are created or deleted meanwhile do not count; one that moves does. The bridge never reverts that change, because it may belong to another client. When git cannot read the target before or after the run (a corrupt index, a removed `.git`), the job fails closed as `external_runner_guard_unverifiable` with the git error, without a pause (log.md B-116).
 - Slots: each runner has its own provider key (`<key>:codex`, `<key>:agy`). `CODEX_OPENCODE_PROVIDER_LIMITS` sets the slots of the listed providers (any provider, not only runners); the others keep `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT`. `set_opencode_concurrency` `providerLimits` changes a provider's own limit at runtime and wins over the env entry; `providerLimit` changes the default limit.
 - Quota groups (both directions, log.md Q-014): a rate limit or a hard quota detected on any member of a `CODEX_OPENCODE_QUOTA_GROUPS` group (`chatgpt:codex,openai`: Codex and `openai/*` share the ChatGPT quota) pauses the provider keys of every member until the same time, whether a runner or an OpenCode run (`openai/<model>`) hit it; the model's own pause (B-061) is recorded as before. A provider-wide pause of any member holds every member: at the slot request, in the retry chooser (`models`) and in the scheduler's pause-wait check, so a job with `["codex/...", "openai/..."]` waits for the pause instead of picking the other member and being refused (B-131). With `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` set every provider shares one key and the groups do nothing.
-- Environment: the OpenCode base keys plus the real `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` (both CLIs keep their login there) and, for codex, `CODEX_HOME`. Sensitive names stay stripped unless `CODEX_OPENCODE_PASSTHROUGH_ENV` names them; `OPENCODE_*` and `CODEX_OPENCODE_*` never reach a runner. The bridge reads the CLIs' credential files only for the agy guard's in-memory fingerprints above.
+- Environment: the OpenCode base keys plus the real `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` (both CLIs keep their login there) and, for codex, `CODEX_HOME`. Sensitive names stay stripped unless `CODEX_OPENCODE_PASSTHROUGH_ENV` names them. `OPENCODE_*` and `CODEX_OPENCODE_*` never reach a runner. Explicit Codex profile jobs additionally remove inherited OpenAI/Codex credential and endpoint overrides.
 - Sidecar files (`last-message.txt`, `agy.log`) live in `<state-dir>/runs/<job>-<random>/`, outside the worktree; a successful run's folder is removed, a failed run's is kept and named in the result (`Runner sidecar: <dir>`, B-146). The report read from `last-message.txt` is redacted like any agent report; the file itself is not.
 - Status and logs: `get_opencode_bridge_status` prints `External runners: codex, agy (unattested ...)` with one line per runner, the per-provider limits and the quota groups (nothing while none is set). `agent.run_failed`, `queue.job_failed` and `provider.rate_limit_detected` carry `runner`, and the issue log line says `(runner codex)`.
+
+### Select a Codex account per job
+
+Register already signed-in Codex homes in the Bridge server's environment. For a Codex client, add these keys to the existing `[mcp_servers.opencode.env]` table and merge the runner and model entries with any already configured.
+
+```toml
+CODEX_OPENCODE_EXTERNAL_RUNNERS = "codex"
+CODEX_OPENCODE_MODEL_ALLOWLIST = "codex/gpt-6.1-sol@high"
+CODEX_OPENCODE_CODEX_PROFILES = '{"profile-3":{"home":"C:/Users/10User/.codex-account3"}}'
+```
+
+Start the Bridge on demand with that environment. If a separate queue worker runs jobs from the same state directory, give it the same map, runner and model settings. Profile IDs are case-sensitive, up to 64 characters, and may contain ASCII letters, digits, underscores and hyphens, starting with a letter or digit. To disable a registered entry, set its `enabled` to `false`. Keep each ID bound to the same account while jobs using it are outstanding.
+
+Pass these arguments to `enqueue_opencode_job`, replacing the example checkout path and file with ones in your workspace.
+
+```json
+{
+  "agent": "reviewer",
+  "task": "Read README.md and summarize its first heading.",
+  "cwd": "C:/work/my-repo",
+  "write": false,
+  "codexProfile": "profile-3",
+  "scopeContract": {
+    "mode": "read",
+    "read": ["README.md"],
+    "modelRequirement": {"provider": "codex", "model": "gpt-6.1-sol", "variant": "high"}
+  }
+}
+```
+
+Use the same field in `run_opencode_agent` or on each job passed to `validate_delegation_plan`, `run_opencode_parallel`, or the pipeline planner. The Bridge checks that the home contains a readable file-backed Codex login (`auth.json`). Codex checks whether that login is still valid at run time. A selected profile applies to that Codex child, including retries on allowlisted Codex models. The queue receipt and job status expose the profile ID. Omit the field to inherit the Bridge default. Provider slot limits and quota pauses still apply across the managed Codex runner.
 
 Not guaranteed: the CLIs' own permissions are not attested (reads outside the scope and network use are not prevented), agy runs with the real `HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA` and can write anywhere: the guard only detects, after the run, changes to the target checkout and the profile files listed above. Not covered are, among others, `~/.claude/settings.json` (hooks), the other parts of `~/.claude.json` and `auth.json`, the contents of `provider-concurrency.sqlite`, `~/.ssh`, shell profiles, other repositories, the bridge's other state files, agy's own settings and MCP registry (their location is not documented), and a path a bridge integration wrote into the target checkout during the run. There is no runtime model proof (`CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=true` fails every runner job), agy reports no step events or mid-run quota, and agy daemons outside the killed process tree may survive. agy keeps its own MCP registry with no print-mode switch: make sure no entry for this bridge is in it (`agy mcp list`). The immutable release cannot pin these CLIs.
 
@@ -493,6 +524,7 @@ Every `CODEX_OPENCODE_*` variable that `server.js` reads is listed here with its
 | `CODEX_OPENCODE_MODEL_ALLOWLIST` | unset | Comma-separated `provider/model` or `provider/model@variant` entries a job may select through `scopeContract.modelRequirement`. A matching requirement becomes an explicit `--model`/`--variant` pin for that job and is attested against runtime evidence like any other run; a requirement that is not listed still fails with `configured_model_requirement_mismatch`. The sanitized reader is never overridable. |
 | `CODEX_OPENCODE_EXTERNAL_RUNNERS` | unset | `codex`, `agy` or both: enables the reserved allowlist providers `codex/<model>` and `agy/<model>` (see External runners). Anything else stops the bridge at startup. |
 | `CODEX_OPENCODE_CODEX_EXECUTABLE`, `CODEX_OPENCODE_AGY_EXECUTABLE` | `codex`, `agy` | The runner executable: an absolute path or a name on the bridge's PATH. |
+| `CODEX_OPENCODE_CODEX_PROFILES` | unset | JSON object mapping profile IDs to absolute Codex homes via `{"profile-id":{"home":"/path/to/codex-home","enabled":true}}`. See Select a Codex account per job. |
 | `CODEX_OPENCODE_CODEX_WINDOWS_SANDBOX` | `elevated` (Windows only) | Passed to codex as `-c windows.sandbox=<value>`: `--ignore-user-config` drops the user's `[windows] sandbox`, and without one codex refuses every write. |
 | `CODEX_OPENCODE_RUNNER_SHA256` | unset | `codex=<sha256>,agy=<sha256>`: the runner executable (for an npm shim, its JavaScript entry) must have one of these hashes. |
 | `CODEX_OPENCODE_PROVIDER_LIMITS` | unset | `provider=slots,...` (1 to 32): the slot limit of those provider keys instead of `CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT`, also in the `run_opencode_parallel` batch check. `set_opencode_concurrency` `providerLimits` overrides an entry at runtime. |

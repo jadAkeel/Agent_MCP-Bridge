@@ -22,6 +22,12 @@ const binDir = nodePath.join(scratch, "bin");
 const recordDir = nodePath.join(scratch, "records");
 const controlFile = nodePath.join(scratch, "control.json");
 const codexHome = nodePath.join(scratch, "codex-home");
+const profileA = nodePath.join(scratch, "codex-a");
+const profileB = nodePath.join(scratch, "codex-b");
+for (const home of [profileA, profileB]) {
+  mkdirSync(home);
+  writeFileSync(nodePath.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture" } }));
+}
 const xdgConfig = nodePath.join(scratch, "xdg-config");
 for (const directory of [binDir, recordDir, codexHome, nodePath.join(xdgConfig, "opencode")]) mkdirSync(directory, { recursive: true });
 const writeControl = (value) => writeFileSync(controlFile, JSON.stringify(value), "utf8");
@@ -50,6 +56,13 @@ const mode = control[runner] || "ok";
 const writeWork = () => { if (control.writeFile) fs.writeFileSync(path.join(process.cwd(), control.writeFile), control.content || "changed\\n"); };
 (async () => {
   if (runner === "codex") {
+    if (control.profileBarrier) {
+      const deadline = Date.now() + 6000;
+      while (fs.readdirSync(${JSON.stringify(recordDir)}).length < 2) {
+        if (Date.now() >= deadline) process.exit(2);
+        await sleep(25);
+      }
+    }
     const lastMessage = args[args.indexOf("-o") + 1];
     out({ type: "thread.started", thread_id: "t-1" });
     out({ type: "item.completed", item: { id: "item_0", type: "error", message: "Ignoring malformed agent role definition" } });
@@ -135,6 +148,10 @@ process.env.CODEX_OPENCODE_QUOTA_GROUPS = "chatgpt:codex,openai";
 // The idle watchdog is short: agy must still run until its job timeout.
 process.env.CODEX_OPENCODE_AGENT_IDLE_TIMEOUT_MS = "1500";
 process.env.CODEX_HOME = codexHome;
+process.env.CODEX_OPENCODE_CODEX_PROFILES = JSON.stringify({
+  a: { home: profileA }, b: { home: profileB }, disabled: { home: profileA, enabled: false },
+  missing: { home: nodePath.join(scratch, "missing") }, unsigned: { home: codexHome },
+});
 process.env.XDG_CONFIG_HOME = xdgConfig;
 // Must never reach a runner.
 process.env.FLEX_RUNNER_API_TOKEN = "secret-value";
@@ -405,8 +422,85 @@ test("Q-012: a codex reader runs in the checkout with the read-only sandbox", as
   assert.equal(errorTypeOf(text), "none", text);
   const [record] = records("codex");
   assert.equal(record.args[record.args.indexOf("-s") + 1], "read-only");
+  assert.equal(record.env.CODEX_HOME, codexHome);
   assert.equal(record.args.some((arg) => arg.startsWith("model_reasoning_effort=")), false, "no variant, no effort override");
   assert.equal(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase());
+});
+
+test("Codex profiles: overlapping parallel children each receive their own home", async () => {
+  clearRecords();
+  writeControl({ profileBarrier: true });
+  const jobs = ["a", "b"].map((codexProfile) => runnerReadJob(requirement("codex", "gpt-read"), {
+    codexProfile, task: `Read src/a.txt for profile ${codexProfile}.`,
+  }));
+  const text = textOf(await callTool("run_opencode_parallel", { jobs }));
+  assert.match(text, /Parallel group status: completed/);
+  assert.match(text, /Ran concurrently \(OpenCode child interval overlap\): yes/);
+  assert.match(text, /Codex profile: a/);
+  assert.match(text, /Codex profile: b/);
+  for (const [id, home] of [["a", profileA], ["b", profileB]]) {
+    const record = records("codex").find((item) => item.args.at(-1).includes(`for profile ${id}.`));
+    assert.equal(record?.env.CODEX_HOME, home);
+  }
+  assert.equal(process.env.CODEX_HOME, codexHome);
+});
+
+test("Codex profiles: unknown, disabled, unusable, path and non-Codex selections fail preflight", async () => {
+  clearRecords();
+  writeControl({});
+  for (const [codexProfile, provider, model, errorType] of [
+    ["unknown", "codex", "gpt-read", "codex_profile_unknown"],
+    ["disabled", "codex", "gpt-read", "codex_profile_disabled"],
+    ["missing", "codex", "gpt-read", "codex_profile_unusable"],
+    ["unsigned", "codex", "gpt-read", "codex_profile_unusable"],
+    [profileA, "codex", "gpt-read", "codex_profile_invalid"],
+    ["a", "agy", "default", "codex_profile_requires_codex"],
+  ]) {
+    const job = runnerReadJob(requirement(provider, model), { codexProfile });
+    const plan = textOf(await callTool("validate_delegation_plan", { jobs: [job] }));
+    assert.match(plan, new RegExp(errorType));
+    assert.equal(errorTypeOf(await run({ ...job, dryRun: true })), errorType);
+  }
+  assert.equal(records("codex").length, 0);
+});
+
+test("Codex profiles: a durable queue job retains its ID through execution and status", async () => {
+  clearRecords();
+  writeControl({});
+  const job = runnerReadJob(requirement("codex", "gpt-read"), { codexProfile: "b" });
+  const receipt = textOf(await callTool("enqueue_opencode_job", job));
+  const jobId = /^Job ID: (\S+)$/m.exec(receipt)?.[1];
+  assert.ok(jobId, receipt);
+  assert.ok(await fixture.waitFor(async () => fixture.terminal((await fixture.durable(jobId))?.status), 20000));
+  assert.match(receipt, /Codex profile: b/);
+  const record = await fixture.durable(jobId);
+  assert.equal(record.status, "completed");
+  assert.equal(record.codexProfile, "b");
+  assert.equal(records("codex")[0]?.env.CODEX_HOME, profileB);
+  const status = JSON.parse(textOf(await callTool("get_opencode_job", { jobId, cwd: repo })));
+  assert.equal(status.codexProfile, "b");
+  assert.ok(!JSON.stringify(status).includes(profileB));
+});
+
+test("Codex profiles: a login removed after enqueue refuses to start", async () => {
+  clearRecords();
+  const job = runnerReadJob(requirement("codex", "gpt-read"), { codexProfile: "b" });
+  const enqueued = await internals.enqueueQueueJob(job, "", { schedule: false });
+  assert.ok(enqueued.ok, enqueued.error);
+  const { jobId } = enqueued.record;
+  const authPath = nodePath.join(profileB, "auth.json");
+  const fixtureAuth = readFileSync(authPath);
+  rmSync(authPath);
+  try {
+    internals.scheduleQueue();
+    assert.ok(await fixture.waitFor(async () => fixture.terminal((await fixture.durable(jobId))?.status), 20000));
+    const record = await fixture.durable(jobId);
+    assert.equal(record.status, "failed");
+    assert.equal(record.errorType, "codex_profile_unusable");
+    assert.equal(records("codex").length, 0);
+  } finally {
+    writeFileSync(authPath, fixtureAuth);
+  }
 });
 
 test("Light: isolated writes preserve target edits, capture exact result/session and retain review output", async () => {
