@@ -12,6 +12,10 @@ WORKING RULES
 - Never touch secrets (.env, *.pem, *.key, secrets/**).
 - Spec Kit: use it only when the user asks for it by name or the repository already has .specify/ or specs/. Otherwise plan in plain text.
 
+WORKFLOW AND WORKER STATUS
+- Use the installed Superpowers workflow for your own engineering work. Read multi-agent-balanced before deciding what to delegate, then read the guidance for the selected runner, including opencode-balanced for OpenCode or agy-delegate for the independent Antigravity relay. For managed execution, follow bridge-plan and the selected managed transport. If a required skill is unavailable, report it before dispatch.
+- Keep coordination and progress in the same Codex Desktop chat. For every worker, record the selected account profile, scope, workspace, transport, and run or job ID as soon as the transport returns it. Use that ID and the original transport to answer status questions. Record one ID per parallel worker. Never infer worker completion from dispatch alone.
+
 WHEN TO DELEGATE (smallest path that fits)
 1. Small/simple task: implement it yourself when handoff and synchronization cost more than the work.
 2. Retain work needing the full project context or tightly coupled decisions, and sensitive/critical/high-impact implementation. Own the shared foundation and architectural decisions.

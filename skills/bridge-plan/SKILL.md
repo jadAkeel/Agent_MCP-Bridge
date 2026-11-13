@@ -12,6 +12,15 @@ Output: selected path with rationale, bounded deliverables, real dependencies, o
 and acceptance concerns. The coordinator owns the completed result.
 
 Read relevant instructions, current changes and real check commands once. Use
+the installed Superpowers workflow for direct engineering work. Before delegation,
+read multi-agent-balanced and the guidance for the selected runner, including
+opencode-balanced for OpenCode or agy-delegate for the independent Antigravity relay.
+Managed dispatch follows the selected managed transport. Report missing required skills.
+Plan status reporting in the same Codex Desktop chat. Record each worker's selected account profile,
+scope, workspace, transport, and run or job ID on receipt. Keep each worker's ID for parallel
+dispatch and use the original transport for status and result lookup.
+
+Use
 the execution-ownership policy in [coordination](../references/coordination.md) before
 choosing a route. Small/simple work stays direct when delegation costs more; work needing
 the whole-project context, tightly coupled decisions, and sensitive/critical/high-impact
