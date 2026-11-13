@@ -19,9 +19,9 @@
 
 ## Task 1. Orchestrator workflow
 
-- [x] Add a focused regression for workflow selection, bounded scope and status reporting in the same Codex Desktop chat.
-- [x] Update codex/agents/principal-engineer-orchestrator.toml and skills/bridge-plan/SKILL.md. Regenerate the skill package manifest if required.
-- [x] Verify packaged policy and record the gap between instructions and observed Desktop behavior.
+- [x] Add focused regressions for workflow selection, bounded scope and status reporting in the same Codex Desktop chat.
+- [x] Add `skills/bridge-orchestrator/SKILL.md` to the default setup package, wire the Codex role and planning skill to it, update setup docs and regenerate the package manifest.
+- [x] Verify the host skill package and disposable Codex install. Record the gap between instructions and observed Desktop behavior.
 
 ## Task 2. Profile inheritance
 
@@ -47,3 +47,5 @@
 - The installed agy 1.5.8 CLI exposes session settings. Concurrent personal OAuth selection has not been verified.
 
 - Task 1: the policy test failed before implementation and passed afterwards. The focused and packaging suites passed 5 tests. The manifest verified 26 skills and 189 files. This is source and package evidence. A real Desktop dispatch, installed activation, inheritance, and status across transports remain pending.
+
+- Task 1 follow-up: the new ridge-orchestrator skill is included by default in setup for the selected host client. 	ests/skill-package.test.js passed 4 checks, 	ests/worker-orchestration-policy.test.js passed 1 check, 	ests/review-setup-cli.js passed 39 checks with no skips, and the package integrity gate verified 27 skills and 190 rendered files. Real Codex Desktop automatic skill activation remains pending.

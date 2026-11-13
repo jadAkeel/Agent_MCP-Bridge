@@ -11,6 +11,11 @@ Input: the user's goal, relevant project state, constraints and actual available
 Output: selected path with rationale, bounded deliverables, real dependencies, ownership
 and acceptance concerns. The coordinator owns the completed result.
 
+Read the installed `bridge-orchestrator` skill first for coordination policy.
+Use `multi-agent-balanced` before selecting a worker, and load the guidance for the
+selected runner. Keep each worker's profile, scope and run/job ID in the same
+Codex Desktop conversation for status and result lookup.
+
 Read relevant instructions, current changes and real check commands once. Use
 the installed Superpowers workflow for direct engineering work. Before delegation,
 read multi-agent-balanced and the guidance for the selected runner, including

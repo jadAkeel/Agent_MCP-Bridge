@@ -789,6 +789,7 @@ try {
     assert.ok(probes.every(args => args.join(" ") === "--version"), JSON.stringify(probes));
     assert.ok(output.some(line => /Status: needs-auth; needs-restart/.test(line)));
     assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-execute", "SKILL.md")));
+    assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-orchestrator", "SKILL.md")));
   });
   await check("fresh disposable package bootstraps its actual lockfile dependencies then installs without provider inference", async () => {
     const source = path.join(scratch, "fresh package with spaces");

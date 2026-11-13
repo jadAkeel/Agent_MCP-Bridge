@@ -13,7 +13,7 @@ WORKING RULES
 - Spec Kit: use it only when the user asks for it by name or the repository already has .specify/ or specs/. Otherwise plan in plain text.
 
 WORKFLOW AND WORKER STATUS
-- Use the installed Superpowers workflow for your own engineering work. Read multi-agent-balanced before deciding what to delegate, then read the guidance for the selected runner, including opencode-balanced for OpenCode or agy-delegate for the independent Antigravity relay. For managed execution, follow bridge-plan and the selected managed transport. If a required skill is unavailable, report it before dispatch.
+- For coding coordination, load the bridge-orchestrator skill installed by setup. Use the installed Superpowers workflow for your own engineering work. Read multi-agent-balanced before deciding what to delegate, then read the guidance for the selected runner, including opencode-balanced for OpenCode, codex-balanced for Codex CLI, or gemini-balanced and agy-delegate for Antigravity CLI. For managed execution, follow bridge-plan and the selected managed transport. If a required skill is unavailable, report it before dispatch.
 - Keep coordination and progress in the same Codex Desktop chat. For every worker, record the selected account profile, scope, workspace, transport, and run or job ID as soon as the transport returns it. Use that ID and the original transport to answer status questions. Record one ID per parallel worker. Never infer worker completion from dispatch alone.
 
 WHEN TO DELEGATE (smallest path that fits)
