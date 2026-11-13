@@ -13,6 +13,7 @@ import { closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mk
 import { freemem, homedir, tmpdir, totalmem, userInfo } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
+import { v2BridgeCommand, v2BridgeOutput } from "./lib/opencode-v2.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createDirectRunAudit, directRunMetrics } from "./bin/direct-run-audit.js";
 import { runBuilderModelFallback, sumOpenCodeUsage } from "./bin/builder-model-fallback.js";
@@ -826,10 +827,19 @@ async function attestationFingerprint(key = "") {
       for (const entry of [...(manifest.configs || []), ...(manifest.settings || [])]) {
         tracked.push(resolvePluginManifestEntryPath(entry.path, manifestPath));
       }
-      for (const plugin of manifest.plugins || []) {
-        const resolution = expectedOpenCodePluginResolution(plugin.specifier, plugin);
-        if (!resolution) return null;
-        tracked.push(resolution.root);
+      if (CONFIG.openCodeCliMajor === "2") {
+        if (!path.isAbsolute(String(manifest.runtimeProfile?.root || ""))) return null;
+        tracked.push(manifest.runtimeProfile.root);
+        for (const plugin of manifest.plugins || []) {
+          if (!path.isAbsolute(String(plugin?.root || ""))) return null;
+          tracked.push(plugin.root);
+        }
+      } else {
+        for (const plugin of manifest.plugins || []) {
+          const resolution = expectedOpenCodePluginResolution(plugin.specifier, plugin);
+          if (!resolution) return null;
+          tracked.push(resolution.root);
+        }
       }
     }
   } catch { return null; }
@@ -932,7 +942,10 @@ function buildOpenCodeEnv(extra = {}) {
   env.XDG_CACHE_HOME = String(extra.XDG_CACHE_HOME || activeProfile?.cacheHome || DEFAULT_OPENCODE_CACHE_HOME);
   env.XDG_STATE_HOME = String(extra.XDG_STATE_HOME || activeProfile?.stateHome || DEFAULT_OPENCODE_STATE_HOME);
   if (activeProfile) env.OPENCODE_CONFIG_DIR = activeProfile.configDir;
-  if (activeProfile) env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ skills: { paths: [...new Set([...(activeProfile.skillPaths || []), path.join(USER_HOME_DIR, ".agents", "skills")])] } });
+  if (activeProfile) {
+    const paths = [...new Set([...(activeProfile.skillPaths || []), path.join(USER_HOME_DIR, ".agents", "skills")])];
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ skills: CONFIG.openCodeCliMajor === "2" ? paths : { paths } });
+  }
   // OpenCode's version-pinned internal plugins include the Codex OAuth transport.
   // `--pure` suppresses configured external plugins without disabling those
   // binary-bundled authentication hooks. External plugins are verified below.
@@ -947,11 +960,21 @@ function buildOpenCodeEnv(extra = {}) {
   env.OPENCODE_DISABLE_AUTOUPDATE = "true";
   env.OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
   env.OPENCODE_DISABLE_MODELS_FETCH = "true";
+  if (CONFIG.openCodeCliMajor === "2") {
+    env.OPENCODE_CONFIG_DIR = activeProfile?.configDir || path.join(env.XDG_CONFIG_HOME, "opencode");
+    env.OPENCODE_CONFIG_PROJECT_DISABLE = "true";
+    env.OPENCODE_TEST_HOME = env.HOME;
+    env.OPENCODE_DISABLE_CLAUDE_CODE = "true";
+  }
   // Each bridge child is a bounded one-shot process. Durable queue/pipeline audit
   // belongs to the bridge SQLite store; a shared OpenCode session DB creates
   // cross-process lock races and unnecessary prompt/session persistence.
   env.OPENCODE_DB = ":memory:";
   env.OPENCODE_DISABLE_CHANNEL_DB = "true";
+  // V2 stores provider credentials in its SQLite database, alongside sessions.
+  // An in-memory V2 DB cannot use the operator's existing login. Keep V2's native
+  // durable DB under the explicitly configured XDG data home; no V1 auth copying.
+  if (CONFIG.openCodeCliMajor === "2") delete env.OPENCODE_DB;
   // The agent's own git: a repository-local fsmonitor hook, external diff or gpg.program (run
   // by log.showSignature) must not execute. Appended after any operator entries so they win.
   const inheritedConfigCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT || "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
@@ -1041,6 +1064,7 @@ async function createIsolatedOpenCodeRuntime() {
           prompt: MCP_SANITIZED_READER_PROMPT,
           tools: { apply_patch: false, edit: false, write: false, task: false, bash: false, webfetch: false, websearch: false, skill: false },
           permission: {
+            ...(CONFIG.openCodeCliMajor === "2" ? { "*": "deny", read: "allow", glob: "allow", grep: "allow" } : {}),
             edit: "deny",
             task: "deny",
             bash: "deny",
@@ -2286,19 +2310,27 @@ async function attestContractorNestedAgents(cwd, { forcePure = false, worktreeId
   return { ok: true, profiles };
 }
 
-const { exactPluginSpecifier, parseJsoncObject, pluginSpecsFromConfigText, hashExactTree, readPluginConfigSource, verifyNoLocalPluginDirectory, openCodeProjectConfigDirectories, managedOpenCodeConfigDirectories, exactPluginPackageName, pluginConfigCandidatePaths, expectedOpenCodePluginResolution, verifyExternalPluginPolicyUnshared, externalPluginPolicyFlights, verifyExternalPluginPolicy } = createPluginPolicyRuntime({ CONFIG, DEFAULT_OPENCODE_CACHE_HOME, DEFAULT_OPENCODE_CONFIG_DIR, OPENCODE_EXE, assertNoLinkedPath, buildOpenCodeEnv, cachedAttestation, getOpenCodeWorkerProfile: () => openCodeProfileRuntime.current(), logEvent, parseJsonText, resolveProjectStateRoot, runCommand, runSingleFlight, sha256File, staleBridgeProcessHint, summarizeStderr });
+const { exactPluginSpecifier, parseJsoncObject, pluginSpecsFromConfigText, hashExactTree, readPluginConfigSource, verifyNoLocalPluginDirectory, openCodeProjectConfigDirectories, managedOpenCodeConfigDirectories, exactPluginPackageName, pluginConfigCandidatePaths, expectedOpenCodePluginResolution, verifyV2ExternalPluginPolicyUnshared, verifyExternalPluginPolicyUnshared, externalPluginPolicyFlights, verifyExternalPluginPolicy } = createPluginPolicyRuntime({ CONFIG, DEFAULT_OPENCODE_CACHE_HOME, DEFAULT_OPENCODE_CONFIG_DIR, OPENCODE_AGENT_DIR, OPENCODE_SKILL_DIR, RELEASE_REQUIRED_MANAGED_AGENTS, REQUIRED_MANAGED_SKILLS, OPENCODE_EXE, assertNoLinkedPath, buildOpenCodeEnv, cachedAttestation, getOpenCodeWorkerProfile: () => openCodeProfileRuntime.current(), logEvent, parseJsonText, resolveProjectStateRoot, runCommand, runSingleFlight, sha256File, staleBridgeProcessHint, summarizeStderr });
 
+const v2InventoryFlights = new Map();
 async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
   const activeProfile = openCodeProfileRuntime.current();
   const externalPluginsAllowed = activeProfile ? Boolean(activeProfile.pluginManifestPath) : CONFIG.allowExternalPlugins;
   const pure = forcePure || !externalPluginsAllowed;
+  // V2 has no --pure switch. Discovery itself activates plugins, so validate the
+  // pure profile before starting even a read-only inventory process.
+  if (CONFIG.openCodeCliMajor === "2") {
+    const policy = await verifyExternalPluginPolicy(cwd);
+    if (!policy.ok) return { stdout: "", stderr: policy.error, exitCode: "plugin_policy_rejected", pluginPolicy: policy };
+  }
   if (!pure) {
     const pluginPolicy = verifiedPluginPolicy || await verifyExternalPluginPolicy(cwd);
     if (!pluginPolicy.ok) {
       return { stdout: "", stderr: pluginPolicy.error, exitCode: "plugin_policy_rejected", pluginPolicy };
     }
   }
-  const commandArgs = pure && !args.includes("--pure") ? ["--pure", ...args] : args;
+  const v2Command = CONFIG.openCodeCliMajor === "2" ? v2BridgeCommand(args) : null;
+  const commandArgs = v2Command ? v2Command.args : pure && !args.includes("--pure") ? ["--pure", ...args] : args;
   let ownedRuntime = null;
   let result = null;
   let cleanup = { ok: true, error: "" };
@@ -2306,7 +2338,15 @@ async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure
     ownedRuntime = forcePure && !runtimeContext ? await createIsolatedOpenCodeRuntime() : null;
     const isolatedRuntime = runtimeContext || ownedRuntime;
     const executionEnv = isolatedRuntime?.env || buildOpenCodeEnv();
-    result = { ...(await runCommand(OPENCODE_EXE, commandArgs, cwd, timeoutMs, executionEnv)), isolatedRuntimeRoot: isolatedRuntime?.root || "" };
+    const commandResult = ["skills", "agent", "list"].includes(v2Command?.kind)
+      ? await runSingleFlight(v2InventoryFlights, JSON.stringify([cwd, executionEnv]), () => runSpawnCommand(process.execPath,
+        [path.join(BRIDGE_RUNTIME_DIR, "bin", "opencode-v2-inventory.js"), OPENCODE_EXE], cwd, timeoutMs, executionEnv))
+      : await runCommand(OPENCODE_EXE, commandArgs, cwd, timeoutMs, executionEnv);
+    result = { ...commandResult, isolatedRuntimeRoot: isolatedRuntime?.root || "" };
+    if (v2Command && result.exitCode === 0) {
+      try { result.stdout = v2BridgeOutput(v2Command, result.stdout); }
+      catch (error) { result = { ...result, stdout: "", stderr: error.message, exitCode: "opencode_v2_metadata_invalid" }; }
+    }
   } finally {
     if (ownedRuntime) {
       cleanup = await wipeIsolatedOpenCodeRuntime(ownedRuntime.root);

@@ -36,7 +36,7 @@ const eventsOf = async file => (await readFile(file, "utf8")).trim().split(/\r?\
 test("canonical command inventory preserves every original argv and the grouped node --test command", async () => {
   const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
   assert.equal(packageJson.scripts.test, "npm run test:packaging && npm run test:smoke && npm run test:command-boundary && npm run test:pi && node bin/test-runner.js");
-  assert.equal(packageJson.scripts["test:packaging"], "node bin/skill-package.js --check && node --test tests/skill-package.test.js tests/orchestration-diagnostics.test.js tests/install-choices.test.js tests/agensi-package.test.js");
+  assert.equal(packageJson.scripts["test:packaging"], "node bin/skill-package.js --check && node --test tests/skill-package.test.js tests/orchestration-diagnostics.test.js tests/install-choices.test.js tests/agensi-package.test.js tests/opencode-v2.test.js tests/v2-runtime-profile.test.js tests/v2-plugin-profile.test.js tests/setup-v2-gemini.test.js tests/fresh-healthcheck-v2-plugin.test.js");
   assert.equal(packageJson.scripts["test:smoke"], "node --test tests/live-smoke.test.js");
   assert.equal(packageJson.scripts["test:command-boundary"], "node --test tests/command-boundary.test.js");
   assert.equal(packageJson.scripts["test:agensi"], "node --test tests/agensi-package.test.js");

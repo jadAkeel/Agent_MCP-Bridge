@@ -14,6 +14,7 @@
 | Named accounts inherit compatible tools and skills | 2 | Isolated fixtures prove account separation, enablement, secret handling, recursion prevention and profile selection; supported real account modes are reported separately |
 | Dispatch remains traceable across modes | 3 | Stable IDs and queryable active/terminal results cover direct, parallel and durable queue work; restart and interruption behavior are recorded |
 | Portable release | 4 | Regression, packaging and release gates pass; portable files are reviewed and the authorized GitHub branch is updated |
+| Local OpenCode V2 compatibility | 5 | Reuse the inspected local V2 adapter; native offline discovery works without V1, named V2 account storage stays separate, and user skill/tool configuration survives the adapter |
 
 ## Task 1. Orchestrator workflow
 
@@ -46,3 +47,12 @@
 ## Progress evidence
 
 See [progress evidence](2026-11-13-worker-profile-inheritance-progress.md) for the tested revision, commands, outcomes, risks and remaining checks.
+
+## Task 5. OpenCode V2 operational dependency
+
+The candidate health check proved that the installed local route is V2 while this branch still used V1 commands. Reuse the existing local V2 implementation as an inspected predecessor; preserve that other worktree and do not reinstall V1 or change the user's default account/startup settings.
+
+- [ ] Port the bounded V2 command, inventory, model-evidence and plugin-integrity adapters, preserving the V1 route and named-profile isolation. Own changes in this feature worktree only.
+- [ ] Add meaningful regressions for V2 native account storage, shared skill-path/config translation, recursive Bridge exclusion and account/status binding. Verify failing cases before implementing new behavior.
+- [ ] Run adapter and inheritance fixtures, then an on-demand native offline health/discovery check against a disposable compatible profile. Close its private inventory server and verify owned process cleanup.
+- [ ] Review the combined candidate and affected setup/release checks. Keep live inference and actual account/tool acceptance distinct; no provider request without an explicitly selected route.

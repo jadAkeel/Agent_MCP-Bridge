@@ -43,6 +43,8 @@ Ruling: retain the existing approved plan and implementation; complete the missi
 
 ## Acceptance limits
 
+V2 follow-up: ported the local 2.2.2 adapter into the feature branch, including private inventory, installer/package checks, and native named account database selection. A fresh isolated 2.2.2 setup passed health smoke and found every required agent. A separate offline inventory found a fixture user skill and agent. The installed 2.3.0 binary found the fixture agent through its direct CLI but did not return the fixture skill through the private inventory path, so it remains outside the runtime pin. Named V2 profiles support the shared skill and approved MCP configuration path. V2 external plugins remain on the managed pinned route pending profile-specific manifest integration. Actual provider calls, Desktop activation and per-account plugin behavior remain unverified.
+
 Actual Codex Desktop skill activation, live provider account/tool execution across all transports, standalone relay result retrieval through Desktop, and fresh-user installation remain operational acceptance checks. Repository fixtures do not establish these observations. No production deployment or merge is authorized. Final feature-branch publication follows verification and review.
 
 ## Resource ownership

@@ -17,7 +17,7 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 - Node.js 22.13 or newer
 - Git
-- OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The public installer requires **exactly 1.18.32**, the version qualified for the packaged Skills. Lower-level setup without `--skills` accepts 1.18.32 or newer for the pure profile and notes untested versions; newer versions need separately authorized live verification. The optional Gemini profile also requires exactly 1.18.32, pinned by `opencode/plugin-integrity-manifest.json` (`openCodeVersion`).
+- OpenCode signed in to at least one provider (`opencode auth list`). The public installer accepts **1.18.32** or **2.2.2**. Select a V2 native binary with `--opencode-executable` if it is outside `PATH`. The Gemini profile requires the version-specific plugin manifest and, for V2, the pinned package supplied with `--v2-plugin-package-root`.
 - One MCP client: Codex CLI, Claude Code, or explicitly selected Cursor. Multiple clients can coexist; one is enough. Cursor desktop acceptance is tracked separately from configuration support.
 
 The default planner, builder, debugger, architect, reviewer and tester are configured for `opencode/muse-spark-1.3-contributor-free` in the pure profile. Signing in to Claude Code does not sign OpenCode in to a provider. Gemini is optional; it needs the Gemini setup profile and OpenCode provider sign-in.

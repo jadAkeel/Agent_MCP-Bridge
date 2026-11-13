@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { createOpenCodeProfileRuntime, readOpenCodeProfilesEnv, resolveOpenCodeProfile, resolveOpenCodeSkillPaths } from "../lib/opencode-profiles.js";
 
 test("inherited skill paths resolve against the real user and admitted checkout", () => {
@@ -11,6 +12,36 @@ test("inherited skill paths resolve against the real user and admitted checkout"
   const cwd = path.resolve("fixture-checkout");
   assert.deepEqual(resolveOpenCodeSkillPaths(["~/custom-skills", ".agents/skills", "{env:SKILLS_ROOT}"], { userHome, cwd, env: { SKILLS_ROOT: path.join(userHome, "env-skills") } }),
     [path.join(userHome, "custom-skills"), path.join(cwd, ".agents", "skills"), path.join(userHome, "env-skills")]);
+});
+
+test("V2 named profiles select native account databases and preserve V2 skill sources", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "opencode-v2-account-fixture-"));
+  try {
+    const configDir = path.join(root, "config");
+    mkdirSync(configDir);
+    writeFileSync(path.join(configDir, "opencode.json"), JSON.stringify({ skills: ["~/user-skills", "./project-skills"] }));
+    const entries = {};
+    for (const id of ["one", "two"]) {
+      const dataHome = path.join(root, id);
+      mkdirSync(path.join(dataHome, "opencode"), { recursive: true });
+      const db = new DatabaseSync(path.join(dataHome, "opencode", "opencode.db"));
+      try {
+        db.exec("CREATE TABLE credential (id TEXT, active INTEGER, value TEXT)");
+        db.prepare("INSERT INTO credential VALUES (?, 1, ?)").run(id, `private-fixture-${id}`);
+      } finally { db.close(); }
+      entries[id] = { dataHome };
+    }
+    const env = { CODEX_OPENCODE_CLI_MAJOR: "2", CODEX_OPENCODE_PROFILE_BASE: JSON.stringify({ configDir }), CODEX_OPENCODE_PROFILES: JSON.stringify(entries) };
+    const config = readOpenCodeProfilesEnv(env);
+    const one = resolveOpenCodeProfile(config, "one");
+    const two = resolveOpenCodeProfile(config, "two");
+    assert.equal(one.errorType, undefined);
+    assert.equal(two.errorType, undefined);
+    assert.notEqual(one.dataHome, two.dataHome);
+    assert.deepEqual(one.skillPaths, ["~/user-skills", "./project-skills"]);
+    assert.equal(JSON.stringify(one).includes("private-fixture"), false);
+    assert.equal(resolveOpenCodeProfile(readOpenCodeProfilesEnv({ ...env, CODEX_OPENCODE_CLI_MAJOR: "1" }), "one").errorType, "worker_profile_unusable");
+  } finally { removeFixture(root); }
 });
 
 function removeFixture(root) {
