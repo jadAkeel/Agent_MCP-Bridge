@@ -248,6 +248,32 @@ const test = (name, fn) => cases.push({ name, fn });
 
 // ---- Defect 1: a lapsed queue lease is re-taken by its current owner ----
 
+test("queued profile defaults and customization digest survive SQLite and refuse drift before execution", async () => {
+  const saved = { ...CONFIG.openCodeProfiles };
+  const configDir = path.join(fixtureRoot, "profile-config");
+  const dataHome = path.join(fixtureRoot, "profile-data");
+  await mkdir(configDir, { recursive: true });
+  await mkdir(path.join(dataHome, "opencode"), { recursive: true });
+  await writeFile(path.join(dataHome, "opencode", "auth.json"), JSON.stringify({ openai: { type: "oauth", refresh: "fixture" } }));
+  await writeFile(path.join(configDir, "opencode.json"), "{}");
+  Object.assign(CONFIG.openCodeProfiles, { base: { configDir, pluginRoots: [], mcpServers: [] }, profiles: new Map([["fixture", { dataHome }]]), defaultProfileId: "fixture" });
+  try {
+    const accepted = await enqueueQueueJob({ agent: "reviewer", task: "Profile drift fixture", cwd: repo, dryRun: true }, "", { schedule: false });
+    assert.equal(accepted.ok, true, accepted.error);
+    assert.equal(accepted.record.request.runnerProfile, "fixture");
+    const restored = await readPersistedQueueRecord(accepted.record.jobId, repo);
+    assert.deepEqual(restored.workerProfileBinding, accepted.record.workerProfileBinding);
+    assert.match(restored.workerProfileBinding.sha256, /^[a-f0-9]{64}$/);
+    await writeFile(path.join(configDir, "opencode.json"), '{"mcp":{"github":{"enabled":false}}}');
+    let starts = 0;
+    selfTestHooks.queueJobExecutorTestHook = async () => { starts++; return completedExecution(); };
+    await runWorker(accepted.record);
+    assert.equal(starts, 0, "changed customization must refuse before a worker starts");
+    assert.equal(accepted.record.status, "failed");
+    assert.equal(accepted.record.errorType, "worker_profile_changed");
+  } finally { Object.assign(CONFIG.openCodeProfiles, saved); }
+});
+
 test("D1 heartbeat re-takes a lapsed lease of a pre-execution record", async () => {
   const record = await persistedRecord({ status: "held" });
   QUEUE_JOBS.set(record.jobId, record);

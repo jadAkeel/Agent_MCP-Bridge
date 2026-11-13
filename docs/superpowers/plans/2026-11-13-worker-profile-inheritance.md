@@ -1,51 +1,48 @@
 # Worker Profile Inheritance Implementation Plan
 
-> Use executing-plans and test-driven-development for each implementation task.
+> Approved design: [worker profile inheritance and run tracking](../specs/2026-11-13-worker-profile-inheritance-design.md)
 
 **Goal:** Keep the primary Codex Desktop account in control while named CLI workers inherit compatible customizations and expose durable status.
 
-**Architecture:** Resolve workflow policy before dispatch. Keep customization resolution separate from account binding. Reuse Bridge and relay receipts for lookup.
+**Architecture:** Resolve orchestration policy before dispatch. Keep worker account credentials separate from shared customization. Reuse Bridge and relay receipts for status lookup.
 
-**Tech Stack:** Node.js, SQLite, MCP, Codex role configuration and packaged skills.
-
-**Spec:** docs/superpowers/specs/2026-11-13-worker-profile-inheritance-design.md
+**Tech stack:** Node.js, SQLite, MCP, Codex CLI, OpenCode CLI and Antigravity CLI.
 
 | Requirement | Task | Acceptance |
 | --- | --- | --- |
-| Orchestrator loads the right workflows and communicates in the primary chat | 1 | Policy is present in the role and shared dispatch skills, then verify a Desktop dispatch and lookup |
-| Named accounts inherit compatible settings | 2 | Isolated fixtures prove separate logins, enabled and disabled tool handling, and no recursive dispatch. Verify each supported real account mode |
-| Dispatch remains traceable across modes | 3 | Query in-flight and terminal status across all four modes, including restart and interrupted execution |
-| Portable release | 4 | Regression, packaging, pinned release and fresh-user checks, followed by authorized GitHub publication |
+| Orchestrator uses the installed workflow and reports workers in the primary chat | 1 | Setup packages the orchestration skill; dispatch guidance records scope, profile and ID; Desktop activation is checked where available |
+| Named accounts inherit compatible tools and skills | 2 | Isolated fixtures prove account separation, enablement, secret handling, recursion prevention and profile selection; supported real account modes are reported separately |
+| Dispatch remains traceable across modes | 3 | Stable IDs and queryable active/terminal results cover direct, parallel and durable queue work; restart and interruption behavior are recorded |
+| Portable release | 4 | Regression, packaging and release gates pass; portable files are reviewed and the authorized GitHub branch is updated |
 
 ## Task 1. Orchestrator workflow
 
-- [x] Add focused regressions for workflow selection, bounded scope and status reporting in the same Codex Desktop chat.
-- [x] Add `skills/bridge-orchestrator/SKILL.md` to the default setup package, wire the Codex role and planning skill to it, update setup docs and regenerate the package manifest.
-- [x] Verify the host skill package and disposable Codex install. Record the gap between instructions and observed Desktop behavior.
+- [x] Add regressions for orchestration workflow selection, bounded scope and status reporting in the same Codex Desktop chat.
+- [x] Add `skills/bridge-orchestrator/SKILL.md` to the default setup package and update setup guidance.
+- [x] Verify the host skill package and disposable setup. Keep actual Desktop activation as an operational check, not a source-only claim.
 
 ## Task 2. Profile inheritance
 
-- [ ] Establish native profile capabilities. Verify agy account selection before advertising personal OAuth concurrency. Start with isolated fixture credentials and use live accounts only on authorized routes.
-- [ ] Extend the profile resolver and job contract in lib/codex-profiles.js, lib/lock-plan.js and server.js. Bind the selected profile and configuration revision to queued work and retries.
-- [ ] Adapt lib/external-runners.js and OpenCode environment assembly to load compatible native configuration and shared skills while preserving account state, enablement and scope. Keep mutable customization inputs outside immutable release files.
-- [ ] Exercise disabled tools, missing required skills, recursive Bridge endpoints, cross-account credential isolation and concurrent quota attribution.
+- [x] Add operator-mapped OpenCode, Codex and Antigravity profiles while keeping account credentials separate.
+- [x] Inherit supported OpenCode config, plugins, MCP policy and skills; copy compatible Codex plugin caches and skills; select Antigravity Gemini API-key profiles without claiming personal OAuth concurrency.
+- [x] Add fixture checks for tool enablement, unavailable assets, recursive Bridge exclusion, credential isolation and concurrent account routing.
+- [x] Bind selected/default profiles and a customization revision before queued work starts; refuse changed bindings before execution and preserve the binding on retries. Final regression verification is recorded below.
+- [ ] Verify supported account modes against real providers only on an explicitly selected route. Do not use live inference for this local implementation pass.
 
 ## Task 3. Worker receipts
 
-- [ ] Add tests for stable dispatch identifiers, per-worker parallel lookup, restart, failure and cancellation.
-- [ ] Extend Bridge direct and queue records and connect the supported standalone relay receipts through a common lookup. Keep process ownership with the transport.
-- [ ] Verify all modes from Codex Desktop without changing its login.
+- [x] Preserve selected profile IDs in direct, parallel and durable queue records, retries and status views.
+- [x] Verify managed queue IDs remain queryable through execution and result reporting with fixture runners.
+- [ ] Verify Codex Desktop skill activation, user-visible dispatch and status lookup after returning to the same chat. The Desktop runtime is not available to this repository test suite.
+- [ ] Verify standalone relay results through the actual Codex Desktop transport; do not claim a single Bridge lookup covers transport-owned relay runs.
 
 ## Task 4. Release
 
-- [ ] Run applicable npm regression and release gates. Verify Windows installation and owned-process cleanup.
-- [ ] Verify a fresh-user install. Publish portable files only, after confirming the intended GitHub destination and scope.
+- [ ] Run the full regression, packaging and release gates; review the portable diff and generated files.
+- Evidence: broad run 189/190; its stale inventory fixture was corrected and reran 27/27. Packaging, focused profiles and concurrency passed; production audit is clean. The release receipt remains failed, and the installed V2 CLI needs a separate compatibility integration before local activation.
+- [ ] Publish the verified portable changes to the authorized GitHub branch. Do not merge or deploy.
+- [ ] Record live provider, Desktop and fresh-user acceptance limits.
 
-## Evidence
+## Progress evidence
 
-- Baseline: local design commit c1c69fd, Windows, Node 24.11.1. The worktree initially had no node_modules.
-- The installed agy 1.5.8 CLI exposes session settings. Concurrent personal OAuth selection has not been verified.
-
-- Task 1: the policy test failed before implementation and passed afterwards. The focused and packaging suites passed 5 tests. The manifest verified 26 skills and 189 files. This is source and package evidence. A real Desktop dispatch, installed activation, inheritance, and status across transports remain pending.
-
-- Task 1 follow-up: the new ridge-orchestrator skill is included by default in setup for the selected host client. 	ests/skill-package.test.js passed 4 checks, 	ests/worker-orchestration-policy.test.js passed 1 check, 	ests/review-setup-cli.js passed 39 checks with no skips, and the package integrity gate verified 27 skills and 190 rendered files. Real Codex Desktop automatic skill activation remains pending.
+See [progress evidence](2026-11-13-worker-profile-inheritance-progress.md) for the tested revision, commands, outcomes, risks and remaining checks.

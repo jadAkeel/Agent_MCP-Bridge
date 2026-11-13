@@ -192,6 +192,8 @@ import { createProviderLeaseRuntime } from "./lib/provider-leases.js";
 import { createProviderQuarantineRuntime } from "./lib/provider-quarantine.js";
 import { createReleaseIntegrityRuntime } from "./lib/release-integrity.js";
 import { createExternalRunnersRuntime } from "./lib/external-runners.js";
+import { createOpenCodeProfileRuntime, resolveOpenCodeProfile, resolveOpenCodeSkillPaths } from "./lib/opencode-profiles.js";
+import { captureWorkerProfileBinding, verifyWorkerProfileBinding } from "./lib/worker-profile-binding.js";
 
 const execFileAsync = promisify(execFile);
 const BRIDGE_RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -254,6 +256,7 @@ const {
   assertSupportedCallerModel,
   readOpenCodeLogPathEnv,
 } = createBridgeConfig();
+const openCodeProfileRuntime = createOpenCodeProfileRuntime();
 
 const DEFAULT_RETURN_FORMAT = [
   "1. Summary",
@@ -717,9 +720,10 @@ const jobInputShape = {
   models: z.array(z.string().min(1).max(300)).min(1).max(8).optional().describe("enqueue_opencode_job only. Models to try in order, each provider/model[@variant] from CODEX_OPENCODE_MODEL_ALLOWLIST. After a provider failure (rate limit, pause, quota, 5xx), an idle stop, a timeout, no output or a failed validation the bridge requeues the job on the next model that is not paused; after maxAttempts it marks the job outcome=gave_up."),
   maxAttempts: z.number().int().min(1).max(10).optional().describe("enqueue_opencode_job only. Attempts in total, the first included (default 4 when models is given). Alone (without models) it retries on the same model."),
   autoIntegrate: z.boolean().optional().describe("enqueue_opencode_job only, write jobs with a validationCommand. When the finished job only ADDED new files and its validation passed, the bridge integrates them (the same dry run, receipt, validation and rollback as integrate_opencode_worktree) and commits exactly those files with the target repository's last commit identity. Any other patch keeps the normal reviewed flow."),
-  dryRun: z.boolean().optional().describe("Validate routing without running OpenCode."),
-  scopeContract: scopeContractSchema.optional().describe("Full Scope Contract; required for write jobs."),
-  codexProfile: z.string().optional().describe("Operator-registered Codex account ID. Requires an allowlisted codex model. Omit to inherit the Bridge's default Codex home."),
+  dryRun: z.boolean().optional(),
+  scopeContract: scopeContractSchema.optional().describe("Required for writes."),
+  codexProfile: z.string().optional().describe("Legacy Codex ID."),
+  runnerProfile: z.string().optional().describe("Profile ID."),
   allowFallbackToBuild: z.boolean().optional(),
   subagentStrategy: z.enum(["proxy", "reject"]).optional(),
   proxyAgent: z.string().optional(),
@@ -792,8 +796,11 @@ async function statFingerprint(filePath) {
 }
 
 async function attestationFingerprint(key = "") {
+  const profile = openCodeProfileRuntime.current();
+  const configDirectory = profile?.configDir || DEFAULT_OPENCODE_CONFIG_DIR;
+  const expectedManifestSha256 = profile?.pluginManifestSha256 || CONFIG.expectedExternalPluginManifestSha256;
   const configFiles = ["opencode.json", "opencode.jsonc", "config.json", "antigravity.json", "package.json"]
-    .map((name) => path.join(DEFAULT_OPENCODE_CONFIG_DIR, name));
+    .map((name) => path.join(configDirectory, name));
   const executable = await resolveAttestationExecutable(OPENCODE_EXE, buildOpenCodeEnv());
   if (!executable || !BRIDGE_LIB_SHA256_AT_STARTUP) return null;
   const env = buildOpenCodeEnv();
@@ -801,23 +808,26 @@ async function attestationFingerprint(key = "") {
   const tracked = [...configFiles, OPENCODE_AGENT_DIR, OPENCODE_SKILL_DIR, executable];
   try {
     const managed = managedOpenCodeConfigDirectories();
-    for (const directory of [DEFAULT_OPENCODE_CONFIG_DIR, ...managed, path.join(env.HOME, ".opencode")]) {
+    for (const directory of [configDirectory, ...managed, path.join(env.HOME, ".opencode")]) {
       tracked.push(...["opencode.json", "opencode.jsonc", "config.json", "agents", "agent", "skills", "skill", "plugins", "plugin"].map((name) => path.join(directory, name)));
     }
+    if (profile?.pluginManifestPath) tracked.push(profile.pluginManifestPath);
     const cwd = String(key).split(/\0|\\0/).find((part) => path.isAbsolute(part));
     if (cwd) for (const directory of await openCodeProjectConfigDirectories(cwd)) {
       tracked.push(path.join(directory, ".opencode", "plugins"), path.join(directory, ".opencode", "plugin"));
     }
-    if (CONFIG.allowExternalPlugins) {
-      const manifestBytes = await readFile(CONFIG.externalPluginManifestPath);
-      if (createHash("sha256").update(manifestBytes).digest("hex") !== CONFIG.expectedExternalPluginManifestSha256) return null;
+    const globalPluginsAllowed = !profile && CONFIG.allowExternalPlugins;
+    const manifestPath = profile ? profile.pluginManifestPath : globalPluginsAllowed ? CONFIG.externalPluginManifestPath : "";
+    if (manifestPath) {
+      const manifestBytes = await readFile(manifestPath);
+      if (createHash("sha256").update(manifestBytes).digest("hex") !== expectedManifestSha256) return null;
       const manifest = parseJsonText(manifestBytes.toString("utf8"));
-      tracked.push(CONFIG.externalPluginManifestPath);
+      tracked.push(manifestPath);
       for (const entry of [...(manifest.configs || []), ...(manifest.settings || [])]) {
-        tracked.push(resolvePluginManifestEntryPath(entry.path, CONFIG.externalPluginManifestPath));
+        tracked.push(resolvePluginManifestEntryPath(entry.path, manifestPath));
       }
       for (const plugin of manifest.plugins || []) {
-        const resolution = expectedOpenCodePluginResolution(plugin.specifier);
+        const resolution = expectedOpenCodePluginResolution(plugin.specifier, plugin);
         if (!resolution) return null;
         tracked.push(resolution.root);
       }
@@ -825,8 +835,8 @@ async function attestationFingerprint(key = "") {
   } catch { return null; }
   return attestationInputFingerprint(tracked, {
     env: envIdentity,
-    plugins: CONFIG.allowExternalPlugins ? CONFIG.externalPluginAllowlist : [],
-    manifestPin: CONFIG.expectedExternalPluginManifestSha256,
+    plugins: profile ? (profile.pluginManifestPath ? [profile.pluginManifestSha256] : []) : CONFIG.allowExternalPlugins ? CONFIG.externalPluginAllowlist : [],
+    manifestPin: expectedManifestSha256,
     executable,
   });
 }
@@ -889,6 +899,9 @@ const OPENCODE_BASE_ENV_KEYS = new Set([
 const SENSITIVE_ENV_PATTERN = /(?:api[-_]?key|access[-_]?token|auth|credential|password|secret|token|private[-_]?key|(?:^|_)pat(?:$|_))/i;
 
 function buildOpenCodeEnv(extra = {}) {
+  // Sanitized readers receive a fresh empty home/config; ordinary profile jobs inherit the
+  // operator's shared OpenCode config/cache and one selected auth data home.
+  const activeProfile = extra.HOME ? null : openCodeProfileRuntime.current();
   const passthrough = new Set(
     String(process.env.CODEX_OPENCODE_PASSTHROUGH_ENV || "")
       .split(",")
@@ -914,10 +927,12 @@ function buildOpenCodeEnv(extra = {}) {
   // the operator's explicit XDG config/data/cache/state locations.
   env.HOME = String(extra.HOME || BRIDGE_OPENCODE_HOME_DIR);
   env.USERPROFILE = String(extra.USERPROFILE || env.HOME);
-  env.XDG_CONFIG_HOME = String(extra.XDG_CONFIG_HOME || path.dirname(DEFAULT_OPENCODE_CONFIG_DIR));
-  env.XDG_DATA_HOME = String(extra.XDG_DATA_HOME || path.dirname(DEFAULT_OPENCODE_DATA_DIR));
-  env.XDG_CACHE_HOME = String(extra.XDG_CACHE_HOME || DEFAULT_OPENCODE_CACHE_HOME);
-  env.XDG_STATE_HOME = String(extra.XDG_STATE_HOME || DEFAULT_OPENCODE_STATE_HOME);
+  env.XDG_CONFIG_HOME = String(extra.XDG_CONFIG_HOME || (activeProfile ? path.dirname(activeProfile.configDir) : path.dirname(DEFAULT_OPENCODE_CONFIG_DIR)));
+  env.XDG_DATA_HOME = String(extra.XDG_DATA_HOME || activeProfile?.dataHome || path.dirname(DEFAULT_OPENCODE_DATA_DIR));
+  env.XDG_CACHE_HOME = String(extra.XDG_CACHE_HOME || activeProfile?.cacheHome || DEFAULT_OPENCODE_CACHE_HOME);
+  env.XDG_STATE_HOME = String(extra.XDG_STATE_HOME || activeProfile?.stateHome || DEFAULT_OPENCODE_STATE_HOME);
+  if (activeProfile) env.OPENCODE_CONFIG_DIR = activeProfile.configDir;
+  if (activeProfile) env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ skills: { paths: [...new Set([...(activeProfile.skillPaths || []), path.join(USER_HOME_DIR, ".agents", "skills")])] } });
   // OpenCode's version-pinned internal plugins include the Codex OAuth transport.
   // `--pure` suppresses configured external plugins without disabling those
   // binary-bundled authentication hooks. External plugins are verified below.
@@ -927,7 +942,7 @@ function buildOpenCodeEnv(extra = {}) {
   // jobs use only operator-managed global configuration and bridge-pinned CLI args.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   env.OPENCODE_DISABLE_SHARE = "true";
-  env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "true";
+  env.OPENCODE_DISABLE_EXTERNAL_SKILLS = activeProfile ? "false" : "true";
   env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "true";
   env.OPENCODE_DISABLE_AUTOUPDATE = "true";
   env.OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
@@ -2011,12 +2026,27 @@ async function managedSkillTreeInventory(root, { optional = false, prefix = "" }
 async function managedSkillPolicyError(agent, {
   sourceRoot = OPENCODE_SKILL_DIR,
   effectiveConfigRoot = DEFAULT_OPENCODE_CONFIG_DIR,
+  allowAdditionalSkills = false,
   debugSkills = null,
   metadata = null,
 } = {}) {
   const normalizedAgent = String(agent || "").toLowerCase();
   const managed = RELEASE_REQUIRED_MANAGED_AGENTS.some((item) => item.toLowerCase() === normalizedAgent);
   if (!managed || metadata?.skillDenied === true) return null;
+  if (allowAdditionalSkills) {
+    if (!Array.isArray(debugSkills)) return { errorType: "managed_skill_integrity_failed", error: "OpenCode did not provide effective user-profile skill metadata." };
+    const seen = new Set();
+    for (const skill of debugSkills) {
+      if (String(skill?.location || "").trim() === "<built-in>") continue;
+      const name = String(skill?.name || "").trim();
+      const location = String(skill?.location || "").trim();
+      if (!name || !path.isAbsolute(location) || seen.has(name) || !/[/\\]SKILL\.md$/i.test(location)) {
+        return { errorType: "managed_skill_integrity_failed", error: "OpenCode reported invalid or duplicate skills in the selected user profile." };
+      }
+      seen.add(name);
+    }
+    return null;
+  }
   try {
     const source = await managedSkillTreeInventory(sourceRoot);
     const missing = REQUIRED_MANAGED_SKILLS.filter((skill) => !source.some((entry) => entry.path === `${skill}/SKILL.md`));
@@ -2030,7 +2060,10 @@ async function managedSkillPolicyError(agent, {
     const canonical = (entries) => entries
       .map((entry) => `${entry.path}\0${entry.sha256}`)
       .sort();
-    if (JSON.stringify(canonical(source)) !== JSON.stringify(canonical(effective))) {
+    const sourceKeys = canonical(source);
+    const effectiveKeys = canonical(effective);
+    const sourceMatches = JSON.stringify(sourceKeys) === JSON.stringify(effectiveKeys);
+    if (!sourceMatches) {
       throw new Error("Effective OpenCode skill tree does not exactly match the immutable managed source.");
     }
     if (!Array.isArray(debugSkills)) {
@@ -2049,13 +2082,16 @@ async function managedSkillPolicyError(agent, {
       if (!name || !path.isAbsolute(location) || seen.has(name)) {
         throw new Error("OpenCode reported an invalid or duplicate effective managed skill.");
       }
+      const isManagedSkill = expectedSkillNames.includes(name);
       const expectedLocation = path.join(effectiveSkillsRoot, name, "SKILL.md");
-      if (normalizePathForCompare(location) !== normalizePathForCompare(expectedLocation)) {
+      if ((isManagedSkill || !allowAdditionalSkills) && normalizePathForCompare(location) !== normalizePathForCompare(expectedLocation)) {
         throw new Error(`OpenCode resolved managed skill ${name} from an unexpected origin.`);
       }
       seen.add(name);
     }
-    if (JSON.stringify([...seen].sort()) !== JSON.stringify(expectedSkillNames)) {
+    const missingEffective = expectedSkillNames.filter((name) => !seen.has(name));
+    const unexpected = [...seen].filter((name) => !expectedSkillNames.includes(name));
+    if (missingEffective.length || unexpected.length) {
       throw new Error("OpenCode effective skill names do not exactly match the immutable managed source.");
     }
     return null;
@@ -2205,7 +2241,12 @@ async function readAgentDebugMetadataUncached(agent, cwd, { forcePure = false, r
         };
       }
     }
-    const skillPolicyError = metadata ? await managedSkillPolicyError(agent, { debugSkills, metadata }) : null;
+    const activeProfile = openCodeProfileRuntime.current();
+    const skillPolicyError = metadata ? await managedSkillPolicyError(agent, {
+      debugSkills,
+      metadata,
+      ...(activeProfile ? { effectiveConfigRoot: activeProfile.configDir, allowAdditionalSkills: true } : {}),
+    }) : null;
     if (skillPolicyError) {
       return { ok: false, ...skillPolicyError, metadata: null, isolatedRuntimeRoot: result.isolatedRuntimeRoot || "" };
     }
@@ -2245,10 +2286,12 @@ async function attestContractorNestedAgents(cwd, { forcePure = false, worktreeId
   return { ok: true, profiles };
 }
 
-const { exactPluginSpecifier, parseJsoncObject, pluginSpecsFromConfigText, hashExactTree, readPluginConfigSource, verifyNoLocalPluginDirectory, openCodeProjectConfigDirectories, managedOpenCodeConfigDirectories, exactPluginPackageName, pluginConfigCandidatePaths, expectedOpenCodePluginResolution, verifyExternalPluginPolicyUnshared, externalPluginPolicyFlights, verifyExternalPluginPolicy } = createPluginPolicyRuntime({ CONFIG, DEFAULT_OPENCODE_CACHE_HOME, DEFAULT_OPENCODE_CONFIG_DIR, OPENCODE_EXE, assertNoLinkedPath, buildOpenCodeEnv, cachedAttestation, logEvent, parseJsonText, resolveProjectStateRoot, runCommand, runSingleFlight, sha256File, staleBridgeProcessHint, summarizeStderr });
+const { exactPluginSpecifier, parseJsoncObject, pluginSpecsFromConfigText, hashExactTree, readPluginConfigSource, verifyNoLocalPluginDirectory, openCodeProjectConfigDirectories, managedOpenCodeConfigDirectories, exactPluginPackageName, pluginConfigCandidatePaths, expectedOpenCodePluginResolution, verifyExternalPluginPolicyUnshared, externalPluginPolicyFlights, verifyExternalPluginPolicy } = createPluginPolicyRuntime({ CONFIG, DEFAULT_OPENCODE_CACHE_HOME, DEFAULT_OPENCODE_CONFIG_DIR, OPENCODE_EXE, assertNoLinkedPath, buildOpenCodeEnv, cachedAttestation, getOpenCodeWorkerProfile: () => openCodeProfileRuntime.current(), logEvent, parseJsonText, resolveProjectStateRoot, runCommand, runSingleFlight, sha256File, staleBridgeProcessHint, summarizeStderr });
 
 async function safeOpenCodeCommand(args, cwd, timeoutMs = 1000 * 30, { forcePure = false, runtimeContext = null, verifiedPluginPolicy = null } = {}) {
-  const pure = forcePure || !CONFIG.allowExternalPlugins;
+  const activeProfile = openCodeProfileRuntime.current();
+  const externalPluginsAllowed = activeProfile ? Boolean(activeProfile.pluginManifestPath) : CONFIG.allowExternalPlugins;
+  const pure = forcePure || !externalPluginsAllowed;
   if (!pure) {
     const pluginPolicy = verifiedPluginPolicy || await verifyExternalPluginPolicy(cwd);
     if (!pluginPolicy.ok) {
@@ -2573,11 +2616,21 @@ async function loadProjectAgentPolicy(
   }
 }
 
-const { callerPathSpellings, pathSpeller, buildCompactPrompt, dependencyRequestPayloadSchema, DEPENDENCY_ABSENT, parseDependencyRequest, openCodePromptArgument, openCodeRunArgs, OPENCODE_WINDOWS_COMMAND_LINE_LIMIT, OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT, openCodeCommandLineLengthError, commandShape, timeoutForAgent, unboundedTimeoutForAgent, isTimeoutResult, applyRateLimitOutcome, rateLimitPauseReason, classifyResultError, createPhaseClock, PHASE_LABELS, formatPhaseTimings } = createOpenCodeCommandRuntime({ CONFIG, DEFAULT_RETURN_FORMAT, OPENCODE_EXE, defaultBuilderTimeoutMs, defaultContractorOrchestratorTimeoutMs, defaultOrchestratorTimeoutMs, defaultReadOnlyAgentTimeoutMs, defaultWriteAgentTimeoutMs, isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), nowMs });
+const { callerPathSpellings, pathSpeller, buildCompactPrompt, dependencyRequestPayloadSchema, DEPENDENCY_ABSENT, parseDependencyRequest, openCodePromptArgument, openCodeRunArgs, OPENCODE_WINDOWS_COMMAND_LINE_LIMIT, OPENCODE_POSIX_ARGUMENT_BYTE_LIMIT, openCodeCommandLineLengthError, commandShape, timeoutForAgent, unboundedTimeoutForAgent, isTimeoutResult, applyRateLimitOutcome, rateLimitPauseReason, classifyResultError, createPhaseClock, PHASE_LABELS, formatPhaseTimings } = createOpenCodeCommandRuntime({ CONFIG, DEFAULT_RETURN_FORMAT, OPENCODE_EXE, defaultBuilderTimeoutMs, defaultContractorOrchestratorTimeoutMs, defaultOrchestratorTimeoutMs, defaultReadOnlyAgentTimeoutMs, defaultWriteAgentTimeoutMs, getOpenCodeWorkerProfile: () => openCodeProfileRuntime.current(), isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), nowMs });
 
-const { runOpenCode, readOnlyResultRetryable, runOpenCodeWithPolicy, readOnlyRetryBudgetExhaustedResult, logOpenCodeResult } = createOpenCodeRunRuntime({ CONFIG, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, OPENCODE_EXE, acquireProviderLease, agentIdleTimeoutForModel, allowlistedModelOverride, applyModelOverrideToMetadata, applyRateLimitOutcome, buildOpenCodeEnv, classifyResultError, clearAgentActivity, combineAbortSignals: (...args) => combineAbortSignals(...args), commandShape, containmentRecord, createIsolatedOpenCodeRuntime, defaultWriteAgentTimeoutMs, delayWithSignal, detectsOpenCodeFallback, effectiveReadOnlyMetadataError, emptyOpenCodeUsage, inspectOpenCodeEventStream, isManagedReadOnlyAgent: (...args) => isManagedReadOnlyAgent(...args), isTimeoutResult, logEvent, maxReadOnlyAgentRetries, mergeHeavyToolCalls, modelPauseKeyForMetadata, noteAgentActivity, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, parseDependencyRequest, providerKeyForMetadata, providerSlotWaitStorage, providerSlotWaitingJobs, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, readAgentDebugMetadata, readAgentDebugMetadataUncached, reattestAgentMetadata, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, runSpawnCommand, startProviderLeaseHeartbeat, summarizeStderr, timeoutForAgent, verifyExternalPluginPolicy, wipeIsolatedOpenCodeRuntime, externalRunnerSelection: (...args) => externalRunnerSelection(...args), runExternalCli: (...args) => runExternalCli(...args) });
+const { runOpenCode, readOnlyResultRetryable, runOpenCodeWithPolicy, readOnlyRetryBudgetExhaustedResult, logOpenCodeResult } = createOpenCodeRunRuntime({ CONFIG, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, OPENCODE_EXE, acquireProviderLease, agentIdleTimeoutForModel, allowlistedModelOverride, applyModelOverrideToMetadata, applyRateLimitOutcome, buildOpenCodeEnv, classifyResultError, clearAgentActivity, combineAbortSignals: (...args) => combineAbortSignals(...args), commandShape, containmentRecord, createIsolatedOpenCodeRuntime, defaultWriteAgentTimeoutMs, delayWithSignal, detectsOpenCodeFallback, effectiveReadOnlyMetadataError, emptyOpenCodeUsage, getOpenCodeWorkerProfile: () => openCodeProfileRuntime.current(), inspectOpenCodeEventStream, isManagedReadOnlyAgent: (...args) => isManagedReadOnlyAgent(...args), isTimeoutResult, logEvent, maxReadOnlyAgentRetries, mergeHeavyToolCalls, modelPauseKeyForMetadata, noteAgentActivity, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, parseDependencyRequest, providerKeyForMetadata, providerSlotWaitStorage, providerSlotWaitingJobs, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, readAgentDebugMetadata, readAgentDebugMetadataUncached, reattestAgentMetadata, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, runSpawnCommand, startProviderLeaseHeartbeat, summarizeStderr, timeoutForAgent, verifyExternalPluginPolicy, wipeIsolatedOpenCodeRuntime, externalRunnerSelection: (...args) => externalRunnerSelection(...args), runExternalCli: (...args) => runExternalCli(...args) });
 // Q-012: codex and agy as external runners; inert unless CODEX_OPENCODE_EXTERNAL_RUNNERS lists one.
 const { externalRunnerName, externalRunnerSelection, externalRunnerStartupProblems, buildRunnerEnv, resolveRunnerExecutable, verifyRunnerExecutable, runExternalCli, externalRunnerStatusLines, captureTargetState, targetStateChanges } = createExternalRunnersRuntime({ acquireProviderLease, activeModelOverrideAllowlist, agentIdleTimeoutForModel, allowlistedModelOverride, classifyResultError, clearAgentActivity, closeDb, combineAbortSignals: (...args) => combineAbortSignals(...args), CONFIG, containmentRecord, DEFAULT_OPENCODE_CONFIG_DIR, effectiveBridgeStateDirectory, isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), isTimeoutResult, logEvent, modelPauseKeyForMetadata, noteAgentActivity, nowMs, OPENCODE_BASE_ENV_KEYS, openCodeCommandLineLengthError, openCodePromptArgument, openLockDb, parseDependencyRequest, parseModelAllowlistEntry, providerKeyForMetadata, providerSlotWaitingJobs, providerSlotWaitStorage, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, resolveWindowsNodeShim, runCommand, runGitReadOnlyCommand, runSpawnCommand, SENSITIVE_ENV_PATTERN, sha256File, startProviderLeaseHeartbeat, summarizeStderr, USER_HOME_DIR });
+
+function withOpenCodeWorkerProfile(job, operation) {
+  const route = externalRunnerSelection(job?.scopeContract?.modelRequirement || null, job?.agent);
+  const profileId = job?.runnerProfile || (!route ? CONFIG.openCodeProfiles.defaultProfileId : "");
+  if (route || !profileId) return operation();
+  const profile = resolveOpenCodeProfile(CONFIG.openCodeProfiles, profileId, "opencode");
+  if (profile.errorType) return operation(); // The lock-plan preflight reports the sanitized refusal.
+  profile.skillPaths = resolveOpenCodeSkillPaths(profile.skillPaths || [], { userHome: USER_HOME_DIR, cwd: job.cwd });
+  return openCodeProfileRuntime.run(profile, operation);
+}
 
 const { continuedWorktreeSummary, formatSingleResultParts, formatSingleResult, timedOutWriterNote, timedOutWriterEvidence, timedOutWriterLine, COMPACT_FILE_LIST_LIMIT, compactFileList, compactJobLines, fitJobResultText, fitRedactedJobResult, patchPreviewOmittedLine, conflictPathsFromConflict, formatRejectedExecution } = createResultFormatRuntime({ CONFIG, formatHeavyToolCalls, formatOpenCodeUsage, formatPhaseTimings, formatReadOnlyHeadMove: (...args) => formatReadOnlyHeadMove(...args), rateLimitPauseReason, summarizeStderr, truncateResultText });
 
@@ -3015,7 +3068,7 @@ async function migrateLegacyEncryptedState(db, dbPath) {
   return true;
 }
 
-const { directRunAuditStore, abortSignalErrorType, combineAbortSignals, validateDelegationPlanInputs, findActiveLockConflict, prepareDelegationJobs, formatDelegationPlanJob } = registerLockAndStatusTools({ withProjectRootCache, providerSlotWaitStorage, attestationCacheStatus, attachRetainedWorktree, continueWorktreeJobError: (...args) => continueWorktreeJobError(...args), BRIDGE_INSTANCE_ID, BRIDGE_PROCESS_STARTED_AT, BRIDGE_RUNTIME_DIR, BRIDGE_SOURCE_SHA256, CONFIG, DEFAULT_LOCK_TTL_MS, DEFAULT_SUBAGENT_PROXY_AGENT, GLOBALLY_REQUIRED_MANAGED_AGENTS, GLOBAL_BRIDGE_STATE_DIR, MAX_LOCK_TTL_MS, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, MCP_ORCHESTRATOR_AGENT, MCP_SANITIZED_READER_AGENT, OPENCODE_AGENT_DIR, OPENCODE_EXE, OPENCODE_SKILL_DIR, QUEUE_JOBS, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentIdleTimeoutStatusLine, agentMetadataPolicyOptions, allowlistedModelOverride, applyModelOverrideToMetadata, assessQueuePlan, attestContractorNestedAgents, availableAgentLabels, bridgeSourceFreshness, bridgeSourceFreshnessLines, clearAttestationCache, closeDb, commandShape, compactQueueJobLines: (...args) => compactQueueJobLines(...args), conflictPathsFromConflict, conflictsWithActiveLock, contractorAuthorizationToken: (...args) => contractorAuthorizationToken(...args), decryptIntegrationJournalBytes, describeConcurrencyLimits, diagnoseJobView: (...args) => diagnoseJobView(...args), dirtyCheckpointDetails, directExecutionLockConflictDetails: (...args) => directExecutionLockConflictDetails(...args), effectiveContractorAuthorizationSha256: (...args) => effectiveContractorAuthorizationSha256(...args), effectiveQueueMode, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, encryptIntegrationJournalBytes, enqueueQueueJob, executeOpenCodeJob: (...args) => executeOpenCodeJob(...args), prepareOpenCodeJob: (...args) => prepareOpenCodeJob(...args), shouldUseWorktree, formatAgentLockList, formatLockExpiry, formatRejectedExecution, hardLockPathsForPlan, integrationJournalDiagnosis, jobAgentRuntime: (...args) => jobAgentRuntime(...args), jobInputShape, listAvailableAgents, listLocks, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), queryPersistedPipelineRecords: (...args) => queryPersistedPipelineRecords(...args), listPersistedQueueRecords: (...args) => listPersistedQueueRecords(...args), queryPersistedQueueRecords: (...args) => queryPersistedQueueRecords(...args), listRetainedWorktreeArtifacts: (...args) => listRetainedWorktreeArtifacts(...args), makeQueueJobId, managedSkillSourceEvidence, normalizeJobCwd, nowMs, openLockDb, parallelBatchCapacityError: (...args) => parallelBatchCapacityError(...args), parallelProviderKeys: (...args) => parallelProviderKeys(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), providerCapacitySnapshot, queueAgentActivity, queueCapacityReport, queueMemoryGate, queueMemoryStatusLines, queueMemoryWaitingJobs, queueOnlyOptionsError: (...args) => queueOnlyOptionsError(...args), queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), readAgentDebugMetadata, readOnlyRoutingPolicyError: (...args) => readOnlyRoutingPolicyError(...args), recordMatchesProject, refreshRuntimeConcurrency, releaseHardLock, reservedLockAgentError, resolveProjectStateRoot, retainedWorktreeView: (...args) => retainedWorktreeView(...args), runCommand, safeOpenCodeCommand, sanitizedAgentMetadataError, sanitizedDiscoveryContext: (...args) => sanitizedDiscoveryContext(...args), sanitizedRoutingPolicyError, sanitizedWorkspaceSchema, server, summarizeStderr, timeoutForAgent, userAuthorizedOrchestrator: (...args) => userAuthorizedOrchestrator(...args), validateParallelWritePlan: (...args) => validateParallelWritePlan(...args), validateSingleLockPlan: (...args) => validateSingleLockPlan(...args), validationCommandPreflightError, verifyExternalPluginPolicy, verifyJobWorkspaceReadiness, verifySanitizedJobsBeforeDiscovery: (...args) => verifySanitizedJobsBeforeDiscovery(...args), verifySanitizedWorkspace, externalRunnerStatusLines: (...args) => externalRunnerStatusLines(...args) });
+const { directRunAuditStore, abortSignalErrorType, combineAbortSignals, validateDelegationPlanInputs, findActiveLockConflict, prepareDelegationJobs, formatDelegationPlanJob } = registerLockAndStatusTools({ externalRunnerSelection, withProjectRootCache, providerSlotWaitStorage, attestationCacheStatus, attachRetainedWorktree, continueWorktreeJobError: (...args) => continueWorktreeJobError(...args), BRIDGE_INSTANCE_ID, BRIDGE_PROCESS_STARTED_AT, BRIDGE_RUNTIME_DIR, BRIDGE_SOURCE_SHA256, CONFIG, DEFAULT_LOCK_TTL_MS, DEFAULT_SUBAGENT_PROXY_AGENT, GLOBALLY_REQUIRED_MANAGED_AGENTS, GLOBAL_BRIDGE_STATE_DIR, MAX_LOCK_TTL_MS, MCP_CONTRACTOR_ORCHESTRATOR_AGENT, MCP_ORCHESTRATOR_AGENT, MCP_SANITIZED_READER_AGENT, OPENCODE_AGENT_DIR, OPENCODE_EXE, OPENCODE_SKILL_DIR, QUEUE_JOBS, VALIDATION_PREFLIGHT_FIX, acquireHardLock, agentIdleTimeoutStatusLine, agentMetadataPolicyOptions, allowlistedModelOverride, applyModelOverrideToMetadata, assessQueuePlan, attestContractorNestedAgents, availableAgentLabels, bridgeSourceFreshness, bridgeSourceFreshnessLines, clearAttestationCache, closeDb, commandShape, compactQueueJobLines: (...args) => compactQueueJobLines(...args), conflictPathsFromConflict, conflictsWithActiveLock, contractorAuthorizationToken: (...args) => contractorAuthorizationToken(...args), decryptIntegrationJournalBytes, describeConcurrencyLimits, diagnoseJobView: (...args) => diagnoseJobView(...args), dirtyCheckpointDetails, directExecutionLockConflictDetails: (...args) => directExecutionLockConflictDetails(...args), effectiveContractorAuthorizationSha256: (...args) => effectiveContractorAuthorizationSha256(...args), effectiveQueueMode, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, encryptIntegrationJournalBytes, enqueueQueueJob, executeOpenCodeJob: (...args) => executeOpenCodeJob(...args), prepareOpenCodeJob: (...args) => prepareOpenCodeJob(...args), shouldUseWorktree, formatAgentLockList, formatLockExpiry, formatRejectedExecution, hardLockPathsForPlan, integrationJournalDiagnosis, jobAgentRuntime: (...args) => jobAgentRuntime(...args), jobInputShape, listAvailableAgents, listLocks, listPersistedPipelineRecords: (...args) => listPersistedPipelineRecords(...args), queryPersistedPipelineRecords: (...args) => queryPersistedPipelineRecords(...args), listPersistedQueueRecords: (...args) => listPersistedQueueRecords(...args), queryPersistedQueueRecords: (...args) => queryPersistedQueueRecords(...args), listRetainedWorktreeArtifacts: (...args) => listRetainedWorktreeArtifacts(...args), makeQueueJobId, managedSkillSourceEvidence, normalizeJobCwd, nowMs, openLockDb, parallelBatchCapacityError: (...args) => parallelBatchCapacityError(...args), parallelProviderKeys: (...args) => parallelProviderKeys(...args), pipelineOwnedByThisInstance: (...args) => pipelineOwnedByThisInstance(...args), providerCapacitySnapshot, queueAgentActivity, queueCapacityReport, queueMemoryGate, queueMemoryStatusLines, queueMemoryWaitingJobs, queueOnlyOptionsError: (...args) => queueOnlyOptionsError(...args), queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), readAgentDebugMetadata, readOnlyRoutingPolicyError: (...args) => readOnlyRoutingPolicyError(...args), recordMatchesProject, refreshRuntimeConcurrency, releaseHardLock, reservedLockAgentError, resolveProjectStateRoot, retainedWorktreeView: (...args) => retainedWorktreeView(...args), runCommand, safeOpenCodeCommand, sanitizedAgentMetadataError, sanitizedDiscoveryContext: (...args) => sanitizedDiscoveryContext(...args), sanitizedRoutingPolicyError, sanitizedWorkspaceSchema, server, summarizeStderr, timeoutForAgent, userAuthorizedOrchestrator: (...args) => userAuthorizedOrchestrator(...args), validateParallelWritePlan: (...args) => validateParallelWritePlan(...args), validateSingleLockPlan: (...args) => validateSingleLockPlan(...args), validationCommandPreflightError, verifyExternalPluginPolicy, verifyJobWorkspaceReadiness, verifySanitizedJobsBeforeDiscovery: (...args) => verifySanitizedJobsBeforeDiscovery(...args), verifySanitizedWorkspace, externalRunnerStatusLines: (...args) => externalRunnerStatusLines(...args) });
 
 const { listRetainedWorktreeArtifacts, QUEUE_JOB_RUNNING_STATUSES, retainedWorktreeView, directRunView, diagnoseJobView, ESSENTIAL_QUEUE_JOB_FIELDS, essentialQueueJobView, queueTimedOutWriterNote, compactQueueJobLines, formatToolRefusal, formatConcurrencyChange } = registerJobTools({ releaseFinishedQueueDetails: (record) => releaseFinishedQueueDetails(record), providerSlotWaitingJobs, BRIDGE_INSTANCE_ID, CONFIG, MAX_GLOBAL_WORKER_LIMIT, MAX_RUNTIME_CONCURRENCY_LIMIT, QUEUE_JOBS, RETAINED_WORKTREE_STATUSES, assessQueuePlan, authoritativeQueueRecord: (...args) => authoritativeQueueRecord(...args), cancelPersistedQueueJob: (...args) => cancelPersistedQueueJob(...args), closeDb, describeConcurrencyLimits, directRunAuditStore, effectiveBridgeStateDirectory, effectiveQueueMode, formatIdleDuration, formatOpenCodeUsage, logEvent, nowMs, openLockDb, pauseProvider, persistQueueRecord: (...args) => persistQueueRecord(...args), processIsAlive, queueAgentActivity, queueRecordSnapshot: (...args) => queueRecordSnapshot(...args), queueRunStage, readPersistedQueueRecord: (...args) => readPersistedQueueRecord(...args), reconcileParentPipelineAfterQueueTerminal: (...args) => reconcileParentPipelineAfterQueueTerminal(...args), reconcileStaleQueueRecords, recordMatchesProject, requeueQueueJob: (...args) => requeueQueueJob(...args), resolveProjectStateRoot, resumeProvider, scheduleQueue: (...args) => scheduleQueue(...args), server, setRuntimeConcurrency, timedOutWriterNote });
 
@@ -3041,7 +3094,7 @@ const { continueWorktreeJobError, normalizeLockType, normalizeLockMode, createLo
 
 const { sanitizedDiscoveryContext, verifySanitizedJobsBeforeDiscovery, parallelProviderKeys, jobAgentRuntime, getAgentRuntimeTestHook, setAgentRuntimeTestHook } = createJobDiscoveryRuntime({ allowlistedModelOverride, applyModelOverrideToMetadata, providerKeyForMetadata, readAgentDebugMetadata, resolveAgent, runOpenCodeWithPolicy, verifySanitizedWorkspace });
 
-const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProcessMsOf, buildValidationFixPrompt, buildSelfCheckFixPrompt, selfCheckFailureSummary, selfCheckPassSkipReason, formatSelfCheck, validationFixPassSkipReason, mergeValidationFixRuns, formatValidationFixPass, readOnlyEditsDeniedByAttestation, readOnlyWorkspaceDrift, formatReadOnlyWorkspaceDrift, pinnedProviderPause, executeOpenCodeJob, prepareOpenCodeJob } = createExecuteJobRuntime({ validateSingleLockPlanAsync, withProjectRootCache, allowlistedModelOverride, providerPauseSnapshot, providerKeyForMetadata, modelPauseKeyForMetadata, quotaGroupProviderKeys, withAttestationFingerprintScope, finishAttestationFingerprintScope, attachRetainedWorktree, releaseRetainedWorktreeClaim, CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, OPENCODE_EXE, SELF_CHECK_DEFAULT_PASSES, VALIDATION_PREFLIGHT_FIX, abortSignalErrorType, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, attestContractorNestedAgents, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, combineAbortSignals, compactFileList, compactJobLines, conflictPathsFromConflict, containmentRecord, createPhaseClock, createWorktreeForJob, directExecutionLockConflictDetails, dirtyCheckpointDetails, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitChangedFileSnapshotParts, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, jobAgentRuntime, logEvent, makeQueueJobId, mergeHeavyToolCalls, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, patchPreviewOmittedLine, quarantineHardLock, readAgentDefinition, readOnlyHeadMove, readOnlyRoutingPolicyError, recordChangedFiles, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, shouldUseWorktree, startHardLockHeartbeat, timeoutForAgent, truncateText, updateRetainedWorktreeMeasurement, validateChangedFilesForPlan, validateSingleLockPlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifySanitizedWorkspace, providerCapacitySnapshot });
+const { VALIDATION_FIX_MIN_REMAINING_MS, VALIDATION_FIX_OUTPUT_CHARS, agentProcessMsOf, buildValidationFixPrompt, buildSelfCheckFixPrompt, selfCheckFailureSummary, selfCheckPassSkipReason, formatSelfCheck, validationFixPassSkipReason, mergeValidationFixRuns, formatValidationFixPass, readOnlyEditsDeniedByAttestation, readOnlyWorkspaceDrift, formatReadOnlyWorkspaceDrift, pinnedProviderPause, executeOpenCodeJob, prepareOpenCodeJob } = createExecuteJobRuntime({ validateSingleLockPlanAsync, withProjectRootCache, withOpenCodeProfile: withOpenCodeWorkerProfile, allowlistedModelOverride, providerPauseSnapshot, providerKeyForMetadata, modelPauseKeyForMetadata, quotaGroupProviderKeys, withAttestationFingerprintScope, finishAttestationFingerprintScope, attachRetainedWorktree, releaseRetainedWorktreeClaim, CONFIG, DEFAULT_SUBAGENT_PROXY_AGENT, OPENCODE_EXE, SELF_CHECK_DEFAULT_PASSES, VALIDATION_PREFLIGHT_FIX, abortSignalErrorType, acquireHardLock, agentMetadataPolicyOptions, applyGitControlSurfaceCheck, attestContractorNestedAgents, buildCompactPrompt, buildSubagentProxyPrompt, callerPathSpellings, captureGitHead, changedFileValidationErrorType, changedFilesBetween, changedPathSetEvidence, cleanupWorktree, collectWorktreeDiff, combineAbortSignals, compactFileList, compactJobLines, conflictPathsFromConflict, containmentRecord, createPhaseClock, createWorktreeForJob, directExecutionLockConflictDetails, dirtyCheckpointDetails, effectiveQueueWriteConflictPolicy, effectiveReadOnlyMetadataError, fitRedactedJobResult, formatRejectedExecution, formatSingleResultParts, formatWorktreeSummary, gitChangedFileSnapshot, gitChangedFileSnapshotParts, gitControlSurfaceFingerprint, hardLockPathsForPlan, hardLockSummary, hardLockTtlForPlan, jobAgentRuntime, logEvent, makeQueueJobId, mergeHeavyToolCalls, nowMs, openCodeCommandLineLengthError, openCodeRunArgs, patchPreviewOmittedLine, quarantineHardLock, readAgentDefinition, readOnlyHeadMove, readOnlyRoutingPolicyError, recordChangedFiles, releaseHardLock, runValidationGate, sanitizedAgentMetadataError, sanitizedDiscoveryContext, sanitizedRoutingPolicyError, shouldUseWorktree, startHardLockHeartbeat, timeoutForAgent, truncateText, updateRetainedWorktreeMeasurement, validateChangedFilesForPlan, validateSingleLockPlan, validationCommandPreflightError, verifyJobWorkspaceReadiness, verifySanitizedWorkspace, providerCapacitySnapshot });
 
 function queueRunStage(record) {
   if (record.status !== "running") {
@@ -3393,6 +3446,11 @@ async function assessQueuePlan(lockPlans = []) {
 // Q-015: `unowned: true` (queue-worker.js --add) persists the row with no owner and no lease and
 // keeps it out of this process: the running queue worker of the repository adopts it in its next
 // recovery pass (an empty lease and owner are adoptable at once). Durable (sqlite) queue only.
+function workerProfileBindingOptions(job) {
+  return { config: CONFIG, runner: externalRunnerSelection(job.scopeContract?.modelRequirement, job.agent)?.runner || "opencode",
+    profileId: job.runnerProfile ?? job.codexProfile, cwd: job.cwd, userHome: USER_HOME_DIR, openCodeConfigDir: DEFAULT_OPENCODE_CONFIG_DIR, openCodeDataHome: path.dirname(DEFAULT_OPENCODE_DATA_DIR) };
+}
+
 async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initialStatus = "pending", persist = true, recordFields = null, unowned = false } = {}) {
   if (unowned && effectiveQueueMode() !== "sqlite") {
     return {
@@ -3458,6 +3516,16 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   const jobId = makeQueueJobId(job.agent);
   const idempotencyKey = String(job.idempotencyKey || "").trim();
   const safeRequest = { ...normalizedJob };
+  // Resolve defaults now: a later server must not choose a different account.
+  if (lockPlan.runnerProfile !== undefined) safeRequest.runnerProfile = lockPlan.runnerProfile;
+  let workerProfileBinding;
+  try {
+    const bindingOptions = workerProfileBindingOptions(safeRequest);
+    workerProfileBinding = recordFields?.workerProfileBinding || await captureWorkerProfileBinding(bindingOptions);
+    await verifyWorkerProfileBinding(workerProfileBinding, bindingOptions);
+  } catch (error) {
+    return { ok: false, errorType: "worker_profile_changed", error: error.message };
+  }
   delete safeRequest.idempotencyKey;
   delete safeRequest.contractorAuthorizationToken;
   if (safeRequest.delegation) {
@@ -3482,9 +3550,11 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
     idempotencyKey,
     requestEncrypted,
     requestFingerprint,
+    workerProfileBinding,
     mode: lockPlan.lockType === "read" ? "read" : "write",
     scopeContract: lockPlan.scopeContract || null,
     ...(lockPlan.codexProfile === undefined ? {} : { codexProfile: lockPlan.codexProfile }),
+    ...(lockPlan.runnerProfile === undefined ? {} : { runnerProfile: lockPlan.runnerProfile }),
     sanitizedWorkspace: normalizedJob.sanitizedWorkspace || null,
     sanitizedWorkspaceVerification: null,
     lockMode: lockPlan.lockMode,
@@ -3539,6 +3609,7 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   };
   // Lineage fields of a requeued job (requeuedFrom, requeueSequence); set before the first write.
   if (recordFields) Object.assign(record, recordFields);
+  record.workerProfileBinding = workerProfileBinding;
   // B-078: a new job whose every model is paused waits for the first pause to end instead of
   // failing its first attempt at the slot. The request keeps its first model (the idempotency
   // fingerprint must not depend on the pauses of the moment); a requeue chose its own start.
@@ -4103,7 +4174,7 @@ const {
   enqueueQueueJob,
 });
 
-const { QUEUE_RETRYABLE_LOCK_ERROR_TYPES, QUEUE_TERMINAL_COMMIT_ATTEMPTS, queueBlockedBackoffPatch, reacquireQueueRecordLease, updateQueueRecordDurableReacquiringLease, queueRecordOwnedElsewhere, commitQueueTerminalRecord, blockQueueRecordAfterLockRefusal, startQueueRecord, queueFailureReason, getQueueJobExecutorTestHook, setQueueJobExecutorTestHook } = createQueueStartRuntime({ createQueueWaitOwnershipProbe, releaseFinishedQueueDetails, directRunAuditStore, externalRunnerName, BRIDGE_INSTANCE_ID, CONFIG, QUEUE_ACTIVE_STATUSES, QUEUE_TERMINAL_STATUSES, abandonLocalQueueWorker, assertQueueRecordDurableOwnership, changedFileValidationErrorType, claimQueueRecord, clearQueueLeaseFence, closeDb, delayWithSignal, effectiveQueueMode, effectiveQueueWriteConflictPolicy, executeOpenCodeJob, findQueueWriteConflict, handleQueueWorkerInfrastructureFailure, logEvent, loseQueueOwnership, nowMs, openLockDb, providerSlotWaitStorage, queueOwnershipLossError, reacquirePersistedQueueRecordLease, reconcileParentPipelineAfterQueueTerminal: (...args) => reconcileParentPipelineAfterQueueTerminal(...args), renewQueueRecordDurableOwnership, resetQueueLeaseFence, scheduleAutoIntegration, scheduleQueue: (...args) => scheduleQueue(...args), scheduleQueueRetryPolicy, summarizeStderr, superviseQueueWorker, timedOutWriterEvidence, timedOutWriterNote, truncateText, updateQueueRecordDurable, updateQueueTerminalRecordDurable });
+const { QUEUE_RETRYABLE_LOCK_ERROR_TYPES, QUEUE_TERMINAL_COMMIT_ATTEMPTS, queueBlockedBackoffPatch, reacquireQueueRecordLease, updateQueueRecordDurableReacquiringLease, queueRecordOwnedElsewhere, commitQueueTerminalRecord, blockQueueRecordAfterLockRefusal, startQueueRecord, queueFailureReason, getQueueJobExecutorTestHook, setQueueJobExecutorTestHook } = createQueueStartRuntime({ verifyQueueProfileBinding: (record) => verifyWorkerProfileBinding(record.workerProfileBinding, workerProfileBindingOptions(record.request)), createQueueWaitOwnershipProbe, releaseFinishedQueueDetails, directRunAuditStore, externalRunnerName, BRIDGE_INSTANCE_ID, CONFIG, QUEUE_ACTIVE_STATUSES, QUEUE_TERMINAL_STATUSES, abandonLocalQueueWorker, assertQueueRecordDurableOwnership, changedFileValidationErrorType, claimQueueRecord, clearQueueLeaseFence, closeDb, delayWithSignal, effectiveQueueMode, effectiveQueueWriteConflictPolicy, executeOpenCodeJob, findQueueWriteConflict, handleQueueWorkerInfrastructureFailure, logEvent, loseQueueOwnership, nowMs, openLockDb, providerSlotWaitStorage, queueOwnershipLossError, reacquirePersistedQueueRecordLease, reconcileParentPipelineAfterQueueTerminal: (...args) => reconcileParentPipelineAfterQueueTerminal(...args), renewQueueRecordDurableOwnership, resetQueueLeaseFence, scheduleAutoIntegration, scheduleQueue: (...args) => scheduleQueue(...args), scheduleQueueRetryPolicy, summarizeStderr, superviseQueueWorker, timedOutWriterEvidence, timedOutWriterNote, truncateText, updateQueueRecordDurable, updateQueueTerminalRecordDurable });
 
 // `progressed` is false when a pass advanced no record: pending records that could not be
 // planned or claimed (a lost or lapsed lease) are then polled, not rescheduled at 0 ms,
@@ -5542,6 +5613,7 @@ export const __selfTest = {
     requalifyStateDriftQuarantine,
     quarantineIntegrationOperation,
     buildOpenCodeEnv,
+    withOpenCodeWorkerProfile,
     buildTrustedGitEnv,
     buildValidationEnv,
     cachedAttestation,
@@ -5570,6 +5642,7 @@ export const __selfTest = {
     createHash,
     createIsolatedOpenCodeRuntime,
     createPipelinePlan,
+    createLockPlan,
     attachRetainedWorktree,
     inspectWorktreeSourceIdentity,
     claimRetainedWorktree,

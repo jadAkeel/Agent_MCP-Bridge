@@ -464,7 +464,7 @@ int main(int argc, char **argv) {
     // And the effective config OpenCode reports, wherever it came from.
     const marker = path.join(rootA, "fake-effective-mcp");
     await writeFile(marker, "", "utf8");
-    rejected(verifyPluginPolicy({ configHome: rootA, ...tree }), /Effective OpenCode config enables MCP server\(s\) x/);
+    rejected(verifyPluginPolicy({ configHome: rootA, ...tree }), /Effective OpenCode MCP servers \(x\) do not match the selected profile allowlist \(none\)/);
     await rm(marker, { force: true });
     accepted(verifyPluginPolicy({ configHome: rootA, ...tree }));
   });

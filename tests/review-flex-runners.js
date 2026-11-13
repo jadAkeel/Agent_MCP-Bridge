@@ -11,25 +11,37 @@
 //   node tests/review-flex-runners.js
 import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge reads it
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
-const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync } = await import("node:fs");
+const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync, existsSync } = await import("node:fs");
 const { createHash } = await import("node:crypto");
 const { tmpdir: osTmpdir } = await import("node:os");
 const nodePath = (await import("node:path")).default;
 const { fileURLToPath } = await import("node:url");
 
 const scratch = mkdtempSync(nodePath.join(osTmpdir(), "review-flex-runners-"));
+const testUserHome = nodePath.join(scratch, "user-home");
+mkdirSync(testUserHome, { recursive: true });
+process.env.USERPROFILE = testUserHome;
+process.env.HOME = testUserHome;
 const binDir = nodePath.join(scratch, "bin");
 const recordDir = nodePath.join(scratch, "records");
 const controlFile = nodePath.join(scratch, "control.json");
 const codexHome = nodePath.join(scratch, "codex-home");
 const profileA = nodePath.join(scratch, "codex-a");
 const profileB = nodePath.join(scratch, "codex-b");
+const openCodeDataA = nodePath.join(scratch, "opencode-account-a");
+const openCodeDataB = nodePath.join(scratch, "opencode-account-b");
 for (const home of [profileA, profileB]) {
   mkdirSync(home);
   writeFileSync(nodePath.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fixture" } }));
 }
 const xdgConfig = nodePath.join(scratch, "xdg-config");
-for (const directory of [binDir, recordDir, codexHome, nodePath.join(xdgConfig, "opencode")]) mkdirSync(directory, { recursive: true });
+const openCodeConfigDir = nodePath.join(xdgConfig, "opencode");
+const openCodeCacheHome = nodePath.join(scratch, "opencode-cache");
+for (const directory of [binDir, recordDir, codexHome, openCodeConfigDir, openCodeCacheHome,
+  nodePath.join(openCodeDataA, "opencode"), nodePath.join(openCodeDataB, "opencode")]) mkdirSync(directory, { recursive: true });
+for (const [home, id] of [[openCodeDataA, "a"], [openCodeDataB, "b"]]) {
+  writeFileSync(nodePath.join(home, "opencode", "auth.json"), JSON.stringify({ fixture: `opencode-account-${id}` }));
+}
 const writeControl = (value) => writeFileSync(controlFile, JSON.stringify(value), "utf8");
 writeControl({});
 
@@ -48,7 +60,10 @@ if (args[0] === "--version") {
 const pick = (...names) => Object.fromEntries(names.map((name) => [name, process.env[name] === undefined ? null : process.env[name]]));
 fs.writeFileSync(path.join(${JSON.stringify(recordDir)}, runner + "-" + Date.now() + "-" + process.pid + ".json"), JSON.stringify({
   args, cwd: process.cwd(),
-  env: pick("CODEX_HOME", "USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "FLEX_RUNNER_API_TOKEN", "OPENCODE_CONFIG_CONTENT", "CODEX_OPENCODE_EXTERNAL_RUNNERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"),
+  codexProfile: runner === "codex" ? args[args.indexOf("--profile") + 1] : "",
+  codexProfileExists: runner === "codex" && args.includes("--profile") ? fs.existsSync(path.join(process.env.CODEX_HOME, args[args.indexOf("--profile") + 1] + ".config.toml")) : false,
+  workerProfileConfig: runner === "codex" && args.includes("--profile") ? fs.readFileSync(path.join(process.env.CODEX_HOME, args[args.indexOf("--profile") + 1] + ".config.toml"), "utf8") : "",
+  env: pick("CODEX_HOME", "USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "GEMINI_API_KEY", "FLEX_RUNNER_API_TOKEN", "OPENCODE_CONFIG_CONTENT", "CODEX_OPENCODE_EXTERNAL_RUNNERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"),
 }));
 const out = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,7 +117,7 @@ const writeWork = () => { if (control.writeFile) fs.writeFileSync(path.join(proc
   if (mode === "quota-exit3") { process.stderr.write("RESOURCE_EXHAUSTED: Quota resets in 1h 5m\\n"); process.exit(3); }
   out({ event: "init", conversation_id: "c-1", init: { cwd: process.cwd(), tools: [], permission_mode: "auto" } });
   writeWork();
-  if (mode === "write-target") fs.writeFileSync(control.targetFile, "agy wrote here\\n");
+  if (mode === "write-target") fs.writeFileSync(control.targetFile, control.targetContent || "agy wrote here\\n");
   out({ event: "step_update", step_update: { step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "REPORT" } });
   out({ event: "result", result: { status: "SUCCESS", response: "REPORT: done by fake agy", num_turns: 2, usage: { input_tokens: 900, output_tokens: 40, thinking_tokens: 5, cache_read_tokens: 100 } } });
   process.exit(0);
@@ -152,10 +167,25 @@ process.env.CODEX_OPENCODE_CODEX_PROFILES = JSON.stringify({
   a: { home: profileA }, b: { home: profileB }, disabled: { home: profileA, enabled: false },
   missing: { home: nodePath.join(scratch, "missing") }, unsigned: { home: codexHome },
 });
+process.env.CODEX_OPENCODE_AGY_PROFILES = JSON.stringify({
+  agyPrimary: { apiKeyEnv: "AGY_PRIMARY_KEY" }, agySecondary: { apiKeyEnv: "AGY_SECONDARY_KEY" },
+  agyDisabled: { apiKeyEnv: "AGY_PRIMARY_KEY", enabled: false },
+});
+process.env.CODEX_OPENCODE_PROFILE_BASE = JSON.stringify({ configDir: openCodeConfigDir, cacheHome: openCodeCacheHome, mcpServers: [] });
+process.env.CODEX_OPENCODE_PROFILES = JSON.stringify({ openCodeA: { dataHome: openCodeDataA }, openCodeB: { dataHome: openCodeDataB } });
+process.env.CODEX_OPENCODE_DEFAULT_PROFILE = "openCodeA";
+process.env.AGY_PRIMARY_KEY = "fixture-agy-primary-secret";
+process.env.AGY_SECONDARY_KEY = "fixture-agy-secondary-secret";
 process.env.XDG_CONFIG_HOME = xdgConfig;
 // Must never reach a runner.
 process.env.FLEX_RUNNER_API_TOKEN = "secret-value";
 process.env.OPENCODE_CONFIG_CONTENT = "{\"agent\":{}}";
+writeFileSync(nodePath.join(codexHome, "config.toml"), [
+  "[mcp_servers.filtered-secret]",
+  'command = "secret-mcp"',
+  'env = { FLEX_RUNNER_API_TOKEN = "secret-value" }',
+  "enabled = true",
+].join("\n"), "utf8");
 delete process.env.CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY;
 delete process.env.CODEX_OPENCODE_RATE_LIMIT_HITS;
 delete process.env.CODEX_OPENCODE_RATE_LIMIT_PAUSE_MS;
@@ -175,15 +205,20 @@ const {
   CONFIG,
   acquireProviderLease,
   assert,
+  buildOpenCodeEnv,
   buildRunnerEnv,
+  createLockPlan,
   describeFailedMcpMessage,
   externalRunnerName,
   externalRunnerSelection,
   externalRunnerStartupProblems,
   externalRunnerStatusLines,
+  withOpenCodeWorkerProfile,
+  modelPauseKeyForMetadata,
   parseModelAllowlistEntry,
   providerCapacitySnapshot,
   providerKeyForMetadata,
+  quotaGroupProviderKeys,
   providerLimitForKey,
   releaseProviderLease,
   resumeProvider,
@@ -337,24 +372,30 @@ test("Q-012: a model requirement selects a runner only when enabled and allowlis
 });
 
 test("Q-012: argv: fixed flags, the variant and the read-only sandbox; env keeps the real profile and strips secrets", () => {
-  const codex = runners.buildCodexArgs({ model: "gpt-test", variant: "high", cwd: "W", lastMessagePath: "L", prompt: "P", windowsSandbox: "" });
-  assert.deepEqual(codex, ["exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "-s", "workspace-write", "-C", "W", "-m", "gpt-test", "-c", "model_reasoning_effort=high", "-o", "L", "--", "P"]);
-  // Without a Windows sandbox codex refuses every write; --ignore-user-config drops the user's one.
+  const codex = runners.buildCodexArgs({ model: "gpt-test", variant: "high", cwd: "W", lastMessagePath: "L", prompt: "P", profileId: "bridge-test", windowsSandbox: "" });
+  assert.deepEqual(codex, ["exec", "--json", "--ephemeral", "--profile", "bridge-test", "--ignore-rules", "-s", "workspace-write", "-C", "W", "-m", "gpt-test", "-c", "model_reasoning_effort=high", "-o", "L", "--", "P"]);
+  // Without a Windows sandbox codex refuses every write; the worker profile must retain the host's compatible sandbox config.
   const winArgs = runners.buildCodexArgs({ model: "m", cwd: "W", lastMessagePath: "L", prompt: "P", windowsSandbox: "elevated" });
   assert.deepEqual(winArgs.slice(winArgs.indexOf("-c"), winArgs.indexOf("-c") + 2), ["-c", "windows.sandbox=elevated"]);
   assert.equal(runners.defaultCodexWindowsSandbox({}, "win32"), "elevated");
   assert.equal(runners.defaultCodexWindowsSandbox({ CODEX_OPENCODE_CODEX_WINDOWS_SANDBOX: "unelevated" }, "win32"), "unelevated");
   assert.equal(runners.defaultCodexWindowsSandbox({}, "linux"), "");
-  assert.equal(runners.buildCodexArgs({ model: "m", readOnly: true, cwd: "W", lastMessagePath: "L", prompt: "P" })[6], "read-only");
+  const readOnlyCodex = runners.buildCodexArgs({ model: "m", readOnly: true, cwd: "W", lastMessagePath: "L", prompt: "P", profileId: "bridge-read" });
+  assert.equal(readOnlyCodex[readOnlyCodex.indexOf("-s") + 1], "read-only");
   const agy = runners.buildAgyArgs({ model: "claude-test", variant: "high", timeoutMs: 600_000, logPath: "G", prompt: "P" });
-  assert.deepEqual(agy, ["-p", "P", "--dangerously-skip-permissions", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json", "--print-timeout", "540s", "--log-file", "G", "--model", "claude-test", "--effort", "high"]);
+  assert.deepEqual(agy, ["-p", "P", "--dangerously-skip-permissions", "--sandbox", "--output-format", "stream-json", "--print-timeout", "540s", "--log-file", "G", "--model", "claude-test", "--effort", "high"]);
   assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" }).includes("--model"), false, "agy/default passes no --model");
+  const agyApiKey = runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P", geminiApiKeyProfile: true });
+  assert.deepEqual(agyApiKey.slice(4, 6), ["--settings", JSON.stringify({ modelProvider: "gemini" })]);
   // B-148: a short budget keeps agy's own timeout inside it (a tenth of it as margin, at least 1 s).
-  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" })[8], "9s");
-  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 120_000, logPath: "G", prompt: "P" })[8], "108s");
-  assert.equal(runners.buildAgyArgs({ model: "default", timeoutMs: 900, logPath: "G", prompt: "P" })[8], "1s");
+  const shortAgy = runners.buildAgyArgs({ model: "default", timeoutMs: 10_000, logPath: "G", prompt: "P" });
+  const mediumAgy = runners.buildAgyArgs({ model: "default", timeoutMs: 120_000, logPath: "G", prompt: "P" });
+  const tinyAgy = runners.buildAgyArgs({ model: "default", timeoutMs: 900, logPath: "G", prompt: "P" });
+  assert.equal(shortAgy[shortAgy.indexOf("--print-timeout") + 1], "9s");
+  assert.equal(mediumAgy[mediumAgy.indexOf("--print-timeout") + 1], "108s");
+  assert.equal(tinyAgy[tinyAgy.indexOf("--print-timeout") + 1], "1s");
   assert.equal(runners.runnerFlagsError("codex", codex), "");
-  assert.match(runners.runnerFlagsError("codex", codex.filter((item) => item !== "--ignore-user-config")), /--ignore-user-config/);
+  assert.match(runners.runnerFlagsError("codex", codex.filter((item) => item !== "--profile" && item !== "bridge-test")), /--profile/);
   assert.equal(runners.runnerFlagsError("agy", agy), "");
   const env = buildRunnerEnv("codex");
   assert.equal(env.CODEX_HOME, codexHome);
@@ -364,6 +405,7 @@ test("Q-012: argv: fixed flags, the variant and the read-only sandbox; env keeps
   assert.equal(Object.keys(env).some((key) => key.toUpperCase().startsWith("CODEX_OPENCODE_")), false);
   assert.equal(env.GIT_CONFIG_KEY_0, "core.fsmonitor");
   assert.equal(buildRunnerEnv("agy").CODEX_HOME, undefined, "agy gets no CODEX_HOME");
+  assert.equal(buildRunnerEnv("agy").AGY_PRIMARY_KEY, undefined, "profile key references do not leak into the normal child environment");
 });
 
 test("Q-012: path, hash pin and version floor are checked before a runner starts", async () => {
@@ -395,6 +437,7 @@ test("Q-012: a codex writer completes in its worktree with changed files, usage 
   assert.match(text, /^External runner: codex 0\.159\.3 \(unattested/m);
   assert.match(text, /^Configured provider: codex$/m);
   assert.match(text, /^Model selection: external_runner$/m);
+  assert.match(text, /^Worker customization SHA-256: [a-f0-9]{64}$/m);
   assert.match(text, /^Token usage: steps=1 input=1000 output=50 reasoning=7 cache_read=200 cache_write=0/m);
   assert.match(text, new RegExp(`^Provider/account concurrency key: ${KEY}:codex$`, "m"));
   assert.match(text, /src\/a\.txt/);
@@ -402,7 +445,9 @@ test("Q-012: a codex writer completes in its worktree with changed files, usage 
   const [record] = records("codex");
   assert.ok(record, "the fake ran once");
   assert.notEqual(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase(), "it ran in the worktree");
-  assert.deepEqual(record.args.slice(0, 7), ["exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "-s", "workspace-write"]);
+  assert.deepEqual(record.args.slice(0, 8), ["exec", "--json", "--ephemeral", "--profile", record.codexProfile, "--ignore-rules", "-s", "workspace-write"]);
+  assert.match(record.codexProfile, /^bridge-[a-f0-9]{20}$/);
+  assert.equal(record.codexProfileExists, true, "the selected Codex profile exists for the worker's lifetime");
   assert.equal(record.args[record.args.indexOf("-m") + 1], "gpt-test");
   assert.equal(record.args[record.args.indexOf("-c") + 1], "model_reasoning_effort=high");
   assert.equal(nodePath.resolve(record.args[record.args.indexOf("-C") + 1]).toLowerCase(), nodePath.resolve(record.cwd).toLowerCase());
@@ -410,8 +455,11 @@ test("Q-012: a codex writer completes in its worktree with changed files, usage 
   assert.match(record.args.at(-1), /Do not commit/);
   assert.equal(record.env.CODEX_HOME, codexHome);
   assert.equal(record.env.FLEX_RUNNER_API_TOKEN, null);
+  assert.equal(record.workerProfileConfig.includes("secret-value"), false, "a filtered bridge environment secret is neither copied into the worker config nor forwarded to the child");
+  assert.match(record.workerProfileConfig, /enabled = false/);
   assert.equal(record.env.OPENCODE_CONFIG_CONTENT, null);
   assert.equal(record.env.CODEX_OPENCODE_EXTERNAL_RUNNERS, null);
+  assert.equal(existsSync(nodePath.join(codexHome, `${record.codexProfile}.config.toml`)), false, "the per-run profile is removed when the worker exits");
   assert.equal(readFileSync(nodePath.join(repo, "src", "a.txt"), "utf8"), "a\n", "the target checkout is untouched until integration");
 });
 
@@ -441,6 +489,9 @@ test("Codex profiles: overlapping parallel children each receive their own home"
   for (const [id, home] of [["a", profileA], ["b", profileB]]) {
     const record = records("codex").find((item) => item.args.at(-1).includes(`for profile ${id}.`));
     assert.equal(record?.env.CODEX_HOME, home);
+    assert.match(record?.codexProfile || "", /^bridge-[a-f0-9]{20}$/);
+    assert.equal(record?.codexProfileExists, true);
+    assert.equal(existsSync(nodePath.join(home, `${record.codexProfile}.config.toml`)), false, "each account's temporary config is removed after its worker exits");
   }
   assert.equal(process.env.CODEX_HOME, codexHome);
 });
@@ -455,6 +506,7 @@ test("Codex profiles: unknown, disabled, unusable, path and non-Codex selections
     ["unsigned", "codex", "gpt-read", "codex_profile_unusable"],
     [profileA, "codex", "gpt-read", "codex_profile_invalid"],
     ["a", "agy", "default", "codex_profile_requires_codex"],
+    ["agyPrimary", "codex", "gpt-read", "codex_profile_unknown"],
   ]) {
     const job = runnerReadJob(requirement(provider, model), { codexProfile });
     const plan = textOf(await callTool("validate_delegation_plan", { jobs: [job] }));
@@ -462,6 +514,119 @@ test("Codex profiles: unknown, disabled, unusable, path and non-Codex selections
     assert.equal(errorTypeOf(await run({ ...job, dryRun: true })), errorType);
   }
   assert.equal(records("codex").length, 0);
+});
+
+test("Antigravity runner profiles select separate API keys, quota slots and durable status IDs", async () => {
+  clearRecords();
+  writeControl({});
+  const job = runnerWriteJob(requirement("agy", "default"), "src/a.txt", { runnerProfile: "agySecondary" });
+  const receipt = textOf(await callTool("enqueue_opencode_job", job));
+  const jobId = /^Job ID: (\S+)$/m.exec(receipt)?.[1];
+  assert.ok(jobId, receipt);
+  assert.ok(await fixture.waitFor(async () => fixture.terminal((await fixture.durable(jobId))?.status), 20000));
+  const record = records("agy")[0];
+  assert.equal(record.env.GEMINI_API_KEY, "fixture-agy-secondary-secret");
+  assert.equal(record.args[record.args.indexOf("--settings") + 1], JSON.stringify({ modelProvider: "gemini" }));
+  assert.equal(record.env.CODEX_OPENCODE_AGY_PROFILES, undefined);
+  assert.equal(record.env.AGY_PRIMARY_KEY, undefined);
+  assert.equal(record.env.AGY_SECONDARY_KEY, undefined);
+  assert.equal(providerKeyForMetadata({ provider: "agy", profileId: "agySecondary" }), `${KEY}:agy-agysecondary`);
+  assert.equal(modelPauseKeyForMetadata({ provider: "agy", model: "default", profileId: "agySecondary" }), `${KEY}:agy-agysecondary/default`);
+  assert.deepEqual(quotaGroupProviderKeys({ provider: "codex", profileId: "account-a" }).sort(), [`${KEY}:codex-account-a`, `${KEY}:openai`]);
+  assert.match(receipt, /Worker profile: agySecondary/);
+  const status = JSON.parse(textOf(await callTool("get_opencode_job", { jobId, cwd: repo })));
+  assert.equal(status.runnerProfile, "agySecondary");
+  assert.doesNotMatch(JSON.stringify(status), /fixture-agy-(?:primary|secondary)-secret/);
+});
+
+test("Antigravity profiles reject disabled, unknown, missing-key and wrong-runner selections before spawn", async () => {
+  clearRecords();
+  const jobFor = (runnerProfile, provider = "agy") => runnerWriteJob(requirement(provider, provider === "agy" ? "default" : "gpt-test"), "src/a.txt", { runnerProfile });
+  for (const [profile, provider, errorType] of [
+    ["missing-profile", "agy", "worker_profile_unknown"],
+    ["agyDisabled", "agy", "worker_profile_disabled"],
+    ["agyPrimary", "codex", "worker_profile_runner_mismatch"],
+  ]) {
+    const job = jobFor(profile, provider);
+    const plan = textOf(await callTool("validate_delegation_plan", { jobs: [job] }));
+    assert.match(plan, new RegExp(errorType));
+    assert.equal(errorTypeOf(await run({ ...job, dryRun: true })), errorType);
+  }
+  const savedKey = process.env.AGY_PRIMARY_KEY;
+  delete process.env.AGY_PRIMARY_KEY;
+  try {
+    const job = jobFor("agyPrimary");
+    assert.match(textOf(await callTool("validate_delegation_plan", { jobs: [job] })), /worker_profile_unusable/);
+    assert.equal(errorTypeOf(await run({ ...job, dryRun: true })), "worker_profile_unusable");
+  } finally {
+    if (savedKey === undefined) delete process.env.AGY_PRIMARY_KEY;
+    else process.env.AGY_PRIMARY_KEY = savedKey;
+  }
+  assert.equal(records("agy").length, 0);
+  assert.equal(records("codex").length, 0);
+});
+
+test("Antigravity refuses a recursive Bridge MCP endpoint before starting a worker", async () => {
+  clearRecords();
+  const config = nodePath.join(testUserHome, ".gemini", "config", "mcp_config.json");
+  mkdirSync(nodePath.dirname(config), { recursive: true });
+  writeFileSync(config, JSON.stringify({ mcpServers: { bridge: { command: "node", args: [process.argv[1]] } } }));
+  try {
+    const text = await run(runnerWriteJob(requirement("agy", "default"), "src/a.txt", { runnerProfile: "agyPrimary" }));
+    assert.equal(errorTypeOf(text), "agy_recursive_bridge_mcp", text);
+    assert.equal(records("agy").length, 0, "a recursive user MCP server is refused before any agy process starts");
+  } finally {
+    rmSync(config, { force: true });
+  }
+});
+
+test("OpenCode profiles share the user's skills and config while parallel accounts isolate auth and state", async () => {
+  const bridgeXdgDataHome = process.env.XDG_DATA_HOME;
+  const customSkills = nodePath.join(testUserHome, "custom-skills");
+  writeFileSync(nodePath.join(openCodeConfigDir, "opencode.json"), JSON.stringify({ skills: { paths: [customSkills] } }));
+  const jobs = [
+    ["openCodeA", openCodeDataA],
+    ["openCodeB", openCodeDataB],
+  ];
+  const environments = await Promise.all(jobs.map(([runnerProfile, dataHome]) => withOpenCodeWorkerProfile({
+    runnerProfile,
+    scopeContract: { modelRequirement: requirement("openai", "fixture-model") },
+  }, async () => {
+    await new Promise((resolve) => setTimeout(resolve, runnerProfile === "openCodeA" ? 5 : 0));
+    return buildOpenCodeEnv();
+  })));
+  assert.equal(environments[0].OPENCODE_CONFIG_DIR, openCodeConfigDir);
+  assert.equal(environments[1].OPENCODE_CONFIG_DIR, openCodeConfigDir);
+  assert.ok(JSON.parse(environments[0].OPENCODE_CONFIG_CONTENT).skills.paths.includes(nodePath.join(testUserHome, ".agents", "skills")), "shared Windows skills are explicitly discoverable despite the isolated HOME");
+  assert.ok(JSON.parse(environments[0].OPENCODE_CONFIG_CONTENT).skills.paths.includes(customSkills), "existing custom skill paths survive the discovery overlay");
+  assert.equal(environments[0].XDG_CONFIG_HOME, xdgConfig);
+  assert.equal(environments[1].XDG_CONFIG_HOME, xdgConfig);
+  assert.equal(environments[0].XDG_CACHE_HOME, openCodeCacheHome);
+  assert.equal(environments[1].XDG_CACHE_HOME, openCodeCacheHome);
+  assert.equal(environments[0].XDG_DATA_HOME, openCodeDataA);
+  assert.equal(environments[1].XDG_DATA_HOME, openCodeDataB);
+  assert.equal(environments[0].XDG_STATE_HOME, nodePath.join(openCodeDataA, "state"));
+  assert.equal(environments[1].XDG_STATE_HOME, nodePath.join(openCodeDataB, "state"));
+  assert.equal(environments[0].OPENCODE_DISABLE_EXTERNAL_SKILLS, "false");
+  assert.equal(environments[1].OPENCODE_DISABLE_EXTERNAL_SKILLS, "false");
+  assert.equal(process.env.XDG_DATA_HOME, bridgeXdgDataHome, "per-job profile selection does not mutate the bridge environment");
+
+  const defaultJob = { agent: "builder", task: "Use the primary OpenCode profile.", scopeContract: { modelRequirement: requirement("openai", "fixture-model") } };
+  const defaultPlan = createLockPlan(defaultJob, 0);
+  assert.equal(defaultPlan.runnerProfile, "openCodeA", "the configured primary profile is durably bound at planning time");
+  const defaultEnv = await withOpenCodeWorkerProfile(defaultJob, async () => buildOpenCodeEnv());
+  assert.equal(defaultEnv.XDG_DATA_HOME, openCodeDataA, "jobs without runnerProfile inherit the primary user account by default");
+  const codexPlan = createLockPlan({ ...defaultJob, scopeContract: { modelRequirement: requirement("codex", "gpt-test") } }, 0);
+  assert.equal(codexPlan.runnerProfile, undefined, "the OpenCode default never routes an external Codex CLI job");
+
+  const directText = textOf(await callTool("run_opencode_agent", { ...readJob({ dryRun: true }), detail: true }));
+  assert.match(directText, /Worker profile: openCodeA/);
+  const runId = /^Direct run audit: ([^;]+)/m.exec(directText)?.[1];
+  assert.ok(runId, directText);
+  const directStatus = JSON.parse(textOf(await callTool("get_opencode_job", { jobId: runId, cwd: repo })));
+  assert.equal(directStatus.kind, "direct_run");
+  assert.equal(directStatus.runnerProfile, "openCodeA");
+  assert.equal(directStatus.status, "dry_run");
 });
 
 test("Codex profiles: a durable queue job retains its ID through execution and status", async () => {
@@ -479,6 +644,7 @@ test("Codex profiles: a durable queue job retains its ID through execution and s
   assert.equal(records("codex")[0]?.env.CODEX_HOME, profileB);
   const status = JSON.parse(textOf(await callTool("get_opencode_job", { jobId, cwd: repo })));
   assert.equal(status.codexProfile, "b");
+  assert.match(status.resultText, /Worker customization SHA-256: [a-f0-9]{64}/);
   assert.ok(!JSON.stringify(status).includes(profileB));
 });
 
@@ -684,6 +850,24 @@ test("B-140: agy changing a profile file (CODEX_HOME config.toml) fails the job 
   } finally {
     writeControl({});
     rmSync(profileFile, { force: true });
+    await resumeAll();
+  }
+});
+
+test("B-140: agy changing global Antigravity customizations fails the job and pauses agy", async () => {
+  const profileFile = nodePath.join(testUserHome, ".gemini", "config", "skills", "worker-test", "SKILL.md");
+  mkdirSync(nodePath.dirname(profileFile), { recursive: true });
+  writeFileSync(profileFile, "# Before\n", "utf8");
+  writeControl({ agy: "write-target", targetFile: profileFile, targetContent: "# Changed by worker\n" });
+  try {
+    const text = await run(runnerWriteJob(requirement("agy", "default")));
+    assert.equal(errorTypeOf(text), "external_runner_wrote_outside_worktree", text);
+    assert.ok(text.includes(`Target checkout guard: profile files changed (${nodePath.join(testUserHome, ".gemini", "config")})`), text);
+    assert.ok((await cooldownKeys()).has(`${KEY}:agy`), "the runner is paused after changing global skills");
+    assert.equal(readFileSync(profileFile, "utf8"), "# Changed by worker\n", "the Bridge does not revert user profile changes");
+  } finally {
+    writeControl({});
+    rmSync(nodePath.join(testUserHome, ".gemini", "config"), { recursive: true, force: true });
     await resumeAll();
   }
 });
