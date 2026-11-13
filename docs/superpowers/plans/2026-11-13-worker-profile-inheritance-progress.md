@@ -2,7 +2,9 @@
 
 Plan: [implementation](2026-11-13-worker-profile-inheritance.md).
 Environment: Windows, Node.js v24.11.1, feature/worker-profile-inheritance.
-Base revision: 67ce133df37d7a781ee0ab9621aab8e2c040e456; implementation remains in the working tree.
+Base revision: 67ce133df37d7a781ee0ab9621aab8e2c040e456.
+Implementation revision: b2ce386 (includes the focused privacy repair and corrected inventory assertions).
+Published candidate: [feature/worker-profile-inheritance](https://github.com/jadAkeel/Agent_MCP-Bridge/tree/feature/worker-profile-inheritance). No PR, merge or production activation was performed.
 
 ## Implementation
 
@@ -45,4 +47,6 @@ Actual Codex Desktop skill activation, live provider account/tool execution acro
 
 ## Resource ownership
 
-No relay, WSL distribution, browser or optional helper was started in this resumed pass. Node test sessions are task-owned and must finish or be cleaned up by the caller. Independent review is read-only and must preserve unrelated work.
+No relay, WSL distribution or browser was started in this resumed pass. The health-only MCP helper and offline Codex fixture processes exited; their temporary profile files and project database were removed. The final process inspection found no owned release/test runner or native-profile/smoke process remaining. The client MCP entry stayed disabled. The installed orchestrator skill remains as intentional user customization.
+
+Publication initially returned 403 under the existing default GitHub identity. The already-installed repository-owner credential was then selected only in the push process, verified against its login, and discarded from that process afterward. No global auth switch, credential rewrite or client startup change was made. Local test logs are preserved in the plan evidence directory, excluded locally from Git.

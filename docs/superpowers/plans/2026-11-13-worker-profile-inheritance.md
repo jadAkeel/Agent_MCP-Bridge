@@ -40,8 +40,8 @@
 
 - [ ] Run the full regression, packaging and release gates; review the portable diff and generated files.
 - Evidence: broad run 189/190; its stale inventory fixture was corrected and reran 27/27. Packaging, focused profiles and concurrency passed; production audit is clean. The release receipt remains failed, and the installed V2 CLI needs a separate compatibility integration before local activation.
-- [ ] Publish the verified portable changes to the authorized GitHub branch. Do not merge or deploy.
-- [ ] Record live provider, Desktop and fresh-user acceptance limits.
+- [x] Publish the reviewed implementation candidate to the authorized GitHub feature branch with its failed-gate and operational limits recorded. Do not merge or deploy.
+- [x] Record live provider, Desktop and fresh-user acceptance limits.
 
 ## Progress evidence
 
