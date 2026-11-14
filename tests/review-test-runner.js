@@ -36,7 +36,7 @@ const eventsOf = async file => (await readFile(file, "utf8")).trim().split(/\r?\
 test("canonical command inventory preserves every original argv and the grouped node --test command", async () => {
   const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
   assert.equal(packageJson.scripts.test, "npm run test:packaging && npm run test:smoke && npm run test:command-boundary && npm run test:pi && node bin/test-runner.js");
-  assert.equal(packageJson.scripts["test:packaging"], "node bin/skill-package.js --check && node --test tests/skill-package.test.js tests/orchestration-diagnostics.test.js tests/install-choices.test.js tests/agensi-package.test.js");
+  assert.equal(packageJson.scripts["test:packaging"], "node bin/skill-package.js --check && node --test tests/skill-package.test.js tests/orchestration-diagnostics.test.js tests/install-choices.test.js tests/agensi-package.test.js tests/opencode-v2.test.js tests/v2-runtime-profile.test.js tests/v2-plugin-profile.test.js tests/setup-v2-gemini.test.js tests/fresh-healthcheck-v2-plugin.test.js");
   assert.equal(packageJson.scripts["test:smoke"], "node --test tests/live-smoke.test.js");
   assert.equal(packageJson.scripts["test:command-boundary"], "node --test tests/command-boundary.test.js");
   assert.equal(packageJson.scripts["test:agensi"], "node --test tests/agensi-package.test.js");
@@ -45,7 +45,7 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.equal(packageJson.scripts["test:platform"], "node --test tests/platform-portability.test.js");
   const allCommands = parseCommandChain(packageJson.scripts["test:commands"]);
   validateGateManifest(allCommands);
-  assert.equal(allCommands.length, 182);
+  assert.equal(allCommands.length, 190);
   const flexFallbackCommand = allCommands.find(command => command.argv.includes("tests/review-flex-fallback.js"));
   assert.equal(flexFallbackCommand?.lane, "exclusive");
   const propertyCommand = allCommands.filter(command => command.argv.includes("tests/property-provider-wait.js"));
@@ -60,12 +60,19 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.equal(packageJson.scripts["test:mutation:locks"], "stryker run stryker.locks.config.json");
   assert.equal(packageJson.scripts["test:mutation:leases"], "stryker run stryker.leases.config.json");
   assert.deepEqual(packageJson.devDependencies, { "@stryker-mutator/core": "9.6.1", "fast-check": "4.10.2" });
-  assert.deepEqual(packageJson.overrides, { "typed-rest-client": { qs: "6.16.0" } });
+  assert.deepEqual(packageJson.overrides, { "typed-rest-client": { qs: "6.17.1" } });
   assert.equal(propertyCommand[0].index, allCommands.length - 2);
   assert.equal(propertyCommand[0].lane, "parallel");
   const commands = allCommands.filter(command => !command.argv.includes("tests/property-provider-wait.js"));
-  assert.equal(commands.length, 181);
-  const precedingR06 = commands.filter(command => !command.argv.includes("tests/review-day5-pipeline-token.js"));
+  assert.equal(commands.length, 189);
+  const profileInheritanceCommands = [
+    "lib/codex-profile-inheritance.js", "lib/opencode-profiles.js", "lib/agy-profiles.js",
+    "tests/codex-profile-inheritance.test.js", "tests/opencode-profiles.test.js",
+    "tests/agy-profiles.test.js", "tests/plugin-policy-profile.test.js", "tests/worker-profile-binding.test.js",
+  ];
+  for (const file of profileInheritanceCommands) assert.equal(commands.filter(command => command.argv.includes(file)).length, 1, file);
+  const legacyCommands = commands.filter(command => !profileInheritanceCommands.some(file => command.argv.includes(file)));
+  const precedingR06 = legacyCommands.filter(command => !command.argv.includes("tests/review-day5-pipeline-token.js"));
   assert.equal(precedingR06.length, 180);
   assert.equal(createHash("sha256").update(JSON.stringify(precedingR06.map(command => command.argv))).digest("hex"), "d521fd0bcf3f31382857204a8bd06057d4cafa5d435837fbfd51517a53124c56");
   const predecessorCommands = precedingR06.filter(command => !command.argv.includes("tests/review-day5-worker-release.js"));
@@ -88,10 +95,10 @@ test("canonical command inventory preserves every original argv and the grouped 
   assert.equal(createHash("sha256").update(JSON.stringify(preceding)).digest("hex"), "828588f65b2d26402149e601680d1a15749fbe8dd15b2e21143fb384f047782a");
   const additions = ["tests/review-test-runner.js", "tests/review-mcp-robustness-isolation.js", "lib/result-text.js", "lib/tools-call-errors.js", "tests/review-postrun.js", "tests/review-f2-results.js", "tests/review-prespawn.js", "tests/review-f6-finalize-snapshots.js", "tests/review-f8-diagnostics.js", "tests/review-f9-startup.js", "tests/review-f9-backfill.js", "tests/review-day5-quarantine.js", "tests/review-day5-finalizer-containment.js", "tests/review-day5-retry-intent.js", "tests/review-day5-serial.js", "tests/review-day5-validation.js", "tests/review-day5-state-key.js"];
   additions.push("tests/review-day5-worker-release.js", "tests/review-day5-pipeline-token.js");
-  const original = commands.filter(command => !command.argv.some(arg => additions.includes(arg))).map(command => command.argv);
+  const original = legacyCommands.filter(command => !command.argv.some(arg => additions.includes(arg))).map(command => command.argv);
   assert.equal(original.length, 162);
   assert.equal(createHash("sha256").update(JSON.stringify(original)).digest("hex"), "f8a95274918ebbe3953c2894b8d38e3a8772bf02e0a5d4de2276baefe931f36b");
-  const grouped = commands.find(command => command.argv[0] === "--test");
+  const grouped = commands.find(command => command.argv.includes("bin/direct-run-audit.test.js"));
   assert.deepEqual(grouped.argv, ["--test", "bin/direct-run-audit.test.js", "bin/builder-model-fallback.test.js", "bin/main-module.test.js", "bin/daily-doctor.test.js", "bin/pipeline-admin.test.js"]);
   for (const file of ["review-provider-wait.js", "review-spawn.js", "review-provider-fallback.js", "review-queue-features.js", "review-round5.js", "review-friend-runtime.js", "review-flex-runners.js", "review-flex-rate-limit.js", "review-batch-race.js", "review-shared-attestation.js", "review-pause-precheck.js", "review-validation-tree.js", "review-test-runner.js", "review-flex-self-check.js", "review-flex-queue-worker.js"])
     assert.equal(commands.find(command => path.basename(command.file) === file && command.argv[0] !== "--check").lane, "exclusive", file);

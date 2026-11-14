@@ -495,8 +495,20 @@ try {
     assert.equal(older.ok, false);
     assert.match(older.text, /opencode: wrong version \(1\.18\.31\); install: OpenCode 1\.18\.32 or newer/);
     assert.equal(probe("1.18.34", "gemini").ok, false);
-    assert.match(probe("1.18.34", "gemini").text, /install: exactly OpenCode 1\.18\.32/);
+    assert.match(probe("1.18.34", "gemini").text, /install: OpenCode 1\.18\.32 for V1 or exactly 2\.2\.2 with @cortexkit\/opencode-antigravity-auth@3\.0\.19 for V2/);
     assert.equal(probe("1.18.32", "gemini").ok, true);
+    assert.equal(probe("2.2.2").ok, true, "the V2 pure profile accepts its exact runtime pin");
+    const unsupportedV2 = probe("2.2.3");
+    assert.equal(unsupportedV2.ok, false, "V2 stays pinned until a newer runtime is qualified");
+    assert.match(unsupportedV2.text, /exactly OpenCode 2\.2\.2 for V2/);
+    assert.equal(probe("2.2.2", "gemini").ok, false, "V2 Gemini requires its pinned plugin package root");
+    const geminiPrefix = path.join(scratch, "gemini-v2-plugin-prefix");
+    const geminiPackage = path.join(geminiPrefix, "node_modules", "@cortexkit", "opencode-antigravity-auth");
+    await mkdir(geminiPackage, { recursive: true });
+    await writeFile(path.join(geminiPackage, "package.json"), JSON.stringify({ name: "@cortexkit/opencode-antigravity-auth", version: "3.0.19" }));
+    await writeFile(path.join(geminiPrefix, "package-lock.json"), "{}\n");
+    const geminiV2 = preflight({ ...options, profile: "gemini", v2PluginPackageRoot: geminiPrefix }, { commands, run: command => ({ status: command ? 0 : 1, stdout: command?.command === "python" ? "Python 3.12.4" : "2.2.2" }), env: process.env, log: () => {} });
+    assert.equal(geminiV2.ok, true, "the exact plugin pin qualifies OpenCode V2 Gemini preflight");
     const dev = probe("0.0.0-dev-202610030456");
     assert.equal(dev.ok, true, "a development build is not judged old");
     assert.match(dev.text, /Note: OpenCode reported development build 0\.0\.0; the pure profile accepts it untested/);
@@ -789,6 +801,7 @@ try {
     assert.ok(probes.every(args => args.join(" ") === "--version"), JSON.stringify(probes));
     assert.ok(output.some(line => /Status: needs-auth; needs-restart/.test(line)));
     assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-execute", "SKILL.md")));
+    assert.ok(existsSync(path.join(options.hostHome, ".agents", "skills", "bridge-orchestrator", "SKILL.md")));
   });
   await check("fresh disposable package bootstraps its actual lockfile dependencies then installs without provider inference", async () => {
     const source = path.join(scratch, "fresh package with spaces");

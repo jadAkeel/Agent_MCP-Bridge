@@ -63,7 +63,11 @@ test("OpenCode prerequisite diagnostics match packaged, pure and Gemini admissio
   assert.match(oldPure.output, /OpenCode 1\.18\.32 or newer/);
   const gemini = probe(["--profile", "gemini"], "1.18.33");
   assert.equal(gemini.ok, false);
-  assert.match(gemini.output, /exactly OpenCode 1\.18\.32.*Gemini profile/);
+  assert.match(gemini.output, /OpenCode 1\.18\.32 for V1 or exactly 2\.2\.2 with @cortexkit\/opencode-antigravity-auth@3\.0\.19 for V2/);
+  assert.equal(probe([], "2.2.2").ok, true);
+  const unconfiguredGeminiV2 = probe(["--profile", "gemini"], "2.2.2");
+  assert.equal(unconfiguredGeminiV2.ok, false);
+  assert.match(unconfiguredGeminiV2.output, /--v2-plugin-package-root/);
 });
 
 test("native home defaults and executable discovery respect the platform", async () => {

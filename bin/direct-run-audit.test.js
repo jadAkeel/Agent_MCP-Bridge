@@ -62,6 +62,19 @@ test("direct success, provider failure, pre-provider rejection and dry run survi
   assert.equal((await readFile(dbPath)).includes(Buffer.from("sk-canary")), false);
 });
 
+test("L-025: direct and parallel audit records retain selected worker profiles", async (t) => {
+  const { audit, root } = await fixture(t);
+  const direct = await audit.run({ cwd: root, agent: "builder", runnerProfile: "openCodeB" }, async () => response());
+  const parallel = await audit.run({ cwd: root, agent: "reviewer", codexProfile: "codex-2" }, async () => response(), { kind: "parallel" });
+  const directRecord = await audit.get(root, direct._meta.directRunAudit.runId);
+  const parallelRecord = await audit.get(root, parallel._meta.directRunAudit.runId);
+  assert.equal(directRecord.runnerProfile, "openCodeB");
+  assert.equal(directRecord.codexProfile, "");
+  assert.equal(parallelRecord.runnerProfile, "");
+  assert.equal(parallelRecord.codexProfile, "codex-2");
+  assert.doesNotMatch(JSON.stringify([directRecord, parallelRecord]), /auth\.json|sk-canary/);
+});
+
 test("direct client cancellation before spawn, during execution and after a successful return is never completed", async (t) => {
   const { audit, root } = await fixture(t);
   for (const childStarted of [false, true]) {
@@ -385,6 +398,8 @@ test("L-025: a table from before the result columns is migrated, and older rows 
   const old = await audit.get(root, "old-run", { includeResult: true });
   assert.equal(old.status, "completed");
   assert.equal(old.result, null);
+  assert.equal(old.runnerProfile, "");
+  assert.equal(old.codexProfile, "");
   const handle = await audit.start({ cwd: root, agent: "builder" }, { runId: "new-run" });
   assert.equal((await audit.finish(handle, { execution: { result: {} }, stored: { text: "after the migration" } })).persisted, true);
   assert.equal((await audit.get(root, "new-run", { includeResult: true })).result.text, "after the migration");

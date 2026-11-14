@@ -2740,6 +2740,17 @@ async function runSelfTests() {
       immutableReleasePluginModeError({ releasePinned: true, allowExternalPlugins: true }),
       /Immutable releases must use pure mode/
     );
+    assert.equal(immutableReleasePluginModeError({
+      releasePinned: true, allowExternalPlugins: true, openCodeCliMajor: "2",
+      externalPluginManifestPath: path.join(tmpdir(), "v2-plugin-manifest.json"),
+      expectedExternalPluginManifestSha256: "a".repeat(64),
+      externalPluginAllowlist: ["@cortexkit/opencode-antigravity-auth@3.0.19"],
+    }), "");
+    assert.match(immutableReleasePluginModeError({
+      releasePinned: true, allowExternalPlugins: true, openCodeCliMajor: "2",
+      externalPluginManifestPath: "relative.json", expectedExternalPluginManifestSha256: "bad",
+      externalPluginAllowlist: ["@cortexkit/opencode-antigravity-auth@3.0.19"],
+    }), /Immutable releases must use pure mode/);
     assert.equal(immutableReleasePluginModeError({ releasePinned: false, allowExternalPlugins: true }), "");
     const releaseFixtureFiles = [
       "server.js",
