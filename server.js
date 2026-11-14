@@ -3558,11 +3558,24 @@ async function enqueueQueueJob(job, parentJobId = "", { schedule = true, initial
   const safeRequest = { ...normalizedJob };
   // Resolve defaults now: a later server must not choose a different account.
   if (lockPlan.runnerProfile !== undefined) safeRequest.runnerProfile = lockPlan.runnerProfile;
+  if (lockPlan.runnerProfile !== undefined && normalizedJob.runnerProfile === undefined) {
+    const pinnedRetry = applyRetryPolicyToJob(safeRequest, parentJobId);
+    if (!pinnedRetry.ok) return pinnedRetry;
+  }
   let workerProfileBinding;
   try {
     const bindingOptions = workerProfileBindingOptions(safeRequest);
-    workerProfileBinding = recordFields?.workerProfileBinding || await captureWorkerProfileBinding(bindingOptions);
-    await verifyWorkerProfileBinding(workerProfileBinding, bindingOptions);
+    workerProfileBinding = recordFields?.workerProfileBinding;
+    if (workerProfileBinding) {
+      await verifyWorkerProfileBinding(workerProfileBinding, bindingOptions);
+    } else {
+      const routes = new Set([bindingOptions.runner]);
+      for (const model of retryPolicy.policy?.models || []) {
+        routes.add(externalRunnerSelection(retryPolicyRequirement(model), safeRequest.agent)?.runner || "opencode");
+      }
+      const bindings = await Promise.all([...routes].map(runner => captureWorkerProfileBinding({ ...bindingOptions, runner })));
+      workerProfileBinding = bindings.length === 1 ? bindings[0] : { version: 2, routes: bindings };
+    }
   } catch (error) {
     return { ok: false, errorType: "worker_profile_changed", error: error.message };
   }

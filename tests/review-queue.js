@@ -10,6 +10,7 @@ import "./test-env.js"; // B-179: scratch XDG_CONFIG_HOME before the bridge read
 if (!process.argv.includes("--self-test")) process.argv.push("--self-test");
 // The tool wrapper's startup-recovery wait is read at import; keep it short for the gate test.
 process.env.CODEX_OPENCODE_STARTUP_RECOVERY_WAIT_MS = "200";
+process.env.CODEX_OPENCODE_EXTERNAL_RUNNERS = "codex";
 const { __selfTest } = await import("../server.js");
 const selfTestHooks = __selfTest.hooks;
 const {
@@ -47,6 +48,7 @@ const {
   readPersistedPipelineRecord,
   readPersistedQueueRecord,
   reconcileQueueStateAtStartup,
+  requeueQueueJob,
   releaseHardLock,
   resolveProjectStateRoot,
   rm,
@@ -272,6 +274,43 @@ test("queued profile defaults and customization digest survive SQLite and refuse
     assert.equal(accepted.record.status, "failed");
     assert.equal(accepted.record.errorType, "worker_profile_changed");
   } finally { Object.assign(CONFIG.openCodeProfiles, saved); }
+});
+
+test("a queued unnamed OpenCode account cannot be replaced by a new named default", async () => {
+  const saved = { ...CONFIG.openCodeProfiles };
+  CONFIG.openCodeProfiles.defaultProfileId = "";
+  try {
+    const accepted = await enqueueQueueJob({ agent: "reviewer", task: "Unnamed account", cwd: repo, dryRun: true }, "", { schedule: false });
+    assert.equal(accepted.ok, true, accepted.error);
+    assert.equal(accepted.record.workerProfileBinding.profileId, "");
+    CONFIG.openCodeProfiles.defaultProfileId = "new-account";
+    let starts = 0;
+    selfTestHooks.queueJobExecutorTestHook = async () => { starts++; return completedExecution(); };
+    const restored = await readPersistedQueueRecord(accepted.record.jobId, repo);
+    assert.deepEqual(restored.workerProfileBinding, accepted.record.workerProfileBinding);
+    await runWorker(accepted.record);
+    assert.equal(starts, 0);
+    assert.equal(accepted.record.errorType, "worker_profile_changed");
+  } finally { Object.assign(CONFIG.openCodeProfiles, saved); }
+});
+
+test("an unnamed queue job can requeue on another authorized retry runner", async () => {
+  const savedCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(fixtureRoot, "fixture-codex-home");
+  selfTestHooks.selfTestModelOverrideAllowlist = ["openai/fixture", "codex/fixture"];
+  try {
+    const accepted = await enqueueQueueJob({ agent: "reviewer", task: "Retry routing", cwd: repo, dryRun: true,
+      models: ["openai/fixture", "codex/fixture"] }, "", { schedule: false });
+    assert.equal(accepted.ok, true, accepted.error);
+    await updateQueueRecordDurable(accepted.record, { status: "failed", finishedAt: new Date().toISOString() });
+    selfTestHooks.queueJobExecutorTestHook = async () => completedExecution();
+    const retry = await requeueQueueJob({ cwd: repo, jobId: accepted.record.jobId, model: "codex/fixture" });
+    assert.equal(retry.ok, true, retry.error);
+  } finally {
+    if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = savedCodexHome;
+    selfTestHooks.selfTestModelOverrideAllowlist = null;
+  }
 });
 
 test("D1 heartbeat re-takes a lapsed lease of a pre-execution record", async () => {

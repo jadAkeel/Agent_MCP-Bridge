@@ -246,21 +246,21 @@ Codex workers retain the selected account's login, while a temporary `--profile`
 
 ### Select an OpenCode account per job
 
-OpenCode profiles share one user-owned configuration directory, including its skills and role definitions. They also share the selected plugin and MCP policy. Each profile uses its own OpenCode data directory and state directory, so its `auth.json`, sessions, and account data remain separate. Register both maps in the Bridge server environment:
+OpenCode profiles share one user-owned configuration directory, including its skills and role definitions. Each profile uses its own OpenCode data directory and state directory, so its credentials, sessions, and account data remain separate. Register both maps in the Bridge server environment:
 
 ```toml
-CODEX_OPENCODE_PROFILE_BASE = '{"configDir":"C:/Users/you/.opencode-v2/config","cacheHome":"C:/Users/you/.opencode-v2/cache","pluginRoots":["C:/Users/you/.opencode-v2/plugin-packages"],"mcpServers":[],"pluginManifestPath":"C:/Users/you/.opencode-v2/bridge-profile-manifest.json","pluginManifestSha256":"<64-character SHA-256>"}'
+CODEX_OPENCODE_PROFILE_BASE = '{"configDir":"C:/Users/you/.opencode-v2/config","cacheHome":"C:/Users/you/.opencode-v2/cache","mcpServers":[]}'
 CODEX_OPENCODE_PROFILES = '{"openai-a":{"dataHome":"C:/Users/you/.opencode-v2/data"},"openai-b":{"dataHome":"C:/Users/you/.opencode-account-b/data"}}'
 CODEX_OPENCODE_DEFAULT_PROFILE = "openai-a"
 ```
 
-Every `dataHome` must contain that account's existing `opencode/auth.json`; the Bridge never copies credentials between accounts. Use one unique data home per account and leave the user's config, skills and approved plugin installation in the shared base. The cache is shared. The selected account gets its own state folder under `<dataHome>/state`.
+Each `dataHome` must contain that account's existing `opencode/opencode.db` for V2 or `opencode/auth.json` for V1. The Bridge uses the selected account's native credentials in place. Use one unique data home per account. The cache is shared. The selected account gets its own state folder under `<dataHome>/state`.
 
 `CODEX_OPENCODE_DEFAULT_PROFILE` makes the primary account and its customizations the default for all native OpenCode jobs. A job can select another registered account with `runnerProfile`; an explicit Codex or Antigravity CLI model still uses that CLI's profile map and is not rerouted through OpenCode.
 
 Set `mcpServers` to the exact names of enabled MCP servers in the shared user config. The Bridge checks this list against the effective config before starting the worker. Disabled MCP entries stay disabled; listing a server does not turn it on. Use an empty list when none should run.
 
-External or local plugins run only when `pluginManifestPath` names an operator-reviewed manifest and `pluginManifestSha256` matches its contents. For a local plugin, the manifest pins the installation tree, dependency lockfile and source config, and `pluginRoots` must contain the installation. Without a manifest, the profile runs in pure mode and no configured external plugin loads. Keep profile manifests and account paths local to the machine; do not commit credentials or machine-specific absolute paths.
+Named V2 profiles support shared skills and approved MCP entries. The managed V2 Gemini profile is the supported route for the pinned CortexKit plugin. For named V1 profiles, external or local plugins require an operator-reviewed `pluginManifestPath` and matching `pluginManifestSha256`. For a local plugin, the manifest pins the installation tree, dependency lockfile and source config, and `pluginRoots` must contain the installation. Keep profile manifests and account paths local to the machine.
 
 Select a profile on an OpenCode job with `runnerProfile` and keep the model provider as `opencode`:
 
