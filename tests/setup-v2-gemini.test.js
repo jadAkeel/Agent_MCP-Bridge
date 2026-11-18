@@ -9,6 +9,9 @@ test("V2 Gemini setup dry-run pins plural plugin config, runtime tree and bridge
   const base = await mkdtemp(path.join(tmpdir(), "bridge-v2-gemini-setup-"));
   t.after(() => rm(base, { recursive: true, force: true }));
   const packagePrefix = path.join(base, "plugin-prefix");
+  const fixtureExecutable = path.join(base, process.platform === "win32" ? "opencode.exe" : "opencode");
+  const fixtureDataHome = path.join(base, "opencode-data");
+  const fixtureStateHome = path.join(base, "opencode-state");
   const packageRoot = path.join(packagePrefix, "node_modules", "@cortexkit", "opencode-antigravity-auth");
   await mkdir(packageRoot, { recursive: true });
   await writeFile(path.join(packagePrefix, "package.json"), JSON.stringify({ private: true }));
@@ -18,19 +21,19 @@ test("V2 Gemini setup dry-run pins plural plugin config, runtime tree and bridge
   const options = parseArguments([
     "--dry-run", "--client", "codex", "--profile", "gemini",
     "--v2-plugin-package-root", packagePrefix,
-    "--opencode-executable", "C:\\fixture\\opencode.exe",
-    "--opencode-data-home", "C:\\Users\\fixture\\opencode-data",
-    "--opencode-state-home", "C:\\Users\\fixture\\opencode-state",
+    "--opencode-executable", fixtureExecutable,
+    "--opencode-data-home", fixtureDataHome,
+    "--opencode-state-home", fixtureStateHome,
     "--runtime-dir", path.join(base, "runtime"),
     "--state-dir", path.join(base, "state"),
     "--codex-home", path.join(base, "codex"),
   ]);
   const messages = [];
   const result = await runSetup(options, {
-    env: { ...process.env, XDG_DATA_HOME: "C:\\Users\\fixture\\opencode-data" },
+    env: { ...process.env, XDG_DATA_HOME: fixtureDataHome },
     checked: {
       ok: true, needsAuth: true,
-      commands: { openCodeMajor: "2", opencode: { command: "C:\\fixture\\opencode.exe", args: [] } },
+      commands: { openCodeMajor: "2", opencode: { command: fixtureExecutable, args: [] } },
       clients: { codex: true, claude: false, cursor: false },
     },
     log: line => messages.push(String(line)),
