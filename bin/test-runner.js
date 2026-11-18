@@ -254,7 +254,8 @@ export async function runTestCommands({ commands, cwd = ROOT, env = process.env,
   for (const command of commands.filter(command => command.lane === "exclusive")) await run(command);
   for (const command of commands.filter(command => command.lane === "final")) await run(command);
   results.sort((a, b) => a.index - b.index);
-  const report = { startedAt: new Date(startedAtMs).toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - startedAtMs,
+  const finishedAtMs = Date.now();
+  const report = { startedAt: new Date(startedAtMs).toISOString(), finishedAt: new Date(finishedAtMs).toISOString(), durationMs: finishedAtMs - startedAtMs,
     suiteWorkers: jobs, heavySuiteWorkers: Math.min(2, jobs),
     commandCount: commands.length, passed: results.filter(result => result.status === "passed").length,
     failed: results.filter(result => result.status !== "passed").length, results,

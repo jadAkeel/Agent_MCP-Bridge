@@ -104,3 +104,29 @@ against the published commit, followed by the user-authorized merge only if requ
 checks pass. That timeline carries final gate/merge state without moving the tested
 candidate merely to append a result. Live Desktop/provider acceptance and native
 AGY project-plugin activation remain separate operational limits.
+
+### CI follow-up, 18 November 2026
+
+Candidate `2a84608` failed CI run `44376137096` in all nine OS/Node jobs.
+All reported the increased tools/list advertisement; the supervisor suite also
+retained an outdated exact packaging-command expectation. Two Windows jobs
+additionally failed to compile the native plugin-policy fixture with their GCC
+installation; the old diagnostic did not retain its exit code or signal.
+
+Follow-up keeps the fixed advertisement ceilings and all schema constraints,
+shortens editorial descriptions, and updates the exact inventory to include the
+new regression file. Native fixture compilation now also tries Clang, probes the
+resulting executable, and retains compiler failure codes/signals. The native
+fixture still must compile and run; no skip or successful result is fabricated.
+An isolated supervisor rerun also exposed a one-millisecond inconsistency from
+sampling report end time twice; one timestamp now supplies both end and duration.
+Its original equality assertion remains unchanged. Existing assertions supplied
+the failing evidence before these repairs.
+
+Local advertisement tests passed 13/13, the full isolated Windows server self-test
+passed, and the supervisor passed 27/27, all with zero skips. Independent reviewer
+`ci_repair_review` found no actionable blockers in the four-file code/test diff.
+Hosted Windows CI remains the acceptance check for the compiler fallback. The
+published candidate's fresh CI evidence belongs on PR #10 before merge. Retain
+`.test-logs/ci-*.log` and their isolated verification receipts; the original
+failed CI is retained as `.test-logs/merge-blockers-ci-failed.log`.

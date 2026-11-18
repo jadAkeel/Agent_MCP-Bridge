@@ -2599,7 +2599,7 @@ async function runSelfTests() {
         "  fputs(\"unexpected fake OpenCode arguments\", stderr); return 2;",
         "}",
       ].join("\n"), "utf8");
-      const compilerCandidates = ["gcc", "C:\\MinGW\\bin\\gcc.exe"];
+      const compilerCandidates = ["gcc", "C:\\MinGW\\bin\\gcc.exe", "clang", "C:\\Program Files\\LLVM\\bin\\clang.exe"];
       const compilerFailures = [];
       let compiled = false;
       for (const compiler of compilerCandidates) {
@@ -2609,10 +2609,14 @@ async function runSelfTests() {
             windowsHide: true,
             timeout: 1000 * 30,
           });
+          const probe = await execFileAsync(pluginFixtureHostExecutable, ["debug", "config"], {
+            cwd: pluginFixtureHome, windowsHide: true, timeout: 1000 * 15,
+          });
+          assert.equal(probe.stdout, pluginFixtureEffectiveConfig);
           compiled = true;
           break;
         } catch (error) {
-          compilerFailures.push(`${compiler}: ${error.message || String(error)}`);
+          compilerFailures.push(`${compiler}: ${error.message || String(error)}; code=${error.code}; signal=${error.signal}; killed=${error.killed}`);
         }
       }
       assert.equal(compiled, true, `A C compiler is required for the deterministic Windows plugin-policy host.\n${compilerFailures.join("\n")}`);
