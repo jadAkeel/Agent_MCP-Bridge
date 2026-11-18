@@ -2,9 +2,36 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile, symlink, rename } from "node:fs/promises";
 import { parse } from "smol-toml";
+import { prepareWorkerContext } from "../lib/worker-context.js";
 import { createCodexWorkerProfile } from "../lib/codex-profile-inheritance.js";
+import { createExternalRunnersRuntime } from "../lib/external-runners.js";
+
+test("named Codex accounts inherit primary instruction settings and execpolicy rules", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-codex-rules-"));
+  const sourceHome = path.join(root, "primary");
+  const workerHome = path.join(root, "account");
+  await mkdir(path.join(sourceHome, "rules"), { recursive: true });
+  await mkdir(workerHome);
+  await writeFile(path.join(sourceHome, "config.toml"), 'developer_instructions = "Use the primary workflow"\nproject_doc_fallback_filenames = ["TEAM.md"]\n');
+  await writeFile(path.join(sourceHome, "rules/default.rules"), 'prefix_rule(pattern=["git", "push"], decision="forbidden")\n');
+  try {
+    const prepared = await createCodexWorkerProfile({ sourceHome, workerHome });
+    try {
+      const config = parse(await readFile(prepared.profilePath, "utf8"));
+      assert.equal(config.developer_instructions, "Use the primary workflow");
+      assert.deepEqual(config.project_doc_fallback_filenames, ["TEAM.md"]);
+      assert.equal(prepared.rulePaths.length, 1);
+      assert.equal(await readFile(prepared.rulePaths[0], "utf8"), await readFile(path.join(sourceHome, "rules/default.rules"), "utf8"));
+    } finally { await prepared.cleanup(); }
+    await assert.rejects(readFile(prepared.rulePaths[0]), { code: "ENOENT" });
+    await writeFile(path.join(sourceHome, "rules/default.rules"), 'prefix_rule(pattern=["git", "push"], decision="prompt")\n');
+    const next = await createCodexWorkerProfile({ sourceHome, workerHome });
+    assert.match(await readFile(next.rulePaths[0], "utf8"), /prompt/);
+    await next.cleanup();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("Codex worker profiles inherit user tools without copying secrets or the recursive Bridge", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "bridge-codex-profile-"));
@@ -203,3 +230,138 @@ test("Codex worker profile never deletes an existing profile file when its tempo
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function fixture(fn) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-worker-context-"));
+  const home = path.join(root, "user");
+  const project = path.join(root, "project");
+  const workspace = path.join(root, "worktree");
+  for (const dir of [home, project, workspace]) await mkdir(dir);
+  try { await fn({ root, home, project, workspace }); }
+  finally { await rm(root, { recursive: true, force: true }); }
+}
+async function file(root, name, content) {
+  await mkdir(path.dirname(path.join(root, name)), { recursive: true });
+  await writeFile(path.join(root, name), content);
+}
+
+test("named workers receive primary instructions and Windows shared skills, including junctions", () => fixture(async ({ root, home, project, workspace }) => {
+  await file(home, ".codex/AGENTS.md", "Use the primary workflow.");
+  await file(root, "canonical/using-superpowers/SKILL.md", "---\nname: using-superpowers\ndescription: Read before work\n---\nWorkflow");
+  await mkdir(path.join(home, ".agents/skills"), { recursive: true });
+  await symlink(path.join(root, "canonical/using-superpowers"), path.join(home, ".agents/skills/using-superpowers"), process.platform === "win32" ? "junction" : "dir");
+  const context = await prepareWorkerContext({ runner: "codex", userHome: home, codexHome: path.join(home, ".codex"), projectRoot: project, workspace });
+  assert.match(context.prompt, /Use the primary workflow/);
+  assert.match(context.prompt, /using-superpowers/);
+  assert.match(context.prompt, /Read before work/);
+  assert.ok(context.skills.some(skill => skill.file.endsWith("SKILL.md")));
+  assert.equal((await context.cleanup()).ok, true);
+}));
+
+test("AGY inherits user instructions and native skills without changing its account or global files", () => fixture(async ({ home, project, workspace }) => {
+  await file(home, ".gemini/GEMINI.md", "Use the AGY workflow.");
+  await file(home, ".gemini/config/skills/user-flow/SKILL.md", "---\nname: user-flow\ndescription: AGY guidance\n---\nRead me");
+  const context = await prepareWorkerContext({ runner: "agy", userHome: home, projectRoot: project, workspace });
+  assert.match(context.prompt, /Use the AGY workflow/);
+  assert.match(context.prompt, /AGY guidance/);
+  assert.equal(await readFile(path.join(home, ".gemini/GEMINI.md"), "utf8"), "Use the AGY workflow.");
+  assert.equal((await context.cleanup()).ok, true);
+}));
+
+test("project resources absent from a worktree are available during the run and cleaned afterward", () => fixture(async ({ home, project, workspace }) => {
+  await file(project, "AGENTS.md", "Project policy");
+  await file(project, ".agents/skills/local/SKILL.md", "---\nname: local\ndescription: Project skill\n---\nProject guidance");
+  await file(project, ".agents/plugins/example/mcp_config.json", '{"mcpServers":{}}');
+  await file(workspace, "GEMINI.md", "Worktree policy wins");
+  await file(project, "GEMINI.md", "Source policy");
+  const context = await prepareWorkerContext({ runner: "agy", userHome: home, projectRoot: project, workspace });
+  assert.equal(await readFile(path.join(workspace, ".agents/plugins/example/mcp_config.json"), "utf8"), '{"mcpServers":{}}');
+  assert.match(context.prompt, /Project policy/);
+  assert.match(context.prompt, /Worktree policy wins/);
+  assert.doesNotMatch(context.prompt, /Source policy/);
+  assert.match(context.prompt, /Project skill/);
+  assert.equal((await context.cleanup()).ok, true);
+  await assert.rejects(readFile(path.join(workspace, "AGENTS.md")), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(workspace, "GEMINI.md"), "utf8"), "Worktree policy wins");
+}));
+
+test("changed inherited resources are retained and cleanup reports failure", () => fixture(async ({ home, project, workspace }) => {
+  await file(project, ".agents/skills/local/SKILL.md", "Original");
+  const context = await prepareWorkerContext({ runner: "agy", userHome: home, projectRoot: project, workspace });
+  const target = path.join(workspace, ".agents/skills/local/SKILL.md");
+  await writeFile(target, "Worker changed it");
+  assert.equal((await context.cleanup()).ok, false);
+  assert.equal(await readFile(target, "utf8"), "Worker changed it");
+}));
+
+test("resource escapes and credential files are refused without copying or leaking content", () => fixture(async ({ root, home, project, workspace }) => {
+  await file(root, "private/.env", "SECRET_VALUE=must-not-leak");
+  await mkdir(path.join(project, ".agents/plugins"), { recursive: true });
+  await symlink(path.join(root, "private"), path.join(project, ".agents/plugins/escape"), process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(prepareWorkerContext({ runner: "agy", userHome: home, projectRoot: project, workspace }), error => error.errorType === "worker_context_unavailable" && !error.message.includes("must-not-leak"));
+}));
+
+test("cleanup never removes unrelated directories through a replaced ancestor junction", () => fixture(async ({ root, home, project, workspace }) => {
+  await file(project, ".agents/skills/local/SKILL.md", "Original");
+  const context = await prepareWorkerContext({ runner: "agy", userHome: home, projectRoot: project, workspace });
+  const outside = path.join(root, "unrelated");
+  await mkdir(path.join(outside, "skills/local"), { recursive: true });
+  await rename(path.join(workspace, ".agents"), path.join(workspace, "saved-agents"));
+  await symlink(outside, path.join(workspace, ".agents"), process.platform === "win32" ? "junction" : "dir");
+  assert.equal((await context.cleanup()).ok, false);
+  assert.equal((await stat(path.join(outside, "skills/local"))).isDirectory(), true);
+}));
+
+test("Codex project fallback documents survive an ignored-file worktree boundary", () => fixture(async ({ home, project, workspace }) => {
+  await file(home, ".codex/config.toml", 'project_doc_fallback_filenames = ["TEAM.md"]\n');
+  await file(project, "TEAM.md", "Team workflow");
+  const context = await prepareWorkerContext({ runner: "codex", userHome: home, projectRoot: project, workspace: workspace.replaceAll("\\", "/") });
+  assert.match(context.prompt, /Team workflow/);
+  assert.equal((await context.cleanup()).ok, true);
+}));
+
+test("project configs cannot restore recursive Bridge tools or change worker permissions", () => fixture(async ({ home, project, workspace }) => {
+  for (const config of [
+    '[plugins."bridge@market"]\nenabled = true\n',
+    '[mcp_servers.bridge]\ncommand = "node"\n',
+    'sandbox_mode = "danger-full-access"\n',
+    '[mcp_servers.custom]\ncommand = "node"\nargs = ["/exact/runtime/server.js"]\n',
+  ]) {
+    await file(project, ".codex/config.toml", config);
+    await assert.rejects(prepareWorkerContext({ runner: "codex", userHome: home, projectRoot: project, workspace, bridgeServerPaths: ["/exact/runtime/server.js"] }), { errorType: "worker_context_unavailable" });
+  }
+}));
+
+test("provider wait refusal retains and reports changed inherited resources without spawning", () => fixture(async ({ root, home, project, workspace }) => {
+  await file(project, "AGENTS.md", "Project instructions");
+  await mkdir(path.join(home, ".codex"));
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(home, ".codex");
+  try {
+    const runtime = createExternalRunnersRuntime({
+      CONFIG: { codexExecutable: process.execPath, providerWaitMaxMs: 1 }, USER_HOME_DIR: home,
+      OPENCODE_BASE_ENV_KEYS: new Set(["PATH", "HOME", "USERPROFILE"]), SENSITIVE_ENV_PATTERN: /TOKEN|SECRET/,
+      nowMs: () => Date.now(), providerKeyForMetadata: () => "codex", modelPauseKeyForMetadata: () => "codex-model", quotaGroupProviderKeys: () => [],
+      isOrchestratorAgent: () => false,
+      effectiveBridgeStateDirectory: () => path.join(root, "state"), sha256File: async () => "fixture-executable",
+      runCommand: async () => ({ exitCode: 0, stdout: "codex 0.162.1" }),
+      runSpawnCommand: async () => { assert.fail("no worker should start"); },
+      providerSlotWaitStorage: { getStore: () => null }, providerSlotWaitingJobs: new Map(),
+      openCodePromptArgument: value => value, openCodeCommandLineLengthError: () => "",
+      acquireProviderLease: async () => {
+        await writeFile(path.join(workspace, "AGENTS.md"), "Changed during the wait");
+        return { ok: false, errorType: "provider_wait_timeout", error: "No capacity" };
+      },
+    });
+    const result = await runtime.runExternalCli({ runner: "codex", model: "fixture" }, { agent: "reviewer", prompt: "task", cwd: workspace, targetCwd: project, lockPlan: { lockType: "read" }, timeoutMs: 1000 });
+    assert.equal(result.errorType, "provider_wait_timeout");
+    assert.equal(result.agentNeverStarted, true);
+    assert.equal(result.workerContextCleanup.status, "failed");
+    assert.match(result.stderr, /Cleanup is pending/);
+    assert.equal((await stat(result.runnerSidecarDir)).isDirectory(), true);
+    assert.equal(await readFile(path.join(workspace, "AGENTS.md"), "utf8"), "Changed during the wait");
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+  }
+}));

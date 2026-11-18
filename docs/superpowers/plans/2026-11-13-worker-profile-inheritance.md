@@ -56,3 +56,16 @@ The candidate health check proved that the installed local route is V2 while thi
 - [ ] Add meaningful regressions for V2 native account storage, shared skill-path/config translation, recursive Bridge exclusion and account/status binding. Verify failing cases before implementing new behavior.
 - [ ] Run adapter and inheritance fixtures, then an on-demand native offline health/discovery check against a disposable compatible profile. Close its private inventory server and verify owned process cleanup.
 - [ ] Review the combined candidate and affected setup/release checks. Keep live inference and actual account/tool acceptance distinct; no provider request without an explicitly selected route.
+
+## Task 6. Windows user and project context completion (18 November)
+
+User approved the disclosed Codex/AGY inheritance repairs and updating the existing PR.
+Reuse this plan; no dependency, account, startup-service or provider changes.
+
+- [x] Reproduce missing context propagation with new regressions, then supply primary instructions and compatible user skills, including Windows shared skill junctions.
+- [x] Stage missing project customization for the lifetime of a worker; preserve worktree files, retain changed copies and refuse unsafe links/credential files.
+- [x] Inherit Codex developer instructions, fallback documents and per-run command rules; keep execpolicy rules enabled and block recursive project Bridge tools and project permission overrides.
+- [x] Report cleanup failures on startup, capacity refusal and execution; defer cleanup while process containment remains unconfirmed.
+- [x] Replace references to unavailable runner guidance with installed guides and packaged policy fallbacks; repair the tracked skill-package hash mismatch.
+- [x] Verify native Codex offline prompt discovery and native execpolicy parsing without model inference. Windows native known-folder discovery uses the real OS user even with fixture HOME/USERPROFILE values; shared fixture skill context is verified separately.
+- [ ] Complete final regression gates, independent scoped repair review and publication to PR #10. Native AGY provider/plugin and Desktop workflow activation remain separate operational checks.

@@ -144,6 +144,30 @@ If both appear, the whole system works end to end.
 
 ## 6. Everyday usage
 
+### User and project customization for CLI workers
+
+Codex Desktop stays the coordinator. A named Codex CLI or AGY CLI worker keeps its
+selected account while receiving the compatible Windows user's instructions and
+skills. Shared skills under `~/.agents/skills`, including directory junctions such
+as Superpowers, are listed in a private per-run context file. The worker is told
+to read that file and the applicable `SKILL.md` files before starting its task.
+Codex also inherits primary developer instructions and command rules. AGY keeps
+its real user home so its native global plugins remain discoverable; named AGY
+profiles currently select Gemini API keys, not separate personal OAuth logins.
+
+When a worker uses a worktree, missing local project instructions, skills and native
+plugin configuration are copied there for that run. Existing worktree files win.
+Only unchanged copies are removed afterward; changed resources are retained and
+the run fails review. Credential-like files, unsafe links, recursive Bridge tools
+and Codex project permission overrides refuse startup. Worker scopes, sandbox
+settings and account credentials are not broadened by inheritance.
+
+An available skill or plugin does not prove the model used it or that its external
+service is authenticated. Required unavailable tools must be reported. Fixture
+tests cover propagation, isolation and cleanup; native provider/plugin use still
+needs a separately selected real-client acceptance check. Use the saved run/job ID
+through the original transport to inspect a worker's state and result.
+
 Talk to Codex like you would talk to a senior engineer. You do not need to name tools; Codex chooses them. Some example prompts:
 
 | You want | Example prompt |

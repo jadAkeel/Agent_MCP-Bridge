@@ -39,6 +39,9 @@ const openCodeConfigDir = nodePath.join(xdgConfig, "opencode");
 const openCodeCacheHome = nodePath.join(scratch, "opencode-cache");
 for (const directory of [binDir, recordDir, codexHome, openCodeConfigDir, openCodeCacheHome,
   nodePath.join(openCodeDataA, "opencode"), nodePath.join(openCodeDataB, "opencode")]) mkdirSync(directory, { recursive: true });
+writeFileSync(nodePath.join(codexHome, "AGENTS.md"), "Primary fixture workflow instructions.\n");
+mkdirSync(nodePath.join(testUserHome, ".gemini"), { recursive: true });
+writeFileSync(nodePath.join(testUserHome, ".gemini", "GEMINI.md"), "AGY fixture workflow instructions.\n");
 for (const [home, id] of [[openCodeDataA, "a"], [openCodeDataB, "b"]]) {
   writeFileSync(nodePath.join(home, "opencode", "auth.json"), JSON.stringify({ fixture: `opencode-account-${id}` }));
 }
@@ -58,8 +61,11 @@ if (args[0] === "--version") {
   process.exit(0);
 }
 const pick = (...names) => Object.fromEntries(names.map((name) => [name, process.env[name] === undefined ? null : process.env[name]]));
+const contextArg = args.find(arg => arg.includes("skill inventory in this UTF-8 file:")) || "";
+const contextMatch = contextArg.match(/UTF-8 file: ("(?:[^"\\\\]|\\\\.)*")/);
+const workerContext = contextMatch ? fs.readFileSync(JSON.parse(contextMatch[1]), "utf8") : "";
 fs.writeFileSync(path.join(${JSON.stringify(recordDir)}, runner + "-" + Date.now() + "-" + process.pid + ".json"), JSON.stringify({
-  args, cwd: process.cwd(),
+  args, cwd: process.cwd(), workerContext,
   codexProfile: runner === "codex" ? args[args.indexOf("--profile") + 1] : "",
   codexProfileExists: runner === "codex" && args.includes("--profile") ? fs.existsSync(path.join(process.env.CODEX_HOME, args[args.indexOf("--profile") + 1] + ".config.toml")) : false,
   workerProfileConfig: runner === "codex" && args.includes("--profile") ? fs.readFileSync(path.join(process.env.CODEX_HOME, args[args.indexOf("--profile") + 1] + ".config.toml"), "utf8") : "",
@@ -373,7 +379,7 @@ test("Q-012: a model requirement selects a runner only when enabled and allowlis
 
 test("Q-012: argv: fixed flags, the variant and the read-only sandbox; env keeps the real profile and strips secrets", () => {
   const codex = runners.buildCodexArgs({ model: "gpt-test", variant: "high", cwd: "W", lastMessagePath: "L", prompt: "P", profileId: "bridge-test", windowsSandbox: "" });
-  assert.deepEqual(codex, ["exec", "--json", "--ephemeral", "--profile", "bridge-test", "--ignore-rules", "-s", "workspace-write", "-C", "W", "-m", "gpt-test", "-c", "model_reasoning_effort=high", "-o", "L", "--", "P"]);
+  assert.deepEqual(codex, ["exec", "--json", "--ephemeral", "--profile", "bridge-test", "-s", "workspace-write", "-C", "W", "-m", "gpt-test", "-c", "model_reasoning_effort=high", "-o", "L", "--", "P"]);
   // Without a Windows sandbox codex refuses every write; the worker profile must retain the host's compatible sandbox config.
   const winArgs = runners.buildCodexArgs({ model: "m", cwd: "W", lastMessagePath: "L", prompt: "P", windowsSandbox: "elevated" });
   assert.deepEqual(winArgs.slice(winArgs.indexOf("-c"), winArgs.indexOf("-c") + 2), ["-c", "windows.sandbox=elevated"]);
@@ -445,7 +451,7 @@ test("Q-012: a codex writer completes in its worktree with changed files, usage 
   const [record] = records("codex");
   assert.ok(record, "the fake ran once");
   assert.notEqual(nodePath.resolve(record.cwd).toLowerCase(), nodePath.resolve(repo).toLowerCase(), "it ran in the worktree");
-  assert.deepEqual(record.args.slice(0, 8), ["exec", "--json", "--ephemeral", "--profile", record.codexProfile, "--ignore-rules", "-s", "workspace-write"]);
+  assert.deepEqual(record.args.slice(0, 7), ["exec", "--json", "--ephemeral", "--profile", record.codexProfile, "-s", "workspace-write"]);
   assert.match(record.codexProfile, /^bridge-[a-f0-9]{20}$/);
   assert.equal(record.codexProfileExists, true, "the selected Codex profile exists for the worker's lifetime");
   assert.equal(record.args[record.args.indexOf("-m") + 1], "gpt-test");
@@ -453,6 +459,7 @@ test("Q-012: a codex writer completes in its worktree with changed files, usage 
   assert.equal(nodePath.resolve(record.args[record.args.indexOf("-C") + 1]).toLowerCase(), nodePath.resolve(record.cwd).toLowerCase());
   assert.ok(!nodePath.resolve(record.args[record.args.indexOf("-o") + 1]).toLowerCase().startsWith(nodePath.resolve(record.cwd).toLowerCase()), "the sidecar is outside the worktree");
   assert.match(record.args.at(-1), /Do not commit/);
+  assert.match(record.workerContext, /Primary fixture workflow instructions/);
   assert.equal(record.env.CODEX_HOME, codexHome);
   assert.equal(record.env.FLEX_RUNNER_API_TOKEN, null);
   assert.equal(record.workerProfileConfig.includes("secret-value"), false, "a filtered bridge environment secret is neither copied into the worker config nor forwarded to the child");
@@ -525,6 +532,7 @@ test("Antigravity runner profiles select separate API keys, quota slots and dura
   assert.ok(jobId, receipt);
   assert.ok(await fixture.waitFor(async () => fixture.terminal((await fixture.durable(jobId))?.status), 20000));
   const record = records("agy")[0];
+  assert.match(record.workerContext, /AGY fixture workflow instructions/);
   assert.equal(record.env.GEMINI_API_KEY, "fixture-agy-secondary-secret");
   assert.equal(record.args[record.args.indexOf("--settings") + 1], JSON.stringify({ modelProvider: "gemini" }));
   assert.equal(record.env.CODEX_OPENCODE_AGY_PROFILES, undefined);
