@@ -168,6 +168,19 @@ tests cover propagation, isolation and cleanup; native provider/plugin use still
 needs a separately selected real-client acceptance check. Use the saved run/job ID
 through the original transport to inspect a worker's state and result.
 
+To make a tool mandatory, declare exact IDs in `scopeContract.requiredTools`, for
+example `["read", "grep"]`. The Bridge checks explicit tool enablement and allowed
+native permissions during discovery and final pre-spawn attestation. It refuses a
+missing, denied or unverified tool; it never enables one automatically. MCP tool
+flags alone do not establish connected tools. External CLI routes currently have
+no attested tool inventory and refuse nonempty required-tool contracts.
+
+The sanitized reader is a separate isolation route. V2 sanitized jobs currently
+return `sanitized_v2_unsupported` before account lookup or worker startup because
+native credential isolation and model evidence are not verified there. Regular
+V2 managed jobs remain available. A compatible V1 sanitized reader must be selected
+explicitly; the Bridge never changes routes or accounts automatically.
+
 Talk to Codex like you would talk to a senior engineer. You do not need to name tools; Codex chooses them. Some example prompts:
 
 | You want | Example prompt |

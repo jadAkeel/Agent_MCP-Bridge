@@ -64,3 +64,43 @@ New `worker-context` fixtures first failed because the implementation was absent
 Evidence so far: focused profile/context/binding/orchestration tests passed; platform portability 4/4; packaging 40 passed, 2 filesystem file-symlink skips. The native Codex 0.162.1 offline check passed generated developer instructions, staged project AGENTS, actual Windows shared Superpowers discovery and the native execpolicy parser. No model inference. The first native fixture assumed HOME relocated Windows known-folder discovery; it failed that assumption, and the corrected test checks the actual OS user's shared skills plus explicit fixture context separately.
 
 Full `npm test` is running. Final gate counts, repair-review outcome, publication and cleanup evidence will be appended below. Logs and the host-specific native check are retained under ignored `.test-logs/inheritance-*` and `.test-logs/native-worker-context.mjs`. Live AGY provider/plugin use, live Codex plugin/tool use, Desktop activation, synchronization benchmarks and a fresh-user end-to-end session remain unverified; fixture results do not establish those observations.
+
+## Merge-blocking review resolution — 18 November 2026
+
+The prior candidate 907df73 passed all nine GitHub OS/Node jobs. Its local full run
+finished 189/190 commands with six canonical-runner skips; the sole phase-clock
+tolerance failure passed all 13 measurement cases in an unchanged isolated rerun.
+These receipts belong to that candidate, not to the repair below.
+
+User then explicitly approved correcting the outstanding older review before the
+already requested merge. Scope includes the shared provider lease runtime,
+sanitized execution preflight, optional required-tool contract, and the original
+queue binding/requeue review findings. No dependency version, account, permission
+grant or global client startup change is included.
+
+| Original finding | Resolution and acceptance |
+| --- | --- |
+| Grouped accounts could each acquire a full concurrency budget | Connected group keys share admission inside one SQLite writer transaction; strictest member capacity wins. Fixtures cover overlapping groups, unequal limits, competing independent runtime instances and ungrouped-account independence. This is not a multiprocess stress benchmark. |
+| V2 sanitized route reused V1 auth and could not supply model evidence | Explicit `sanitized_v2_unsupported` refusal before profile resolution, isolated runtime creation, credentials or spawn. Both public prepare/execute entry points are covered. Native V2 sanitized functionality remains unsupported; V1 must be configured explicitly. |
+| Required inherited tools were only prose | Optional `scopeContract.requiredTools` survives normalization and reaches discovery/final pre-spawn checks. Unknown, denied, MCP and external-CLI requirements without attested inventories refuse; no tools are auto-enabled and no live authentication is inferred. |
+| Binding omitted resolved plugin artifacts | Digest includes canonical manifest-resolved package caches, explicit plugin roots, primary instructions and rules. Mutating a cache artifact or primary AGENTS refuses a queued binding. |
+| Manual requeue could switch outside admitted runners | A model override must use a runner present in the stored binding or originally declared fallback routes; otherwise submit a new job explicitly. |
+
+TDD evidence: the first fixture attempt incorrectly tried to mutate frozen config,
+then the corrected isolated-runtime/config fixtures failed for the actual three
+defects. Cache mutation and public-entry profile lookup each separately failed
+before their repair. Final merge-blocker tests passed 8/8; focused inherited
+profile/binding/orchestration run passed 22/22 before the final added entry-path
+cases. Existing provider-wait tests passed 22/22 and queue regressions 37/37.
+Final packaging passed 48/50 with two filesystem file-symlink skips. Logs are
+retained as `.test-logs/merge-blockers-*.log`. The restricted Windows sandbox
+refused fixture junction creation; the authorized unsandboxed fixture rerun passed.
+
+Independent reviewer `merge_blocker_review` rechecked the single identified repair
+(profile lookup before V2 refusal), then accepted all original findings as resolved
+in the current source. It did not duplicate tests or start services. Final external
+runner fixture and CI receipts are recorded on [PR #10](https://github.com/jadAkeel/Agent_MCP-Bridge/pull/10)
+against the published commit, followed by the user-authorized merge only if required
+checks pass. That timeline carries final gate/merge state without moving the tested
+candidate merely to append a result. Live Desktop/provider acceptance and native
+AGY project-plugin activation remain separate operational limits.

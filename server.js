@@ -1011,6 +1011,9 @@ async function readOpenCodeAuthContentForIsolatedRuntime() {
 }
 
 async function createIsolatedOpenCodeRuntime() {
+  if (CONFIG.openCodeCliMajor === "2") {
+    throw Object.assign(new Error("Sanitized OpenCode V2 execution is unsupported: native credential isolation and runtime model evidence are not attested. Use an explicitly configured compatible V1 sanitized reader; no credentials were read or copied."), { errorType: "sanitized_v2_unsupported" });
+  }
   const root = await mkdtemp(path.join(tmpdir(), `codex-opencode-sanitized-${process.pid}-`));
   try {
     const home = path.join(root, "home");
@@ -2663,6 +2666,8 @@ const { runOpenCode, readOnlyResultRetryable, runOpenCodeWithPolicy, readOnlyRet
 const { externalRunnerName, externalRunnerSelection, externalRunnerStartupProblems, buildRunnerEnv, resolveRunnerExecutable, verifyRunnerExecutable, runExternalCli, externalRunnerStatusLines, captureTargetState, targetStateChanges } = createExternalRunnersRuntime({ acquireProviderLease, activeModelOverrideAllowlist, agentIdleTimeoutForModel, allowlistedModelOverride, classifyResultError, clearAgentActivity, closeDb, combineAbortSignals: (...args) => combineAbortSignals(...args), CONFIG, containmentRecord, DEFAULT_OPENCODE_CONFIG_DIR, effectiveBridgeStateDirectory, isOrchestratorAgent: (...args) => isOrchestratorAgent(...args), isTimeoutResult, logEvent, modelPauseKeyForMetadata, noteAgentActivity, nowMs, OPENCODE_BASE_ENV_KEYS, openCodeCommandLineLengthError, openCodePromptArgument, openLockDb, parseDependencyRequest, parseModelAllowlistEntry, providerKeyForMetadata, providerSlotWaitingJobs, providerSlotWaitStorage, quarantineProviderLease, quotaGroupProviderKeys, rateLimitPauseReason, recordProviderCooldown, recordRateLimitPause, releaseProviderLease, resolveWindowsNodeShim, runCommand, runGitReadOnlyCommand, runSpawnCommand, SENSITIVE_ENV_PATTERN, sha256File, startProviderLeaseHeartbeat, summarizeStderr, USER_HOME_DIR });
 
 function withOpenCodeWorkerProfile(job, operation) {
+  // Let normal preflight report unsupported sanitized V2 before account lookup.
+  if (job?.sanitizedWorkspace && CONFIG.openCodeCliMajor === "2") return operation();
   const route = externalRunnerSelection(job?.scopeContract?.modelRequirement || null, job?.agent);
   const profileId = job?.runnerProfile || (!route ? CONFIG.openCodeProfiles.defaultProfileId : "");
   if (route || !profileId) return operation();

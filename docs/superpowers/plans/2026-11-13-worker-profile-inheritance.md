@@ -69,3 +69,16 @@ Reuse this plan; no dependency, account, startup-service or provider changes.
 - [x] Replace references to unavailable runner guidance with installed guides and packaged policy fallbacks; repair the tracked skill-package hash mismatch.
 - [x] Verify native Codex offline prompt discovery and native execpolicy parsing without model inference. Windows native known-folder discovery uses the real OS user even with fixture HOME/USERPROFILE values; shared fixture skill context is verified separately.
 - [ ] Complete final regression gates, independent scoped repair review and publication to PR #10. Native AGY provider/plugin and Desktop workflow activation remain separate operational checks.
+
+## Task 7. Resolve the earlier merge-blocking review
+
+User explicitly approved repairing the disclosed shared concurrency, execution and
+tool-contract findings before the already authorized merge. Also close the older
+binding/requeue findings from that same review. No dependencies, credentials,
+permissions grants or enabled services change.
+
+- [ ] Share SQLite lease admission across explicitly grouped account/provider keys, including connected groups, with the strictest member capacity and shared wait diagnostics. Ungrouped account IDs remain independent.
+- [ ] Refuse unsupported V2 sanitized jobs before credential access or worker startup, with `sanitized_v2_unsupported`. Preserve explicitly configured V1 execution. This closes unsafe misleading compatibility, not native V2 isolated account support.
+- [ ] Add optional `scopeContract.requiredTools` and preserve it through normalization and final policy checks. Attest known native tools only with explicit allowed metadata; refuse unknown/MCP/external-CLI tool requirements rather than inventing availability or broadening permissions.
+- [ ] Bind primary instructions/rules and actual manifest-resolved plugin cache files; reject manual requeue to a runner absent from the original admitted route binding.
+- [ ] Run failing then passing focused regression cases, existing provider/queue/external-runner suites, independent source review, packaging and CI for the new candidate. Record every original review finding and its disposition before merge.
