@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isMainModule } from "./main-module.js";
 
-export const ORCHESTRATOR_SKILLS = Object.freeze(["bridge-plan", "bridge-execute", "bridge-learn"]);
+export const ORCHESTRATOR_SKILLS = Object.freeze(["bridge-orchestrator", "bridge-plan", "bridge-execute", "bridge-learn"]);
 export const DELEGATE_SKILLS = Object.freeze({ opencode: "bridge-delegate-opencode", codex: "bridge-delegate-codex", pi: "bridge-delegate-pi" });
 // These original skills run independent CLIs, not managed bridge workers.
 export const STANDALONE_DELEGATE_SKILLS = Object.freeze(Object.fromEntries([

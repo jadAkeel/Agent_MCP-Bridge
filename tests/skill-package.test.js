@@ -9,9 +9,13 @@ import { renderSkills, verifySkillPackage, selectStandaloneDelegates, STANDALONE
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 test("the selected package is standalone, minimal and license-preserving", async () => {
+  const defaultFiles = await renderSkills();
+  assert.ok(defaultFiles.has("bridge-orchestrator/SKILL.md"), "the setup package includes the orchestration skill by default");
+  assert.match(defaultFiles.get("bridge-orchestrator/SKILL.md"), /multi-agent-balanced/);
+  assert.match(defaultFiles.get("bridge-orchestrator/SKILL.md"), /Codex Desktop chat/);
   for (const delegates of [[], ["opencode"], ["codex"], ["pi"], ["opencode", "codex"], ["opencode", "codex", "pi"]]) {
     const files = await renderSkills({ delegates });
-    assert.equal([...files.keys()].filter(file => file.endsWith("/SKILL.md")).length, 3 + delegates.length);
+    assert.equal([...files.keys()].filter(file => file.endsWith("/SKILL.md")).length, 4 + delegates.length);
     for (const [name, content] of files) {
       assert.doesNotMatch(content, /C:\\Users\\10User|\/Users\/10User/);
       if (name.endsWith("SKILL.md")) {
@@ -55,11 +59,11 @@ test("independent selection preserves original files, helpers, links and license
   await assert.rejects(renderSkills({ standaloneDelegates: ["../codex"] }), /Unsupported standalone/);
   assert.equal([...await renderSkills()].some(([file]) => file.startsWith("codex-delegate/")), false);
   const subset = await renderSkills({ delegates: [], standaloneDelegates: ["claude", "kimi", "claude"] });
-  assert.equal([...subset.keys()].filter(file => file.endsWith("/SKILL.md")).length, 5);
+  assert.equal([...subset.keys()].filter(file => file.endsWith("/SKILL.md")).length, 6);
   assert.equal([...subset.keys()].some(file => file.startsWith("codex-background/")), false, "individual selection must not silently install background service support");
   const sources = await verifySkillPackage();
   const rendered = await renderSkills({ delegates: ["opencode", "codex"], standaloneDelegates: all });
-  assert.equal([...rendered.keys()].filter(file => file.endsWith("/SKILL.md")).length, 25);
+  assert.equal([...rendered.keys()].filter(file => file.endsWith("/SKILL.md")).length, 26);
   for (const name of Object.values(STANDALONE_SKILLS)) {
     const prefix = `vendor/delegate-skills/upstream/skills/${name}/`;
     const originals = [...sources].filter(([file]) => file.startsWith(prefix));

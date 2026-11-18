@@ -254,7 +254,8 @@ export async function runTestCommands({ commands, cwd = ROOT, env = process.env,
   for (const command of commands.filter(command => command.lane === "exclusive")) await run(command);
   for (const command of commands.filter(command => command.lane === "final")) await run(command);
   results.sort((a, b) => a.index - b.index);
-  const report = { startedAt: new Date(startedAtMs).toISOString(), finishedAt: new Date().toISOString(), durationMs: Date.now() - startedAtMs,
+  const finishedAtMs = Date.now();
+  const report = { startedAt: new Date(startedAtMs).toISOString(), finishedAt: new Date(finishedAtMs).toISOString(), durationMs: finishedAtMs - startedAtMs,
     suiteWorkers: jobs, heavySuiteWorkers: Math.min(2, jobs),
     commandCount: commands.length, passed: results.filter(result => result.status === "passed").length,
     failed: results.filter(result => result.status !== "passed").length, results,
@@ -336,15 +337,16 @@ export async function prepareTestEnvironment(directory, ambient = process.env, {
     env.HOMEDRIVE = path.parse(env.HOME).root.replace(/[\\/]$/, "");
     env.HOMEPATH = env.HOME.slice(env.HOMEDRIVE.length);
   }
-  // Native diagnostic prerequisites stay available, but OpenCode and bridge state
-  // writes go only to this run. Never hand a test the operator's mutable profiles.
+  // Native agent and skill profiles stay available, but OpenCode and bridge state
+  // writes go only to this run. Never copy operator config, plugin activation, or
+  // MCP declarations into a test profile.
   if (copyProfiles) {
-    await copyIfPresent(path.join(sourceConfig, "opencode"), path.join(env.XDG_CONFIG_HOME, "opencode"));
+    for (const relative of ["agents", "skills"]) {
+      await copyIfPresent(path.join(sourceConfig, "opencode", relative), path.join(env.XDG_CONFIG_HOME, "opencode", relative));
+      await copyIfPresent(path.join(sourceHome, ".opencode", relative), path.join(env.HOME, ".opencode", relative));
+    }
     // Public model/plugin prerequisites only: never copy operator data/auth.
     for (const relative of ["packages", "bin", "models.json"]) await copyIfPresent(path.join(sourceCache, "opencode", relative), path.join(env.XDG_CACHE_HOME, "opencode", relative));
-    await copyIfPresent(path.join(sourceHome, ".opencode", "agents"), path.join(env.HOME, ".opencode", "agents"));
-    await copyIfPresent(path.join(sourceHome, ".opencode", "skills"), path.join(env.HOME, ".opencode", "skills"));
-    for (const file of ["opencode.json", "opencode.jsonc"]) await copyIfPresent(path.join(sourceHome, ".opencode", file), path.join(env.HOME, ".opencode", file));
   }
   env.CODEX_OPENCODE_SYNC_MANAGED_RUNTIME = "false";
   return env;

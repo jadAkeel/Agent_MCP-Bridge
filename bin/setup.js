@@ -14,20 +14,27 @@ import { recordCliFailure, redactCliText } from "./ops-log.js";
 import { renderSkills, hashContent, SKILL_PACKAGE_VERSION, selectStandaloneDelegates } from "./skill-package.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both|cursor|<comma-separated clients>] [--skip-claude-code] [--profile pure|gemini] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--cursor-config <file>] [--cursor-home <dir>] [--provider-limit N] [--skills] [--workers opencode,codex,pi] [--pi-safety deny|unsandboxed-worktree] [--delegates opencode,codex,pi|none] [--standalone-delegates all|<keys>|none] [--self-test]";
+const USAGE = "node bin/setup.js [--yes] [--dry-run] [--client auto|codex|claude|both|cursor|<comma-separated clients>] [--skip-claude-code] [--profile pure|gemini] [--v2-plugin-package-root <absolute-npm-prefix>] [--opencode-data-home <dir>] [--opencode-state-home <dir>] [--opencode-executable <absolute-native-path>] [--runtime-dir <dir>] [--state-dir <dir>] [--codex-home <dir>] [--claude-config <file>] [--cursor-config <file>] [--cursor-home <dir>] [--provider-limit N] [--skills] [--workers opencode,codex,pi] [--pi-safety deny|unsandboxed-worktree] [--delegates opencode,codex,pi|none] [--standalone-delegates all|<keys>|none] [--self-test]";
 requireSelfTestRun(import.meta.url);
 // The OpenCode version the managed profiles were reviewed and tested on (the Gemini
 // profile's plugin manifest pins exactly this one).
 const OPENCODE_PINNED_VERSION = "1.18.32";
+const OPENCODE_V2_PINNED_VERSION = "2.2.2";
+const OPENCODE_V2_PLUGIN = "@cortexkit/opencode-antigravity-auth@3.0.19";
+const OPENCODE_V2_GEMINI_MODEL = "google/antigravity-gemini-3.8-flash@high";
 
 function parseArguments(argv, env = process.env) {
   const options = { yes: false, dryRun: false, skipClaudeCode: false, client: "auto", profile: "pure", providerLimit: 2, selfTest: false };
-  const valued = { "--client": "client", "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--cursor-config": "cursorConfigPath", "--cursor-home": "cursorHome", "--provider-limit": "providerLimit", "--host-home": "hostHome", "--claude-home": "claudeHome", "--delegates": "delegates", "--standalone-delegates": "standaloneDelegates", "--workers": "workers", "--pi-safety": "piSafety" };
+  const valued = { "--client": "client", "--profile": "profile", "--runtime-dir": "runtimeDir", "--state-dir": "stateDir", "--codex-home": "codexHome", "--claude-config": "claudeConfigPath", "--cursor-config": "cursorConfigPath", "--cursor-home": "cursorHome", "--provider-limit": "providerLimit", "--host-home": "hostHome", "--claude-home": "claudeHome", "--delegates": "delegates", "--standalone-delegates": "standaloneDelegates", "--workers": "workers", "--pi-safety": "piSafety", "--v2-plugin-package-root": "v2PluginPackageRoot", "--opencode-data-home": "opencodeDataHome", "--opencode-state-home": "opencodeStateHome" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (valued[arg]) {
+    if (arg === "--opencode-executable") {
+      if (!argv[i + 1] || !path.isAbsolute(argv[i + 1]) || /\.(?:cmd|bat|ps1)$/i.test(argv[i + 1])) throw new Error("--opencode-executable requires an absolute native executable path (no shell wrapper).");
+      options.opencodeExecutable = argv[++i];
+    } else if (valued[arg]) {
       if (!argv[i + 1] || argv[i + 1].startsWith("--")) throw new Error(`${arg} requires a value.`);
       options[valued[arg]] = argv[++i];
+      if (arg === "--provider-limit") options.providerLimitExplicit = true;
     } else if (arg === "--yes") options.yes = true;
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--skip-claude-code") options.skipClaudeCode = true;
@@ -37,6 +44,13 @@ function parseArguments(argv, env = process.env) {
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!["pure", "gemini"].includes(options.profile)) throw new Error("--profile must be pure or gemini.");
+  if (options.v2PluginPackageRoot && !path.isAbsolute(options.v2PluginPackageRoot)) throw new Error("--v2-plugin-package-root requires an absolute npm-prefix directory.");
+  if (options.v2PluginPackageRoot) options.v2PluginPackageRoot = path.resolve(options.v2PluginPackageRoot);
+  if (options.v2PluginPackageRoot && options.profile !== "gemini") throw new Error("--v2-plugin-package-root is only used by --profile gemini.");
+  for (const name of ["opencodeDataHome", "opencodeStateHome"]) {
+    if (options[name] && !path.isAbsolute(options[name])) throw new Error(`--${name === "opencodeDataHome" ? "opencode-data-home" : "opencode-state-home"} requires an absolute directory.`);
+    if (options[name]) options[name] = path.resolve(options[name]);
+  }
   if (!["auto", "both", "all"].includes(options.client) && options.client.split(",").some(name => !["codex", "claude", "cursor"].includes(name))) throw new Error("--client supports auto, codex, claude, both, cursor, all or comma-separated client names.");
   if (options.cursorConfigPath && options.client !== "all" && !options.client.split(",").includes("cursor")) throw new Error("--cursor-config requires --client cursor (alone or in a client list).");
   if (options.skipClaudeCode) {
@@ -136,21 +150,22 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
   const found = {};
   const exactOpenCode = options.profile === "gemini" || options.packageSkills;
   const openCodeHint = options.profile === "gemini"
-    ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the Gemini profile's plugin manifest pins it): https://opencode.ai/docs/`
+    ? `OpenCode ${OPENCODE_PINNED_VERSION} for V1 or exactly ${OPENCODE_V2_PINNED_VERSION} with ${OPENCODE_V2_PLUGIN} for V2: https://opencode.ai/docs/`
     : options.packageSkills
-      ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} (the packaged Skills are qualified on this version): https://opencode.ai/docs/`
-      : `OpenCode ${OPENCODE_PINNED_VERSION} or newer: https://opencode.ai/docs/`;
+      ? `exactly OpenCode ${OPENCODE_PINNED_VERSION} for V1 or exactly OpenCode ${OPENCODE_V2_PINNED_VERSION} for V2 (the packaged Skills are qualified on these versions): https://opencode.ai/docs/`
+      : `OpenCode ${OPENCODE_PINNED_VERSION} or newer for V1, or exactly OpenCode ${OPENCODE_V2_PINNED_VERSION} for V2: https://opencode.ai/docs/`;
   const hints = { git: "https://git-scm.com/downloads", opencode: openCodeHint, codex: "npm install -g @openai/codex", claude: "https://code.claude.com/docs/en/setup" };
   // B-176: no Python: the TOML entry is read in-process (bin/fresh-healthcheck.js).
   for (const name of ["git", "opencode", ...(options.client !== "cursor" || options.workers?.includes("codex") || options.delegates?.includes("codex") ? ["codex", "claude"] : [])]) {
-    found[name] = Object.hasOwn(commands, name) ? commands[name] : findCommand(name, env);
+    found[name] = Object.hasOwn(commands, name) ? commands[name] : findCommand(name === "opencode"
+      ? options.opencodeExecutable || env.CODEX_OPENCODE_EXECUTABLE || name : name, env);
     // OpenCode eagerly mkdirs <XDG_CONFIG_HOME>/opencode even for --version.
     // In a dry run use the checkout's already-existing opencode directory, so
     // probing its version cannot create the planned runtime as a side effect.
     const probeEnv = name === "opencode" && options.dryRun ? { ...env, XDG_CONFIG_HOME: ROOT } : env;
     const result = run(found[name], ["--version"], probeEnv);
     const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
-    const version = /\b(\d+\.\d+\.\d+)\b/.exec(output)?.[1];
+    const version = /\bv?(\d+\.\d+\.\d+)\b/.exec(output)?.[1];
     const missing = Boolean(result.error) || result.status !== 0;
     // OpenCode: the Gemini profile needs the exact pinned version (its plugin manifest binds
     // it); the pure profile accepts the pinned version or newer and refuses older ones, which
@@ -159,11 +174,29 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
     // A version that does not parse, or a 0.0.0 development build, is not judged old.
     const openCodeTooOld = name === "opencode" && Boolean(version) && !version.startsWith("0.0.0")
       && !versionAtLeast(version, OPENCODE_PINNED_VERSION.split(".").map(Number));
-    const wrong = !missing && name === "opencode" && (exactOpenCode ? openCodeNotPinned : openCodeTooOld);
+    const v2 = name === "opencode" && version?.startsWith("2.");
+    if (name === "opencode") { found.openCodeVersion = version || ""; found.openCodeMajor = v2 ? "2" : "1"; }
+    const pluginRootValid = Boolean(options.v2PluginPackageRoot && (() => {
+      try {
+        if (!statSync(options.v2PluginPackageRoot).isDirectory()) return false;
+        const pkg = JSON.parse(readFileSync(path.join(options.v2PluginPackageRoot, "node_modules", "@cortexkit", "opencode-antigravity-auth", "package.json"), "utf8"));
+        return pkg.name === "@cortexkit/opencode-antigravity-auth" && pkg.version === "3.0.19"
+          && statSync(path.join(options.v2PluginPackageRoot, "package-lock.json")).isFile();
+      } catch { return false; }
+    })());
+    const wrong = !missing && name === "opencode" && (v2
+      ? version !== OPENCODE_V2_PINNED_VERSION || (options.profile === "gemini" && !pluginRootValid)
+      : exactOpenCode ? openCodeNotPinned : openCodeTooOld);
     log(`${name}: ${missing ? "missing" : wrong ? "wrong version" : "ok"}${version ? ` (${version})` : ""}${missing || wrong ? `; install: ${hints[name]}` : ""}`);
     if (missing) found[name] = null;
     if ((missing && !["codex", "claude"].includes(name)) || wrong) ok = false;
-    if (name === "opencode" && !missing && !wrong && openCodeNotPinned && (!version || version.startsWith("0.0.0"))) {
+    if (options.profile === "gemini" && v2 && !pluginRootValid) {
+      log(`OpenCode V2 Gemini: supply an npm prefix containing ${OPENCODE_V2_PLUGIN} with --v2-plugin-package-root.`);
+      ok = false;
+    }
+    if (v2 && !missing && !wrong) {
+      log(`OpenCode V2: ${version}; bridge tasks use a private --standalone server and an isolated ${options.profile} profile.`);
+    } else if (name === "opencode" && !missing && !wrong && openCodeNotPinned && (!version || version.startsWith("0.0.0"))) {
       log(`Note: OpenCode reported ${version ? `development build ${version}` : "no readable version"}; the pure profile accepts it untested. npm run smoke:live proves it after setup.`);
     } else if (name === "opencode" && !missing && !wrong && openCodeNotPinned) {
       log(`Note: OpenCode ${version} is newer than the tested ${OPENCODE_PINNED_VERSION}; the pure profile accepts it. npm run smoke:live proves it after setup.`);
@@ -184,6 +217,11 @@ function preflight(options, { env, log, commands = {}, run = runCommand, nodeVer
   let needsAuth = false;
   if (ok) for (const [name, args] of [["codex", ["login", "status"]], ["opencode", ["auth", "list"]], ["claude", ["auth", "status"]]]) {
     if (!found[name] || (name !== "opencode" && !clients[name])) continue;
+    if (name === "opencode" && options.profile === "gemini" && found.openCodeMajor === "2") {
+      needsAuth = true;
+      log("OpenCode V2 Gemini: the Bridge profile uses a separate Antigravity pool; complete its browser login after setup. Personal CLI/Desktop auth is not reused.");
+      continue;
+    }
     if (options.dryRun) { log(`Would check sign-in: ${name} ${args.join(" ")} (not run in dry-run)`); continue; }
     const result = run(found[name], args, env);
     const text = `${result.stdout || ""}${result.stderr || ""}`;
@@ -247,11 +285,27 @@ async function runSetup(options, dependencies = {}) {
   const hash = (content) => createHash("sha256").update(content).digest("hex");
   const source = path.join(ROOT, "opencode");
   const runtime = path.join(options.runtimeDir, "opencode");
+  const releaseManifestPath = path.join(ROOT, "release-manifest.json");
+  let expectedReleaseManifestSha256 = "";
+  if (existsSync(releaseManifestPath) && options.profile === "gemini" && checked.commands?.openCodeMajor === "2") {
+    await assertNoLinkedComponents(releaseManifestPath);
+    const releaseBytes = await readFile(releaseManifestPath);
+    const releaseManifest = JSON.parse(releaseBytes.toString("utf8"));
+    if (releaseManifest.version !== 1 || !releaseManifest.files || typeof releaseManifest.files !== "object") {
+      throw new Error("The companion immutable release manifest is invalid.");
+    }
+    expectedReleaseManifestSha256 = hash(releaseBytes);
+  }
   // B-092: lib/ is pinned with server.js, from the same checkout; a server pin without it
   // would make the bridge refuse to start.
   const libSha256 = await repinnableLibSha256(path.join(ROOT, "server.js"));
   const bridgeEnv = {
+    ...(checked.commands?.openCodeMajor === "2" ? { CODEX_OPENCODE_CLI_MAJOR: "2" } : {}),
+    ...(checked.commands?.opencode?.command && path.isAbsolute(checked.commands.opencode.command)
+      && !checked.commands.opencode.args?.length ? { CODEX_OPENCODE_EXECUTABLE: checked.commands.opencode.command } : {}),
     XDG_CONFIG_HOME: options.runtimeDir,
+    ...(options.opencodeDataHome ? { XDG_DATA_HOME: options.opencodeDataHome } : {}),
+    ...(options.opencodeStateHome ? { XDG_STATE_HOME: options.opencodeStateHome } : {}),
     CODEX_OPENCODE_AGENT_DIR: path.join(runtime, "agents"),
     CODEX_OPENCODE_SKILL_DIR: path.join(runtime, "skills"),
     CODEX_OPENCODE_STATE_DIR: options.stateDir,
@@ -266,6 +320,7 @@ async function runSetup(options, dependencies = {}) {
     CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE: "false",
     CODEX_OPENCODE_EXPECTED_SERVER_SHA256: await repinnableServerSha256(path.join(ROOT, "server.js")),
     ...(libSha256 ? { CODEX_OPENCODE_EXPECTED_LIB_SHA256: libSha256 } : {}),
+    ...(expectedReleaseManifestSha256 ? { CODEX_OPENCODE_EXPECTED_RELEASE_MANIFEST_SHA256: expectedReleaseManifestSha256 } : {}),
     ...(options.workers?.some(name => name !== "opencode") ? {
       CODEX_OPENCODE_EXTERNAL_RUNNERS: options.workers.filter(name => name !== "opencode").join(","),
     } : {}),
@@ -299,8 +354,44 @@ async function runSetup(options, dependencies = {}) {
     }
     if (before !== content) files.push({ file, before, content, kind });
   };
-  await addFile(path.join(runtime, "opencode.jsonc"), await readFile(path.join(source, "opencode.jsonc"), "utf8"));
-  if (options.profile === "gemini") {
+  let managedConfig = await readFile(path.join(source, "opencode.jsonc"), "utf8");
+  let v2Plugin = null;
+  let v2SettingsContent = "";
+  if (checked.commands?.openCodeMajor === "2") {
+    const parsed = JSON.parse(managedConfig);
+    delete parsed.plugin;
+    parsed.plugins = [];
+    if (options.profile === "gemini") {
+      const { inspectV2PluginPackageRoot } = await import("../lib/v2-plugin-package.js");
+      v2Plugin = await inspectV2PluginPackageRoot(options.v2PluginPackageRoot, OPENCODE_V2_PLUGIN);
+      const pluginRelative = path.relative(path.resolve(options.runtimeDir), v2Plugin.root);
+      const pluginIsOutsideRuntime = pluginRelative === ".." || pluginRelative.startsWith(`..${path.sep}`) || path.isAbsolute(pluginRelative);
+      if (!pluginRelative || !pluginIsOutsideRuntime) {
+        throw new Error("The V2 Antigravity package tree must be outside the mutable OpenCode runtime profile.");
+      }
+      parsed.plugins = [v2Plugin.packageRoot];
+    }
+    // V2 has more built-in tools; deny unknown actions unless the managed role grants them.
+    parsed.permission = { "*": "deny", read: "allow", glob: "allow", grep: "allow", skill: "allow" };
+    managedConfig = JSON.stringify(parsed, null, 2) + "\n";
+  }
+  await addFile(path.join(runtime, "opencode.jsonc"), managedConfig);
+  if (options.profile === "gemini" && checked.commands?.openCodeMajor === "2") {
+    const settingsPath = path.join(source, "antigravity.json");
+    const settingsContent = await readFile(settingsPath, "utf8");
+    v2SettingsContent = settingsContent;
+    const settings = JSON.parse(settingsContent);
+    const requiredValues = {
+      auto_update: false, debug: false, debug_tui: false, cli_first: false,
+      quota_fallback: false, quota_style_fallback: false,
+      account_selection_strategy: "sticky", pid_offset_enabled: false,
+      soft_quota_threshold_percent: 90,
+    };
+    for (const [key, expected] of Object.entries(requiredValues)) {
+      if (settings[key] !== expected) throw new Error(`V2 Antigravity setting ${key} differs from the reviewed local policy.`);
+    }
+    await addFile(path.join(runtime, "antigravity.json"), settingsContent);
+  } else if (options.profile === "gemini") {
     const manifestPath = path.join(source, "plugin-integrity-manifest.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     if (manifest.version !== 1 || manifest.openCodeVersion !== "1.18.32" || manifest.configs?.length !== 1 || manifest.settings?.length !== 1 || !manifest.plugins?.length) throw new Error("Unsupported managed Gemini manifest.");
@@ -320,12 +411,72 @@ async function runSetup(options, dependencies = {}) {
     bridgeEnv.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = hash(content);
     log("Gemini: reviewed plugin cache and provider sign-in must already exist (REFERENCE: Managed Gemini OAuth profile); health smoke will verify the cache.");
   }
+  const syncOptions = { source, agentDir: bridgeEnv.CODEX_OPENCODE_AGENT_DIR, skillDir: bridgeEnv.CODEX_OPENCODE_SKILL_DIR, apply: false, removeStale: false };
+  const sync = await runSync(syncOptions);
+  for (const plan of sync.plans) for (const action of plan.actions.filter((item) => item.action !== "stale")) {
+    await addFile(path.join(plan.targetRoot, action.relative), await readFile(path.join(plan.sourceRoot, action.relative), "utf8"), "managed");
+  }
+  if (v2Plugin) {
+    await assertNoLinkedComponents(options.v2PluginPackageRoot);
+    const runtimeFiles = {};
+    for (const item of planned.values()) {
+      const relative = path.relative(options.runtimeDir, item.file);
+      if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+      runtimeFiles[relative.split(path.sep).join("/")] = hash(item.content);
+    }
+    const configPath = path.join(runtime, "opencode.jsonc");
+    const settingsPath = path.join(runtime, "antigravity.json");
+    const v2Manifest = {
+      version: 2,
+      openCodeVersion: OPENCODE_V2_PINNED_VERSION,
+      plugins: [v2Plugin],
+      configs: [{ path: configPath, sha256: hash(managedConfig), scope: "global", plugins: [v2Plugin.packageRoot] }],
+      settings: [{ path: settingsPath, sha256: hash(v2SettingsContent), requiredValues: {
+        auto_update: false, debug: false, debug_tui: false, cli_first: false,
+        quota_fallback: false, quota_style_fallback: false,
+        account_selection_strategy: "sticky", pid_offset_enabled: false,
+        soft_quota_threshold_percent: 90,
+      } }],
+      runtimeProfile: { root: options.runtimeDir, files: runtimeFiles },
+    };
+    const v2ManifestPath = path.join(options.stateDir, "v2-plugin-integrity-manifest.json");
+    const v2ManifestContent = `${JSON.stringify(v2Manifest, null, 2)}\n`;
+    await addFile(v2ManifestPath, v2ManifestContent, "manifest");
+    bridgeEnv.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS = "true";
+    bridgeEnv.CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST = OPENCODE_V2_PLUGIN;
+    bridgeEnv.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH = v2ManifestPath;
+    bridgeEnv.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 = hash(v2ManifestContent);
+    log(`V2 Gemini profile: ${OPENCODE_V2_PLUGIN}; package tree, config, settings, agents and skills are hash-pinned. Complete Antigravity pool browser login in this isolated profile before Gemini inference.`);
+  }
+  const original = await optionalText(options.configPath);
+  if (checked.commands?.openCodeMajor === "2" && original !== null) {
+    try {
+      const { parse } = await import("smol-toml");
+      const priorEnv = parse(original)?.mcp_servers?.opencode?.env || {};
+      if (priorEnv.CODEX_OPENCODE_CLI_MAJOR === "2") {
+        for (const name of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) {
+          if (typeof priorEnv[name] === "string" && path.isAbsolute(priorEnv[name])) bridgeEnv[name] = priorEnv[name];
+        }
+        for (const name of ["CODEX_OPENCODE_MODEL_ALLOWLIST", "CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE", "CODEX_OPENCODE_BUILDER_MODEL_FALLBACK"]) {
+          if (typeof priorEnv[name] === "string" && priorEnv[name].trim()) bridgeEnv[name] = priorEnv[name];
+        }
+        if (!options.providerLimitExplicit && /^\d+$/.test(String(priorEnv.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT || ""))) {
+          const previousLimit = Number(priorEnv.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT);
+          if (previousLimit >= 1 && previousLimit <= 32) bridgeEnv.CODEX_OPENCODE_PROVIDER_CONCURRENCY_LIMIT = String(previousLimit);
+        }
+      }
+    } catch { throw new Error("The existing Codex MCP config could not be parsed safely while preserving its OpenCode V2 data paths."); }
+  }
+  if (v2Plugin) {
+    const previousModels = String(bridgeEnv.CODEX_OPENCODE_MODEL_ALLOWLIST || "").split(",").map(value => value.trim()).filter(Boolean);
+    bridgeEnv.CODEX_OPENCODE_MODEL_ALLOWLIST = [...new Set([...previousModels, OPENCODE_V2_GEMINI_MODEL])].join(",");
+    bridgeEnv.CODEX_OPENCODE_BUILDER_MODEL_FALLBACK = "false";
+  }
   const timeout = clientToolTimeoutSeconds(bridgeEnv);
   log(`tool_timeout_sec = ${timeout} (provider wait + longest agent + validation + 5 min)`);
   const entryText = ["[mcp_servers.opencode]", `command = ${JSON.stringify(process.execPath)}`,
     `args = [${JSON.stringify(path.join(ROOT, "server.js"))}]`, "startup_timeout_sec = 120", `tool_timeout_sec = ${timeout}`, "",
     "[mcp_servers.opencode.env]", ...Object.entries(bridgeEnv).map(([key, value]) => `${key} = ${JSON.stringify(value)}`), ""].join("\n");
-  const original = await optionalText(options.configPath);
   const rewritten = rewriteCodexConfig(original || "", entryText);
   await addFile(options.configPath, rewritten.text, "codex");
   const { codex: useCodex, claude: useClaude, cursor: useCursor } = checked.clients;
@@ -341,11 +492,6 @@ async function runSetup(options, dependencies = {}) {
     await addFile(options.cursorConfigPath, rewriteCursorConfig(await optionalText(options.cursorConfigPath), rewritten.entry), "cursor");
   }
   const restartSteps = [...[useCodex && "Restart Codex.", useClaude && "Restart Claude Code.", useCursor && "Restart Cursor, enable opencode in MCP settings and check get_opencode_bridge_status."].filter(Boolean), "Run npm run smoke:live once."].map((step, index) => `${index + 1}. ${step}`).join("\n");
-  const syncOptions = { source, agentDir: bridgeEnv.CODEX_OPENCODE_AGENT_DIR, skillDir: bridgeEnv.CODEX_OPENCODE_SKILL_DIR, apply: false, removeStale: false };
-  const sync = await runSync(syncOptions);
-  for (const plan of sync.plans) for (const action of plan.actions.filter((item) => item.action !== "stale")) {
-    await addFile(path.join(plan.targetRoot, action.relative), await readFile(path.join(plan.sourceRoot, action.relative), "utf8"), "managed");
-  }
   if (options.packageSkills) {
     const skills = await renderSkills({ delegates: options.delegates, standaloneDelegates: options.standaloneDelegates });
     // Cursor also discovers ~/.agents/skills: use one common root when both clients are selected.

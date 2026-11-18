@@ -45,7 +45,8 @@ test("submission has one root entrypoint and retains every original script, help
   validateSubmission(files);
   assert.match(files.get("SKILL.md"), /name: agent-mcp-bridge/);
   assert.match(files.get("SKILL.md"), /marketplace are not evidence that executable files exist/);
-  assert.equal([...files.keys()].filter(name => name === "SKILL.md" || name.endsWith("/SKILL.md")).length, 27);
+  assert.equal([...files.keys()].filter(name => name === "SKILL.md" || name.endsWith("/SKILL.md")).length, 28);
+  assert.ok([...files.keys()].some(name => name === "library/bridge-orchestrator/SKILL.md"), "the default submission includes the Bridge orchestrator workflow");
   const sources = await verifySkillPackage();
   for (const name of Object.values(STANDALONE_SKILLS)) {
     const prefix = `vendor/delegate-skills/upstream/skills/${name}/`;

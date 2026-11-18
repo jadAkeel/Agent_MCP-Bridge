@@ -8,6 +8,8 @@ import { fitResultParts, honestResultPointers } from "../lib/result-text.js";
 const AUDIT_METRIC_COLUMNS = [
   ["kind", "TEXT NOT NULL DEFAULT 'direct'"],
   ["job_id", "TEXT NOT NULL DEFAULT ''"],
+  ["runner_profile", "TEXT NOT NULL DEFAULT ''"],
+  ["codex_profile", "TEXT NOT NULL DEFAULT ''"],
   ["agent_run_ms", "INTEGER"],
   ["startup_ms", "INTEGER"],
   ["provider_wait_ms", "INTEGER"],
@@ -103,7 +105,8 @@ export function directRunMetrics(result = {}) {
 
 const RECORD_SELECT = `SELECT run_id AS runId, project_key AS projectKey, kind, job_id AS jobId, status,
   error_type AS errorType, started_at AS startedAt, finished_at AS finishedAt, duration_ms AS durationMs,
-  agent, configured_model AS configuredModel, model_evidence_present AS modelEvidencePresent,
+  agent, runner_profile AS runnerProfile, codex_profile AS codexProfile,
+  configured_model AS configuredModel, model_evidence_present AS modelEvidencePresent,
   agent_run_ms AS agentRunMs, startup_ms AS startupMs, provider_wait_ms AS providerWaitMs,
   usage_steps AS usageSteps, tokens_input AS inputCount, tokens_output AS outputCount,
   tokens_reasoning AS reasoningCount, tokens_cache_read AS cacheReadCount, tokens_cache_write AS cacheWriteCount,
@@ -207,9 +210,9 @@ export function createDirectRunAudit({
             throw new Error("Direct run audit is full of unfinished records.");
           }
           db.prepare(`INSERT INTO opencode_direct_runs (run_id, project_key, kind, job_id, status, started_at, agent,
-            owner_instance_id, owner_process_id) VALUES (?, ?, ?, ?, 'started', ?, ?, ?, ?)`)
+            runner_profile, codex_profile, owner_instance_id, owner_process_id) VALUES (?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?)`)
             .run(record.runId, projectKey, record.kind, record.jobId, record.startedAt, record.agent,
-              identifier(instanceId), Number.isInteger(processId) ? processId : null);
+              record.runnerProfile, record.codexProfile, identifier(instanceId), Number.isInteger(processId) ? processId : null);
         } else {
           // Sealing and database opening can yield after finish classified the run.
           if (["direct", "parallel"].includes(record.kind) && signal?.aborted) {
@@ -274,6 +277,8 @@ export function createDirectRunAudit({
         jobId: identifier(jobId),
         startedAt: new Date(startMs).toISOString(),
         agent: identifier(job.agent),
+        runnerProfile: identifier(job.runnerProfile),
+        codexProfile: identifier(job.codexProfile),
       };
       const audit = { runId: record.runId, kind: record.kind, persisted: false, startedPersisted: false, errorType: "" };
       let projectKey = "";

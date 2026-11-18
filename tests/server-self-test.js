@@ -2599,7 +2599,7 @@ async function runSelfTests() {
         "  fputs(\"unexpected fake OpenCode arguments\", stderr); return 2;",
         "}",
       ].join("\n"), "utf8");
-      const compilerCandidates = ["gcc", "C:\\MinGW\\bin\\gcc.exe"];
+      const compilerCandidates = ["gcc", "C:\\MinGW\\bin\\gcc.exe", "clang", "C:\\Program Files\\LLVM\\bin\\clang.exe"];
       const compilerFailures = [];
       let compiled = false;
       for (const compiler of compilerCandidates) {
@@ -2609,10 +2609,14 @@ async function runSelfTests() {
             windowsHide: true,
             timeout: 1000 * 30,
           });
+          const probe = await execFileAsync(pluginFixtureHostExecutable, ["debug", "config"], {
+            cwd: pluginFixtureHome, windowsHide: true, timeout: 1000 * 15,
+          });
+          assert.equal(probe.stdout, pluginFixtureEffectiveConfig);
           compiled = true;
           break;
         } catch (error) {
-          compilerFailures.push(`${compiler}: ${error.message || String(error)}`);
+          compilerFailures.push(`${compiler}: ${error.message || String(error)}; code=${error.code}; signal=${error.signal}; killed=${error.killed}`);
         }
       }
       assert.equal(compiled, true, `A C compiler is required for the deterministic Windows plugin-policy host.\n${compilerFailures.join("\n")}`);
@@ -2740,6 +2744,17 @@ async function runSelfTests() {
       immutableReleasePluginModeError({ releasePinned: true, allowExternalPlugins: true }),
       /Immutable releases must use pure mode/
     );
+    assert.equal(immutableReleasePluginModeError({
+      releasePinned: true, allowExternalPlugins: true, openCodeCliMajor: "2",
+      externalPluginManifestPath: path.join(tmpdir(), "v2-plugin-manifest.json"),
+      expectedExternalPluginManifestSha256: "a".repeat(64),
+      externalPluginAllowlist: ["@cortexkit/opencode-antigravity-auth@3.0.19"],
+    }), "");
+    assert.match(immutableReleasePluginModeError({
+      releasePinned: true, allowExternalPlugins: true, openCodeCliMajor: "2",
+      externalPluginManifestPath: "relative.json", expectedExternalPluginManifestSha256: "bad",
+      externalPluginAllowlist: ["@cortexkit/opencode-antigravity-auth@3.0.19"],
+    }), /Immutable releases must use pure mode/);
     assert.equal(immutableReleasePluginModeError({ releasePinned: false, allowExternalPlugins: true }), "");
     const releaseFixtureFiles = [
       "server.js",

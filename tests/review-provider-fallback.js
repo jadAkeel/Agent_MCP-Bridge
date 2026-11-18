@@ -74,7 +74,7 @@ function harness(agent = "builder", options = {}) {
     buildOpenCodeEnv: () => ({}), summarizeStderr: value => String(value || ""),
     isManagedReadOnlyAgent: role => ["tester", "reviewer"].includes(role), maxReadOnlyAgentRetries: 2,
     mergeHeavyToolCalls: (a, b) => [...(a || []), ...(b || [])], delayWithSignal: sleep,
-    quotaGroupProviderKeys: provider => options.groups?.[provider] || options.groupKeys || [],
+    quotaGroupProviderKeys: provider => options.groups?.[typeof provider === "string" ? provider : provider?.provider] || options.groupKeys || [],
     verifyExternalPluginPolicy: async () => { calls.push("plugin"); return { ok: true }; },
     readAgentDebugMetadata: async () => ({ ok: true, metadata }),
     readAgentDebugMetadataUncached: async () => {

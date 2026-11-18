@@ -144,6 +144,43 @@ If both appear, the whole system works end to end.
 
 ## 6. Everyday usage
 
+### User and project customization for CLI workers
+
+Codex Desktop stays the coordinator. A named Codex CLI or AGY CLI worker keeps its
+selected account while receiving the compatible Windows user's instructions and
+skills. Shared skills under `~/.agents/skills`, including directory junctions such
+as Superpowers, are listed in a private per-run context file. The worker is told
+to read that file and the applicable `SKILL.md` files before starting its task.
+Codex also inherits primary developer instructions and command rules. AGY keeps
+its real user home so its native global plugins remain discoverable; named AGY
+profiles currently select Gemini API keys, not separate personal OAuth logins.
+
+When a worker uses a worktree, missing local project instructions, skills and native
+plugin configuration are copied there for that run. Existing worktree files win.
+Only unchanged copies are removed afterward; changed resources are retained and
+the run fails review. Credential-like files, unsafe links, recursive Bridge tools
+and Codex project permission overrides refuse startup. Worker scopes, sandbox
+settings and account credentials are not broadened by inheritance.
+
+An available skill or plugin does not prove the model used it or that its external
+service is authenticated. Required unavailable tools must be reported. Fixture
+tests cover propagation, isolation and cleanup; native provider/plugin use still
+needs a separately selected real-client acceptance check. Use the saved run/job ID
+through the original transport to inspect a worker's state and result.
+
+To make a tool mandatory, declare exact IDs in `scopeContract.requiredTools`, for
+example `["read", "grep"]`. The Bridge checks explicit tool enablement and allowed
+native permissions during discovery and final pre-spawn attestation. It refuses a
+missing, denied or unverified tool; it never enables one automatically. MCP tool
+flags alone do not establish connected tools. External CLI routes currently have
+no attested tool inventory and refuse nonempty required-tool contracts.
+
+The sanitized reader is a separate isolation route. V2 sanitized jobs currently
+return `sanitized_v2_unsupported` before account lookup or worker startup because
+native credential isolation and model evidence are not verified there. Regular
+V2 managed jobs remain available. A compatible V1 sanitized reader must be selected
+explicitly; the Bridge never changes routes or accounts automatically.
+
 Talk to Codex like you would talk to a senior engineer. You do not need to name tools; Codex chooses them. Some example prompts:
 
 | You want | Example prompt |
@@ -222,7 +259,8 @@ Orchestrator profiles (advanced):
 - When an allowlisted override is used, the result says `Model selection: operator_allowlist_override` and names the model it replaced.
 - A model that is **not** allowlisted is rejected before anything runs (`configured_model_requirement_mismatch`). There is no silent fallback.
 - **To allow a new model:** add it to `CODEX_OPENCODE_MODEL_ALLOWLIST` in `~/.codex/config.toml` under `[mcp_servers.opencode.env]`, restart Codex, then run `npm run smoke:live`.
-- **codex and agy as runners (optional):** with `CODEX_OPENCODE_EXTERNAL_RUNNERS=codex,agy`, allowlist entries such as `codex/gpt-6.1-sol@high` or `agy/default` run the Codex CLI or the Antigravity CLI instead of OpenCode, in the same worktree and with the same checks. The result says `Role enforcement: none (runner codex)`: the CLI does not follow the OpenCode role's permissions. agy runs only worktree writers; if it changes the checkout you work in or a profile file such as `~/.codex/config.toml` or `~/.gitconfig`, the job fails with `external_runner_wrote_outside_worktree` and agy is paused for an hour (`resume_opencode_provider agy` ends it early). A failed runner's files are kept in the folder the result names as `Runner sidecar:`. Do not set `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` together with the runner settings: the bridge refuses to start. Details: `docs/REFERENCE.md`, "External runners".
+- **codex and agy as runners (optional):** with `CODEX_OPENCODE_EXTERNAL_RUNNERS=codex,agy`, allowlist entries such as `codex/gpt-6.1-sol@high` or `agy/default` run the Codex CLI or the Antigravity CLI instead of OpenCode, in the same worktree and with the same checks. The result says `Role enforcement: none (runner codex)`: the CLI does not follow the OpenCode role's permissions. agy keeps slash-command and skill expansion enabled, inherits current-user skills/plugins/MCP tools, and runs only worktree writers. The Bridge refuses an enabled recursive MCP entry and reports unavailable profile assets. If agy changes the checkout or a protected profile file/tree such as `.gemini/config`, `~/.codex/config.toml` or `~/.gitconfig`, the job fails with `external_runner_wrote_outside_worktree` and agy is paused for an hour (`resume_opencode_provider agy` ends it early). A failed runner's files are kept in the folder the result names as `Runner sidecar:`. Do not set `CODEX_OPENCODE_PROVIDER_CONCURRENCY_KEY` together with the runner settings: the bridge refuses to start. Details: `docs/REFERENCE.md`, "External runners".
+- **Named worker accounts:** `runnerProfile` selects an OpenCode account while sharing its configured skills and tool policy, or selects a registered Codex/Antigravity profile. Codex CLI keeps each account login separate and inherits the primary Codex MCP/plugin settings and installed skills through a temporary config profile; unavailable items appear in the result. Antigravity inherits the current user's global settings and skills; named Gemini API-key profiles are supported, while concurrent personal OAuth accounts are not. See [worker profile setup](REFERENCE.md#select-a-codex-account-per-job) and [OpenCode profile setup](REFERENCE.md#select-an-opencode-account-per-job). Results and queue status show the selected profile.
 
 > **Model identity note.** OpenCode (observed on 1.17.13) does not report in every stream which model actually answered. The bridge therefore reports the *configured* model and never claims runtime proof it does not have. Keep `CODEX_OPENCODE_REQUIRE_RUNTIME_MODEL_EVIDENCE=false`, because `true` rejects every real run whose stream lacks that proof.
 

@@ -17,7 +17,7 @@ The client decides. The bridge enforces scope, isolation, and review. OpenCode a
 
 - Node.js 22.13 or newer
 - Git
-- OpenCode on `PATH`, signed in to at least one provider (`opencode auth list`). The public installer requires **exactly 1.18.32**, the version qualified for the packaged Skills. Lower-level setup without `--skills` accepts 1.18.32 or newer for the pure profile and notes untested versions; newer versions need separately authorized live verification. The optional Gemini profile also requires exactly 1.18.32, pinned by `opencode/plugin-integrity-manifest.json` (`openCodeVersion`).
+- OpenCode signed in to at least one provider (`opencode auth list`). The public installer accepts **1.18.32** or **2.2.2**. Select a V2 native binary with `--opencode-executable` if it is outside `PATH`. The Gemini profile requires the version-specific plugin manifest and, for V2, the pinned package supplied with `--v2-plugin-package-root`.
 - One MCP client: Codex CLI, Claude Code, or explicitly selected Cursor. Multiple clients can coexist; one is enough. Cursor desktop acceptance is tracked separately from configuration support.
 
 The default planner, builder, debugger, architect, reviewer and tester are configured for `opencode/muse-spark-1.3-contributor-free` in the pure profile. Signing in to Claude Code does not sign OpenCode in to a provider. Gemini is optional; it needs the Gemini setup profile and OpenCode provider sign-in.
@@ -100,6 +100,9 @@ Sign in through the normal client/provider flow. Live inference smoke is a separ
 Custom homes, ownership/conflicts, backups and safe rollback are in
 [ONBOARDING](docs/ONBOARDING.md#package-installation-windows-linux-and-macos).
 
+The installer includes the `bridge-orchestrator` skill in the selected host's skills folder,
+alongside the managed planning and execution guides. It teaches Codex Desktop to choose a
+worker, apply the runner-specific guidance, and keep each run or job ID available for follow-up.
 The lower-level `npm run setup` remains available after dependencies are installed. It
 checks prerequisites and sign-in, previews its changes for approval, creates the isolated
 runtime, registers the installed client (Codex, Claude Code, or both) with the real server hash, copies managed agents/skills, and runs
@@ -114,7 +117,7 @@ The `agent-mcp-bridge` bin entry is ready for a future `npx` release; this packa
 ## Quick start
 
 1. Open Codex (or Claude Code) in your project, which must be a Git repository with at least one commit.
-2. Nothing to copy: the bridge sends its delegation workflow to the client in the MCP handshake (log.md B-177). Optional, for more detail: the Codex agent `principal-engineer-orchestrator` (`codex/agents/`), or the owner's fuller Claude Code rules in [claude/CLAUDE.md](claude/CLAUDE.md), which you can add to `~/.claude/CLAUDE.md`.
+2. Setup installs the `bridge-orchestrator` skill and the managed planning/execution guides for the selected client. The bridge also sends its delegation workflow in the MCP handshake (log.md B-177). The optional Codex agent profile `principal-engineer-orchestrator` remains available in `codex/agents/`.
 3. Ask: *"Run get_opencode_bridge_status for this project, then ask an OpenCode reviewer for a short opinion on the code."*
 
 The public skills keep small/simple work direct when handoff costs more, and retain work

@@ -14,6 +14,8 @@ import { parse as parseToml } from "smol-toml";
 import { libDigest, libPinError } from "./lib-digest.js";
 import { isMainModule, requireSelfTestRun, selfTestPassed } from "./main-module.js";
 import { recordCliFailure } from "./ops-log.js";
+import { inspectV2PluginPackageRoot } from "../lib/v2-plugin-package.js";
+import { readPinnedV2Manifest, verifyV2RuntimeProfile } from "../lib/v2-runtime-profile.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 requireSelfTestRun(import.meta.url);
@@ -171,6 +173,12 @@ function immutableReleasePluginModeError(env) {
     return "Candidate CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS must be explicitly true or false.";
   }
   if (externalMode === "true") {
+    const allowlist = String(env.CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST || "").split(",").map(item => item.trim()).filter(Boolean);
+    if (env.CODEX_OPENCODE_CLI_MAJOR === "2"
+      && path.isAbsolute(String(env.CODEX_OPENCODE_PLUGIN_MANIFEST_PATH || ""))
+      && /^[a-f0-9]{64}$/.test(String(env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 || ""))
+      && allowlist.length === 1
+      && /^@[a-z0-9._-]+\/[a-z0-9._-]+@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/i.test(allowlist[0])) return "";
     return "Immutable releases must use pure mode and built-in authentication; external OAuth plugins share XDG_CONFIG_HOME with credential storage and are not supported.";
   }
   return "";
@@ -242,6 +250,44 @@ async function validateCandidateReleaseEntry(entry) {
     if (await sha256File(path.join(releaseRoot, ...relative.split("/"))) !== expected) {
       throw new Error(`Candidate release file does not match its manifest digest: ${relative}`);
     }
+  }
+  const externalMode = String(env.CODEX_OPENCODE_ALLOW_EXTERNAL_PLUGINS || "").trim().toLowerCase();
+  if (env.CODEX_OPENCODE_CLI_MAJOR === "2" && externalMode === "true") {
+    const configHome = requiredAbsoluteEnvPath(env, "XDG_CONFIG_HOME");
+    const agentDir = requiredAbsoluteEnvPath(env, "CODEX_OPENCODE_AGENT_DIR");
+    const skillDir = requiredAbsoluteEnvPath(env, "CODEX_OPENCODE_SKILL_DIR");
+    const pluginManifestPath = requiredAbsoluteEnvPath(env, "CODEX_OPENCODE_PLUGIN_MANIFEST_PATH");
+    const pluginManifestSha256 = requiredSha256(env, "CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256");
+    const pinned = await readPinnedV2Manifest(pluginManifestPath, pluginManifestSha256);
+    const allowlist = String(env.CODEX_OPENCODE_EXTERNAL_PLUGIN_ALLOWLIST || "").split(",").map(item => item.trim()).filter(Boolean).sort();
+    const specifiers = pinned.plugins.map(item => String(item?.specifier || "")).sort();
+    if (pinned.openCodeVersion !== "2.2.2" || pinned.plugins.length !== 1
+      || pinned.configs.length !== 1 || pinned.settings.length !== 1
+      || JSON.stringify(specifiers) !== JSON.stringify(allowlist)) {
+      throw new Error("Candidate V2 plugin manifest and external-plugin allowlist do not match the qualified host/profile.");
+    }
+    const requiredAgents = Object.keys(releaseFiles)
+      .filter(relative => relative.startsWith("opencode/agents/") && relative.endsWith(".md"))
+      .map(relative => path.basename(relative, ".md")).sort();
+    const requiredSkills = Object.keys(releaseFiles)
+      .filter(relative => relative.startsWith("opencode/skills/") && relative.endsWith("/SKILL.md"))
+      .map(relative => relative.split("/").at(-2)).sort();
+    const profile = await verifyV2RuntimeProfile(pinned, {
+      configHome, agentDir, skillDir, sha256File, requiredAgents, requiredSkills,
+    });
+    const packageEntry = pinned.plugins[0];
+    await assertRealPath(packageEntry.root, "directory", "Candidate V2 plugin npm prefix");
+    await assertRealPath(packageEntry.packageRoot, "directory", "Candidate V2 plugin package");
+    const packageDetails = await inspectV2PluginPackageRoot(packageEntry.root, packageEntry.specifier, { sha256File });
+    if (normalizedPath(packageDetails.packageRoot) !== normalizedPath(packageEntry.packageRoot)
+      || packageDetails.treeSha256 !== packageEntry.treeSha256
+      || packageDetails.packageLockSha256 !== packageEntry.packageLockSha256
+      || packageDetails.fileCount !== packageEntry.fileCount || packageDetails.entryCount !== packageEntry.entryCount) {
+      throw new Error("Candidate V2 plugin package tree or npm lockfile does not match its manifest.");
+    }
+    const pluginModeError = immutableReleasePluginModeError(env);
+    if (pluginModeError) throw new Error(pluginModeError);
+    return { releaseRoot, serverPath, profile: "v2-antigravity", integrityMode: "immutable-release+v2-plugin-profile" };
   }
   const requiredReleaseFiles = [
     "server.js",
@@ -341,6 +387,13 @@ async function runFreshHealthcheck({ configPath, cwd, serverName = "opencode", t
     const status = resultText(result);
     if (!/^OpenCode MCP bridge status: healthy\./im.test(status)) {
       throw new Error(`Fresh MCP process was not healthy:\n${status || "no status text"}`);
+    }
+    if (candidate.profile === "v2-antigravity") {
+      const expectedPluginSha = String(entry.env.CODEX_OPENCODE_EXPECTED_PLUGIN_MANIFEST_SHA256 || "").trim().toLowerCase();
+      if (!status.includes("OpenCode external plugins: enabled (exact allowlist and pinned tree verified)")
+        || !status.includes(`External plugin manifest SHA-256: ${expectedPluginSha}`)) {
+        throw new Error("Fresh MCP process did not attest the exact V2 Antigravity plugin manifest.");
+      }
     }
     return {
       serverName,

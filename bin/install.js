@@ -28,7 +28,7 @@ async function install(argv, dependencies) {
   let selected = argv.filter(arg => arg !== "--interactive");
   let options = parseArguments([...selected, "--skills"]);
   if (options.help) {
-    log("Usage: node bin/install.js [--interactive | --yes] [--dry-run] [--client auto|codex|claude|both|cursor|all|<client-list>] [--workers opencode,codex,pi] [--pi-safety deny|unsandboxed-worktree] [--delegates opencode,codex,pi|none] [--standalone-delegates all|<keys>|none] [--host-home <home>] [--claude-home <config-dir>] [--cursor-home <dir>] [--cursor-config <file>] [--codex-home <dir>] [--claude-config <file>] [--runtime-dir <dir>] [--state-dir <dir>] [--profile pure|gemini]. List skills: node bin/skill-package.js --list");
+    log("Usage: node bin/install.js [--interactive | --yes] [--dry-run] [--client auto|codex|claude|both|cursor|all|<client-list>] [--workers opencode,codex,pi] [--pi-safety deny|unsandboxed-worktree] [--delegates opencode,codex,pi|none] [--standalone-delegates all|<keys>|none] [--host-home <home>] [--claude-home <config-dir>] [--cursor-home <dir>] [--cursor-config <file>] [--codex-home <dir>] [--claude-config <file>] [--runtime-dir <dir>] [--state-dir <dir>] [--profile pure|gemini] [--opencode-executable <absolute-native-path>]. List skills: node bin/skill-package.js --list");
     return 0;
   }
   const platform = dependencies.platform || process.platform;

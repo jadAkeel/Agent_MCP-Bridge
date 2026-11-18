@@ -179,7 +179,7 @@ test("remaining advertised fields retain their nested constraints; repeated jobs
 });
 
 test("B-213: delegation fields, full detail and contractor discovery stay advertised on each relevant tool", () => {
-  const jobFields = ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract"];
+  const jobFields = ["agent", "task", "cwd", "write", "lockMode", "lockedPaths", "allowedEdits", "validationCommand", "scopeContract", "codexProfile"];
   const scopeFields = ["mode", "read", "write", "allowedEdits", "forbidden", "validationCommand"];
   for (const name of ["run_opencode_agent", "enqueue_opencode_job", "create_multi_agent_pipeline"]) {
     const tool = advertisedTools.get(name);

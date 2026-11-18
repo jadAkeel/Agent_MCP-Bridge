@@ -38,6 +38,7 @@ const RUNTIME_BIN_FILES = Object.freeze([
   "bin/direct-run-audit.js",
   "bin/lib-digest.js",
   "bin/main-module.js",
+  "bin/opencode-v2-inventory.js",
   "bin/ops-log.js",
   "bin/plugin-manifest-paths.js",
   "bin/process-supervisor.js",

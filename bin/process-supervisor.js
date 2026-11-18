@@ -1176,14 +1176,19 @@ async function runSelfTest() {
     // A payload that exits while a descendant keeps its stdio open is reported right away,
     // not when the (here 120 s) timeout fires, and its released PID never reaches taskkill.
     const grandchildMarker = path.join(tempRoot, "grandchild.pid");
+    const grandchildReadyMarker = path.join(tempRoot, "grandchild.ready");
     const orphaningPayload = [
       "const fs = require('node:fs');",
       "const { spawn } = require('node:child_process');",
       // detached on Windows: libuv puts non-detached children in a kill-on-close job, so only
       // a breakaway descendant (as a non-Node payload may create) outlives a Node payload.
-      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: process.platform === 'win32', windowsHide: true });",
+      "const child = spawn(process.execPath, ['-e', 'require(\"node:fs\").writeFileSync(process.argv[1], \"ready\"); setInterval(() => {}, 1000)', process.argv[2]], { stdio: ['ignore', 'inherit', 'inherit'], detached: process.platform === 'win32', windowsHide: true });",
       "fs.writeFileSync(process.argv[1], String(child.pid));",
-      "process.exit(0);",
+      // Keep the payload alive until the OS has actually started the descendant. Without this
+      // handshake, a loaded Windows host can snapshot the process table before the child exists.
+      "const deadline = Date.now() + 5000;",
+      "const waitForGrandchild = () => { if (fs.existsSync(process.argv[2])) process.exit(0); if (Date.now() >= deadline) process.exit(2); setTimeout(waitForGrandchild, 10); };",
+      "waitForGrandchild();",
     ].join(" ");
     descendantHarness = createHarness();
     await waitForEvent(descendantHarness, "ready");
@@ -1191,7 +1196,7 @@ async function runSelfTest() {
     descendantHarness.send({
       type: "launch",
       command: process.execPath,
-      args: ["-e", orphaningPayload, grandchildMarker],
+      args: ["-e", orphaningPayload, grandchildMarker, grandchildReadyMarker],
       cwd: tempRoot,
       env: { ...process.env, PROCESS_SUPERVISOR_SELF_TEST: "1" },
       timeoutMs: 120_000,
@@ -1203,6 +1208,7 @@ async function runSelfTest() {
     const descendantExit = await waitForEvent(descendantHarness, "exit", () => true, 30_000);
     grandchildPid = Number(await readFile(grandchildMarker, "utf8"));
     assert.equal(descendantExit.reason, "descendant_after_exit", JSON.stringify(descendantExit));
+    assert.equal(await fileExists(grandchildReadyMarker), true, "The descendant must be running before its parent exits.");
     assert.ok(performance.now() - descendantLaunchedAt < 30_000);
     assert.equal(descendantExit.payloadExited, true);
     assert.equal(descendantExit.payloadExitCode, 0);
