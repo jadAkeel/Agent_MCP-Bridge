@@ -401,7 +401,7 @@ test("private profiles copy public native prerequisites without credentials, his
   assert.equal(await readFile(path.join(source, "config", "opencode", "agents", "reviewer.md"), "utf8"), "fixture role");
   const outside = path.join(scratch, "outside-linked-profile"); await mkdir(outside);
   await writeFile(path.join(outside, "sentinel"), "outside is untouched");
-  symlinkSync(outside, path.join(source, "config", "opencode", "linked"), process.platform === "win32" ? "junction" : "dir");
+  symlinkSync(outside, path.join(source, "config", "opencode", "agents", "linked"), process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(prepareTestEnvironment(path.join(scratch, "linked-refusal"), ambient), /Test profile links are not allowed/);
   assert.equal(await readFile(path.join(outside, "sentinel"), "utf8"), "outside is untouched");
 });
