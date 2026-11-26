@@ -9,8 +9,11 @@ metadata:
 
 Input: the existing task/check ledger, result receipts, changed events and relevant final
 diff. Output: confirmed/refuted incidents, supported narrow corrections and validation
-status. Adapt the delegation-retrospective workflow; a simple one-pass task needs only a
-brief check. Do not create another tracking or logging engine or another audit agent.
+status. Own Bridge-specific incident evidence, not routine planning, execution or final
+acceptance. When the optional personal `delegation-retrospective` skill is active, use
+it as the analysis owner and supply the Bridge evidence below; do not run two retrospectives.
+A successful task without meaningful incidents needs no retrospective. Do not create
+another tracking or logging engine or another audit agent.
 
 Read summaries and changed evidence once. Reconstruct actual task boundaries, attempts,
 interruptions, checks, required review and available usage. Distinguish implementation,

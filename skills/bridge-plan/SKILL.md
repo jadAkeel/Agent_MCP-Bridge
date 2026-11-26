@@ -11,19 +11,21 @@ Input: the user's goal, relevant project state, constraints and actual available
 Output: selected path with rationale, bounded deliverables, real dependencies, ownership
 and acceptance concerns. The coordinator owns the completed result.
 
-Read the installed `bridge-orchestrator` skill first for coordination policy.
-Use `multi-agent-balanced` when installed before selecting a worker, and load the guidance for the
-selected runner. Keep each worker's profile, scope and run/job ID in the same
-Codex Desktop conversation for status and result lookup.
+## Responsibility and inputs
 
-Read relevant instructions, current changes and real check commands once. Use
-the installed Superpowers workflow for direct engineering work. Before delegation,
-read multi-agent-balanced when installed and the guidance for the selected runner, including
-opencode-balanced for OpenCode or agy-delegate for the independent Antigravity relay.
-Managed dispatch follows the selected managed transport. Report missing required skills.
-Plan status reporting in the same Codex Desktop chat. Record each worker's selected account profile,
-scope, workspace, transport, and run or job ID on receipt. Keep each worker's ID for parallel
-dispatch and use the original transport for status and result lookup.
+Own the assignment plan: decide direct versus delegated work, select the authorized
+route, and define dependencies, ownership and acceptance. `bridge-orchestrator` owns
+the conversation and worker identities; `bridge-execute` consumes the accepted plan.
+Reuse existing coordination decisions instead of restarting the orchestrator on entry.
+Use [coordination](../references/coordination.md) for the relationship with optional
+`multi-agent-balanced` guidance and the authoritative DAG record.
+
+Read relevant instructions, current changes and real check commands once. Follow the
+user's active engineering workflow; do not enable disabled frameworks. Load only the
+selected managed guide or independent runner. Report missing required capabilities.
+Plan one status record in the current Codex Desktop conversation or its existing task
+ledger: selected account profile, scope, workspace, transport, run/job ID and next review.
+A dispatch receipt adds the actual identifier; never invent it during planning.
 
 Use
 the execution-ownership policy in [coordination](../references/coordination.md) before
@@ -65,6 +67,19 @@ Compare useful work with briefing, startup, repeated discovery, review and integ
 Group shared discovery; split coherent acceptance concerns. Do not create planner,
 builder, reviewer and tester jobs for every small edit. Independent review is warranted
 by risk or a required gate, not by a desire to fill available slots.
+
+## DAG handoff
+
+Classify the assignment using [coordination](../references/coordination.md) before
+choosing sequential or parallel execution. Project-linked subtasks require the project
+DAG even with one worker; truly standalone delegation needs only a brief/result record.
+
+For project-linked work, record stable task IDs, predecessor edges, assigned worker/profile,
+read/write/forbidden paths, shared resources, acceptance checks and review state. Include
+an orchestrator-owned join for actual fan-in. Reuse the approved DAG and its task store;
+when user/project rules require Beads, follow the installed `beads` skill and keep that
+store authoritative. Do not create a second checklist with independent task statuses.
+Do not create a DAG for a truly standalone assignment or duplicate an existing project DAG.
 
 Record genuine predecessor file state. A dependency chain stays sequential. Schedule it
 through supported calls; do not invent a `dependsOn` tool field. For related writers,
