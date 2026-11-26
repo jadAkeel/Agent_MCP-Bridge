@@ -7,6 +7,11 @@ metadata:
 
 # Carry out and balance
 
+Own execution of the accepted assignments, result inspection and reviewed integration.
+Do not redo `bridge-plan` unless a changed dependency, scope or failed assumption needs
+an explicit plan update. `bridge-orchestrator` retains conversation-level worker tracking;
+`bridge-learn` handles recurring incidents without repeating acceptance review.
+
 Input: approved plan and current pending work. Output: actual ownership/evidence,
 reviewed combined candidate and honest acceptance state. Use
 [coordination](../references/coordination.md) and the existing
@@ -22,7 +27,14 @@ review the shared foundation before branching; the orchestrator combines predece
 outputs, resolves conflicts and verifies the integrated result before the next DAG stage.
 Keep required independent review; workers' success reports alone never release a stage.
 
-1. Start only runnable priorities. Give each worker goal/acceptance, reviewed input and
+1. Confirm the assignment classification: project-linked subtasks use the documented
+   project DAG even for one worker; truly standalone work uses its brief/result record.
+   For DAG work, select ready tasks from that record; honor predecessor edges and claim
+   tasks using the required tracker before dispatch. When Beads is required, the coordinator
+   is its only writer and records the real job/run ID there. Keep each task open until
+   coordinator acceptance. A fan-in join closes only after reviewing, integrating and
+   verifying the combined candidate; dependents receive those actual accepted files.
+   Give each worker goal/acceptance, reviewed input and
    predecessor decisions, exact read/write ownership, forbidden paths, interfaces and
    shared resources, actual commands and check owners, stop conditions and report contract.
    Point to relevant source rather than transferring the whole chat/manual. Workers must

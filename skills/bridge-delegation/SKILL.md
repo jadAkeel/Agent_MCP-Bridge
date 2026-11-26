@@ -13,6 +13,26 @@ Help the user choose how to delegate, carry out bounded work, and review the act
 result. Match the route to the task, available tools, dependencies and user-selected
 models. The coordinator remains responsible for the outcome.
 
+## Guide boundaries
+
+This `agent-mcp-bridge` skill is the public product guide, stored in the source folder
+`skills/bridge-delegation`. Its packaged library keeps four separate responsibilities:
+`bridge-orchestrator` owns coordination and worker tracking, `bridge-plan` owns assignment
+planning, `bridge-execute` owns execution and reviewed integration, and `bridge-learn`
+owns incident investigation. Open only the stage needed for the current task.
+
+Optional personal `multi-agent-balanced` guidance supplies general coordination policy;
+these Bridge skills supply product-specific procedures. Reuse one plan, DAG and evidence
+record rather than running both workflows independently. No personal skill, Superpowers
+or other engineering framework is required by this package. Honor the user's active
+workflow and disabled-framework choices. Personal skill paths and accounts are not
+installed or changed by this guide.
+
+Use these guides only while assessing or carrying out delegation and its review,
+not as a mandatory workflow for ordinary direct edits. Before dispatch, project-linked
+subtasks require the project DAG even for one worker; a truly standalone deliverable
+uses a brief/result record without a DAG. Both require scoped work and result review.
+
 ## 1. Establish the available route
 
 Inspect project instructions, relevant source, existing edits and actual check commands.

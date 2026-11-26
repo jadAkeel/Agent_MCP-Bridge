@@ -1,8 +1,57 @@
 # Shared coordination boundary
 
-Maintained source adapted from the agent-mcp-bridge orchestration draft and the balanced
-Day4/Day5 and Public Menu lessons. The three entrypoints split decisions, execution and
-learning; this reference owns their common invariants.
+This reference owns common invariants for the separate Bridge skills. It is shared
+policy, not another coordinator or task ledger.
+
+## Responsibility map
+
+| Entry | Owns | Handoff |
+| --- | --- | --- |
+| `agent-mcp-bridge` | Public product/route guide | Open only the relevant library skill |
+| `bridge-orchestrator` | Coordination, worker identities and user status | Planning or execution as needed; direct lookup for status |
+| `bridge-plan` | Assignment DAG, route, ownership and acceptance | Accepted assignments to execution |
+| `bridge-execute` | Ready-task dispatch, recovery, review and integration | Accepted combined results; incidents only when warranted |
+| `bridge-learn` | Bridge incident evidence and proposed corrections | One reviewed learning record |
+
+Optional personal `multi-agent-balanced` owns general delegation policy when enabled;
+Bridge skills apply that policy to Bridge tools. Resolve ownership once and reuse the
+same approved plan, assignments and evidence. Do not create two planners or repeat
+reviews merely because both sets are installed. Without personal skills, these packaged
+rules remain usable. Follow user/project instructions and the active engineering workflow;
+never activate a disabled framework or require Superpowers, EGM or personal skill files.
+
+Original `*-delegate` skills own independent CLI launch and relay mechanics only when
+that route is selected; managed `bridge-delegate-*` guides describe Bridge workers.
+Do not select an external route or enable a helper merely because a guide exists.
+`delegation-retrospective`, when active, owns general incident analysis; `bridge-learn`
+supplies Bridge diagnostics to that same investigation.
+
+## One authoritative DAG record
+
+Before dispatch, classify the assignment:
+
+- **Project-linked work:** a subtask of a larger project objective, a prerequisite,
+  a consumer of another task's output, or work that must join other changes. Record it
+  in the project's documented DAG before dispatch, even for one worker. Reuse existing
+  task IDs and real dependency edges; do not invent edges between independent tasks.
+- **Truly standalone work:** one self-contained deliverable with no predecessor or
+  downstream integration dependency in a larger objective. Use one brief and run/result
+  record, without creating a DAG. Being located in a repository alone does not make it
+  project-linked. Still define scope, acceptance, review and the next status lookup.
+
+Worker count and sequential/parallel mode do not decide whether a DAG is needed.
+If the relationship is uncertain, inspect the existing project plan before dispatch.
+
+For project-linked delegation, reuse its approved plan and task store. Record task IDs,
+predecessor edges, scope/resources, selected worker/profile, acceptance, actual run/job
+ID and next review. When user/project rules require Beads, use the installed `beads`
+skill and the approved project store as the sole task/dependency record. Do not embed
+personal paths, create a parallel status list or install a tracker automatically.
+If a required tracker is unavailable, report the blocked tracking step before dispatch.
+The coordinator owns task updates and actual fan-in joins. Individual worker success
+is not acceptance: close a join only after inspecting, integrating and verifying the
+combined candidate, then release its dependents from those actual files. A DAG record
+is orchestration guidance, not a new Bridge scheduler or tool argument.
 
 ## Execution ownership before mode selection
 
@@ -32,8 +81,8 @@ predecessor changes, resolve merge and interface conflicts, and verify the combi
 before releasing dependent tasks. Passing individual jobs alone does not release a stage.
 Workers receive the actual reviewed file state and do not merge other branches or launch
 the next stage unless explicitly assigned. Model dependencies in the existing plan; do
-not invent a general DAG scheduler or unsupported tool fields. A small single task needs
-neither a new DAG nor a compulsory worktree.
+not invent a general DAG scheduler or unsupported tool fields. A truly standalone assignment needs no DAG; project-linked subtasks still use the
+project DAG. Worktree requirements come from the selected transport, not task size.
 
 ## Shared invariants
 

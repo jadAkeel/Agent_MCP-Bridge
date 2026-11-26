@@ -100,6 +100,18 @@ Sign in through the normal client/provider flow. Live inference smoke is a separ
 Custom homes, ownership/conflicts, backups and safe rollback are in
 [ONBOARDING](docs/ONBOARDING.md#package-installation-windows-linux-and-macos).
 
+The skills have separate responsibilities: `bridge-orchestrator` owns coordination and
+worker status, `bridge-plan` owns assignments and the dependency DAG, `bridge-execute`
+owns execution and reviewed integration, and `bridge-learn` handles meaningful incidents.
+The marketplace `agent-mcp-bridge` entry is the public guide to those workflows.
+Optional personal `multi-agent-balanced` supplies general policy, not a second plan;
+`delegation-retrospective` can analyze the same incident evidence without another review.
+Project-linked delegated subtasks use the documented project DAG even with one worker;
+truly standalone assignments use a brief/result record without a DAG. Both require scope,
+tracking and coordinator review. User/project instructions choose the authoritative tracker
+(including Beads where required) and active engineering workflow. These guides apply to
+delegation, not every direct edit. No Superpowers or other framework is required.
+
 The installer includes the `bridge-orchestrator` skill in the selected host's skills folder,
 alongside the managed planning and execution guides. It teaches Codex Desktop to choose a
 worker, apply the runner-specific guidance, and keep each run or job ID available for follow-up.
